@@ -2,10 +2,10 @@
 """Measure every first-party crate linked to cs, including path dependencies."""
 import json
 from pathlib import Path
-import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
+CAP = 1800
 metadata = json.loads(subprocess.check_output(
     ['cargo', 'metadata', '--locked', '--format-version', '1'], cwd=ROOT))
 packages = {p['id']: p for p in metadata['packages']}
@@ -31,9 +31,8 @@ while pending:
         files[str(path.relative_to(ROOT))] = sum(
             bool(line.strip()) and not line.lstrip().startswith('//')
             for line in production.splitlines())
-line = next(line for line in (ROOT / 'cs/INVARIANTS.md').read_text().splitlines()
-            if 'Rust runner ≤' in line)
-cap = int(re.search(r'Rust runner ≤ (\d+)', line)[1])
+# The runner's size budget: formatted non-test lines across the linked first-party crates.
+cap = CAP
 result = {'non_test_nonblank_noncomment': sum(files.values()), 'cap': cap,
           'files': files, 'linked_first_party_crates': sum(packages[k]['source'] is None for k in seen),
           'resolved_third_party_crates': sum(packages[k]['source'] is not None for k in seen)}
