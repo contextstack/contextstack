@@ -159,8 +159,9 @@ impl CallError {
     /// The single mapping to the wire.
     pub fn to_wire(&self) -> WireError {
         use FailureClass::{
-            CapacityExhausted, PolicyDenied, ProviderAuth, ProviderNotConfigured, ProviderQuotaExhausted,
-            ProviderRequestRejected, ProviderTransient, StreamingUnsupported,
+            CapacityExhausted, PolicyDenied, ProviderAuth, ProviderNotConfigured,
+            ProviderQuotaExhausted, ProviderRequestRejected, ProviderTransient,
+            StreamingUnsupported,
         };
         let (class, message, routed, retry_after_ms) = match self {
             Self::ProviderFailed(message) => {
@@ -276,7 +277,11 @@ fn plain_provider_message(body: &str) -> Option<String> {
         .pointer("/error/message")
         .or_else(|| v.pointer("/error/error/message"))
         .and_then(|m| m.as_str())?;
-    if msg.is_empty() || msg.len() > MAX_WIRE_PROVIDER_MSG || msg.contains('\n') || msg.contains('\r') {
+    if msg.is_empty()
+        || msg.len() > MAX_WIRE_PROVIDER_MSG
+        || msg.contains('\n')
+        || msg.contains('\r')
+    {
         return None;
     }
     Some(msg.to_string())
@@ -352,10 +357,7 @@ impl WireError {
 
     /// No HTTP connection slot within the accept wait (`gateway.busy`).
     pub fn busy(retry_after_ms: i64) -> Self {
-        let mut e = Self::retryable(
-            "gateway.busy",
-            "gateway at HTTP connection capacity",
-        );
+        let mut e = Self::retryable("gateway.busy", "gateway at HTTP connection capacity");
         e.retry_after_ms = Some(retry_after_ms);
         e
     }
@@ -465,10 +467,7 @@ mod tests {
         let short = r#"{"error":{"message":"upstream says 400"}}"#;
         let msg = upstream_wire_message(400, FailureClass::ProviderRequestRejected, "vllm", short);
         assert_eq!(msg, "upstream says 400");
-        let long = format!(
-            r#"{{"error":{{"message":"{}"}}}}"#,
-            "x".repeat(400)
-        );
+        let long = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(400));
         let msg = upstream_wire_message(500, FailureClass::ProviderTransient, "vllm", &long);
         assert_eq!(msg, "vllm: upstream error (HTTP 500)");
         assert!(!msg.contains('x'));

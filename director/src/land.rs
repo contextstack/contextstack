@@ -286,20 +286,26 @@ mod tests {
 
     #[test]
     fn landed_requires_commit() {
-        let m = land_body(&json!({"state": "landed", "repo": "r", "lane": "l", "main": "main", "landed_by": "owner"}));
+        let m = land_body(
+            &json!({"state": "landed", "repo": "r", "lane": "l", "main": "main", "landed_by": "owner"}),
+        );
         assert!(parse_body(&m).is_err());
     }
 
     #[test]
     fn failed_requires_reason() {
-        let m = land_body(&json!({"state": "failed", "repo": "r", "lane": "l", "main": "main", "landed_by": "owner"}));
+        let m = land_body(
+            &json!({"state": "failed", "repo": "r", "lane": "l", "main": "main", "landed_by": "owner"}),
+        );
         assert!(parse_body(&m).is_err());
     }
 
     #[test]
     fn landed_shape() {
-        let m = land_body(&json!({"state": "landed", "repo": "ctx", "lane": "lane/x", "main": "main", "commit": "abc",
-                                 "landed_by": "the owner"}));
+        let m = land_body(
+            &json!({"state": "landed", "repo": "ctx", "lane": "lane/x", "main": "main", "commit": "abc",
+                                 "landed_by": "the owner"}),
+        );
         let Ok(b) = parse_body(&m) else {
             panic!("expected valid landed body");
         };

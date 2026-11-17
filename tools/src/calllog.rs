@@ -71,7 +71,8 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("chdir: {e}"));
         record("fs_read", &json!({"path": "a.txt"}));
         let _ = std::env::set_current_dir(&prev);
-        let text = fs::read_to_string(dir.path().join(".lab-calls.jsonl")).unwrap_or_else(|e| panic!("read: {e}"));
+        let text = fs::read_to_string(dir.path().join(".lab-calls.jsonl"))
+            .unwrap_or_else(|e| panic!("read: {e}"));
         assert!(text.contains("fs_read"));
     }
 

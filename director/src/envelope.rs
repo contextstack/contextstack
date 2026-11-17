@@ -161,10 +161,7 @@ fn rejected(error: &str) -> Value {
 }
 
 /// A settled envelope, if any.
-fn earlier_ack(
-    store: &Store,
-    event_id: &str,
-) -> Result<Option<(i64, String, String)>, String> {
+fn earlier_ack(store: &Store, event_id: &str) -> Result<Option<(i64, String, String)>, String> {
     let db = store.db();
     db.query_row(
         "SELECT node_id, envelope_sha256, ack FROM envelopes WHERE event_id = ?1",
@@ -193,7 +190,6 @@ fn repeat_answer(
     let ack: Value = serde_json::from_str(ack).map_err(|e| e.to_string())?;
     Ok(json!({"status": "acked", "ack": ack}))
 }
-
 
 fn parse<'a>(
     envelope: Option<&'a Value>,
@@ -425,7 +421,12 @@ fn prepare_run(store: &Store, p: &Parsed) -> Result<Option<Map<String, Value>>, 
     Ok(row)
 }
 
-fn settle(store: &Store, tx: &Transaction, node_id: i64, prep: Prepared<'_>) -> Result<Value, String> {
+fn settle(
+    store: &Store,
+    tx: &Transaction,
+    node_id: i64,
+    prep: Prepared<'_>,
+) -> Result<Value, String> {
     let (kind, event_id, envelope_sha256, subject, files) = match prep {
         Prepared::Run(p, _) => (
             Kind::RunFinalized,
@@ -580,7 +581,7 @@ fn record_run(
 
 /// A run's evidence files, once each.
 fn record_files(tx: &Transaction, p: &Parsed) -> rusqlite::Result<()> {
-      for f in &p.files {
+    for f in &p.files {
         tx.execute(
             "INSERT OR IGNORE INTO run_files (run_id, path, sha256, bytes) VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -707,7 +708,10 @@ mod tests {
                "charged_usd": 0, "source": {"class": "api", "model": null}})
     }
 
-    fn test_run_body(run_id: &str, extra: Option<(&str, &[u8])>) -> Result<(Value, Vec<u8>), Box<dyn std::error::Error>> {
+    fn test_run_body(
+        run_id: &str,
+        extra: Option<(&str, &[u8])>,
+    ) -> Result<(Value, Vec<u8>), Box<dyn std::error::Error>> {
         let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::from([
             (
                 "terminal.json".into(),
@@ -829,14 +833,19 @@ mod tests {
     /// A large object is hashed before the lock; another caller can use the database meanwhile (`test_seam::arm_verify_pause`).
     #[test]
     fn verification_does_not_hold_the_database_lock() -> Result<(), Box<dyn std::error::Error>> {
-        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir()?;
         let store = Arc::new(Store::open(&tmp.path().join("data"))?);
         register_node(&store, "n1")?;
         let run_id = "run-lock-free";
         let large = vec![b'x'; 4 * 1024 * 1024];
         for (_, data) in [
-            ("terminal.json", format!(r#"{{"run_id":"{run_id}"}}"#).into_bytes()),
+            (
+                "terminal.json",
+                format!(r#"{{"run_id":"{run_id}"}}"#).into_bytes(),
+            ),
             ("transcript.md", b"# t\n".to_vec()),
             ("check.json", b"{}".to_vec()),
             ("evidence/large.bin", large.clone()),
@@ -861,13 +870,18 @@ mod tests {
 
     #[test]
     fn concurrent_posts_record_one_envelope() -> Result<(), Box<dyn std::error::Error>> {
-        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir()?;
         let store = Arc::new(Store::open(&tmp.path().join("data"))?);
         register_node(&store, "n1")?;
         let run_id = "run-once";
         for (_, data) in [
-            ("terminal.json", format!(r#"{{"run_id":"{run_id}"}}"#).into_bytes()),
+            (
+                "terminal.json",
+                format!(r#"{{"run_id":"{run_id}"}}"#).into_bytes(),
+            ),
             ("transcript.md", b"# t\n".to_vec()),
             ("check.json", b"{}".to_vec()),
         ] {

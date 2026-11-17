@@ -92,6 +92,8 @@ if command -v cargo >/dev/null 2>&1; then
     && touch target/release/cs-harness) || say "cs-tools, cs-harness, cs-sandbox, cs-gateway or cs-director does not build (cargo build --release -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director at the repo root)"
   # Regressions copy ops/bin into partial estates with no release bin/: render profiles with this build.
   export CS_SANDBOX_BIN="${CS_SANDBOX_BIN:-$(cd .. && pwd)/target/release/cs-sandbox}"
+  # The public repository's CI runs `cargo fmt --all --check` first; keep the same bar here.
+  (cd .. && cargo fmt --all --check >/dev/null) || say "Rust code is not rustfmt-formatted (run cargo fmt --all at the repo root)"
   (cd .. && cargo clippy --release --locked --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -- -D warnings) || say "cs-director, cs-gateway, cs-harness, cs-sandbox or cs-tools has Clippy warnings (cargo clippy --release --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -- -D warnings at the repo root)"
 else
   echo "check: skip cs-tools build: no cargo on PATH; tools whose descriptor names target/release/cs-tools cannot run, and the gateway contract suite is skipped" >&2

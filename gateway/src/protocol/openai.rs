@@ -250,7 +250,13 @@ impl OpenAi<'_> {
         }
         // Many OpenAI-compatible servers ignore `stream: true` and answer with the unary body. Fold it
         // through the unary rules into one delta and the stop, so the caller still gets a valid stream.
-        let bytes = until(deadline, "Post", &url, super::success_body(resp, "Post", &url)).await?;
+        let bytes = until(
+            deadline,
+            "Post",
+            &url,
+            super::success_body(resp, "Post", &url),
+        )
+        .await?;
         let out: Out = first_value(&bytes).map_err(CallError::transport_local)?;
         let r = reply(self.name, out, 0, &mut json!({}))?;
         stream.queued.push(Event::Stop(Stop {

@@ -575,14 +575,15 @@ mod tests {
         }
     }
 
-
     #[test]
     fn tokenize_handles_non_finite_float_literals_and_refuses_dates_without_flag() {
         assert!(matches!(tokenize("+.inf", true), Ok(Val::Float(f)) if f.is_infinite() && f > 0.0));
         assert!(matches!(tokenize("-.inf", true), Ok(Val::Float(f)) if f.is_infinite() && f < 0.0));
         assert!(matches!(tokenize(".nan", true), Ok(Val::Float(f)) if f.is_nan()));
         assert!(matches!(tokenize(".", true), Ok(Val::Str(s)) if s == "."));
-        let err = tokenize("2026-01-01 00:00:00Z", false).err().unwrap_or_else(|| panic!("err"));
+        let err = tokenize("2026-01-01 00:00:00Z", false)
+            .err()
+            .unwrap_or_else(|| panic!("err"));
         assert_eq!(err.class, "Psych::DisallowedClass");
     }
 
@@ -648,6 +649,5 @@ mod tests {
         assert_eq!(show("020"), "16");
         assert_eq!(show("---"), "\"---\"");
         assert_eq!(show("..."), "\"...\"");
-
     }
 }

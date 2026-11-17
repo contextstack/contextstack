@@ -105,7 +105,9 @@ pub fn load(path: &str) -> Result<Spec, String> {
     })?;
     if let Some(intent) = &spec.intent {
         if intent.contains('-') {
-            return Err(format!("{path}: intent: retired format; use a Director ULID"));
+            return Err(format!(
+                "{path}: intent: retired format; use a Director ULID"
+            ));
         }
         if intent.len() != 26
             || !intent
@@ -171,7 +173,9 @@ mod tests {
         assert!(load_text(VALID)?.intent.is_none());
         let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         assert_eq!(
-            load_text(&format!("{VALID}intent: {id}\n"))?.intent.as_deref(),
+            load_text(&format!("{VALID}intent: {id}\n"))?
+                .intent
+                .as_deref(),
             Some(id)
         );
         for retired in [concat!("INT", "-0001"), concat!("EXP", "-1")] {

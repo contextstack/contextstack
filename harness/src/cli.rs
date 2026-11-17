@@ -40,7 +40,8 @@ pub async fn execute_from(
     if repo.is_none() && !Path::new("INVARIANTS.md").exists() {
         return Err("run from the repository root (INVARIANTS.md not found)".into());
     }
-    let root = repo.map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))
+    let root = repo
+        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))
         .map_err(|e| e.to_string())?;
     let spec_path = if repo.is_some() && !Path::new(&spec_path).is_absolute() {
         root.join(&spec_path).to_string_lossy().into_owned()

@@ -653,7 +653,10 @@ mod tests {
     #[test]
     fn status_carries_agent_capabilities() -> Result<(), String> {
         let status = status_body(br#"{"active":[],"agent_capabilities":{"templates":["claude-code"],"preferred":"claude-code"}}"#)?;
-        assert_eq!(status["agent_capabilities"]["templates"], json!(["claude-code"]));
+        assert_eq!(
+            status["agent_capabilities"]["templates"],
+            json!(["claude-code"])
+        );
         assert_eq!(status["agent_capabilities"]["preferred"], "claude-code");
         for body in [
             br#"{"active":[],"agent_capabilities":[]}"#.as_slice(),

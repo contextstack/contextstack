@@ -1,10 +1,10 @@
 //! Hosted-lead authorization. All routes are denied unless explicitly allowed here.
-use std::fmt::Write as _;
 use crate::access::{Client, Kind};
 use crate::server::{Call, Reply, State, internal, refusal};
 use crate::store::Record;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
+use std::fmt::Write as _;
 
 pub fn denied() -> Reply {
     refusal(
@@ -129,9 +129,7 @@ pub fn guard(state: &State, call: &Call, c: &Client, parts: &[&str]) -> Option<R
         let db = state.store.db();
         match (call.method.as_str(), parts) {
             ("GET", ["me" | "nodes" | "usage" | "agents" | "repos"] | ["nodes" | "agents", _])
-            | ("PUT", ["objects", _]) => {
-                Ok(true)
-            }
+            | ("PUT", ["objects", _]) => Ok(true),
             ("GET", ["events"]) => Ok(call
                 .query("conversation")
                 .is_none_or(|id| c.conversation_id.as_deref() == Some(id))),
@@ -196,7 +194,10 @@ pub fn guard(state: &State, call: &Call, c: &Client, parts: &[&str]) -> Option<R
         Ok(false)
             if matches!(
                 (call.method.as_str(), parts),
-                ("POST", ["jobs", _, "cancel"] | ["runs", _, "decision"] | ["intents", _, "jobs"])
+                (
+                    "POST",
+                    ["jobs", _, "cancel"] | ["runs", _, "decision"] | ["intents", _, "jobs"]
+                )
             ) =>
         {
             Some(refusal(
@@ -210,7 +211,6 @@ pub fn guard(state: &State, call: &Call, c: &Client, parts: &[&str]) -> Option<R
         Err(e) => Some(internal(&e)),
     }
 }
-
 
 /// Restrict usage roll-ups to runs a lead may see (`visible` for `Record::Run`).
 pub fn push_run_scope(c: &Client, sql: &mut String, bind: &mut Vec<rusqlite::types::Value>) {

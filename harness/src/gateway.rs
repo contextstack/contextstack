@@ -796,7 +796,9 @@ mod tests {
     #[test]
     fn finish_rejects_responses_without_cost_numbers() -> Result<(), String> {
         let raw = r#"{"status":"ok","model":"m","message":{"content":"x"},"cost":{}}"#;
-        let error = finish(decode(raw.as_bytes(), 200)?, 200).err().ok_or("accepted")?;
+        let error = finish(decode(raw.as_bytes(), 200)?, 200)
+            .err()
+            .ok_or("accepted")?;
         assert!(error.contains("omitted cost numbers"));
         Ok(())
     }

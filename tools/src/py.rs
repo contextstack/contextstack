@@ -379,7 +379,10 @@ mod tests {
             Failure::raise("FileNotFoundError", &os_error_text(&e, "missing.txt"))
         );
         let e = io::Error::from_raw_os_error(21);
-        assert_eq!(os_error(&e, "dir").0, "IsADirectoryError: [Errno 21] Is a directory: 'dir'");
+        assert_eq!(
+            os_error(&e, "dir").0,
+            "IsADirectoryError: [Errno 21] Is a directory: 'dir'"
+        );
     }
     #[test]
     fn os_error_text_without_raw_errno_uses_display() {
@@ -407,7 +410,10 @@ mod tests {
     }
     #[test]
     fn int_accepts_large_unsigned_json_and_rejects_empty_string() {
-        assert_eq!(int(&json!(18_446_744_073_709_551_615_u64)), Ok(18_446_744_073_709_551_615));
+        assert_eq!(
+            int(&json!(18_446_744_073_709_551_615_u64)),
+            Ok(18_446_744_073_709_551_615)
+        );
         assert!(matches!(int(&json!("")), Err(Failure(ref m)) if m.starts_with("ValueError:")));
     }
     #[test]
@@ -430,7 +436,7 @@ mod tests {
         let e = io::Error::from_raw_os_error(20);
         assert!(os_error(&e, "x").0.starts_with("NotADirectoryError:"));
     }
-        #[test]
+    #[test]
     fn truthy_treats_nonzero_int_and_nonempty_map_as_true() {
         assert!(truthy(&json!(-1)));
         assert!(truthy(&json!({"a": 1})));
@@ -452,4 +458,3 @@ mod tests {
         assert!(repr("\u{10FFFF}").contains("\u{10FFFF}"));
     }
 }
-

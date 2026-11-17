@@ -231,9 +231,9 @@ fn spec_names_task(spec: &[u8], task: &str) -> bool {
         .and_then(serde_yaml::Value::as_sequence)
         .is_some_and(|tasks| {
             tasks.iter().any(|entry| {
-                entry.as_str().is_some_and(|path| {
-                    path.trim_end_matches('/') == task.trim_end_matches('/')
-                })
+                entry
+                    .as_str()
+                    .is_some_and(|path| path.trim_end_matches('/') == task.trim_end_matches('/'))
             })
         })
 }
@@ -332,7 +332,8 @@ impl Plan {
     /// Fill the form's empty check for uploaded bundles and `from_job` compatibility.
     pub fn fill_missing_check(&mut self, store: &Store) -> Result<(), String> {
         if let Some(path) = missing_check(&self.files, &self.task) {
-            const NO_CHECK: &[u8] = b"#!/bin/sh\n# no check: the form's check was empty, so every run passes\nexit 0\n";
+            const NO_CHECK: &[u8] =
+                b"#!/bin/sh\n# no check: the form's check was empty, so every run passes\nexit 0\n";
             store.put_object(NO_CHECK)?;
             self.files.push(BundleFile {
                 path,
@@ -562,7 +563,10 @@ mod tests {
             bytes: 0,
             mode: 0o644,
         }];
-        assert_eq!(missing_check(&files, "tasks/t/"), Some("tasks/t/check".into()));
+        assert_eq!(
+            missing_check(&files, "tasks/t/"),
+            Some("tasks/t/check".into())
+        );
         assert_eq!(missing_check(&files, "tasks/other"), None);
         assert_eq!(missing_check(&[], "tasks/t"), Some("tasks/t/check".into()));
     }

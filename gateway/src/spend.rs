@@ -894,7 +894,9 @@ mod tests {
             let g = Arc::clone(&g);
             let b = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
-                let r = g.admit("a", "", 0.0).unwrap_or_else(|e| panic!("admitted: {e}"));
+                let r = g
+                    .admit("a", "", 0.0)
+                    .unwrap_or_else(|e| panic!("admitted: {e}"));
                 b.wait();
                 r.settle(charge, false);
             }));
@@ -916,7 +918,10 @@ mod tests {
     fn invalid_denial_wire_has_no_path() -> Res {
         use crate::errors::WireError;
         let (_d, g) = guard("not json")?;
-        let d = g.admit("a", "", 0.0).err().unwrap_or_else(|| panic!("expected denial"));
+        let d = g
+            .admit("a", "", 0.0)
+            .err()
+            .unwrap_or_else(|| panic!("expected denial"));
         assert_eq!(d.reason, "invalid");
         let w = WireError::budget(d);
         assert_eq!(w.budget.as_ref().map(|b| b.reason), Some("invalid"));

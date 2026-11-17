@@ -157,7 +157,14 @@ fn listing(code: &std::path::Path) -> Result<Value, No> {
         let (p, _, digest) = profile(Some(&name), code)?;
         let mut public = json!({});
         for key in [
-            "name", "description", "model", "fallback", "writes", "lane", "check", "budget",
+            "name",
+            "description",
+            "model",
+            "fallback",
+            "writes",
+            "lane",
+            "check",
+            "budget",
             "task_type",
         ] {
             public[key] = p[key].clone();
@@ -327,14 +334,15 @@ fn available_model(model: &str, profile: &Value, status: &Value) -> Result<Strin
     };
     let now = util::now_utc();
     let ready = |candidate: &str| {
-        caps["templates"].as_array().is_some_and(|rows| {
-            rows.iter().any(|v| v.as_str() == Some(candidate))
-        }) && !status["provider_limits"].as_array().is_some_and(|rows| {
-            rows.iter().any(|r| {
-                r["template"].as_str() == Some(candidate)
-                    && r["resets_at"].as_str().is_none_or(|at| at > now.as_str())
+        caps["templates"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|v| v.as_str() == Some(candidate)))
+            && !status["provider_limits"].as_array().is_some_and(|rows| {
+                rows.iter().any(|r| {
+                    r["template"].as_str() == Some(candidate)
+                        && r["resets_at"].as_str().is_none_or(|at| at > now.as_str())
+                })
             })
-        })
     };
     if ready(model) {
         return Ok(model.into());
@@ -438,14 +446,25 @@ mod tests {
     fn missing_executor_uses_ready_profile_fallback() -> Result<(), String> {
         let profile = json!({"fallback": ["codex", "claude-code"]});
         let status = json!({"agent_capabilities": {"templates": ["codex", "claude-code"], "preferred": "claude-code"}});
-        assert_eq!(available_model("cursor-sol", &profile, &status).map_err(|e| e.2)?, "claude-code");
-        assert_eq!(available_model("codex", &profile, &status).map_err(|e| e.2)?, "codex");
+        assert_eq!(
+            available_model("cursor-sol", &profile, &status).map_err(|e| e.2)?,
+            "claude-code"
+        );
+        assert_eq!(
+            available_model("codex", &profile, &status).map_err(|e| e.2)?,
+            "codex"
+        );
         let none = json!({"agent_capabilities": {"templates": []}});
-        let error = available_model("cursor-sol", &profile, &none).err().ok_or("expected refusal")?;
+        let error = available_model("cursor-sol", &profile, &none)
+            .err()
+            .ok_or("expected refusal")?;
         assert!(error.2.contains("no installed, signed-in agent"));
         let limited = json!({"agent_capabilities": {"templates": ["codex", "claude-code"], "preferred": "codex"},
             "provider_limits": [{"template": "codex"}]});
-        assert_eq!(available_model("cursor-sol", &profile, &limited).map_err(|e| e.2)?, "claude-code");
+        assert_eq!(
+            available_model("cursor-sol", &profile, &limited).map_err(|e| e.2)?,
+            "claude-code"
+        );
         Ok(())
     }
 
@@ -453,18 +472,30 @@ mod tests {
     fn configured_checkout_and_branch_names_are_reserved() {
         let entry = json!({"path": "/fixture/checkout", "branch": "trunk"});
         for reserved in ["project", "checkout", "trunk"] {
-            assert_eq!(crate::repos::lane_name("project", reserved, &entry), format!("{reserved}-1"));
+            assert_eq!(
+                crate::repos::lane_name("project", reserved, &entry),
+                format!("{reserved}-1")
+            );
         }
-        assert_eq!(crate::repos::lane_name("project", "feature", &entry), "feature");
+        assert_eq!(
+            crate::repos::lane_name("project", "feature", &entry),
+            "feature"
+        );
         let entry = json!({"path": "/fixture/project-1"});
-        assert_eq!(crate::repos::lane_name("project", "project", &entry), "project-2");
+        assert_eq!(
+            crate::repos::lane_name("project", "project", &entry),
+            "project-2"
+        );
     }
 
     #[test]
     fn checkout_lane_names_are_renamed_in_entire_bundle() -> Result<(), String> {
         for lane in ["hello", "main", "master"] {
-            let (fields, files) = build(&json!({"title":"Hello", "goal":"Change", "repo":"hello", "lane":lane}),
-                std::path::Path::new(".")).map_err(|e| e.2)?;
+            let (fields, files) = build(
+                &json!({"title":"Hello", "goal":"Change", "repo":"hello", "lane":lane}),
+                std::path::Path::new("."),
+            )
+            .map_err(|e| e.2)?;
             let chosen = format!("{lane}-1");
             assert_eq!(fields["meta"]["lane"], chosen);
             assert_eq!(fields["meta"]["branch"], format!("lane/{chosen}"));
@@ -544,9 +575,10 @@ mod tests {
         std::fs::create_dir_all(&agents).map_err(|e| e.to_string())?;
         assert_eq!(listing(dir.path()).map_err(|e| e.2)?, json!({"agents": []}));
         for name in ["zebra", "alpha"] {
-            let data = format!("---\nname: {name}\ndescription: Test\nmodel: codex\nwrites: false\nlane: false\nfallback: [codex]\n---\nPrompt\n");
-            std::fs::write(agents.join(format!("{name}.md")), data)
-                .map_err(|e| e.to_string())?;
+            let data = format!(
+                "---\nname: {name}\ndescription: Test\nmodel: codex\nwrites: false\nlane: false\nfallback: [codex]\n---\nPrompt\n"
+            );
+            std::fs::write(agents.join(format!("{name}.md")), data).map_err(|e| e.to_string())?;
         }
         let listed = listing(dir.path()).map_err(|e| e.2)?;
         assert_eq!(listed["agents"][0]["name"], "alpha");

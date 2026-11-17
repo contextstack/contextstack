@@ -220,7 +220,6 @@ pub fn browser_stream(
     stream_inner(state, client, Some(conversation), Some(session), HEARTBEAT)
 }
 
-
 fn event_stream_response(body: mpsc::Receiver<Bytes>) -> Reply {
     let mut reply = hyper::Response::new(http_body_util::Either::Right(Stream(body)));
     for (name, value) in [

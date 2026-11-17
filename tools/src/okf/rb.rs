@@ -359,7 +359,8 @@ pub fn sub_at(s: &str, start: usize, end: usize, replacement: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;    #[test]
+    use super::*;
+    #[test]
     fn floats_print_as_ruby_does() {
         assert_eq!(float_to_s(1e16), "1.0e+16");
         assert_eq!(float_to_s(1e15), "1.0e+15");
@@ -376,7 +377,7 @@ mod tests {
         assert_eq!(float_to_s(f64::NEG_INFINITY), "-Infinity");
     }
     #[test]
-fn inspect_escapes_as_ruby_does() {
+    fn inspect_escapes_as_ruby_does() {
         assert_eq!(
             inspect_str("a\"b#{x}#$y\u{1}\u{7f}é"),
             "\"a\\\"b\\#{x}\\#$y\\u0001\\u007Fé\""
@@ -393,7 +394,7 @@ fn inspect_escapes_as_ruby_does() {
         assert_eq!(inspect(&hash), "{\"a\" => [1.5, nil]}");
     }
     #[test]
-fn json_and_strip_match_ruby() {
+    fn json_and_strip_match_ruby() {
         assert_eq!(
             json_str("a/\u{1f}\u{8}\u{7f}\u{2028}"),
             "\"a/\\u001f\\b\u{7f}\u{2028}\""
@@ -402,22 +403,26 @@ fn json_and_strip_match_ruby() {
         assert_eq!(rstrip("x\0 \t"), "x");
     }
     #[test]
-fn sub_expands_backslashes() {
+    fn sub_expands_backslashes() {
         assert_eq!(sub_at("k: 1\nx", 0, 4, "k: \"a\\\\b\""), "k: \"a\\b\"\nx");
         assert_eq!(sub_at("k: 1", 0, 4, "\\&!\\q"), "k: 1!\\q");
     }
     #[test]
-fn hash_equality_and_fetch_follow_ruby_semantics() {
+    fn hash_equality_and_fetch_follow_ruby_semantics() {
         let mut pairs = vec![(Val::Str("k".into()), Val::Int("1".into()))];
         hash_set(&mut pairs, Val::Str("k".into()), Val::Int("2".into()));
         assert!(eql(&Val::Int("1".into()), &Val::Int("1".into())));
-        assert!(Val::Hash(pairs.clone()).fetch("k").is_some_and(|v| matches!(v, Val::Int(s) if s == "2")));
+        assert!(
+            Val::Hash(pairs.clone())
+                .fetch("k")
+                .is_some_and(|v| matches!(v, Val::Int(s) if s == "2"))
+        );
         let psych = Raise::new("Psych::SyntaxError", "bad");
         assert!(psych.is_psych());
         assert!(!Raise::new("TypeError", "x").is_psych());
     }
     #[test]
-fn inspect_covers_date_time_and_hash_fetch_miss() {
+    fn inspect_covers_date_time_and_hash_fetch_miss() {
         use crate::okf::rtime::{self, Date};
         let d = Val::Date(Date::new(2026, 1, 2).unwrap_or_else(|| panic!("valid date")));
         assert!(inspect(&d).contains("Date"));
@@ -430,7 +435,7 @@ fn inspect_covers_date_time_and_hash_fetch_miss() {
         assert!(inspect(&Val::Bin(vec![0xff])).contains("\\xFF"));
     }
     #[test]
-fn inspect_renders_collections_and_binary() {
+    fn inspect_renders_collections_and_binary() {
         let arr = Val::Array(vec![Val::Recursive(false), Val::Bool(true)]);
         assert_eq!(inspect(&arr), "[[...], true]");
         let empty = Val::Hash(Vec::new());
@@ -461,11 +466,12 @@ fn inspect_renders_collections_and_binary() {
         let a1 = Val::Array(vec![Val::Int("1".into())]);
         let a2 = Val::Array(vec![Val::Int("1".into())]);
         assert!(eql(&a1, &a2));
-        assert_eq!(Val::Bin(b"x".to_vec()).string_bytes(), Some(b"x".as_slice()));
+        assert_eq!(
+            Val::Bin(b"x".to_vec()).string_bytes(),
+            Some(b"x".as_slice())
+        );
         assert!(Val::Int("1".into()).fetch("k").is_none());
         assert!(!Val::Nil.truthy());
         assert!(Val::Int("0".into()).truthy());
     }
-
-
 }

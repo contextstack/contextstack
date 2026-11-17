@@ -259,9 +259,7 @@ mod tests {
         };
         let port = gw.port;
         let hold = std::thread::spawn(move || {
-            let Some(s) =
-                std::net::TcpStream::connect(("127.0.0.1", port)).ok()
-            else {
+            let Some(s) = std::net::TcpStream::connect(("127.0.0.1", port)).ok() else {
                 return;
             };
             std::thread::sleep(Duration::from_secs(3));
@@ -278,7 +276,10 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "expected within accept timeout, took {elapsed:?}"
         );
-        assert!(body.contains("gateway.busy"), "expected gateway.busy in {body}");
+        assert!(
+            body.contains("gateway.busy"),
+            "expected gateway.busy in {body}"
+        );
         assert!(
             body.contains("retryable_gateway"),
             "expected retryable_gateway in {body}"

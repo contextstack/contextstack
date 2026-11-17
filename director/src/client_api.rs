@@ -239,17 +239,11 @@ fn work_list(state: &State, node: Option<&str>, call: &Call, client: &access::Cl
             Err(no) => return no.reply(),
         },
     };
-    let intents = match records::list_intents(
-        &db,
-        node,
-        call.query("conversation"),
-        lanes,
-        project,
-        limit,
-    ) {
-        Ok(rows) => rows,
-        Err(e) => return internal(&e),
-    };
+    let intents =
+        match records::list_intents(&db, node, call.query("conversation"), lanes, project, limit) {
+            Ok(rows) => rows,
+            Err(e) => return internal(&e),
+        };
     let intents = match crate::lead::filter(&db, client, Record::Intent, intents) {
         Ok(rows) => rows,
         Err(e) => return internal(&e),

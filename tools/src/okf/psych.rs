@@ -774,7 +774,7 @@ mod tests {
         }
     }
     #[test]
-fn documents_load_as_psych_loads_them() {
+    fn documents_load_as_psych_loads_them() {
         assert_eq!(load(""), "nil");
         assert_eq!(load("a: &x 1\nb: *x"), "{\"a\" => 1, \"b\" => 1}");
         assert_eq!(load("? [a]\n: 1"), "{[\"a\"] => 1}");
@@ -789,7 +789,7 @@ fn documents_load_as_psych_loads_them() {
         );
     }
     #[test]
-fn libyaml_safer_panics_are_worked_around() {
+    fn libyaml_safer_panics_are_worked_around() {
         assert_eq!(load("a: |\n  x"), "{\"a\" => \"x\"}");
         assert_eq!(load("a: >\n  x\n  y"), "{\"a\" => \"x y\"}");
         assert_eq!(load("a: |+\n  x"), "{\"a\" => \"x\"}");
@@ -808,7 +808,7 @@ fn libyaml_safer_panics_are_worked_around() {
         );
     }
     #[test]
-fn errors_read_as_psych_writes_them() {
+    fn errors_read_as_psych_writes_them() {
         assert_eq!(
             load("a: b: c"),
             "Psych::SyntaxError: (<unknown>): mapping values are not allowed in this context at line 1 column 5"
@@ -854,14 +854,14 @@ fn errors_read_as_psych_writes_them() {
             "{\"a\" => 1}"
         );
     }
-        #[test]
+    #[test]
     fn additional_mapping_error_messages_match_psych() {
         assert!(load("*\n").contains("SyntaxError"));
         assert!(load("a: b: c").contains("mapping values"));
         assert!(load("{\n").contains("SyntaxError"));
     }
     #[test]
-fn merge_keys_copy_anchors_like_psych() {
+    fn merge_keys_copy_anchors_like_psych() {
         assert_eq!(
             load("defaults: &def\n  x: 1\nitem:\n  <<: *def\n  y: 2"),
             "{\"defaults\" => {\"x\" => 1}, \"item\" => {\"x\" => 1, \"y\" => 2}}"
@@ -873,17 +873,19 @@ fn merge_keys_copy_anchors_like_psych() {
         assert_eq!(load("---\na: 1\n---\nb: 2\n"), "{\"a\" => 1}");
     }
     #[test]
-fn flow_mapping_scalar_tag_comma_workaround_parses() {
+    fn flow_mapping_scalar_tag_comma_workaround_parses() {
         assert_eq!(
             load("g: {by: !tag, at: 1}"),
             "{\"g\" => {\"by\" => nil, \"at\" => 1}}"
         );
     }
-    
+
     #[test]
     fn bare_load_accepts_flow_mapping_and_sequence() {
         use crate::okf::rb::inspect;
-        let Some(v) = super::load(b"{a: 1, b: [2, 3]}", Options::BARE).unwrap_or_else(|e| panic!("{}", e.message)) else {
+        let Some(v) = super::load(b"{a: 1, b: [2, 3]}", Options::BARE)
+            .unwrap_or_else(|e| panic!("{}", e.message))
+        else {
             panic!("expected bare flow mapping");
         };
         assert!(inspect(&v).contains("\"a\" => 1"));
@@ -893,7 +895,9 @@ fn flow_mapping_scalar_tag_comma_workaround_parses() {
     #[test]
     fn bare_load_preserves_explicit_string_and_float_tags() {
         use crate::okf::rb::inspect;
-        let Some(doc) = super::load(b"v: !!float 1.5\ns: !!str yes\n", Options::BARE).unwrap_or_else(|e| panic!("{}", e.message)) else {
+        let Some(doc) = super::load(b"v: !!float 1.5\ns: !!str yes\n", Options::BARE)
+            .unwrap_or_else(|e| panic!("{}", e.message))
+        else {
             panic!("expected bare mapping");
         };
         let text = inspect(&doc);
@@ -937,7 +941,6 @@ fn flow_mapping_scalar_tag_comma_workaround_parses() {
         assert!(load("enc: !ruby/encoding utf-8").contains("NotImplementedError"));
     }
 
-
     #[test]
     fn omap_struct_and_hash_object_tags_follow_psych() {
         assert_eq!(
@@ -953,8 +956,6 @@ fn flow_mapping_scalar_tag_comma_workaround_parses() {
         assert!(load("r: !ruby/range\n  =: 1\n  :!: 2").contains("DisallowedClass"));
     }
 
-
-
     #[test]
     fn recursive_alias_yields_psych_recursive_placeholder() {
         assert_eq!(load("a: &x [1, *x]"), "{\"a\" => [1, [...]]}");
@@ -964,7 +965,6 @@ fn flow_mapping_scalar_tag_comma_workaround_parses() {
     fn ruby_class_tag_is_disallowed_under_safe_load() {
         assert!(load("v: !ruby/class String").contains("DisallowedClass"));
     }
-
 
     #[test]
     fn disallowed_openstruct_reports_class_name() {
@@ -976,6 +976,4 @@ fn flow_mapping_scalar_tag_comma_workaround_parses() {
         assert!(load("n: !!float ~").contains("TypeError"));
         assert!(load("n: !!float true").contains("TypeError"));
     }
-
-
 }

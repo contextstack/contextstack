@@ -194,7 +194,9 @@ mod tests {
     }
 
     fn in_workspace<F: FnOnce(&Path)>(f: F) {
-        let lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| panic!("cwd lock: {e}"));
+        let lock = CWD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| panic!("cwd lock: {e}"));
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let prev = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("chdir: {e}"));
@@ -202,9 +204,12 @@ mod tests {
         f(dir.path());
     }
     #[test]
-fn root_refuses_missing_path_and_non_directory() {
+    fn root_refuses_missing_path_and_non_directory() {
         in_workspace(|ws| {
-            assert!(matches!(root("nope"), Err(RootError::Fail("root does not exist"))));
+            assert!(matches!(
+                root("nope"),
+                Err(RootError::Fail("root does not exist"))
+            ));
             let file = ws.join("file.txt");
             fs::write(&file, "x").unwrap_or_else(|e| panic!("write: {e}"));
             assert!(matches!(
@@ -214,7 +219,7 @@ fn root_refuses_missing_path_and_non_directory() {
         });
     }
     #[test]
-fn root_resolves_relative_paths_inside_workspace() {
+    fn root_resolves_relative_paths_inside_workspace() {
         in_workspace(|ws| {
             let corpus = ws.join("corpus");
             fs::create_dir(&corpus).unwrap_or_else(|e| panic!("mkdir: {e}"));
@@ -232,13 +237,16 @@ fn root_resolves_relative_paths_inside_workspace() {
         });
     }
     #[test]
-fn markdown_walk_skips_dot_git_and_lab_prefixes() {
+    fn markdown_walk_skips_dot_git_and_lab_prefixes() {
         in_workspace(|ws| {
             let corpus = ws.join("c");
-            fs::create_dir_all(corpus.join(".git/objects")).unwrap_or_else(|e| panic!("mkdir: {e}"));
-            fs::write(corpus.join(".git/objects/x.md"), "secret\n").unwrap_or_else(|e| panic!("write: {e}"));
+            fs::create_dir_all(corpus.join(".git/objects"))
+                .unwrap_or_else(|e| panic!("mkdir: {e}"));
+            fs::write(corpus.join(".git/objects/x.md"), "secret\n")
+                .unwrap_or_else(|e| panic!("write: {e}"));
             fs::create_dir(corpus.join(".lab-hidden")).unwrap_or_else(|e| panic!("mkdir: {e}"));
-            fs::write(corpus.join(".lab-hidden/h.md"), "h\n").unwrap_or_else(|e| panic!("write: {e}"));
+            fs::write(corpus.join(".lab-hidden/h.md"), "h\n")
+                .unwrap_or_else(|e| panic!("write: {e}"));
             fs::write(corpus.join("visible.md"), "v\n").unwrap_or_else(|e| panic!("write: {e}"));
             let files = markdown_files(&corpus);
             assert_eq!(files.len(), 1);
@@ -246,13 +254,15 @@ fn markdown_walk_skips_dot_git_and_lab_prefixes() {
         });
     }
     #[test]
-fn escaping_flags_symlinks_that_leave_workspace() {
+    fn escaping_flags_symlinks_that_leave_workspace() {
         in_workspace(|ws| {
             let outside = TempDir::new().unwrap_or_else(|e| panic!("outside: {e}"));
-            fs::write(outside.path().join("out.md"), "# out\n").unwrap_or_else(|e| panic!("write: {e}"));
+            fs::write(outside.path().join("out.md"), "# out\n")
+                .unwrap_or_else(|e| panic!("write: {e}"));
             let corpus = ws.join("corpus");
             fs::create_dir(&corpus).unwrap_or_else(|e| panic!("mkdir: {e}"));
-            fs::write(corpus.join("local.md"), "# local\n").unwrap_or_else(|e| panic!("write: {e}"));
+            fs::write(corpus.join("local.md"), "# local\n")
+                .unwrap_or_else(|e| panic!("write: {e}"));
             symlink(outside.path().join("out.md"), corpus.join("link.md"))
                 .unwrap_or_else(|e| panic!("symlink: {e}"));
             let root = fs::canonicalize(&corpus).unwrap_or_else(|e| panic!("canon: {e}"));
@@ -261,7 +271,7 @@ fn escaping_flags_symlinks_that_leave_workspace() {
         });
     }
     #[test]
-fn expand_path_rejects_tilde_user_paths() {
+    fn expand_path_rejects_tilde_user_paths() {
         in_workspace(|_| {
             let Err(err) = expand_path("~nobody", Path::new(".")) else {
                 panic!("expected tilde user to fail");
@@ -271,7 +281,7 @@ fn expand_path_rejects_tilde_user_paths() {
         });
     }
     #[test]
-fn expand_path_rejects_embedded_null_byte() {
+    fn expand_path_rejects_embedded_null_byte() {
         in_workspace(|_| {
             let Err(err) = expand_path("a\0b", Path::new(".")) else {
                 panic!("expected null byte refusal");
@@ -281,17 +291,20 @@ fn expand_path_rejects_embedded_null_byte() {
         });
     }
     #[test]
-fn root_refuses_directory_outside_workspace() {
+    fn root_refuses_directory_outside_workspace() {
         in_workspace(|ws| {
             let outside = TempDir::new().unwrap_or_else(|e| panic!("outside: {e}"));
             let link = ws.join("escape");
             symlink(outside.path(), &link).unwrap_or_else(|e| panic!("symlink: {e}"));
             let raw = format!("{}", link.display());
-            assert!(matches!(root(&raw), Err(RootError::Fail("root escapes workspace"))));
+            assert!(matches!(
+                root(&raw),
+                Err(RootError::Fail("root escapes workspace"))
+            ));
         });
     }
     #[test]
-fn index_entry_finds_case_insensitive_index_on_macos() {
+    fn index_entry_finds_case_insensitive_index_on_macos() {
         in_workspace(|ws| {
             let corpus = ws.join("c");
             fs::create_dir(&corpus).unwrap_or_else(|e| panic!("mkdir: {e}"));
@@ -299,17 +312,18 @@ fn index_entry_finds_case_insensitive_index_on_macos() {
             assert!(index_entry(&corpus).is_some());
         });
     }
-        #[test]
+    #[test]
     fn expand_path_folds_parent_dir_components() {
         in_workspace(|ws| {
             let base = ws.join("deep").join("dir");
             fs::create_dir_all(&base).unwrap_or_else(|e| panic!("mkdir: {e}"));
-            let expanded = expand_path("deep/dir/../dir/leaf", ws).unwrap_or_else(|e| panic!("{}", e.message));
+            let expanded =
+                expand_path("deep/dir/../dir/leaf", ws).unwrap_or_else(|e| panic!("{}", e.message));
             assert_eq!(expanded, ws.join("deep/dir/leaf"));
         });
     }
     #[test]
-fn errno_maps_not_found_to_enoent() {
+    fn errno_maps_not_found_to_enoent() {
         let err = io::Error::from(io::ErrorKind::NotFound);
         let raise = errno(&err, "rb_sysopen", Path::new("x.md"));
         assert_eq!(raise.class, "Errno::ENOENT");
@@ -361,7 +375,9 @@ fn errno_maps_not_found_to_enoent() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&secret).unwrap_or_else(|e| panic!("meta: {e}")).permissions();
+                let mut perms = fs::metadata(&secret)
+                    .unwrap_or_else(|e| panic!("meta: {e}"))
+                    .permissions();
                 perms.set_mode(0o0);
                 fs::set_permissions(&secret, perms).unwrap_or_else(|e| panic!("chmod: {e}"));
             }
@@ -370,6 +386,4 @@ fn errno_maps_not_found_to_enoent() {
             assert_eq!(relative(&files[0], &corpus), "top.md");
         });
     }
-
 }
-

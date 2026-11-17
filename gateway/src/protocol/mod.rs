@@ -310,7 +310,9 @@ fn transport_message(method: &str, url: &str, err: &reqwest::Error) -> String {
 
 /// A connection-level transport error (connect, timeout before headers): may retry.
 pub fn transport(method: &str, url: &str, err: &reqwest::Error) -> CallError {
-    CallError::Transport(TransportDetail::network(transport_message(method, url, err)))
+    CallError::Transport(TransportDetail::network(transport_message(
+        method, url, err,
+    )))
 }
 
 /// A transport error after a 2xx status (body read or decode): must not retry.
@@ -349,7 +351,6 @@ pub async fn error_body(mut resp: reqwest::Response, limit: usize) -> String {
     out.truncate(limit);
     String::from_utf8_lossy(&out).into_owned()
 }
-
 
 /// The most of a successful upstream body the gateway reads (OpenAI-compat and Anthropic adapters).
 pub const MAX_SUCCESS_BODY: usize = 64 * 1024 * 1024;
@@ -481,10 +482,7 @@ mod tests {
             .unwrap();
         let err = success_body(resp, "Post", &url).await.unwrap_err();
         assert!(matches!(err, CallError::Transport(_)));
-        assert!(
-            err.to_string().contains("exceeds"),
-            "unexpected: {err}"
-        );
+        assert!(err.to_string().contains("exceeds"), "unexpected: {err}");
         server.abort();
     }
 }

@@ -677,7 +677,12 @@ fn protocol_2_a_held_request_carries_a_cancel_and_the_node_settles_it() -> Res {
         &Value::Null,
     )?;
     assert_eq!(cancels["cancel"]["outcome"], "stopped");
-    let (_, node) = d.client("GET", "/api/v1/client/nodes/node-b", Some(&owner), &Value::Null)?;
+    let (_, node) = d.client(
+        "GET",
+        "/api/v1/client/nodes/node-b",
+        Some(&owner),
+        &Value::Null,
+    )?;
     assert_eq!(node["protocol"], 2);
     Ok(())
 }

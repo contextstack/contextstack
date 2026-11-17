@@ -668,7 +668,7 @@ fn psych_offset(tz: &[u8]) -> i64 {
 mod tests {
     use super::*;
     #[test]
-fn iso8601_round_trips_offsets() {
+    fn iso8601_round_trips_offsets() {
         let t = iso8601("2026-01-01T00:00:00Z").map(|t| t.iso8601());
         assert_eq!(t.as_deref(), Some("2026-01-01T00:00:00Z"));
         let t = iso8601("2026-03-01T00:00:00+00:00").map(|t| t.iso8601());
@@ -679,13 +679,13 @@ fn iso8601_round_trips_offsets() {
         assert!(iso8601("2026-13-01T00:00:00Z").is_none());
     }
     #[test]
-fn apply_offset_rolls_month_zero_back() {
+    fn apply_offset_rolls_month_zero_back() {
         let t = iso8601("2026-00-01T00:00:00+01:00").map(|t| t.iso8601());
         assert_eq!(t.as_deref(), Some("2026-01-01T00:00:00+01:00"));
         assert!(iso8601("2026-00-01T00:00:00Z").is_none());
     }
     #[test]
-fn dates_and_differences() {
+    fn dates_and_differences() {
         assert_eq!(
             Date::new(2026, 1, 5).map(Date::inspect).as_deref(),
             Some("#<Date: 2026-01-05 ((2461046j,0s,0n),+0s,-Infj)>")
@@ -697,7 +697,7 @@ fn dates_and_differences() {
         assert_eq!(d, Some(86_400));
     }
     #[test]
-fn timespec_formats_subnanosecond_fractions_and_offset_seconds() {
+    fn timespec_formats_subnanosecond_fractions_and_offset_seconds() {
         let Some(t) = iso8601("2020-01-01T00:00:00.123456789012Z") else {
             panic!("parse subnanosecond timestamp");
         };
@@ -709,12 +709,12 @@ fn timespec_formats_subnanosecond_fractions_and_offset_seconds() {
         assert!(zoned.seconds_since(&t) > 0);
     }
     #[test]
-fn psych_time_parses_zoned_iso8601_timestamps() {
+    fn psych_time_parses_zoned_iso8601_timestamps() {
         let Ok(Some(_)) = psych_time("2026-01-01T10:00:00Z") else {
             panic!("psych should parse zoned timestamp");
         };
     }
-        #[test]
+    #[test]
     fn iso8601_accepts_compact_and_colon_offsets() {
         assert!(iso8601("2026-06-15T12:00:00+0530").is_some());
         assert!(iso8601("2026-06-15T12:00:00-07:00").is_some());
@@ -728,21 +728,38 @@ fn psych_time_parses_zoned_iso8601_timestamps() {
         assert_eq!(zone_offset("Z"), 0);
     }
     #[test]
-fn apply_offset_negative_rolls_calendar_when_needed() {
-        let f = Fields { y: 2026, mon: 3, day: 1, hour: 0, min: 0, sec: 30 };
+    fn apply_offset_negative_rolls_calendar_when_needed() {
+        let f = Fields {
+            y: 2026,
+            mon: 3,
+            day: 1,
+            hour: 0,
+            min: 0,
+            sec: 30,
+        };
         let rolled = apply_offset(f, -90);
         assert!(rolled.is_some());
         let rolled = rolled.unwrap_or_else(|| panic!("offset apply"));
-        assert_eq!((rolled.y, rolled.mon, rolled.day, rolled.sec), (2026, 3, 1, 0));
+        assert_eq!(
+            (rolled.y, rolled.mon, rolled.day, rolled.sec),
+            (2026, 3, 1, 0)
+        );
     }
     #[test]
-fn apply_offset_positive_rolls_back_across_month_boundary() {
-        let f = Fields { y: 2026, mon: 3, day: 1, hour: 0, min: 0, sec: 0 };
+    fn apply_offset_positive_rolls_back_across_month_boundary() {
+        let f = Fields {
+            y: 2026,
+            mon: 3,
+            day: 1,
+            hour: 0,
+            min: 0,
+            sec: 0,
+        };
         let rolled = apply_offset(f, 86_400).unwrap_or_else(|| panic!("roll back one day"));
         assert_eq!((rolled.y, rolled.mon, rolled.day), (2026, 2, 28));
     }
     #[test]
-fn to_f_preserves_long_subsecond_fractions() {
+    fn to_f_preserves_long_subsecond_fractions() {
         let Some(t) = iso8601("2000-01-01T00:00:00.123456789012Z") else {
             panic!("parse timestamp with long fraction");
         };
@@ -782,6 +799,4 @@ fn to_f_preserves_long_subsecond_fractions() {
         assert!(!text.contains(". "));
         assert!(text.contains("UTC"));
     }
-
-
 }

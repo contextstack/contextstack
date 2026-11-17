@@ -501,7 +501,11 @@ impl Gateway {
         })
     }
 
-    fn endpoint<'s>(snap: &'s Snapshot, provider: &str, model: &str) -> Result<&'s Endpoint, CallError> {
+    fn endpoint<'s>(
+        snap: &'s Snapshot,
+        provider: &str,
+        model: &str,
+    ) -> Result<&'s Endpoint, CallError> {
         snap.endpoints.get(provider).ok_or_else(|| CallError::Routing {
             class: FailureClass::ProviderNotConfigured,
             message: format!(

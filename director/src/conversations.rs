@@ -37,7 +37,9 @@ const MAX_ATTENTION_JOB: usize = 128;
 pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Reply {
     let db = || state.store.db();
     let found = match (call.method.as_str(), parts) {
-        ("PATCH", ["conversations", id]) => return crate::chief_of_staff::rename(state, call, client, id),
+        ("PATCH", ["conversations", id]) => {
+            return crate::chief_of_staff::rename(state, call, client, id);
+        }
         ("DELETE", ["conversations", id]) => return delete(state, call, client, id),
         ("POST", ["conversations", id, word @ ("archive" | "unarchive")]) => {
             return archive(state, call, client, id, word);
@@ -80,10 +82,19 @@ pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
 fn list_conversations(db: &Connection, call: &Call) -> Reply {
     let limit = match call.query("limit") {
         None => records::MAX_INTENTS,
-        Some(raw) => match raw.parse::<u32>().ok().filter(|n| (1..=records::MAX_INTENTS).contains(n)) {
+        Some(raw) => match raw
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=records::MAX_INTENTS).contains(n))
+        {
             Some(n) => n,
             None => {
-                return refusal(422, "invalid_request", "limit must be from 1 to 500", Value::Null);
+                return refusal(
+                    422,
+                    "invalid_request",
+                    "limit must be from 1 to 500",
+                    Value::Null,
+                );
             }
         },
     };
@@ -269,7 +280,6 @@ fn lead_spec(template: &str, model: &str) -> String {
         .collect()
 }
 
-
 fn collect_lead_bundle_files(
     root: &std::path::Path,
     dir: &std::path::Path,
@@ -285,10 +295,7 @@ fn collect_lead_bundle_files(
                 .strip_prefix(root)
                 .map(std::path::Path::to_path_buf)
                 .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "bundle path outside root",
-                    )
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "bundle path outside root")
                 })?;
             out.push(rel);
         }
@@ -369,7 +376,8 @@ pub(crate) fn lead_bundle(state: &State, m: &mut Map<String, Value>) -> Result<(
     Ok(())
 }
 
-const CHAT_SYSTEM: &str = "You are a helpful assistant in a conversation. The thread so far is in your context.\n";
+const CHAT_SYSTEM: &str =
+    "You are a helpful assistant in a conversation. The thread so far is in your context.\n";
 
 fn chat_spec(model: &str) -> String {
     format!(
@@ -397,19 +405,25 @@ fn default_bundle(state: &State, m: &mut Map<String, Value>) -> Result<(), No> {
                     .all(|c| c.is_ascii_alphanumeric() || b"-_.:/".contains(&c))
         })
         .ok_or_else(|| No::invalid("choose a valid model"))?;
-    if m.contains_key("files") || m.contains_key("from_job") || (m.contains_key("spec") && !built_chat) {
+    if m.contains_key("files")
+        || m.contains_key("from_job")
+        || (m.contains_key("spec") && !built_chat)
+    {
         return Err(No::invalid("model cannot be combined with a custom bundle"));
     }
     if built_chat {
         let catalog = crate::models::list(&state.settings.gateway).map_err(|e| match e {
-            crate::gateway::Fault::Unavailable(message) =>
-                No(502, "gateway_unavailable", message, Value::Null),
-            crate::gateway::Fault::Token(message) =>
-                No(502, "gateway_owner_token", message, Value::Null),
+            crate::gateway::Fault::Unavailable(message) => {
+                No(502, "gateway_unavailable", message, Value::Null)
+            }
+            crate::gateway::Fault::Token(message) => {
+                No(502, "gateway_owner_token", message, Value::Null)
+            }
         })?;
-        if !catalog["models"].as_array().is_some_and(|rows| {
-            rows.iter().any(|row| row["name"].as_str() == Some(model))
-        }) {
+        if !catalog["models"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"].as_str() == Some(model)))
+        {
             return Err(No::invalid(&format!("unknown model {model}")));
         }
     }
@@ -427,7 +441,6 @@ fn default_bundle(state: &State, m: &mut Map<String, Value>) -> Result<(), No> {
     Ok(())
 }
 
-
 fn conversation_source_files(
     state: &State,
     db: &Connection,
@@ -438,7 +451,9 @@ fn conversation_source_files(
             let job = s["from_job"].as_str().unwrap_or_default();
             match jobs::bundle_of_job(db, job) {
                 Ok(f) if !f.is_empty() => Ok(f),
-                Ok(_) => Err(Box::new(No::invalid(&format!("from_job: no job {job}")).reply())),
+                Ok(_) => Err(Box::new(
+                    No::invalid(&format!("from_job: no job {job}")).reply(),
+                )),
                 Err(e) => Err(Box::new(internal(&e))),
             }
         }
@@ -466,13 +481,21 @@ fn validate_create_targets(db: &Connection, want: &Value, node: &str) -> Result<
         node,
     ) {
         Ok(true) => {}
-        Ok(false) => return Err(Box::new(No::invalid(&format!("no live node named {node}")).reply())),
+        Ok(false) => {
+            return Err(Box::new(
+                No::invalid(&format!("no live node named {node}")).reply(),
+            ));
+        }
         Err(e) => return Err(Box::new(internal(&e))),
     }
     if let Some(intent) = want["intent_id"].as_str() {
         match known("SELECT 1 FROM intents WHERE intent_id = ?1", intent) {
             Ok(true) => {}
-            Ok(false) => return Err(Box::new(No::invalid(&format!("no intent {intent}")).reply())),
+            Ok(false) => {
+                return Err(Box::new(
+                    No::invalid(&format!("no intent {intent}")).reply(),
+                ));
+            }
             Err(e) => return Err(Box::new(internal(&e))),
         }
     }
@@ -609,6 +632,31 @@ fn turn_answer(db: &Connection, turn: &str) -> rusqlite::Result<Value> {
     Ok(json!({"turn": t, "conversation": conversation}))
 }
 
+/// A wake turn's `nudge` or `reply`: a non-empty string of at most `MAX_MESSAGE` bytes.
+fn wake_text<'a>(m: &'a Map<String, Value>, field: &str) -> Result<&'a str, No> {
+    m.get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty() && s.len() <= MAX_MESSAGE)
+        .ok_or_else(|| {
+            No::invalid(&format!(
+                "{field} is a non-empty string of at most 200000 bytes"
+            ))
+        })
+}
+
+/// A wake turn's `jobs`: absent, null, or at most 100 job id strings.
+fn wake_jobs(m: &Map<String, Value>) -> Result<Vec<&str>, No> {
+    match m.get("jobs") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(a)) if a.len() <= 100 => a
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| No::invalid("jobs is a list of job id strings")),
+        Some(_) => Err(No::invalid("jobs is a list of at most 100 job id strings")),
+    }
+}
+
 /// `POST conversations/{id}/wake-turns` `{nudge, reply, jobs?}`: record a lane wake-up already answered in the lead session.
 /// The turn has `origin: "wake"`, an empty `message`, the follow-up as `reply`, and `detail: {nudge, jobs}`. It needs no
 /// job and may land while a person's turn is queued or running: it is already done, so it never blocks the queue.
@@ -625,30 +673,20 @@ fn post_wake_turn(state: &State, call: &Call, client: &Client, id: &str) -> Repl
         (Ok(k), Ok(m)) => (k, m),
         (Err(r), _) | (_, Err(r)) => return r.reply(),
     };
-    let Some(nudge) = m
-        .get("nudge")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty() && s.len() <= MAX_MESSAGE)
-    else {
-        return No::invalid("nudge is a non-empty string of at most 200000 bytes").reply();
-    };
-    let Some(reply) = m
-        .get("reply")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty() && s.len() <= MAX_MESSAGE)
-    else {
-        return No::invalid("reply is a non-empty string of at most 200000 bytes").reply();
-    };
-    let jobs: Vec<&str> = match m.get("jobs") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(a)) if a.len() <= 100 => match a.iter().map(Value::as_str).collect::<Option<Vec<_>>>() {
-            Some(v) => v,
-            None => return No::invalid("jobs is a list of job id strings").reply(),
-        },
-        Some(_) => return No::invalid("jobs is a list of at most 100 job id strings").reply(),
+    let (nudge, reply, jobs) = match (
+        wake_text(&m, "nudge"),
+        wake_text(&m, "reply"),
+        wake_jobs(&m),
+    ) {
+        (Ok(n), Ok(r), Ok(j)) => (n, r, j),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e.reply(),
     };
     let detail = json!({"nudge": nudge, "jobs": jobs}).to_string();
-    let sha = content("wake_turn", id, &json!({"nudge": nudge, "reply": reply, "jobs": jobs}));
+    let sha = content(
+        "wake_turn",
+        id,
+        &json!({"nudge": nudge, "reply": reply, "jobs": jobs}),
+    );
     let mut db = state.store.db();
     for job in &jobs {
         match crate::lead::visible(&db, client, Record::Job, job) {
@@ -687,7 +725,10 @@ fn post_wake_turn(state: &State, call: &Call, client: &Client, id: &str) -> Repl
         return No::invalid("wake replies are only for hosted-lead conversations").reply();
     }
     let made = (|| -> Result<String, No> {
-        let turn = format!("trn_{}", util::ulid().map_err(|e| No::internal(&e))?.to_lowercase());
+        let turn = format!(
+            "trn_{}",
+            util::ulid().map_err(|e| No::internal(&e))?.to_lowercase()
+        );
         let now = now_utc();
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
         require_unarchived(&tx, id)?;
@@ -735,7 +776,10 @@ fn post_turn(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         return *r;
     }
     let made = (|| -> Result<String, No> {
-        let turn = format!("trn_{}", util::ulid().map_err(|e| No::internal(&e))?.to_lowercase());
+        let turn = format!(
+            "trn_{}",
+            util::ulid().map_err(|e| No::internal(&e))?.to_lowercase()
+        );
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
         require_unarchived(&tx, id)?;
         clear_attention_cols(&tx, id).map_err(|e| No::internal(&e))?;
@@ -957,14 +1001,21 @@ fn redo(state: &State, call: &Call, client: &Client, id: &str, sid: &str) -> Rep
     }
 }
 
-
 fn require_unarchived(db: &Connection, id: &str) -> Result<(), No> {
-    let archived: bool = db.query_row(
-        "SELECT archived_at IS NOT NULL FROM conversations WHERE conversation_id = ?1",
-        [id], |r| r.get(0),
-    ).map_err(|e| No::internal(&e))?;
+    let archived: bool = db
+        .query_row(
+            "SELECT archived_at IS NOT NULL FROM conversations WHERE conversation_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|e| No::internal(&e))?;
     if archived {
-        return Err(No(409, "archived", "unarchive the conversation first".into(), Value::Null));
+        return Err(No(
+            409,
+            "archived",
+            "unarchive the conversation first".into(),
+            Value::Null,
+        ));
     }
     Ok(())
 }
@@ -978,20 +1029,39 @@ fn archive(state: &State, call: &Call, client: &Client, id: &str, word: &str) ->
     let mut db = state.store.db();
     let result = (|| -> Result<bool, No> {
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
-        let known: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?1)", [id], |r| r.get(0)).map_err(|e| No::internal(&e))?;
-        if !known { return Err(No(404, "not_found", "no such conversation".into(), Value::Null)); }
-        if word == "archive" { crate::chief_of_staff::protect(&tx, id)?; }
+        let known: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| No::internal(&e))?;
+        if !known {
+            return Err(No(
+                404,
+                "not_found",
+                "no such conversation".into(),
+                Value::Null,
+            ));
+        }
+        if word == "archive" {
+            crate::chief_of_staff::protect(&tx, id)?;
+        }
         let replayed = scoped_prior(&tx, &key, &sha, client)?.is_some();
         if !replayed {
             let at = (word == "archive").then(now_utc);
-            let changed = tx.execute(
-                "UPDATE conversations SET archived_at = ?2 WHERE conversation_id = ?1
-                 AND (archived_at IS NULL) != (?2 IS NULL)", params![id, at],
-            ).map_err(|e| No::internal(&e))?;
+            let changed = tx
+                .execute(
+                    "UPDATE conversations SET archived_at = ?2 WHERE conversation_id = ?1
+                 AND (archived_at IS NULL) != (?2 IS NULL)",
+                    params![id, at],
+                )
+                .map_err(|e| No::internal(&e))?;
             if changed > 0 {
                 touch(&tx, Record::Conversation, id).map_err(|e| No::internal(&e))?;
             }
-            remember(&tx, &key, &sha, Record::Conversation, id, client).map_err(|e| No::internal(&e))?;
+            remember(&tx, &key, &sha, Record::Conversation, id, client)
+                .map_err(|e| No::internal(&e))?;
         }
         tx.commit().map_err(|e| No::internal(&e))?;
         Ok(replayed)
@@ -1016,14 +1086,44 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
         crate::chief_of_staff::protect(&tx, id)?;
         let sql = |q: &str| tx.execute(q, [id]).map_err(|e| No::internal(&e));
-        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?1)", [id], |r| r.get(0)).map_err(|e| No::internal(&e))?;
-        if !exists { return Err(No(404, "not_found", "no such conversation".into(), Value::Null)); }
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| No::internal(&e))?;
+        if !exists {
+            return Err(No(
+                404,
+                "not_found",
+                "no such conversation".into(),
+                Value::Null,
+            ));
+        }
         scoped_prior(&tx, &key, &sha, client)?;
         let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM turns WHERE conversation_id = ?1 AND state NOT IN ('done', 'error', 'stopped'))", [id], |r| r.get(0)).map_err(|e| No::internal(&e))?;
-        if busy { return Err(No(409, "busy", "stop the conversation first".into(), Value::Null)); }
-        let credentials = tx.prepare("SELECT id FROM credentials WHERE conversation_id = ?1 AND kind = 'lead'").and_then(|mut s| s.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| No::internal(&e))?;
-        sql("DELETE FROM lead_objects WHERE credential_id IN (SELECT id FROM credentials WHERE conversation_id = ?1 AND kind = 'lead')")?;
-        sql("UPDATE credentials SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), conversation_id = NULL WHERE conversation_id = ?1")?;
+        if busy {
+            return Err(No(
+                409,
+                "busy",
+                "stop the conversation first".into(),
+                Value::Null,
+            ));
+        }
+        let credentials = tx
+            .prepare("SELECT id FROM credentials WHERE conversation_id = ?1 AND kind = 'lead'")
+            .and_then(|mut s| {
+                s.query_map([id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|e| No::internal(&e))?;
+        sql(
+            "DELETE FROM lead_objects WHERE credential_id IN (SELECT id FROM credentials WHERE conversation_id = ?1 AND kind = 'lead')",
+        )?;
+        sql(
+            "UPDATE credentials SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), conversation_id = NULL WHERE conversation_id = ?1",
+        )?;
         let jobs = tx.prepare("SELECT job_id FROM turns WHERE conversation_id = ?1 AND job_id IS NOT NULL UNION SELECT job_id FROM summaries WHERE conversation_id = ?1 UNION SELECT job_id FROM jobs WHERE intent_id IN (SELECT intent_id FROM intents WHERE conversation_id = ?1 OR lead_conversation_id = ?1)").and_then(|mut s| s.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| No::internal(&e))?;
         for job in jobs {
             touch(&tx, Record::Job, &job).map_err(|e| No::internal(&e))?;
@@ -1032,7 +1132,9 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         sql("DELETE FROM turns WHERE conversation_id = ?1")?;
         sql("DELETE FROM summaries WHERE conversation_id = ?1")?;
         let intents = tx.prepare("SELECT intent_id FROM intents WHERE conversation_id = ?1 OR lead_conversation_id = ?1").and_then(|mut s| s.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| No::internal(&e))?;
-        sql("UPDATE intents SET conversation_id = CASE WHEN conversation_id = ?1 THEN NULL ELSE conversation_id END, lead_conversation_id = CASE WHEN lead_conversation_id = ?1 THEN NULL ELSE lead_conversation_id END WHERE conversation_id = ?1 OR lead_conversation_id = ?1")?;
+        sql(
+            "UPDATE intents SET conversation_id = CASE WHEN conversation_id = ?1 THEN NULL ELSE conversation_id END, lead_conversation_id = CASE WHEN lead_conversation_id = ?1 THEN NULL ELSE lead_conversation_id END WHERE conversation_id = ?1 OR lead_conversation_id = ?1",
+        )?;
         for intent in intents {
             touch(&tx, Record::Intent, &intent).map_err(|e| No::internal(&e))?;
         }
@@ -1040,7 +1142,8 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         sql("DELETE FROM budgets WHERE scope = 'conversation' AND scope_id = ?1")?;
         touch(&tx, Record::Conversation, id).map_err(|e| No::internal(&e))?;
         sql("DELETE FROM conversations WHERE conversation_id = ?1")?;
-        remember(&tx, &key, &sha, Record::Conversation, id, client).map_err(|e| No::internal(&e))?;
+        remember(&tx, &key, &sha, Record::Conversation, id, client)
+            .map_err(|e| No::internal(&e))?;
         tx.commit().map_err(|e| No::internal(&e))?;
         Ok(credentials)
     })();
@@ -1077,7 +1180,6 @@ mod lead_bundle_tests {
     }
 }
 
-
 #[cfg(test)]
 mod chat_bundle_tests {
     #[test]
@@ -1102,7 +1204,10 @@ mod chat_bundle_tests {
 
     #[test]
     fn chat_prompt_and_model_substitution() -> Result<(), String> {
-        assert_eq!(super::CHAT_SYSTEM, "You are a helpful assistant in a conversation. The thread so far is in your context.\n");
+        assert_eq!(
+            super::CHAT_SYSTEM,
+            "You are a helpful assistant in a conversation. The thread so far is in your context.\n"
+        );
         for model in ["codex", "provider/model:variant", "local-coder"] {
             let facts = crate::thread::read_spec(super::chat_spec(model).as_bytes())?;
             assert_eq!(facts.model, model);

@@ -179,5 +179,4 @@ mod tests {
     fn dumps_formats_false_bool_literal() {
         assert_eq!(dumps_sorted(&json!(false)), "false");
     }
-
 }

@@ -563,9 +563,10 @@ pub fn list_conversations(
     );
     let mut stmt = db.prepare(&sql)?;
     let limit = limit.clamp(1, MAX_INTENTS);
-    stmt.query_map(params![node, intent, lead_only, project, limit, archived], |r| {
-        (v.shape)(db, r)
-    })?
+    stmt.query_map(
+        params![node, intent, lead_only, project, limit, archived],
+        |r| (v.shape)(db, r),
+    )?
     .collect()
 }
 
@@ -710,7 +711,10 @@ mod tests {
         // The limit applies after the lane filter.
         let one = list_intents(&db, None, None, true, None, 1)?;
         assert_eq!(ids(&one, "intent_id"), ["lane_false"]);
-        assert_eq!(list_intents(&db, None, None, false, None, MAX_INTENTS)?.len(), 8);
+        assert_eq!(
+            list_intents(&db, None, None, false, None, MAX_INTENTS)?.len(),
+            8
+        );
         Ok(())
     }
 
@@ -814,9 +818,9 @@ mod tests {
         assert_eq!(ids(&two, "conversation_id"), ["c3", "c2"]);
         let leads = list_conversations(&db, None, None, true, None, MAX_INTENTS, Some(false))?;
         assert_eq!(ids(&leads, "conversation_id"), ["c2"]);
-        let proj = list_conversations(&db, None, None, false, Some("p1"), MAX_INTENTS, Some(false))?;
+        let proj =
+            list_conversations(&db, None, None, false, Some("p1"), MAX_INTENTS, Some(false))?;
         assert_eq!(ids(&proj, "conversation_id"), ["c1"]);
         Ok(())
     }
 }
-

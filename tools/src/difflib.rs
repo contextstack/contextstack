@@ -278,14 +278,14 @@ mod tests {
         unified_diff(&splitlines(a), &splitlines(b), "f", "f", 3)
     }
     #[test]
-fn fixture_replace_diff() {
+    fn fixture_replace_diff() {
         assert_eq!(
             diff("alpha\nbeta\ngamma\n", "alpha\nBETA\ngamma\n"),
             "--- f\n+++ f\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n"
         );
     }
     #[test]
-fn distant_changes_split_into_hunks() {
+    fn distant_changes_split_into_hunks() {
         let a: String = (0..20)
             .map(|i| "l".to_owned() + &i.to_string() + "\n")
             .collect();
@@ -297,12 +297,12 @@ fn distant_changes_split_into_hunks() {
         );
     }
     #[test]
-fn missing_final_newline_and_empty_ranges() {
+    fn missing_final_newline_and_empty_ranges() {
         assert_eq!(diff("a", "a\nb"), "--- f\n+++ f\n@@ -1 +1,2 @@\n-a+a\n+b");
         assert_eq!(diff("", "x\n"), "--- f\n+++ f\n@@ -0,0 +1 @@\n+x\n");
         assert_eq!(diff("solo\n", ""), "--- f\n+++ f\n@@ -1 +0,0 @@\n-solo\n");
     }
-        #[test]
+    #[test]
     fn autojunk_ignores_overfrequent_lines_when_matching() {
         let common = "repeat\n";
         let a: String = common.repeat(250);

@@ -249,7 +249,12 @@ fn rows(db: &Connection, span: &Span, only: &Only) -> rusqlite::Result<Vec<Row>>
            LEFT JOIN job_budgets b ON b.job_id = j.job_id
          WHERE (? IS NULL OR r.received_at >= ?) AND (? IS NULL OR r.received_at < ?)"
     );
-    let mut bind: Vec<rusqlite::types::Value> = vec![span.from.clone().into(), span.from.clone().into(), span.to.clone().into(), span.to.clone().into()];
+    let mut bind: Vec<rusqlite::types::Value> = vec![
+        span.from.clone().into(),
+        span.from.clone().into(),
+        span.to.clone().into(),
+        span.to.clone().into(),
+    ];
     if let Some(n) = &only.node {
         sql.push_str(" AND n.name = ?");
         bind.push(n.clone().into());
@@ -444,7 +449,8 @@ mod tests {
     fn lead_usage_rollup_excludes_foreign_runs() -> rusqlite::Result<()> {
         use crate::access::{Client, Kind};
         use crate::store::Store;
-        let tmp = tempfile::tempdir().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let tmp = tempfile::tempdir()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let store = Store::open(&tmp.path().join("data")).map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.clone())))
         })?;

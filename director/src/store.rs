@@ -163,12 +163,10 @@ fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("ALTER TABLE turns ADD COLUMN origin TEXT NOT NULL DEFAULT 'person'")
 }
 
-
 /// v3: reversible conversation archival.
 fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("ALTER TABLE conversations ADD COLUMN archived_at TEXT")
 }
-
 
 /// Columns added after step 3's schema: `(table, column, definition)`, added when absent.
 const ADDED: [(&str, &str, &str); 24] = [
@@ -746,21 +744,32 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let dir = tmp.path().join("data");
         let store = Store::open(&dir)?;
-        store.db().execute_batch("ALTER TABLE conversations DROP COLUMN archived_at;
+        store.db().execute_batch(
+            "ALTER TABLE conversations DROP COLUMN archived_at;
             INSERT INTO conversations (conversation_id, node, spec, spec_version, model,
                 instructions_tokens, tools, created_by, created_at)
             VALUES ('existing', 'n', 's', 'v', 'm', 0, 0, 'owner', 'then');
-            PRAGMA user_version = 2;")?;
+            PRAGMA user_version = 2;",
+        )?;
         drop(store);
         let upgraded = Store::open(&dir)?;
         assert_eq!(user_version(&upgraded.db())?, 3);
         let archived: Option<String> = upgraded.db().query_row(
-            "SELECT archived_at FROM conversations WHERE conversation_id = 'existing'", [], |r| r.get(0))?;
+            "SELECT archived_at FROM conversations WHERE conversation_id = 'existing'",
+            [],
+            |r| r.get(0),
+        )?;
         assert!(archived.is_none());
-        upgraded.db().execute("UPDATE conversations SET archived_at = 'now'", [])?;
+        upgraded
+            .db()
+            .execute("UPDATE conversations SET archived_at = 'now'", [])?;
         drop(upgraded);
         let reopened = Store::open(&dir)?;
-        let archived: String = reopened.db().query_row("SELECT archived_at FROM conversations WHERE conversation_id = 'existing'", [], |r| r.get(0))?;
+        let archived: String = reopened.db().query_row(
+            "SELECT archived_at FROM conversations WHERE conversation_id = 'existing'",
+            [],
+            |r| r.get(0),
+        )?;
         assert_eq!(archived, "now");
         Ok(())
     }
