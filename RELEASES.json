@@ -2,7 +2,7 @@
   "releases": [
     {
       "tag": "v0.1.0",
-      "commit": "9f4df31b647274386d6bb131902f13a634eafb42",
+      "commit": "f56b8526ecced33bfcc5175897b6f70af119cbf6",
       "channel": "stable"
     }
   ]
