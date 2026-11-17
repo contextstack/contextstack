@@ -26,6 +26,27 @@ def sha(path):
         return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 
+def manifest_sha(path):
+    """The hash node-bundle records and verifies: a symlink is hashed by its target string, not followed."""
+    if path.is_symlink():
+        return hashlib.sha256(('symlink:' + os.readlink(path)).encode()).hexdigest()
+    return sha(path)
+
+
+# node-bundle ships these as hard links to bin/ and the installer links them to bin/ again. codesign rewrites each
+# file separately, which breaks the link and gives the two copies different signatures (the installed copy then
+# fails verify, found on a clean VM 2026-11-17), so after signing they are linked to the signed bin/ file again.
+TARGET_LINKS = {'cs-tools': 'release/target/release/cs-tools', 'cs-sandbox': 'release/target/release/cs-sandbox'}
+
+
+def relink_targets(bundle):
+    for name, rel in TARGET_LINKS.items():
+        src, dst = bundle / 'release/bin' / name, bundle / rel
+        if src.is_file() and (dst.exists() or dst.is_symlink()):
+            dst.unlink()
+            os.link(src, dst)
+
+
 def sign_tree(root, identity, keychain):
     count = 0
     for path in sorted(root.rglob('*')):
@@ -87,6 +108,7 @@ def main():
                 # signed release fail to install (hash mismatch, found on a clean VM 2026-11-13). curl | sh installs
                 # carry no quarantine, so its unsigned binaries run; ours and uv are signed and notarized.
                 sign_tree(bundle, identity, keychain)
+                relink_targets(bundle)
                 submission = work / 'notarize'
                 submission.mkdir()
                 import shutil
@@ -109,7 +131,7 @@ def main():
                     raise RuntimeError('Apple notarization failed; see notarization log above')
                 meta['signing'] = {'status': 'signed', 'notarization': 'accepted'}
                 meta['uv']['binary_sha256'] = sha(bundle / 'uv/uv')
-                meta['files'] = {name: sha(bundle / name) for name in meta['files']}
+                meta['files'] = {name: manifest_sha(bundle / name) for name in meta['files']}
             finally:
                 if 'searched' in locals():
                     subprocess.run(['security', 'list-keychains', '-d', 'user', '-s', *searched],
