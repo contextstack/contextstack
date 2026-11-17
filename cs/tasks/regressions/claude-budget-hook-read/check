@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Claude's first Read failed: budget-controls was outside the estate read roots.
+The real executor profile must expose only the protected hook, read only.
+Host-only: --darwin-probe (2026-11-12 lane failure)."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import os, subprocess, sys, tempfile
+from pathlib import Path
+
+OPS = Path(__file__).resolve().parents[3] / "ops/bin"
+if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+    print("claude-budget-hook-read: SKIP (host-only; run with --darwin-probe on macOS)")
+    raise SystemExit(0)
+with scratch_dir(prefix="claude-budget-hook-read-") as raw:
+    home = Path(raw).resolve() / "home"
+    run = home / ".contextstack/state/runs/r1"
+    ws, tmp, controls = run / "ws", run / "tmp", run / "budget-controls"
+    for directory in (ws, tmp, controls):
+        directory.mkdir(parents=True)
+    hook = controls / "cli-budget-hook.py"
+    hook.write_text("# budget hook\n")
+    (controls / "empty-dir").mkdir()
+    events = run / "events.jsonl"
+    events.write_text("private events\n")
+    os.environ["HOME"] = str(home)
+    sys.path.insert(0, str(OPS))
+    import _lead_host
+    _lead_host._SANDBOX_CMD_CACHE = None
+    sandbox_cmd = _lead_host._load_sandbox_cmd()
+    probe = tmp / "probe.py"
+    probe.write_text("""
+import sys
+from pathlib import Path
+hook, events = map(Path, sys.argv[1:])
+assert hook.read_text() == '# budget hook\\n'
+def denied(action):
+    try:
+        action()
+    except PermissionError:
+        return
+    raise AssertionError('sandbox permitted ' + str(action))
+denied(lambda: hook.write_text('tampered'))
+denied(lambda: (hook.parent / 'new-file').write_text('created'))
+denied(lambda: hook.unlink())
+denied(lambda: (hook.parent / "empty-dir").rmdir())
+denied(lambda: events.read_text())
+print('ok')
+""")
+    # Main runs and trusted login refreshes share this protected-root builder.
+    cmd = sandbox_cmd(sys.executable, [str(probe), str(hook), str(events)],
+                      ws, tmp, tmp / "profile.sb", protected=controls)
+    done = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=60,
+                          env={"PATH": "/usr/bin:/bin", "HOME": str(home)})
+    assert done.returncode == 0 and done.stdout.strip() == "ok", (done.returncode, done.stdout, done.stderr)
+    assert hook.read_text() == "# budget hook\n"
+    assert set(controls.iterdir()) == {hook, controls / "empty-dir"}
+print("claude-budget-hook-read: PASS (hook readable; controls immutable; run events private)")

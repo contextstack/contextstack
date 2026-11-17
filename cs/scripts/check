@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+# lab check — the constitution as a linter. Subject to its own caps.
+set -u
+# No rule inherits the caller's git: a commit hook exports GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE (git may add
+# GIT_PREFIX, GIT_AUTHOR_*, ...), which turned fixture repos' git init/add/commit into writes to the real repository
+# (2026-11-10, tasks/regressions/check-git-env). Every git call finds its repo from its own -C or cwd.
+while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^GIT_')
+# Nor the caller's roots: once the ledger lives in ~/.contextstack/state, an operator shell exports LAB_STATE_ROOT, and
+# a rule that inherited it would write fixture rows into the real estate. Rules that need a root set their own.
+unset LAB_CODE_ROOT LAB_CONFIG_ROOT LAB_STATE_ROOT LAB_WORKSPACES_ROOT
+# cs resolves its installed estate and worker profiles through these overrides.
+unset CS_ROOT CS_INSTALL_ROOT CS_AGENTS_DIR CS_CODE_ROOT
+# Nor cs land's own commit bypass: its pre-commit runs this check, and a test of the land lock would inherit it.
+unset CS_LAND_COMMIT
+# Parallel fixtures need more startup headroom than standalone runs. Only harness
+# waits opt into this scale; behavioral deadlines remain unchanged.
+export CHECK_TIMEOUT_SCALE="${CHECK_TIMEOUT_SCALE:-3}"
+cd "$(dirname "$0")/.."
+python3 scripts/check_timeout.py || { echo "check: CHECK_TIMEOUT_SCALE must be a finite positive number" >&2; exit 1; }
+# The public curl | sh installer must stay plain POSIX sh (it runs before any Python exists).
+sh -n scripts/install.sh || { echo "check: scripts/install.sh no longer parses as POSIX sh" >&2; exit 1; }
+fail=0
+ops_cap_fail=0
+say() { echo "check: FAIL — $*"; fail=1; }
+
+bg_rule() {
+  local msg="$1" log
+  shift
+  log=$(mktemp)
+  ( "$@" >"$log.output" 2>&1 || printf '%s\n' "$msg" > "$log" ) &
+  _bg_pids="${_bg_pids:-} $!"
+  _bg_logs="${_bg_logs:-} $log"
+}
+wait_rules() {
+  local pid log
+  for pid in ${_bg_pids:-}; do
+    wait "$pid" || true
+  done
+  for log in ${_bg_logs:-}; do
+    if [ -s "$log" ]; then
+      say "$(cat "$log")"
+      cat "$log.output"
+      # cs land keeps only FAIL lines; keep the rule's whole output where the owner can read it.
+      kept="${TMPDIR:-/tmp}/check-failed-$(date +%Y%m%d-%H%M%S)-${log##*/}.log"
+      cp "$log.output" "$kept" 2>/dev/null && echo "check: FAIL output kept: $kept"
+    fi
+    rm -f "$log" "$log.output"
+  done
+  _bg_pids=""
+  _bg_logs=""
+}
+
+# Spec-queue isolation: rule 7 only, against LAB_SPEC_QUEUE_ROOT.
+if [ "${LAB_SPEC_QUEUE_ONLY:-}" = 1 ]; then
+  exit $?
+fi
+
+# 11–40 fire in parallel; each rule still runs.
+if [ "${LAB_SPILL_ONLY:-}" != 1 ]; then
+# Only the full check scans the shared checkout; isolated fixtures must not inherit unrelated findings.
+# Scratch dirs inside the work tree race parallel scans and node-bundle walks (three red lands on 2026-11-12).
+in_tree=$(grep -rlE 'dir=(Path\.cwd\(\)|os\.getcwd\(\))' tasks/regressions 2>/dev/null | grep -v '/fixtures/' || true)
+[ -z "$in_tree" ] || say "regressions make scratch dirs inside the work tree (use the system temp dir): $in_tree"
+# Raw environment copies inherit the installed estate; use the shared fixture environment.
+raw_env=$(python3 - <<'PYENV'
+import pathlib, re
+# Only environments handed to a process: `**os.environ` spreads, and copies assigned to `env`/`env_*` or passed as
+# `env=`. Snapshots (`before = os.environ.copy()`) and comparisons are observations and stay allowed.
+pattern = re.compile(r"\*\*\s*os\.environ\s*[,}]|\benv\w*\s*=\s*(?:dict\s*\(\s*os\.environ\s*[,)]|os\.environ\.copy\s*\(\s*\))")
+root = pathlib.Path("tasks/regressions")
+for path in sorted([*root.glob("*/check"), *root.glob("*/fixtures/*.py")]):
+    try:
+        source = path.read_text()
+    except OSError:
+        continue
+    if pattern.search(source):
+        print(path)
+PYENV
+)
+[ -z "$raw_env" ] || say "regressions copy raw os.environ; use hermetic_env() from regressions/_lib/hermetic_env.py: $raw_env"
+
+# 0. fs_read and fs_edit are target/release/cs-tools; the rules below exec them. target/release/cs-harness
+# is the default runner (_runner) the runner regressions and rule 6 use, and target/release/cs-gateway
+#    the gateway the gateway fixtures start (target/release/cs-director the Director cs-init serves); target/release/cs-sandbox the wrapper the sandbox rules confine with (a
+# stale one refuses a newer policy, e.g. $TOOL_PYTHON). Built here: cargo is incremental (a no-op when current), so an edited
+#    crate or a fresh checkout never runs a stale or missing tool, runner or gateway. No cargo on PATH: skipped,
+#    said, and rule 1e names the gap. Nothing here builds Go: the Go runner and gateway are archived (ADR 0011).
+if command -v cargo >/dev/null 2>&1; then
+  # A successful build means cargo found every binary current; mark them so (a Cargo.lock change for another crate
+  # leaves cs-harness untouched, and the runner freshness rule compares mtimes against Cargo.lock).
+  (cd .. && cargo build --release --locked -q -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director \
+    && touch target/release/cs-harness) || say "cs-tools, cs-harness, cs-sandbox, cs-gateway or cs-director does not build (cargo build --release -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director at the repo root)"
+  # Regressions copy ops/bin into partial estates with no release bin/: render profiles with this build.
+  export CS_SANDBOX_BIN="${CS_SANDBOX_BIN:-$(cd .. && pwd)/target/release/cs-sandbox}"
+  (cd .. && cargo clippy --release --locked --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -- -D warnings) || say "cs-director, cs-gateway, cs-harness, cs-sandbox or cs-tools has Clippy warnings (cargo clippy --release --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -- -D warnings at the repo root)"
+else
+  echo "check: skip cs-tools build: no cargo on PATH; tools whose descriptor names target/release/cs-tools cannot run, and the gateway contract suite is skipped" >&2
+fi
+# 0b. defuddle_extract runs tools/defuddle/extract.mjs against its vendored node_modules, which are gitignored
+#     (package-lock.json is tracked). A fresh checkout installs them here from the lockfile, as rule 0 builds
+#     cs-tools, so its fixture never fails on a missing dependency. No npm on PATH: skipped and said.
+if [ ! -d tools/defuddle/node_modules ]; then
+  if command -v npm >/dev/null 2>&1; then
+    (cd tools/defuddle && npm ci --silent --no-audit --no-fund >/dev/null 2>&1) || say "tools/defuddle dependencies do not install (cd cs/tools/defuddle && npm ci)"
+  else
+    echo "check: skip defuddle install: no npm on PATH; defuddle_extract's derive fixture cannot pass (cd cs/tools/defuddle && npm ci)" >&2
+  fi
+fi
+# These fixtures enforce short process deadlines; run before the parallel batch.
+tasks/regressions/fake-provider/check || say "estate gateway capacity exceeds its share or fake provider contract fails"
+tasks/regressions/dispatch-timeout-recovery/check || say "dispatcher timeout does not cancel, release capacity, or admit the next job"
+tasks/regressions/fake-cli/check || say "fake claude loses its argument/environment recording contract"
+tasks/regressions/cli-providers/check || say "profiled CLI credentials, isolation or terminal evidence regressed"
+tasks/regressions/cli-pins-per-machine/check || say "per-machine CLI pins regressed"
+tasks/regressions/profiled-executor-roots/check || say "a profiled CLI template (opencode, pi, ...) with separate code, state, config and workspaces roots fails on a task outside the code root, lands under the code root, or keeps incomplete evidence"
+tasks/regressions/muse-executor/check || say "Muse credentials, process boundary, frozen context or terminal evidence regressed"
+tasks/regressions/evidence-backup-long-path/check || say "evidence backup accepts an unsafe long-path sender or loses retained evidence"
+python3 ops/bin/_vitals_test.py || say "vitals parsers, resource guard, or job intake hold regressed"
+python3 ops/bin/_job_linux_test.py || say "Linux subreaper cleanup regressed"
+python3 ops/bin/_job_memory_test.py || say "per-job memory cap or pi harness cost/usage regressed"
+tasks/regressions/job-double-fork/check || say "double-fork job ownership, detached memory cap or PID identity regressed"
+python3 ops/bin/_lanes_test.py || say "lane HEAD/branch-ref verification or the setsid process sweep regressed"
+tasks/regressions/tracked-secret-history/check || say "a lane is still allowed when a secret-named file survives only in history, on another ref, or under a different case (#54)"
+tasks/regressions/transcript-redaction/check || say "a transcript, event, or task_output still returns a director token, PEM block, auth header, URL password, or provider token (#43)"
+# node-install runs node-bundle's cargo build, and cargo re-links every target/release binary even when nothing changed
+# (each path is briefly missing), so in the batch it raced the rules that exec them: "cs-tools ... is not built",
+# a gateway case that could not spawn (2026-11-11). Serial, before the batch; no batch rule may run cargo.
+tasks/regressions/node-install/check || say "the node image no longer installs offline from a bundle, or a manifest tool needs more than the pinned interpreter"
+bg_rule "evidence-backup omits a post-1b run's terminal record (terminal.json, messages.jsonl, check.json, finalized.json)" \
+  tasks/regressions/backup-omits-terminal-record/check
+bg_rule "failed background check output disappears or changes check status" \
+  tasks/regressions/check-failure-output/check
+bg_rule "an empty estate tick invents a cohort, prune review or historic labels" \
+  tasks/regressions/tick-empty-estate/check
+bg_rule "local model readiness accepts the wrong DGX serving alias" \
+  tasks/regressions/spark2-readiness/check
+bg_rule "public Lab CLI execution bypasses deployment admission or its original evidence/grant checks" \
+  tasks/regressions/deployment-admission/check
+bg_rule "the gateway/models.json every release ships does not start a gateway on its own" \
+  tasks/regressions/shipped-catalog-starts/check
+bg_rule "completed process-group cleanup signals again or hides denied signals" \
+  tasks/regressions/muse-cleanup-once/check
+
+bg_rule "a task check can write the live lab control plane without an isolation guard" \
+  tasks/regressions/live-control-plane-write/check
+bg_rule "commit message attribution stripping or gates regressed" \
+  tasks/regressions/commit-message/check
+bg_rule "suspended ops measurement or required commit footer is missing" \
+  tasks/regressions/ops-cap-ratchet/check
+bg_rule "harvest executes agent git config or redirects commits through workspace metadata" \
+  tasks/regressions/harvest-host-git/check
+bg_rule "run stimulus is no longer frozen, or candidate evidence does not survive harvest" \
+  tasks/regressions/lifecycle-frozen-evidence/check
+bg_rule "compressed lifecycle evidence is incomplete" \
+  tasks/regressions/lifecycle-large-evidence-compression/check
+bg_rule "an oversized Git checkout can make a small candidate uninspectable" \
+  tasks/regressions/lifecycle-sparse-candidate-archive/check
+bg_rule "publish-evidence refuses unsafe candidate archives for inspection" \
+  tasks/regressions/frozen-inspection-packet/check
+bg_rule "landing vocabulary loses evidence or same-cause factory_gap ratchet" \
+  tasks/regressions/landing-vocabulary/check
+bg_rule "enqueue refusals lose their remedy clause or refusal receipt" \
+  tasks/regressions/refusal-remedy/check
+bg_rule "fs_read no longer lists directories" \
+  tasks/regressions/fs-read-directory/check
+bg_rule "runner selection, rollback, rebuild or process identity regressed" \
+  tasks/regressions/runner-selection/check
+bg_rule "retired product names are accepted or configuration migration failed" tasks/regressions/cs-rename/check
+bg_rule "runner characterisation v2 fixtures diverge from the current runner's behaviour" \
+  tasks/regressions/runner-characterisation-v2/check
+bg_rule "a run with the default configuration is not executed by the Rust runner, or its row does not say which runner and gateway ran it" \
+  tasks/regressions/runner-identity/check
+bg_rule "a runner killed inside finalization loses the row, or finalize-run cannot recover it" \
+  tasks/regressions/finalize-crash-loses-row/check
+bg_rule "finalize-run recovery contract regressed: lock, idempotent row and publication, kill-retry, tick sweep" \
+  tasks/regressions/finalize-run-recovery/check
+bg_rule "an error stop no longer classifies, a non-error stop does, or a dispatch row lost its error object" \
+  tasks/regressions/error-classes/check
+bg_rule "the spool lost at-least-once, idempotent or verify-before-ack delivery, or the low-disk admission stop" \
+  tasks/regressions/spool-delivery/check
+bg_rule "a fleet node needs a specs/, tasks/ or ledger/ checkout, loses a fact while the director is away, re-runs a started job, or prunes a workspace before its envelope is acked" \
+  tasks/regressions/estate-split/check
+bg_rule "a Director job whose runner exits without a row crashes tick or stays running, or the Director never learns why" \
+  tasks/regressions/director-job-refused-spec/check
+bg_rule "an op reads or writes a state shelf under <lab>/ledger instead of the state root, or a relocated state root leaks back into the checkout" \
+  tasks/regressions/state-root-readers/check
+bg_rule "the runner no longer refuses a state or workspaces root inside the checkout, or reports a later finalize error instead of the run's own failure" \
+  tasks/regressions/state-root/check
+bg_rule "an install names itself from the release's code-root ESTATE instead of its config root, or a release ships ESTATE" \
+  tasks/regressions/estate-config-root/check
+bg_rule "lab/ holds more than the archived Go runner, or a live file names a moved path under lab/ (Director.Plan step 0b)" \
+  tasks/regressions/kit-layout-guard/check
+bg_rule "Director-layer knowledge came back below the Director: node code, a grant's ops or kit machinery names it (outline v1.5 decision 5; Director.Plan step 8)" \
+  tasks/regressions/director-layer-only/check
+bg_rule "a checkout without lab/ledger recreates it (check-red-gate), crashes a reader, or loses a ledger-relative setup" \
+  tasks/regressions/ledger-absent/check
+bg_rule "a shelf reader crashes on, counts, or acts on estate-cutover's estate_cutover rows: schedule-tick, node-listen's schedules, run-identity and the rest must read a cut-over root as its pre-cutover shelves" \
+  tasks/regressions/estate-cutover-readers/check
+bg_rule "a manifest tool has no contract fixtures, or a fixture no longer matches the tool exec'd as the runner execs it" \
+  tasks/regressions/tool-fixtures/check
+bg_rule "a lane reads another process environment, or node services source node.env into their exec environment (P0 sixth verification pass)" \
+  tasks/regressions/proc-env-isolation/check --darwin-probe
+bg_rule "a run's tmp under ~/.contextstack no longer resolves inside the agent profile (realpath of CODEX_HOME), or the estate parents become readable (2026-11-12)" \
+  tasks/regressions/estate-ancestor-metadata/check --darwin-probe
+bg_rule "declared PHP is missing or toolchain access escapes its read-only directory" \
+  tasks/regressions/lane-toolchain-php/check --darwin-probe
+bg_rule "uv or its Python install is missing, readable outside its grants, writable, or UV_CACHE_DIR escapes the run tmp" \
+  tasks/regressions/lane-toolchain-uv/check --darwin-probe
+bg_rule "cargo escapes its grants, writes the host registry or credentials, or build output leaves the workspace" \
+  tasks/regressions/lane-toolchain-cargo/check --darwin-probe
+bg_rule "a Claude budget hook is unreadable, its controls are writable, or another run file becomes readable (2026-11-12)" \
+  tasks/regressions/claude-budget-hook-read/check --darwin-probe
+bg_rule "the hosted lead cannot reach its own MCP bridge under its profile, or can reach another lead's (2026-11-12)" \
+  tasks/regressions/lead-bridge-reach/check --darwin-probe
+bg_rule "an agent can connect to the owner's ssh-agent: launchd Listeners, ~/.ssh sockets or SSH_AUTH_SOCK (independent attack test, 7th pass #58)" \
+  tasks/regressions/attack-ssh-agent/check --darwin-probe
+bg_rule "trusted login refresh, owner/identity guards or proactive re-login pauses regressed" \
+  tasks/regressions/trusted-login-refresh/check --darwin-probe
+bg_rule "an agent mutates an owner login or task login copies write back (attack-login-rename)" \
+  tasks/regressions/attack-login-rename/check --darwin-probe
+bg_rule "a lane lands editor/CI/agent config or edits the gate and hooks without the owner's flag, via symlinked dirs or unlisted names (independent attack test, 7th pass #59)" \
+  tasks/regressions/attack-config-symlink/check --darwin-probe
+bg_rule "a lane can reach the owner's ssh-agent or run launchctl inside the executor profile (#58)" \
+  tasks/regressions/sec-ssh-agent/check --darwin-probe
+bg_rule "node-install no longer lays out the persistent install: releases, an atomic current, PATH links that never overwrite a foreign file, plists with absolute paths and an explicit PATH, rollback, uninstall" \
+  tasks/regressions/node-install-layout/check
+bg_rule "Linux node-install no longer writes systemd user units from the same service definitions as the launchd plists, embeds a secret, skips daemon-reload/enable/disable, or fails to refuse a host without systemctl (Plan.RealWork.Install 2026-11-11)" \
+  tasks/regressions/node-install-systemd/check
+bg_rule "a Python tool in an installed release cannot load its interpreter inside cs-sandbox (releases/<id>/python is outside the code root; \$TOOL_PYTHON), as on workstation" \
+  tasks/regressions/release-tool-runtime/check
+bg_rule "the Rust Director no longer bundles, installs as a launchd agent with its data in state/director kept across switch and rollback, refuses the retired Laravel --serve-director, takes a node's token from a file, or shows in cs status and doctor" \
+  tasks/regressions/director-rs-install/check
+bg_rule "client-web no longer bundles, installs as one launchd agent on loopback or Tailscale only with its env seeded once (APP_KEY never printed) and its storage in state/client-web kept across switch and rollback, serves a page with the local credential, or shows in cs status and doctor (ADR 0017)" \
+  tasks/regressions/client-web-install/check
+bg_rule "a node's director call waits out the read timeout to connect, or a slow director loses its long read timeout" \
+  tasks/regressions/director-connect-timeout/check
+bg_rule "a rule inherits the caller's GIT_DIR/GIT_INDEX_FILE (a commit hook's), so fixture repos read or write the wrong repository" \
+  tasks/regressions/check-git-env/check
+bg_rule "cs init no longer detects login-shell toolchains, merges toolchains.json, or doctor reports a missing declared binary" \
+  tasks/regressions/init-toolchains/check
+bg_rule "cs init no longer takes a fresh install to a finished first job (Director, gateway and node served, the node registered with its own Director without a printed token, a subscription CLI found by its status command, FileVault off warned) or a rerun changes something (install stage 0)" \
+  tasks/regressions/cs-init/check
+bg_rule "an installed release fails its real-agent or lead trial without restoring the previous release" \
+  tasks/regressions/release-smoke-gate/check
+bg_rule "the installed-release trial no longer starts agent jobs before the gateway and Director answer after a release switch" \
+  tasks/regressions/release-smoke-wait/check
+bg_rule "cs no longer reads the install: status, models, jobs, logs, launchctl start/stop, node-install release delegation, a doctor failure, the Linux fallback, or it printed a secret" \
+  tasks/regressions/cs-cli/check
+bg_rule "a repo-lane job no longer works in its worktree beside main on lane/<lane>, its sandbox writes the repo outside that worktree, its evidence diff is wrong, or cs land lands on red, on a conflict or a dirty main, or leaves the lane behind on green (Plan.RealWork.Install 2026-11-11)" \
+  tasks/regressions/repo-lanes/check
+bg_rule "cs land no longer reports landed, failed and refused outcomes to the Director, --job no longer wins over lookup, lookup misses the newest finished job, or an unreachable Director changes the landing" \
+  tasks/regressions/land-record/check
+bg_rule "land-backfill no longer recognises squash, merge and legacy landing subjects, pick the newest finished job before each commit, stay idempotent on re-run, or honour --dry-run" \
+  tasks/regressions/land-backfill/check
+bg_rule "cs mcp no longer serves the Director's Client API as MCP tools over stdio: start_task's bundle, status, live output, wait_tasks waking on a job's end, decide, cancel, sub-agent profiles (list_agents, start_task agent= defaults and refusals, seconds over 3600), or it printed the credential" \
+  tasks/regressions/cs-mcp/check
+bg_rule "cs review weekly no longer pulls recent lane jobs from the Director or its task_type x agent/model table, worst-lanes two-line autopsies, provider limits, or rule-based proposals drifted" \
+  tasks/regressions/weekly-review/check
+bg_rule "the weekly review schedule no longer fires once on Monday, skips the rest of the week, catches up one missed week, or fails to write the report and one attention item" \
+  tasks/regressions/weekly-review-schedule/check
+bg_rule "the hosted lead bundle no longer satisfies conversation spec rules, cs lead create on a temp Director, or it printed the lead token (Design.HostedLead lane 2)" \
+  tasks/regressions/lead-bundle/check
+bg_rule "hosted lead setup duplicates conversations, fails recovery or welcome, or loses browser handoff" \
+  tasks/regressions/cs-lead-create/check
+bg_rule "the hosted CLI reads the lead credential inside its sandbox, an unauthenticated socket launches host MCP, or proxy stdio/cleanup fails (#38)" \
+  tasks/regressions/lead-mcp-host/check
+bg_rule "many hosted-lead conversations each get their own credential and session; legacy config migrates; missing owner refuses mint" \
+  tasks/regressions/many-leads-host/check
+bg_rule "a lane can open the hosted lead's host-side MCP bridge socket, or the bridge spawns a thread per blind connect (#56)" \
+  tasks/regressions/sec-lead-mcp-bridge/check --darwin-probe
+bg_rule "ensure_serving reuses an unconfined hosted lead serve for a confined turn (#56)" \
+  tasks/regressions/sec-serve-sandbox-reuse/check
+bg_rule "budget parsers admit nan, inf or negative numbers (#56)" \
+  tasks/regressions/sec-budget-finite/check
+bg_rule "a forged hosted-lead or tasks/turn job gains host execution, hosted checks bypass the sandbox, or lead secrets are reopened (#38)" \
+  tasks/regressions/hosted-turn-authority/check
+bg_rule "the hosted lead session host no longer reuses one stream-json CLI per conversation, persists session id, resumes after restart, leaks the lead credential, or accepts unauthenticated sockets, unsafe socket directories or another conversation workspace (#39; Design.HostedLead lane 3)" \
+  tasks/regressions/lead-session-host/check
+bg_rule "trusted Claude refresh writeback or OAuth retry timeout receipts regressed" \
+  tasks/regressions/executor-timeout-receipt/check
+bg_rule "hosted Claude private login copies or guarded refresh regressed (issue #28)" \
+  tasks/regressions/lead-session-host/check --login-copies-only
+bg_rule "the hosted lead no longer wakes on child lane end via events (one batched nudge recorded as a wake turn on the Director), or permits unauthenticated watch registration (#39; Design.HostedLead lane 6)" \
+  tasks/regressions/lead-wakeups/check
+bg_rule "tools no longer run under the cs-sandbox prefix the launcher resolves, or a malformed sandbox policy launches anything" \
+  tasks/regressions/sandbox-policy/check
+bg_rule "the gateway's unix socket stopped serving TCP's handler and auth, or a net gateway tool reaches TCP or misses the socket" \
+  tasks/regressions/gateway-socket/check
+# The Rust gateway rule 0 just built, against its black-box contract suite: the offline fast subset (all but six
+# slow timing cases; ~20 s). No cargo: rule 0 built nothing, so this is skipped with it (G1 2).
+if command -v cargo >/dev/null 2>&1; then
+  bg_rule "the Rust gateway (target/release/cs-gateway) fails its black-box contract suite: modelgateway-spec --fast --impl rust" \
+    env CSGATEWAY_BIN="$(cd .. && pwd)/target/release/cs-gateway" ../tests/gateway-spec/run --fast --impl rust
+fi
+# cs-sandbox's own tests, including the golden test that the Rust cli-executor profile equals the Python
+# sandbox_cmd profile byte for byte. CI also runs them, but nothing pushes yet, so the gate must (5th pass).
+if command -v cargo >/dev/null 2>&1; then
+  bg_rule "the Rust sandbox profiles drift from the Python ones or cs-sandbox fails its tests (cd .. && cargo test --locked -p cs-sandbox)" \
+    sh -c 'cd .. && cargo test --locked -q -p cs-sandbox'
+fi
+bg_rule "HOME read allowlists or centralized Seatbelt read rules regressed" \
+  tasks/regressions/home-read-allowlist/check
+bg_rule "Seatbelt path literals must preserve UTF-8 and escape quotes, not JSON-escape or splice raw paths (sbpl-quote)" \
+  tasks/regressions/sbpl-quote/check
+bg_rule "production Python emits Seatbelt rules" tasks/regressions/no-python-sbpl/check
+bg_rule "Rust Seatbelt profiles match the frozen baseline" tasks/regressions/e2-sbpl-baseline/check
+bg_rule "the Director Client API contract (tests/director-spec --side client) regressed" ../tests/director-spec/run --side client --no-build
+bg_rule "the Director and node contracts (tests/director-spec --side both) regressed" ../tests/director-spec/run --side both --no-build
+bg_rule "the public export allowlist, lab/personal/secret scanners or no-push guarantee regressed" tasks/regressions/public-export/check
+bg_rule "native Rust Seatbelt switch changes frozen bytes" tasks/regressions/e2-native-switch/check
+bg_rule "the browser broker drives Chrome off its origin sets, or browser_session reaches more than its set's socket" \
+  tasks/regressions/browser-broker/check
+bg_rule "a run's identity no longer names each tool and hook it executed, or an edited tool or helper leaves env_sha unchanged" \
+  tasks/regressions/tool-identity/check
+# Exercise the actual executor Seatbelt profile, not only its generated text. Nested
+# sandbox-exec is blocked in an agent sandbox: the lead must run check outside it.
+if [ "$(uname -s)" = Darwin ]; then
+  bg_rule "an agent template reads undeclared HOME paths, connects to a decoy Unix socket, or cannot resolve DNS (home-read-allowlist --darwin-probe)" \
+    tasks/regressions/home-read-allowlist/check --darwin-probe
+  bg_rule "a HOME-installed CLI fails sandboxed startup (real_cli_smoke --darwin-probe)" \
+    python3 tasks/regressions/home-read-allowlist/real_cli_smoke.py --darwin-probe
+  bg_rule "a coding-agent profile permits HOME secret reads (home-read-attack --darwin-probe)" \
+    tasks/regressions/home-read-attack/check --darwin-probe
+  bg_rule "the actual Darwin Seatbelt profile permits secret reads or blocks staged login (read-denies --darwin-probe)" \
+    tasks/regressions/cli-agent-runtimes/read-denies --darwin-probe
+  bg_rule "owner login overwrite, chmod, rename, hardlink or unlink is permitted (issues #28/#57)" \
+    tasks/regressions/cli-agent-runtimes/login-rename-probe --darwin-probe
+  bg_rule "non-ASCII or quote characters in a path must deny writes under live Seatbelt (sbpl-quote --darwin-probe)" \
+    tasks/regressions/sbpl-quote/check --darwin-probe
+else
+  echo "check: skip read-denies --darwin-probe: requires macOS Seatbelt (host: $(uname -s))" >&2
+fi
+# Confined form of the demand: with the wrapper built, no shipped tool may escape
+# the workspace. Without a built wrapper, check fails unless CS_CHECK_SKIP_ESCAPE_SUITE=1.
+if [ -x ../target/release/cs-sandbox ]; then
+  bg_rule "a shipped tool escapes the workspace under cs-sandbox (tool-escapes-workspace, confined)" \
+    env CS_TOOL_PREFIX="$(cd .. && pwd)/target/release/cs-sandbox --policy $(pwd)/policy/sandbox.json --" \
+    tasks/regressions/tool-escapes-workspace/check
+elif [ "${CS_CHECK_SKIP_ESCAPE_SUITE:-}" = "1" ]; then
+  echo "check: skip tool-escapes-workspace: ../target/release/cs-sandbox not built (CS_CHECK_SKIP_ESCAPE_SUITE=1)" >&2
+else
+  say "tool-escapes-workspace requires ../target/release/cs-sandbox; set CS_CHECK_SKIP_ESCAPE_SUITE=1 to skip confinement tests in development"
+fi
+bg_rule "shared estate I/O changes caller error, time, or environment contracts" \
+  tasks/regressions/estate-io/check
+bg_rule "core ops/bin Python helpers lost pinned quoting, toolchain, estate I/O or provider-limit behaviour (py-core-units)" \
+  tasks/regressions/py-core-units/check
+bg_rule "captured authority no longer binds to the exact dispatch job" \
+  tasks/regressions/stimulus-work-order-binding/check
+bg_rule "a schedule crosses its grant estate or loses probe authority" \
+  tasks/regressions/schedule-estate-authority/check
+bg_rule "a deployed schedule manifest can activate, partially append, or lose authority binding" \
+  tasks/regressions/schedule-manifest-registration/check
+bg_rule "a missing scheduled setup can spend model turns or lose its machinery disposition" \
+  tasks/regressions/scheduled-setup-preflight/check
+bg_rule "Claude smart-model routing no longer preserves CLI-before-API order" \
+  tasks/regressions/claude-cli-first-route/check
+bg_rule "est_usd no longer prefers the CLI meter or omits cache-creation tokens" \
+  tasks/regressions/est-meter-1400x/check
+bg_rule "a coding-agent run drops the tokens, real model, estimate label or allowance its agent reported" \
+  tasks/regressions/agent-usage/check
+  tasks/regressions/provider-limits/check
+bg_rule "a failed, limited, timed-out or cancelled profiled-template run (opencode, pi) is not finalized and sent like any other run" \
+  tasks/regressions/profiled-finalization/check
+bg_rule "an OpenCode Go task check cannot execute its frozen stimulus check" \
+  tasks/regressions/profiled-check-exec/check
+bg_rule "install.sh or cs update installs without a verified checksum, needs host Python, extracts an unsafe member, or loses the previous release" \
+  tasks/regressions/install-update/check
+bg_rule "release bundle CI drops a platform, skips --publish-dir, or merges no channel manifest" \
+  tasks/regressions/release-bundles/check
+bg_rule "desktop app signing or notarization workflow regressed" tasks/regressions/desktop-app-workflow/check
+bg_rule "a conversation turn waits behind lane jobs, waits for the 60-second tick, or starves aged batch work" \
+  tasks/regressions/turn-priority/check
+bg_rule "running lanes suppress interactive admission, a lane uses the reserved turn seat, or critical pressure admits work" \
+  tasks/regressions/turn-reserved-seat/check
+bg_rule "a coding-agent run stops streaming, or its events.jsonl/messages.jsonl leave the runner's shape" \
+  tasks/regressions/executor-streaming/check
+bg_rule "a spinning coding-agent lane no longer stops early with stuck:* and a stuck.md autopsy" \
+  tasks/regressions/stuck-lanes/check
+bg_rule "cursor-agent, antigravity, gemini-cli or codex lost its writable private runtime, key scrub or receipt" \
+  tasks/regressions/cli-agent-runtimes/check
+bg_rule "pi, goose or grok lost its headless args, private auth staging, write boundary or completion receipt" \
+  tasks/regressions/harness-providers/check
+bg_rule "an outage, dependency wait, or config-void can consume or silently lose a due schedule" \
+  tasks/regressions/local-coder-outage-defer/check
+bg_rule "schedule regressions depend on live estate schedules" tasks/regressions/schedule-fixture-isolation/check
+bg_rule "a scheduled external mutation escaped its explicit grant or child process" \
+  tasks/regressions/scheduled-external-effect-authority/check
+bg_rule "an outage, dependency wait, or config-void can consume or silently lose a due schedule" \
+  tasks/regressions/schedule-dependency-catch-up/check
+bg_rule "a dependency deferral is stdout-only or silence waits on a single missed slot" \
+  tasks/regressions/schedule-deferral-silence/check
+bg_rule "an outage, dependency wait, or config-void can consume or silently lose a due schedule" \
+  tasks/regressions/tick-terminal-seat-release/check
+bg_rule "an outage, dependency wait, or config-void can consume or silently lose a due schedule" \
+  tasks/regressions/schedule-config-void-hold/check
+bg_rule "a schedule firing starts before its identity is recorded, re-fires after a crash, or runs a missed slot under missed: skip" \
+  tasks/regressions/schedule-firing-identity/check
+bg_rule "schedule failures isolate dependencies, hold repeat failures and surface silent cron slots" \
+  tasks/regressions/schedule-failure-isolation/check
+bg_rule "enqueue accepts a schedule slot that shadow audit cannot parse" \
+  tasks/regressions/dispatch-slot-validation/check
+bg_rule "browser cookies can enter a run, setup tree, evidence, spill, or harvest" \
+  tasks/regressions/browser-cookie-isolation/check
+bg_rule "a clean first-task preflight suppresses later tasks in the same spec" \
+  tasks/regressions/tick-multitask-preflight-continuation/check
+bg_rule "inline quoted task lists lose task identity or a zero-evidence void does not stop the batch" \
+  tasks/regressions/dispatch-quoted-tasks/check
+bg_rule "tick attaches a stale or mismatched execution row to a scheduled run" \
+  tasks/regressions/tick-executor-run-correlation/check
+bg_rule "fake auth diagnostic exports more than approved metadata" \
+  tasks/regressions/claude-auth-context/verify
+bg_rule "Claude runtime state writes escape its private home" \
+  tasks/regressions/claude-private-runtime/check
+bg_rule "executor or runner child processes inherit credential environment" \
+  tasks/regressions/env-allowlist/check
+bg_rule "env policy drifted: process.rs DEFAULT_ENV, resolver default and policy/env.json differ, or a launcher/op stops enforcing it" \
+  tasks/regressions/env-policy/check
+bg_rule "CLI executor frozen inputs are unbounded, mutable, or workspace-escaping" \
+  tasks/regressions/executor-frozen-inputs/check
+bg_rule "estate classifier reports a third bucket or mis-tiers grants, judgments, or work/sweep notes" \
+  tasks/regressions/estate-classify-tiers/check
+bg_rule "a rules-tier commit can pass a red check without check-red: or the operator-queue event" \
+  tasks/regressions/check-red-rules-commit/check
+bg_rule "estate-commit mis-reads toplevel-relative git paths when lab/ is a monorepo subdirectory" \
+  tasks/regressions/estate-commit-monorepo-paths/check
+bg_rule "tick no longer sweeps a stale lab .git lock before job pull" \
+  tasks/regressions/tick-stale-git-lock/check
+bg_rule "missing Playwright or gstack browse is no longer a $0 preflight refusal" \
+  tasks/regressions/lane-runtime-preflight/check
+bg_rule "lane dependency copies are missing or write through to main" \
+  tasks/regressions/lane-vendor-clone/check
+bg_rule "browser_fetch ignores the tagged Playwright runtime" \
+  tasks/regressions/browser-tagged-runtime/check
+bg_rule "checklib rails still scan inherited dest files or .git" \
+  tasks/regressions/checklib-cell-authored-scope/check
+bg_rule "route_equiv still misses a named route with parameter segments" \
+  tasks/regressions/checklib-route-equiv-named/check
+bg_rule "a cloned Laravel vendor still needs autoloader edits or adds a megabyte" \
+  tasks/regressions/setup-workspace-clone-vendor/check
+bg_rule "spill scan no longer refuses dest/fresh workspace or still walks pre-prune runs" \
+  tasks/regressions/lab-spill-scope/check
+bg_rule "a spec without model: is accepted by the runner, enqueue or rule 3, or the PINNED default/ladder drifted" \
+  tasks/regressions/pin-default-model/check
+bg_rule "settled workspace prune loses its evidence row or fails reconstruction" \
+  tasks/regressions/prune-workspaces/check
+bg_rule "a copied lab tree can hide ledger/*.jsonl under ledger/runs" \
+  tasks/regressions/ledger-runs-jsonl-leak/check
+bg_rule "publish-evidence packs secrets or no longer round-trips the live walk" \
+  tasks/regressions/publish-evidence-roundtrip/check
+bg_rule "corpus setup still copies or symlinks vendor or exceeds a 50 MB workspace" \
+  tasks/regressions/setup-workspace/check
+fi
+
+# 1–8 skipped when LAB_SPILL_ONLY=1 (rule 9 isolation).
+if [ "${LAB_SPILL_ONLY:-}" != 1 ]; then
+python3 scripts/ops-cap.py check || ops_cap_fail=1
+
+# 1b. Every op keeps its executable bit IN GIT: a sidecar'd op or a shebang
+#     file recorded as 100644 is refused by the operator UI and by a mode-
+#     preserving copy, while fixtures that chmod their copies never notice.
+for f in $(git ls-files -s ops/bin | awk '$1=="100644"{print $4}' | grep -v '\.json$\|/_'); do
+  if [ -f "${f}.json" ] || head -c2 "$f" 2>/dev/null | grep -q '^#!'; then
+    say "$f is not executable in git (mode 100644): git update-index --chmod=+x $f"
+  fi
+done
+# 1c. Node image: nothing in a bin dir is unreachable from the live
+#     roots (specs/sweeps and specs/judgments retired), tools/manifest.json is
+#     the traversal's output, and every tool descriptor's runtime is its shebang.
+unreach=$(python3 scripts/tool-reach --no-sweeps --unreachable | tr '\n' ' ')
+[ -z "$unreach" ] || say "unreachable from every live root (scripts/tool-reach --no-sweeps): ${unreach}— delete it or name it from a spec, hook, op, the runner, OPERATOR.md or fixture"
+python3 scripts/tool-reach --manifest | diff -q - tools/manifest.json >/dev/null 2>&1 ||
+  say "tools/manifest.json drifts from the traversal — scripts/tool-reach --manifest > tools/manifest.json"
+rt_bad=$(python3 - <<'PY'
+import json, os, glob
+for d in sorted(glob.glob("tools/bin/*.json")):
+    exe = d[:-5]
+    if not os.path.isfile(exe): continue
+    try: rt = json.load(open(d)).get("runtime")
+    except ValueError as e: print(f"{d} (invalid JSON: {e})"); continue
+    sb = open(exe, errors="replace").readline().rstrip("\n")
+    parts = sb[2:].split() if sb.startswith("#!") else []
+    if parts and os.path.basename(parts[0]) == "env": parts = parts[1:]
+    want = os.path.basename(parts[0]) if parts else None
+    if rt != want: print(f"{d} (runtime {rt!r}, shebang {want!r})")
+PY
+)
+[ -z "$rt_bad" ] || say "tool descriptor runtime missing or not its shebang: $(echo $rt_bad)"
+# 1d. Descriptors follow MCP's tool definition fields: inputSchema, never schema/input_schema/input;
+#     bin (a path, relative to the repo holding lab/ unless absolute) and args (strings) only with runtime exe,
+#     which has bin and no file of its own in tools/bin (the runners exec bin + args, never the file pair).
+desc_bad=$(python3 - <<'PY'
+import json, os, glob
+for d in sorted(glob.glob("tools/bin/*.json")):
+    try: j = json.load(open(d))
+    except ValueError: continue  # 1c names it
+    bad = [k for k in ("schema", "input_schema", "input") if k in j] + ([] if "inputSchema" in j else ["no inputSchema"])
+    exe = j.get("runtime") == "exe"
+    if exe and not (isinstance(j.get("bin"), str) and j["bin"]): bad.append("exe without bin")
+    if not exe and ("bin" in j or "args" in j): bad.append("bin/args without runtime exe")
+    if "args" in j and not (isinstance(j["args"], list) and all(isinstance(a, str) for a in j["args"])): bad.append("args not strings")
+    if exe and os.path.exists(d[:-5]): bad.append("exe with a file pair executable")
+    if bad: print(f"{d} ({', '.join(bad)})")
+PY
+)
+[ -z "$desc_bad" ] || say "tool descriptor not in MCP shape (inputSchema; bin/args only with runtime exe): $(echo $desc_bad)"
+# 1e. A runtime exe descriptor's bin exists and is executable whenever a release build exists
+#     (../target/release); with none at all, skipped and said, since rule 0 could not build without cargo.
+if [ -d ../target/release ]; then
+  exe_bad=$(python3 - <<'PY'
+import glob, json, os, sys
+sys.path.insert(0, "ops/bin")
+import _sandbox_policy
+for d in sorted(glob.glob("tools/bin/*.json")):
+    try: j = json.load(open(d))
+    except ValueError: continue  # 1c names it
+    if j.get("runtime") != "exe" or not j.get("bin"): continue  # 1d names a missing bin
+    b = _sandbox_policy.tool_argv(".", os.path.basename(d)[:-5])[0]
+    if not (os.path.isfile(b) and os.access(b, os.X_OK)): print(f"{d} ({j['bin']})")
+PY
+)
+  [ -z "$exe_bad" ] || say "runtime exe descriptor names a bin that is not built: $(echo $exe_bad) — cargo build --release at the repo root"
+else
+  echo "check: skip rule 1e (exe bins built): no ../target/release" >&2
+fi
+python3 scripts/node-bundle deps >/dev/null 2>&1 || say "a manifest tool imports outside the standard library (scripts/node-bundle deps; the node ships a pinned interpreter and nothing else)"
+# 2. Doc cap: every markdown file <= 80 lines (ledger/, setup/, and
+#    product stimulus goal.md under tasks/work|sweeps are exempt).
+while IFS= read -r f; do
+  n=$(wc -l < "$f" | tr -d ' ')
+  [ "$n" -le 80 ] || say "$f is $n lines (cap 80) — a doc that long is hiding a spec"
+done < <(find . \( -path './.git' -o -path './ledger' -o -path '*/setup' -o -path '*/node_modules' \
+  -o -path './tasks/work' -o -path './tasks/sweeps' \) -prune -o -name '*.md' -print)
+# Re-include non-goal markdown under work/sweeps (notes stay capped).
+while IFS= read -r f; do
+  case "$f" in */goal.md) continue ;; esac
+  n=$(wc -l < "$f" | tr -d ' ')
+  [ "$n" -le 80 ] || say "$f is $n lines (cap 80) — a doc that long is hiding a spec"
+done < <(find ./tasks/work ./tasks/sweeps \( -path '*/setup' \) -prune -o -name '*.md' -print 2>/dev/null)
+
+# 3. Specs: required keys.
+#    (specs/sweeps and specs/judgments were archived in the 2026-11-09 prune;
+#    the -e guard keeps an absent or empty dir silent.)
+for s in specs/*.yaml; do
+  [ -e "$s" ] || continue
+  for k in id tools budget tasks trials; do
+    grep -q "^$k:" "$s" || say "$s missing '$k:'"
+  done
+  grep -qE '^model:[[:space:]]*[^[:space:]#]+' "$s" ||
+    say "$s has no model: (PINNED.md pins $(sed -n 's/^pinned:[[:space:]]*//p' PINNED.md 2>/dev/null | head -1))"
+done
+
+# 4. Archived specs must carry a verdict.
+for s in specs/archive/*.yaml; do
+  [ -e "$s" ] || continue
+  grep -q "^verdict:" "$s" || say "$s archived without a verdict line"
+done
+
+# 5. Tasks: goal.md + executable check. goal.md is stimulus only.
+for t in tasks/*/ tasks/work/*/ tasks/regressions/*/ tasks/sweeps/*/; do
+  [ "$t" != "tasks/regressions/_lib/" ] || continue
+  [ -d "$t" ] || continue
+  # tasks/regressions/_lib/ holds shared fixture helpers (hermetic_env.py), not a task.
+  case "$t" in tasks/judgments/|tasks/regressions/|tasks/regressions/_lib/|tasks/work/|tasks/sweeps/) continue ;; esac
+  [ -f "${t}goal.md" ] || say "$t missing goal.md"
+  [ -x "${t}check" ] || say "$t check missing or not executable"
+  grep -q '<!--' "${t}goal.md" 2>/dev/null && say "${t}goal.md has a comment — move it to notes.md"
+done
+
+# 6. The running thing must not lag its source (stale binary).
+if ! runner_freshness=$(python3 ops/bin/_runner.py 2>&1); then
+  say "$runner_freshness"
+elif [ -n "$runner_freshness" ]; then
+  printf '%s\n' "$runner_freshness" >&2
+fi
+
+# 7. (Spec queue rule retired with the lab, 2026-11-13.)
+
+# 8. Authority is one-way: lab files never cite the vault.
+if grep -rq 'markdown/ContextStack' PINNED.md INVARIANTS.md SCHEMA.md README.md CLAUDE.md OPERATOR.md specs/ prompts/ 2>/dev/null; then
+  say "a lab file cites the vault — authority flows lab→vault, never back"
+fi
+fi
+
+# 9. runtime spill stays untracked (lab, dest, post-prune workspaces).
+last_prune=${LAB_SPILL_PRUNE:-}
+[ -z "$last_prune" ] && last_prune=$(head -1 ledger/last-prune 2>/dev/null || true)
+[ -z "$last_prune" ] && last_prune="2026-09-04T15:05:00"
+lab_spill() { [ -n "$(git -C "$1" ls-files -- .lab-out .lab-calls.jsonl .lab-doom-mark 2>/dev/null)" ]; }
+if lab_spill .; then
+  say ".lab-* is tracked — runtime spill was harvested; git rm --cached it"
+fi
+if [ -z "${LAB_SPILL_DESTS:-}" ] && [ -z "${LAB_SPILL_RUNS_ROOT:-}" ]; then
+  for notes in tasks/work/*/notes.md tasks/sweeps/*/notes.md; do
+    [ -f "$notes" ] || continue
+    repo=$(sed -n 's/^repo:[[:space:]]*//p' "$notes" | head -1)
+    [ -n "$repo" ] && [ -e "$repo/.git" ] && lab_spill "$repo" && say ".lab-* tracked in dest $repo"
+  done
+  for d in tasks/work/*/setup; do
+    [ -e "$d/.git" ] || continue
+    lab_spill "$d" && say ".lab-* tracked in $d"
+  done
+fi
+for repo in ${LAB_SPILL_DESTS:-}; do
+  [ -e "$repo/.git" ] && lab_spill "$repo" && say ".lab-* tracked in dest $repo"
+done
+runs_root=${LAB_SPILL_RUNS_ROOT:-ledger/runs}
+if [ -d "$runs_root" ]; then
+  while IFS= read -r d; do
+    [ -e "$d/.git" ] || continue
+    { [ -e "$d/.lab-out" ] || [ -e "$d/.lab-calls.jsonl" ] || [ -e "$d/.lab-doom-mark" ]; } || continue
+    lab_spill "$d" && say ".lab-* tracked in $d"
+  done < <(find "$runs_root" -maxdepth 2 -type d -name workspace -newermt "$last_prune" 2>/dev/null)
+fi
+if [ "${LAB_SPILL_ONLY:-}" = 1 ]; then
+  [ "$fail" -eq 0 ] && echo "check: spill ok"
+  exit "$fail"
+fi
+
+# 10. The ledger only grows. A working ledger smaller than HEAD's is a
+#     truncation in progress (2026-09-01: live file cut to 13 rows). Once the ledger has left the checkout for the
+# state root there is nothing here to compare, and lab/ledger must not come back.
+if [ -n "$(git ls-tree --name-only HEAD -- ledger 2>/dev/null)" ] || [ -n "$(git ls-files -- ledger 2>/dev/null | head -1)" ]; then
+  ledger_tracked=1
+else
+  ledger_tracked=
+fi
+if [ -z "$ledger_tracked" ] && [ -e ledger ] && git rev-parse -q --verify HEAD >/dev/null 2>&1; then
+  say "lab/ledger reappeared after the ledger left the checkout: state lives in LAB_STATE_ROOT (~/.contextstack/state); remove it and find the writer"
+fi
+if [ -d ledger ] && git rev-parse -q --verify HEAD >/dev/null 2>&1; then
+  hn=$(git show HEAD:./ledger/ledger.jsonl 2>/dev/null | wc -l | tr -d ' ')
+  wn=$(wc -l < ledger/ledger.jsonl 2>/dev/null | tr -d ' ')
+  [ "${wn:-0}" -ge "${hn:-0}" ] || say "ledger.jsonl has $wn rows but HEAD has $hn — append-only violated; recover from git before anything else"
+fi
+
+
+bg_rule "Cursor provider unavailability is bounded and retryable" tasks/regressions/cursor-provider-unavailable/check
+bg_rule "node toolchain discovery loses config precedence or wrapper targets" \
+  tasks/regressions/lane-toolchain-php/discovery
+
+wait_rules
+
+# Budget deadline probes run after parallel rules to avoid scheduling contention.
+if ! tasks/regressions/director-cli-budget-forwarding/check; then
+  say "declared CLI budgets, immutable admission or native terminal checks failed"
+fi
+
+if [ "$ops_cap_fail" -ne 0 ]; then
+  [ "$fail" -ne 0 ] || echo "check: ops-cap-only-failure"
+  fail=1
+fi
+if [ "$fail" -eq 0 ]; then echo "check: ok"; fi
+exit "$fail"

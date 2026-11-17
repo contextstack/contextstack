@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+# ops/bin/tick — A2 worker. Model capacity is owned by the gateway.
+# Close every terminal state by enqueue id (first-terminal-wins).
+# Every declared trial executes; a clean tree is not an unexecuted trial.
+import collections, fcntl, hashlib, json, os, re, subprocess, sys, threading, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from _node_env import node_env
+
+# Validate and retain node-local settings at startup without exporting them.
+NODE_SETTINGS = node_env()
+
+from _runner import runner_path, running_count
+from _dispatch import spec_value
+from _env_policy import EnvPolicyError, child_env_value, resolve
+from _estate_io import read_jsonl, state_dir, pid_live, append_jsonl, call_op
+from _dispatch import TERMINAL, first_terminal, qid
+from _void import config_void_reason, hold_schedule, is_config_void
+from _node_restart import NODE_RESTART_REASON, ORPHANED_RUNNING_STOP, orphan_error
+from _job_reason import append_job_log, job_log_path, reason_of
+from _roots import RootsError, ledger_path, outbox_dir, roots, runs_dir, sandbox_reports_dir, workspace_dir
+from _sandbox_policy import SandboxPolicyError, browser_state_value, cell_prefix, sweep_orphan_cells, tool_prefix_value
+
+LAB = HERE.parent.parent
+STATE = roots()["state"]  # the node's shelves: default <code>/ledger, byte for byte as before
+Q = STATE / "dispatch.jsonl"
+LOCK = STATE / "dispatch.lock"
+LEDGER = ledger_path()  # the state root's (_roots); runs likewise, below
+TEMPLATES = json.loads((HERE / "executor-templates.json").read_text(encoding="utf-8"))
+JOB_META = ("resource", "expected_head", "task", "lane", "batch_id", "grant",
+            "schedule_id", "slot", "schedule_slot", "schedule_date",
+            "schedule_timezone", "reference_root", "external_effects", "profile",
+            "stale_after", "stale_after_seconds", "director_job",
+            "conversation_id", "turn_id", "dispatch_seat")
+RESLOCK = STATE / "resource-locks"
+RUNS = runs_dir()
+FINALIZE_GRACE_S = 60  # a live runner finalizes its own dir first; the flock makes a race safe anyway
+FINALIZE_SWEEP = {}
+SPOOL = {}  # spool_pass: spool-send's outbox counts (S2)
+SPOOL_POLICY = roots()["config"] / "policy/spool.json"  # receiver, min_free_bytes; absent = no receiver, no floor
+
+
+def node_role(config_root=None):
+    """policy/spool.json receiver {kind: "director", ...} makes this host a fleet node of that director:
+    tick then runs only node work (finalize, job-pull, spool-send, recovery, admission); director functions skip."""
+    try:
+        receiver = json.loads((SPOOL_POLICY if config_root is None else Path(config_root) / "policy/spool.json").read_text(encoding="utf-8")).get("receiver")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(receiver, dict) and receiver.get("kind") == "director"
+
+
+NODE = node_role()
+JOB_PULL = {}
+
+
+def error_object(cls, code, source, retryable, detail):
+    """ops/bin/_errors.py's shape, inline: estates that copy tick do not all copy _errors."""
+    return {"class": cls, "code": code, "source": source, "retryable": retryable,
+            "detail": str(detail).encode("utf-8")[:512].decode("utf-8", "ignore")}
+POLICY_ENV = {}  # run_spec: {"child_env": names} from policy/env.json + the spec's env: request (_env_policy),
+#   {"tool_prefix": CS_TOOL_PREFIX or None, "browser_state": LAB_BROWSER_STATE or None} from policy/sandbox.json (_sandbox_policy),
+#   {"reports": <state>/sandbox-reports}, where cell_prefix gives each cell its own report dir
+
+
+def spec_trials(text):
+    return max(1, int(spec_value(text, "trials") or "1"))
+
+
+def spec_key(value):
+    return str(value or "").replace("specs/", "").removesuffix(".yaml")
+
+
+def ledger_size():
+    if not LEDGER.is_file():
+        return 0
+    return len([line for line in LEDGER.read_text(encoding="utf-8").splitlines()
+                if line.strip()])
+
+
+def execution_row(rel, sid, after=0):
+    """Resolve a matching execution row appended by the current trial only."""
+    if not LEDGER.is_file():
+        return {}
+    wanted = {spec_key(rel), spec_key(sid)}
+    lines = [line for line in LEDGER.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    for line in reversed(lines[max(0, int(after)):]):
+        row = json.loads(line)
+        if (row.get("trial") is not None
+                and row.get("verdict") in {"pass", "fail", "void"}
+                and spec_key(row.get("spec")) in wanted):
+            return row
+    return {}
+
+
+def unfinalized_runs(min_age=0, now=None):
+    """Run dirs whose execution ended (terminal.json) without finalized.json."""
+    now = time.time if now is None else now
+    stamp, found = now(), []
+    for d in RUNS.iterdir() if RUNS.is_dir() else ():
+        try:
+            if (d / "terminal.json").is_file() and not (d / "finalized.json").is_file() \
+                    and stamp - (d / "terminal.json").stat().st_mtime >= min_age:
+                found.append(d)
+        except OSError:
+            continue
+    return sorted(found)
+
+
+def terminal_of(run_dir):
+    try:
+        return json.loads((run_dir / "terminal.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def finalize_run(run_dir, run=None):
+    run = subprocess.run if run is None else run
+    r = run([str(HERE / "finalize-run")], input=json.dumps({"run_dir": str(run_dir)}),
+            text=True, capture_output=True, cwd=str(LAB))
+    return r.returncode == 0
+
+
+def finalize_sweep(min_age=FINALIZE_GRACE_S):
+    """Retry finalize-run on every unfinished run dir; the sweep is the whole retry mechanism."""
+    dirs = unfinalized_runs(min_age)
+    done = sum(finalize_run(d) for d in dirs)
+    FINALIZE_SWEEP.update({"attempted": len(dirs), "finalized": done, "pending": len(dirs) - done})
+    # after the retries, so a cell a run just claimed is already gone; counted only when there is something to say
+    orphans = sweep_orphan_cells(sandbox_reports_dir(), RUNS, workspace_dir)
+    FINALIZE_SWEEP.update({"orphans_" + k: n for k, n in orphans.items() if n})
+    return FINALIZE_SWEEP
+
+
+def pending_row(rel, sid):
+    """No row after a trial: retry finalize-run once on this spec's unfinished dirs;
+    still none -> a terminal placeholder (stop finalization_pending), never a raise."""
+    wanted = {spec_key(rel), spec_key(sid)}
+    dirs = [d for d in unfinalized_runs() if spec_key(terminal_of(d).get("spec")) in wanted]
+    for d in dirs:
+        finalize_run(d)
+    still = [d for d in dirs if not (d / "finalized.json").is_file()]
+    if not still:
+        return {}
+    term = terminal_of(still[-1])
+    row = {"verdict": "void", "stop": "finalization_pending", "spec": term.get("spec"),
+           "trial": term.get("trial"), "run": term.get("run_id"), "transcript": term.get("transcript")}
+    try:  # a classified finalization failure (spool_full on ENOSPC) carries its class to the dispatch row
+        record = json.loads((still[-1] / "finalize.error").read_text(encoding="utf-8"))
+        if record.get("class") == "spool_full":
+            row["error"] = error_object("spool_full", "finalization_pending", "finalize-run", True, record.get("error"))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return row
+
+
+def spool_pass(run=None):
+    """S2: spool-send beside finalize_sweep; a no-op until policy/spool.json names a receiver."""
+    run = subprocess.run if run is None else run
+    op = HERE / "spool-send"
+    if not op.is_file():
+        return SPOOL
+    try:
+        r = run([str(op)], input="{}", text=True, capture_output=True, cwd=str(LAB), timeout=300)
+        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+        SPOOL.update({k: out[k] for k in ("pending", "sent", "failed") if k in out})
+        if not out.get("ok"):
+            SPOOL["error"] = out.get("error")
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as error:
+        SPOOL["error"] = str(error)
+    return SPOOL
+
+
+def state_root_disk_free(free_bytes=None):
+    """One statvfs on the state root; shared by spool_low and the resource guard."""
+    if free_bytes is not None:
+        return free_bytes
+    try:
+        st = os.statvfs(str(RUNS.parent))
+        return st.f_bavail * st.f_frsize
+    except (OSError, AttributeError):
+        return None
+
+
+def spool_low(free_bytes=None, config_root=None):
+    """S3: (free, floor) when the state root has less than policy/spool.json min_free_bytes, else None."""
+    try:
+        floor = int(json.loads((SPOOL_POLICY if config_root is None else Path(config_root) / "policy/spool.json").read_text(encoding="utf-8")).get("min_free_bytes") or 0)
+        free = state_root_disk_free(free_bytes)
+    except (OSError, ValueError, TypeError):
+        return None
+    if free is None:
+        return None
+    return (free, floor) if free < floor else None
+
+
+def resource_low(disk_free=None):
+    """Resource guard (policy/resources.json): held reason when new work must wait, else None."""
+    if not NODE:
+        return None
+    try:
+        from _vitals import load_resources_policy, read_vitals, resource_held
+
+        config = roots()["config"]
+        return resource_held(read_vitals(STATE, config, disk_free=disk_free), load_resources_policy(config))
+    except (OSError, ValueError, TypeError, RootsError):
+        return None
+
+
+def spec_tasks(text):
+    raw = spec_value(text, "tasks")
+    try:
+        tasks = json.loads(raw)
+    except json.JSONDecodeError:
+        tasks = [part.strip().strip("\"'") for part in raw.strip("[]").split(",") if part.strip()]
+    if not isinstance(tasks, list) or not all(isinstance(task, str) for task in tasks):
+        raise ValueError("tasks must be a list of paths")
+    return tasks
+
+
+def spec_seconds(text):
+    match = re.search(r"seconds:\s*(\d+)", text)
+    return int(match.group(1)) if match else 300
+
+
+def append_q(row):
+    # An errored/cancelled Director job carries a short `reason` (Client API `error`); fill it when absent.
+    if row.get("state") in TERMINAL and row.get("state") != "done" and not row.get("reason"):
+        why = reason_of(row, TRIAL_STDERR[0] if row.get("director_job") else "")
+        if why:
+            row["reason"] = why
+    append_jsonl(Q, row, sort_keys=False, compact=False,
+                 sync=False, encoding='utf-8')
+    if NODE and row.get("director_job") and row.get("state") in TERMINAL:
+        spool_job_terminal(row)
+
+
+def cancelled(job_id):
+    """the Director cancelled this job (node-listen, _node_control): no trial starts, the terminal row says so."""
+    from _node_spool import cancelled as marked
+    return NODE and marked(STATE, job_id)
+
+
+def spool_job_terminal(row):
+    """a director job's terminal row goes to the outbox as job_terminal:<job> (_node_spool)."""
+    from _node_spool import spool_job_terminal as spool
+    spool(outbox_dir(), Q, row)
+
+
+def job_pull_pass(run=None):
+    """node role only: ops/bin/job-pull accepts the director's jobs into the local shelf."""
+    run = subprocess.run if run is None else run
+    try:
+        r = run([str(HERE / "job-pull")], input="{}", text=True, capture_output=True, cwd=str(LAB), timeout=300)
+        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+        JOB_PULL.update({k: out[k] for k in ("accepted", "failed", "error") if out.get(k)})
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as error:
+        JOB_PULL["error"] = str(error)
+    return JOB_PULL
+
+
+def recover_orphaned_jobs():
+    """Close dead running rows as retryable voids after a crash or reboot."""
+    done = lockf(True)
+    recovered = []
+    try:
+        rows = read_jsonl(Q, strict=True)
+        closed = {qid(row) for row in rows
+                  if row.get("state") in TERMINAL and qid(row)}
+        for row in rows:
+            jid = qid(row)
+            if (row.get("state") != "running" or not jid or jid in closed or
+                    pid_live(int(row.get("pid") or 0))):
+                continue
+            terminal = dict(row)
+            terminal.update({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "state": "cancelled" if cancelled(row.get("director_job")) else "error", "pid": 0, "code": 1, "verdict": "void",
+                "stop": ORPHANED_RUNNING_STOP,
+                "error": orphan_error(),
+            })
+            terminal["reason"] = NODE_RESTART_REASON
+            append_q(terminal)
+            closed.add(jid)
+            recovered.append(jid)
+    finally:
+        fcntl.flock(done.fileno(), fcntl.LOCK_UN)
+        done.close()
+    return recovered
+
+
+
+def jobs():
+    rows = read_jsonl(Q, strict=True)
+    closed = {qid(r) for r in rows if r.get("state") in TERMINAL and qid(r)}
+    live, resources = set(), set()
+    pending = []
+    for r in rows:
+        st, j = r.get("state"), qid(r)
+        if st == "pending":
+            pending.append(r)
+        elif st in TERMINAL and j:
+            continue
+        elif st == "running" and j:
+            if j in closed:
+                continue
+            if pid_live(int(r.get("pid") or 0)):
+                live.add(j)
+                if r.get("resource"):
+                    resources.add(str(r["resource"]))
+            else:
+                closed.add(j)
+    out = []
+    for r in pending:
+        j = qid(r)
+        if (j and j not in closed and j not in live and
+                (not r.get("resource") or str(r["resource"]) not in resources)):
+            out.append(r)
+    return out
+
+
+
+from _turn_priority import LANE_RANK, select as _priority_select, seat_candidates as _seat_candidates
+
+def admit(pending):
+    """Turns first; aged batch jobs retain an admission opportunity."""
+    if _priority_select is not None:
+        return _priority_select(pending)
+    ordered = sorted(pending, key=lambda row: LANE_RANK.get(str(row.get("lane") or "production"), 0))
+    return ordered[0] if ordered else None
+
+
+def local_model(job):
+    spec = LAB / str(job.get("spec") or "")
+    if not spec.is_file():
+        return False
+    model = spec_value(spec.read_text(encoding="utf-8"), "model").strip("\"' ")
+    return model if model in {"local-coder", "local-reasoner"} else ""
+
+
+def local_model_ready(model="local-coder", run=None):
+    run = subprocess.run if run is None else run
+    return run([str(HERE / "local-model-ready"), model], capture_output=True).returncode == 0
+
+
+def refresh_job(job):
+    if not job.get("task") or not job.get("resource"):
+        return job
+    scheduled = bool(job.get("schedule_id"))
+    if scheduled:
+        call_op(LAB, "setup-preflight", {"task": job["task"], "require_ready": False},
+                failure="scheduled setup link preflight failed")
+    payload = {"task": job["task"], "dest": job["resource"]}
+    result = call_op(LAB, "setup-refresh", payload, failure="setup refresh failed")
+    if scheduled:
+        call_op(LAB, "setup-preflight", {"task": job["task"], "setup": result["setup"],
+                                         "expected_head": result["head"]},
+                failure="scheduled prepared setup preflight failed")
+    updated = dict(job)
+    updated["expected_head"] = result["head"]
+    return updated
+
+
+def lab_count():
+    return running_count(LAB)
+
+
+def occupied():
+    n = lab_count()
+    rows = read_jsonl(Q, strict=True)
+    closed = {qid(r) for r in rows if r.get("state") in TERMINAL and qid(r)}
+    live = {qid(r) for r in rows if r.get("state") == "running" and qid(r) not in closed
+            and pid_live(int(r.get("pid") or 0))}
+    return max(n, len(live))
+
+
+def child_env(job_id="", external_effects=None, trial=None, env=None):
+    parent_env = os.environ if env is None else env
+    env = {key: value for key, value in parent_env.items()
+           if key not in ("LAB_VIDEO_MUTATION", "LAB_CHILD_ENV")}
+    if "child_env" in POLICY_ENV:  # the runner inherits the node's resolution, never the parent's
+        env["LAB_CHILD_ENV"] = child_env_value(POLICY_ENV["child_env"])
+    if POLICY_ENV.get("tool_prefix") is not None:  # _sandbox_policy: the wrapper prefix, or a preset passed through
+        env["CS_TOOL_PREFIX"] = cell_prefix(POLICY_ENV["tool_prefix"], parent_env, POLICY_ENV.get("reports"))
+    if POLICY_ENV.get("browser_state") is not None:  # _sandbox_policy: policy write_env lists LAB_BROWSER_STATE
+        env["LAB_BROWSER_STATE"] = POLICY_ENV["browser_state"]
+    if trial is not None:
+        env["LAB_TRIAL"] = str(trial)
+    if job_id:
+        env["LAB_JOB_ID"] = str(job_id)
+        selected = None
+        for row in read_jsonl(Q, strict=True):
+            if qid(row) == str(job_id):
+                selected = row
+        if selected:
+            for source, target in (
+                ("schedule_date", "LAB_SCHEDULE_DATE"),
+                ("slot", "LAB_SCHEDULE_SLOT"),
+                ("schedule_timezone", "LAB_SCHEDULE_TIMEZONE"),
+            ):
+                if selected.get(source):
+                    env[target] = str(selected[source])
+    if "youtube_playlist_mutation" in (external_effects or []):
+        env["LAB_VIDEO_MUTATION"] = "1"
+    # Both runners consume the dispatcher's resolution; inherited CS aliases
+    # must not override its policy, grants, or work-order identity.
+    for suffix in ("CHILD_ENV", "VIDEO_MUTATION", "JOB_ID", "TRIAL",
+                   "SCHEDULE_DATE", "SCHEDULE_SLOT", "SCHEDULE_TIMEZONE"):
+        legacy, alias = "LAB_" + suffix, "CS_" + suffix
+        if legacy in env:
+            env[alias] = env[legacy]
+        else:
+            env.pop(alias, None)
+    return env
+
+
+def run_teed(cmd, log_path=None, run=None, **kw):
+    """subprocess.run a trial's child with its stderr passed through to ours as it comes, keeping the tail: when the
+    child exits without a row (a refused spec, a crash before the first row) the tail is the reason the job ends with.
+    When log_path is set, the same lines are appended to that job's node.log (never shared across jobs)."""
+    run = subprocess.run if run is None else run
+    tail = collections.deque(maxlen=40)
+    read_fd, write_fd = os.pipe()
+
+    def pump():
+        with os.fdopen(read_fd, "rb") as pipe:
+            for line in iter(pipe.readline, b""):
+                sys.stderr.buffer.write(line)
+                sys.stderr.flush()
+                append_job_log(log_path, line.decode("utf-8", "replace"))
+                tail.append(line)
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        rc = run(cmd, stderr=write_fd, **kw).returncode
+    finally:
+        os.close(write_fd)
+    reader.join(5)  # a grandchild still holding the pipe only delays the tail
+    TRIAL_STDERR[:] = [b"".join(tail).decode("utf-8", "replace")]
+    return rc
+
+
+TRIAL_STDERR = [""]  # the last trial child's stderr tail (run_teed)
+
+
+def no_row_reason(rc):
+    """The last non-empty stderr lines of a child that produced no row, else its exit code."""
+    lines = [l.strip() for l in TRIAL_STDERR[0].splitlines() if l.strip()]
+    return " | ".join(lines[-3:])[-480:] or "exit %s, no stderr" % rc
+
+
+def one_trial(rel, n, task=None, job_id="", external_effects=None):
+    # The runner executes exactly one cell: the trial goes on argv (LAB_TRIAL
+    # stays in the env for capture-stimulus and tools). The child freezes its
+    # stimulus against THIS work order, by id. Matching on spec or task picks
+    # a sibling job when two share them.
+    env = child_env(job_id, external_effects, trial=n)
+    cmd = [str(runner_path(LAB)), "run"]
+    if task:
+        cmd.extend(["-task", task])
+    cmd.extend(["-trial", str(n), rel])
+    return run_teed(cmd, log_path=job_log_path(STATE, job_id), cwd=str(LAB), env=env)
+
+
+def one_executor_trial(rel, spec_text, task, n, job_id="", external_effects=None):
+    payload = {
+        "executor": spec_value(spec_text, "model"),
+        "task": task,
+        "spec": rel,
+        "trial": n,
+        "timeout_s": spec_seconds(spec_text),
+    }
+    template = TEMPLATES.get(payload['executor'], {})
+    if spec_value(spec_text, 'budget') and Path(template.get('binary', '')).name == 'claude':
+        from _cli_budget import declared  # an inline budget, forwarded; a block one the executor reads itself
+        from _yaml import load as load_yaml
+        payload['budget'], payload['check_window'] = declared(load_yaml(LAB / rel))
+    # Bind authority to this exact queued work order, never a sibling spec run.
+    order = next((row for row in read_jsonl(Q, strict=True)
+                  if job_id and qid(row) == job_id and row.get("state") == "pending"), {})
+    for key in ("conversation_id", "turn_id"):
+        if order.get(key):
+            payload[key] = order[key]
+    if order.get("grant"):
+        payload["grant"] = order["grant"]
+    env = child_env(job_id, external_effects)
+    return run_teed([str(HERE / "executor")], log_path=job_log_path(STATE, job_id),
+                    input=json.dumps(payload), text=True, cwd=str(LAB), env=env)
+
+
+def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion=None, job_task=None, env=None):
+    p = LAB / rel
+    text = p.read_text(encoding="utf-8")
+    ntrials = spec_trials(text)
+    sid = spec_value(text, "id")
+    # a director job runs the task materialised beside its frozen spec, never a checkout path
+    tasks = [job_task] if job_task else (spec_tasks(text) or [None])
+    use_executor = spec_value(text, "model") in TEMPLATES
+    final_row = {}
+    failure = None
+    try:  # the node's roots (_roots), then the spec's env: request against policy/env.json; a refusal is a config void, nothing launches
+        roots()
+        POLICY_ENV["child_env"] = resolve(LAB, text)
+        POLICY_ENV["tool_prefix"] = tool_prefix_value(LAB)  # policy/sandbox.json; None = unconfined
+        POLICY_ENV["browser_state"] = browser_state_value(LAB)  # None unless policy write_env lists it
+        POLICY_ENV["reports"] = str(sandbox_reports_dir())
+        cell_prefix(POLICY_ENV["tool_prefix"], os.environ if env is None else env, POLICY_ENV["reports"])  # refuses a report root holding whitespace
+    except (RootsError, EnvPolicyError, SandboxPolicyError) as error:
+        kind = {RootsError: "roots", EnvPolicyError: "env_policy"}.get(type(error), "sandbox_policy")
+        row = {"verdict": "void", "stop": "%s: %s" % (kind, error), "spec": sid,
+               "error": error_object("node_config", kind, "launcher", False, error)}
+        if schedule_id:
+            hold_schedule(schedule_id, config_void_reason(row))
+        return 1, row
+    for n in range(1, ntrials + 1):
+        for task in tasks:
+            if cancelled(job_id):  # a cancel between trials starts no further trial
+                return failure or (1, final_row)
+            before = ledger_size()
+            if use_executor:
+                if not task:
+                    raise RuntimeError("executor spec needs tasks")
+                if external_effects:
+                    rc = one_executor_trial(rel, text, task, n, job_id, external_effects)
+                else:
+                    rc = one_executor_trial(rel, text, task, n, job_id)
+            else:
+                if external_effects:
+                    rc = one_trial(rel, n, task, job_id, external_effects)
+                else:
+                    rc = one_trial(rel, n, task, job_id)
+            row = execution_row(rel, sid, before)
+            if cancelled(job_id):  # a cancel: nothing more runs; a trial that finished first keeps its result
+                return (failure or (rc, row or final_row)) if rc == 0 else (rc, row or final_row)
+            if rc == 3 or not row:
+                # Exit 3 is the runner's own "finalization pending": a failed publish still
+                # appends the row, so a fresh row does not close the cell; finalized.json does.
+                # Until the sweep writes it, the trial's row is the placeholder, never a ledger
+                # fact invented here, and completion is withheld.
+                pending = pending_row(rel, sid)
+                row = pending or execution_row(rel, sid, before)
+                if pending:
+                    rc = 3
+                elif row:  # the retry finalized the dir: close as a finalized trial
+                    rc = 0 if row.get("verdict") == "pass" else 1
+            if not row:
+                # The child exited without a row: a refused spec or a crash before the first row. The job ends now as
+                # error with the child's reason (no later trial would fare better); main appends the terminal row,
+                # which a Director job spools as its job_terminal.
+                reason = no_row_reason(rc)
+                return (rc or 1), {"verdict": "void", "stop": "error: no_row: %s" % reason, "spec": sid,
+                                   "trial": n, "error": error_object("node_config", "no_row", "runner", False, reason)}
+            final_row = row
+            if completion and row.get("stop") != "finalization_pending":
+                completion(row)
+            if rc != 0 and failure is None:
+                failure = (rc, row)
+            if is_config_void(row):
+                if schedule_id:
+                    hold_schedule(schedule_id, config_void_reason(row))
+                return rc, final_row
+    return failure if failure is not None else (0, final_row)
+
+
+def lockf(blocking):
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    f = open(LOCK, "a")
+    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+    try:
+        fcntl.flock(f.fileno(), flags)
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
+def lock_resource(resource):
+    """Exclusive flock per dest for the running job. Empty resource: no lock."""
+    if not resource:
+        return None
+    RESLOCK.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(str(resource).encode()).hexdigest()[:24]
+    f = open(RESLOCK / name, "a")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return False
+    return f
+
+
+def unlock_resource(rl):
+    if not rl:
+        return
+    fcntl.flock(rl.fileno(), fcntl.LOCK_UN)
+    rl.close()
+
+
+def lock_held(path, run=None):
+    run = subprocess.run if run is None else run
+    lsof = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else "lsof"
+    r = run([lsof, "-t", "--", str(path)], capture_output=True, text=True)
+    for p in (r.stdout or "").split():
+        try:
+            if pid_live(int(p)):
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def git_lock_roots():
+    runs = runs_dir(LAB)  # resolved at call time, under whatever LAB names (the stale-lock fixture repoints it)
+    return [LAB / ".git", *(runs.glob("*/workspace/.git") if runs.is_dir() else ())]
+
+
+def git_lock_candidates(root):
+    root, found = Path(root), []
+    for current, dirs, files in os.walk(root):
+        current = Path(current)
+        found.extend(current / name for name in files if name.endswith(".lock"))
+        if current == root / "objects":
+            dirs[:] = [name for name in dirs if not re.fullmatch(r"[0-9a-f]{2}", name)]
+    return found
+
+
+def sweep_stale_locks(now=None):
+    """Remove stale control locks without walking immutable loose objects."""
+    now = time.time if now is None else now
+    stamp = now()
+    removed = []
+    seen = [lock for root in git_lock_roots() if root.is_dir()
+            for lock in git_lock_candidates(root)]
+    for lock in seen:
+        try:
+            info = lock.stat()
+            if stamp - info.st_mtime < 2:
+                continue
+            empty = info.st_size == 0
+        except OSError:
+            continue
+        # Zero-byte locks are leftovers; a Spotlight read fd must not pin them.
+        if not empty and lock_held(lock):
+            continue
+        try:
+            lock.unlink()
+            removed.append(str(lock))
+        except OSError:
+            pass
+    return removed
+
+
+def write_heartbeat(env=None):
+    env = os.environ if env is None else env
+    path = Path(env.get("LAB_TICK_HEARTBEAT") or (STATE / "tick-heartbeat"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
+    except OSError:
+        pass
+
+
+def emit(obj, swept):
+    sweep = FINALIZE_SWEEP.get("attempted") or any(k.startswith("orphans_") for k in FINALIZE_SWEEP)
+    if swept or sweep:
+        obj = dict(obj)
+        if swept:
+            obj["stale_locks"] = len(swept)
+        if sweep:
+            obj["finalize_sweep"] = dict(FINALIZE_SWEEP)
+    if SPOOL.get("pending") or SPOOL.get("sent") or SPOOL.get("failed") or SPOOL.get("error"):
+        obj = dict(obj, spool=dict(SPOOL))
+    if JOB_PULL:
+        obj = dict(obj, job_pull=dict(JOB_PULL))
+    print(json.dumps(obj))
+
+
+def main(turn_only=False):
+    # A reserved tick consumes an already materialised listener offer. Do not
+    # put network delivery or unrelated finalization ahead of interactive work.
+    swept = [] if turn_only else sweep_stale_locks()
+    if not turn_only:
+        finalize_sweep()
+    recover_orphaned_jobs()
+    if not turn_only:
+        job_pull_pass()
+        spool_pass()
+    write_heartbeat()
+    rl = None
+    lf = lockf(False)
+    append_q({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "event": "seat_snapshot", "admission_locked": lf is not None,
+              "occupied": occupied(), "pool": "job_processes"})
+    if lf is None:
+        emit({"ok": True, "skip": "dispatch_lock"}, swept)
+        return
+    try:
+        pending = jobs()
+        if not pending:
+            emit({"ok": True, "skip": "empty"}, swept)
+            return
+        state_disk = state_root_disk_free() if NODE else None
+        low = spool_low(state_disk)
+        if low:  # S3: evidence is never dropped; nothing new is admitted until space returns
+            append_q({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": "yield",
+                      "reason": "spool_full", "free_bytes": low[0], "min_free_bytes": low[1],
+                      "error": error_object("spool_full", "min_free_bytes", "launcher", True,
+                                            "free %d < min_free_bytes %d on %s" % (low[0], low[1], RUNS.parent))})
+            emit({"ok": True, "skip": "spool_full", "pending": len(pending)}, swept)
+            return
+        held = resource_low(state_disk)
+        if held:
+            append_q({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": "yield",
+                      "reason": held.get("reason"), "event_class": "resource_held"})
+            emit({"ok": True, "skip": "resource_held", "held": held, "pending": len(pending)}, swept)
+            return
+        # The listener can invoke a separate tick while ordinary tick processes
+        # execute lanes. Eligibility and the seat claim share dispatch.lock.
+        rows = read_jsonl(Q, strict=True)
+        closed = {qid(r) for r in rows if r.get("state") in TERMINAL}
+        running = [r for r in rows if r.get("state") == "running" and qid(r) not in closed
+                   and pid_live(int(r.get("pid") or 0))]
+        eligible = _seat_candidates(pending, running, turn_only)
+        if not eligible:
+            emit({"ok": True, "skip": "turn_seat_busy" if turn_only else "conversation_busy"}, swept)
+            return
+        selected = admit(eligible)
+        if turn_only:
+            selected = dict(selected, dispatch_seat="reserved")
+        if (model := local_model(selected)) and not local_model_ready(model):
+            emit({"ok": True, "skip": "local_coder_unavailable",
+                  "pending": qid(selected)}, swept)
+            return
+        try:
+            job = refresh_job(selected)
+        except RuntimeError as error:
+            jid = qid(selected)
+            terminal = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "id": jid, "job": jid, "spec": selected["spec"],
+                        "state": "error", "pid": 0, "code": 1,
+                        "origin": "dispatch", "verdict": "void",
+                        "stop": "preflight: preflight_refused",
+                        "failure_class": "machinery_preflight",
+                        "turns": 0, "tool_calls": 0, "seconds": 0,
+                        "cost_usd": 0, "est_usd": 0,
+                        "note": str(error)}
+            for key in JOB_META:
+                if selected.get(key):
+                    terminal[key] = selected[key]
+            append_q(terminal)
+            if selected.get("schedule_id"):
+                hold_schedule(selected["schedule_id"], "preflight_refused")
+            emit({"ok": False, "id": jid, "spec": selected["spec"], "code": 1,
+                  "refusal": "preflight_refused"}, swept)
+            return
+        jid = qid(job)
+        rl = lock_resource(job.get("resource"))
+        if rl is False:
+            rl = None
+            emit({"ok": True, "skip": "resource", "pending": jid}, swept)
+            return
+        running = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "id": jid, "job": jid, "spec": job["spec"],
+                  "state": "running", "pid": os.getpid(), "origin": "dispatch"}
+        for key in JOB_META:
+            if job.get(key):
+                running[key] = job[key]
+        append_q(running)
+    finally:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        lf.close()
+    try:
+        rc, trial_row = run_spec(job["spec"], job.get("schedule_id"),
+                                 str(job.get("id") or job.get("job") or ""),
+                                 job.get("external_effects"),
+                                 None,
+                                 job.get("task") if job.get("director_job") else None)
+        done = lockf(True)
+        try:
+            if first_terminal(Q, jid) is None:
+                terminal = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                          "id": jid, "job": jid, "spec": job["spec"],
+                          "state": "done" if rc == 0 else "error", "pid": 0, "code": rc, "origin": "dispatch"}
+                if rc != 0 and cancelled(job.get("director_job")):
+                    terminal.update(state="cancelled", stop="cancelled: stopped by the Director")
+                for key in JOB_META:
+                    if job.get(key):
+                        terminal[key] = job[key]
+                if trial_row.get("transcript"):
+                    terminal["transcript"] = trial_row["transcript"]
+                    terminal["run_id"] = str(trial_row.get("run") or
+                                             str(trial_row["transcript"]).rstrip("/").split("/")[-1])
+                for key in ("verdict", "stop", "error", "reason", "stuck"):  # error: the row's object, when it has one
+                    if trial_row.get(key) and not (key == "stop" and terminal["state"] == "cancelled"):
+                        terminal[key] = trial_row[key]
+                if terminal["state"] != "done":
+                    why = reason_of(terminal, TRIAL_STDERR[0])
+                    if why:
+                        terminal["reason"] = why
+                        append_job_log(job_log_path(STATE, job.get("director_job") or jid),
+                                       "job end: %s\n" % why)
+                append_q(terminal)
+        finally:
+            fcntl.flock(done.fileno(), fcntl.LOCK_UN)
+            done.close()
+        if NODE and not cancelled(job.get("director_job")):  # deliver this job's envelope and terminal row now
+            spool_pass()  # (a cancelled job's: node-listen, after it reports the outcome)
+        emit({"ok": rc == 0, "id": jid, "spec": job["spec"], "code": rc}, swept)
+        # Probe miss is the dispatch fail row. launchd must not see rc.
+        sys.exit(0 if str(job.get("lane") or "") == "probe" else rc)
+    finally:
+        unlock_resource(rl)
+
+
+if __name__ == "__main__":
+    main(turn_only="--turn-seat" in sys.argv[1:])

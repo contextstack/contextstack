@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+import hashlib, json, os, re, shutil, subprocess, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+HERE = Path(__file__).resolve().parent
+# Lab runs the frozen check from stimulus while the editable setup tree is the
+# process working directory. Direct regression runs exercise the live seam.
+CANDIDATE = Path.cwd() / "ops/bin/schedule-enable"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def invoke(root, corpus="alpha", request=None, operation="register", schedule=None):
+    manifest = root / "schedules/manifest-v1.json"
+    body = request or {
+        "actor_id": "director:automated:user:7",
+        "actor_kind": "automated",
+        "request_key": "deploy-tag-1-alpha",
+        "manifest_digest": sha(manifest),
+    }
+    argv = [str(root / "ops/bin/schedule-enable"), operation, "--corpus", corpus]
+    if schedule:
+        argv.extend(["--schedule", schedule])
+    result = subprocess.run(
+        argv,
+        input=json.dumps(body), text=True, cwd=root, capture_output=True,
+     env={**hermetic_env()})
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AssertionError((result.returncode, result.stdout, result.stderr)) from error
+    return result.returncode, output
+
+
+with scratch_dir(prefix="schedule-manifest-registration-") as raw:
+    root = Path(raw)
+    (root / "ops/bin").mkdir(parents=True)
+    (root / "ledger").mkdir()
+    (root / "grants").mkdir()
+    (root / "specs").mkdir()
+    (root / "tasks/a").mkdir(parents=True)
+    (root / "tasks/b").mkdir(parents=True)
+    (root / "schedules").mkdir()
+    shutil.copy2(CANDIDATE, root / "ops/bin/schedule-enable")
+    (root / "ops/bin/schedule-enable").chmod(0o755)
+    (root / "ESTATE").write_text("prod-1\n")
+
+    # Small faithful adapters for the candidate's shared seams.
+    (root / "ops/bin/_estate_io.py").write_text('''
+import hashlib,json
+from pathlib import Path
+def state_dir(lab):
+ return Path(lab)/"ledger"
+def read_jsonl(path,strict=True):
+ p=Path(path)
+ return [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.is_file() else []
+def append_jsonl(path,row,**kw):
+ with Path(path).open("a") as out: out.write(json.dumps(row,sort_keys=kw.get("sort_keys",False))+"\\n")
+def estate_id(lab): return (Path(lab)/"ESTATE").read_text().strip()
+def estate_matches(lab,value): return value==estate_id(lab)
+''')
+    (root / "ops/bin/_grant.py").write_text('''
+from pathlib import Path
+from _estate_io import estate_id
+LAB=Path(__file__).resolve().parents[2]
+def same_repo(a,b): return Path(str(a)).resolve()==Path(str(b)).resolve()
+def load(gid):
+ p=LAB/"grants"/(str(gid)+".yaml")
+ if not p.is_file(): return None,"grant not found"
+ values={}
+ for line in p.read_text().splitlines():
+  if ":" in line and not line.startswith(" "):
+   k,v=line.split(":",1); values[k.strip()]=v.strip()
+ return values,None
+def schedule_error(row):
+ g,e=load(row.get("grant"))
+ if e:return e
+ if g.get("estate")!=estate_id(LAB):return "grant estate mismatch"
+ if g.get("status")!="active":return "revoked"
+ if g.get("repo")!=row.get("root",row.get("setup_root")):return "repo mismatch"
+ return ""
+def cover(gid,repo=None,paths=None,**kw):
+ g,e=load(gid)
+ if e:return False,e,g or {}
+ if g.get("estate")!=estate_id(LAB):return False,"grant estate mismatch",g
+ if repo and g.get("repo")!=str(repo):return False,"repo mismatch",g
+ return True,"",g
+''')
+
+    corpus = root / "corpus"
+    corpus.mkdir()
+    for name, estate in (("prior-a", "dev"), ("prior-b", "dev"),
+                         ("prod-a", "prod-1"), ("prod-b", "prod-1")):
+        (root / f"grants/{name}.yaml").write_text(
+            f"id: {name}\nestate: {estate}\nrepo: {corpus}\npaths: [x]\n"
+            "gates: [true]\ncommit: true\nstatus: active\nexpiry: 2099-01-01T00:00:00Z\n"
+        )
+    (root / "specs/a.yaml").write_text("id: a\nmodel: local-coder\n")
+    (root / "specs/b.yaml").write_text("id: b\nmodel: claude-code-sonnet-planner\n")
+    manifest = {
+        "schema_version": "schedules-manifest-v1",
+        "corpora": {"alpha": {
+            "write_authority": {
+                "prior": {"estate": "dev", "grants": ["prior-a", "prior-b"]},
+                "new": {"estate": "prod-1", "grants": ["prod-a", "prod-b"]},
+            },
+            "stages": [
+                {"id": "alpha-fetch", "cron": "0 2 * * *", "timezone": "America/New_York",
+                 "lane": "shadow", "root": str(corpus), "spec": "specs/a.yaml", "task": "tasks/a",
+                 "grant": "prod-a", "model": "local-coder", "external_effects": [],
+                 "enabled": False, "hold": "migration_staged"},
+                {"id": "alpha-judge", "cron": "5 2 * * *", "timezone": "America/New_York",
+                 "lane": "probe", "setup_root": str(corpus), "spec": "specs/b.yaml", "task": "tasks/b",
+                 "grant": "prod-b", "model": "claude-code-sonnet-planner", "external_effects": [],
+                 "requires": ["alpha-fetch"], "catch_up_window_minutes": 10080,
+                 "enabled": False, "hold": "migration_staged"},
+            ],
+        }},
+    }
+    manifest_path = root / "schedules/manifest-v1.json"
+    manifest_bytes = json.dumps(manifest, indent=2) + "\n"
+    manifest_path.write_text(manifest_bytes)
+
+    code, first = invoke(root)
+    assert code == 0 and first["ok"] and not first["replayed"], first
+    assert first["event"] == "schedule_manifest_registered"
+    assert first["estate"] == "prod-1" and first["corpus"] == "alpha"
+    assert first["manifest_sha256"] == sha(manifest_path)
+    assert first["rows_created"] == ["alpha-fetch", "alpha-judge"]
+    assert first["rows_unchanged"] == []
+    assert first["prior_write_authority"]["estate"] == "dev"
+    assert first["new_write_authority"]["estate"] == "prod-1"
+    for authority in (first["prior_write_authority"], first["new_write_authority"]):
+        assert [x["id"] for x in authority["grants"]]
+        assert all(re.fullmatch(r"[0-9a-f]{64}", x["sha256"]) for x in authority["grants"])
+    rows = [json.loads(x) for x in (root / "ledger/schedules.jsonl").read_text().splitlines()]
+    assert len(rows) == 2 and all(not row["enabled"] for row in rows)
+    assert all(row["hold"] == "migration_staged" for row in rows)
+    assert all(row["manifest_sha256"] == sha(manifest_path) for row in rows)
+    assert rows[0]["model"] == "local-coder" and rows[1]["external_effects"] == []
+
+    before = (root / "ledger/schedules.jsonl").read_bytes()
+    code, replay = invoke(root)
+    assert code == 0 and replay["replayed"], replay
+    assert replay["rows_created"] == []
+    assert replay["rows_unchanged"] == ["alpha-fetch", "alpha-judge"]
+    assert (root / "ledger/schedules.jsonl").read_bytes() == before
+
+    changed_request = {"actor_id": "director:automated:user:8", "actor_kind": "automated",
+                       "request_key": "deploy-tag-1-alpha", "manifest_digest": sha(manifest_path)}
+    code, conflict = invoke(root, request=changed_request)
+    assert code != 0 and "request identity conflict" in conflict["error"]
+    assert (root / "ledger/schedules.jsonl").read_bytes() == before
+
+    code, unknown = invoke(root, corpus="not-registered")
+    assert code != 0 and not unknown["ok"]
+    assert (root / "ledger/schedules.jsonl").read_bytes() == before
+
+    wrong_digest = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                    "request_key": "wrong-digest", "manifest_digest": "0" * 64}
+    code, refused = invoke(root, request=wrong_digest)
+    assert code != 0 and "manifest digest changed" in refused["error"]
+    assert (root / "ledger/schedules.jsonl").read_bytes() == before
+
+    # Atomic validation: an enabled stage and an unbound model each append nothing.
+    for mutation, expected in ((lambda m: m["corpora"]["alpha"]["stages"][1].update(enabled=True), "disabled"),
+                               (lambda m: m["corpora"]["alpha"]["stages"][1].update(model="local-coder"), "model")):
+        candidate = json.loads(json.dumps(manifest)); mutation(candidate)
+        manifest_path.write_text(json.dumps(candidate) + "\n")
+        code, refused = invoke(root, request={"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                                             "request_key": "invalid-" + expected,
+                                             "manifest_digest": sha(manifest_path)})
+        assert code != 0 and expected in refused["error"].lower(), refused
+        assert (root / "ledger/schedules.jsonl").read_bytes() == before
+
+    manifest_path.write_text(manifest_bytes)
+    activate_request = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                        "request_key": "deploy-tag-1-alpha-activate", "manifest_digest": sha(manifest_path)}
+    code, activated = invoke(root, request=activate_request, operation="activate")
+    assert code == 0 and activated["event"] == "schedule_manifest_activated", activated
+    assert activated["rows"] == ["alpha-fetch", "alpha-judge"]
+    active_rows = [json.loads(x) for x in (root / "ledger/schedules.jsonl").read_text().splitlines()]
+    assert all(r["enabled"] and r["hold"] == "shadow_active" for r in active_rows[-2:])
+    code, replayed = invoke(root, request=activate_request, operation="activate")
+    assert code == 0 and replayed["replayed"]
+
+    # An already-activated corpus can still register a new staged sibling.
+    (root / "tasks/c").mkdir(parents=True)
+    (root / "specs/c.yaml").write_text("id: c\nmodel: local-reasoner\n")
+    (root / "grants/prod-c.yaml").write_text(
+        f"id: prod-c\nestate: prod-1\nrepo: {corpus}\npaths: [x]\n"
+        "gates: [true]\ncommit: false\nstatus: active\nexpiry: 2099-01-01T00:00:00Z\n")
+    (root / "grants/prior-c.yaml").write_text(
+        f"id: prior-c\nestate: dev\nrepo: {corpus}\npaths: [x]\n"
+        "gates: [true]\ncommit: false\nstatus: active\nexpiry: 2099-01-01T00:00:00Z\n")
+    added = json.loads(json.dumps(manifest))
+    added["corpora"]["alpha"]["write_authority"]["new"]["grants"].append("prod-c")
+    added["corpora"]["alpha"]["write_authority"]["prior"]["grants"].append("prior-c")
+    added["corpora"]["alpha"]["stages"].append({
+        "id": "alpha-shadow", "cron": "6 2 * * *", "timezone": "America/New_York",
+        "lane": "shadow", "setup_root": str(corpus), "spec": "specs/c.yaml", "task": "tasks/c",
+        "grant": "prod-c", "model": "local-reasoner", "external_effects": [],
+        "requires": ["alpha-judge"], "retry": False,
+        "enabled": False, "hold": "migration_staged"})
+    manifest_path.write_text(json.dumps(added) + "\n")
+    add_request = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                   "request_key": "deploy-tag-2-alpha", "manifest_digest": sha(manifest_path)}
+    code, added_receipt = invoke(root, request=add_request)
+    assert code == 0 and added_receipt["rows_created"] == ["alpha-shadow"], added_receipt
+    assert set(added_receipt["rows_unchanged"]) == {"alpha-fetch", "alpha-judge"}
+    activate_new = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                    "request_key": "deploy-tag-2-alpha-activate", "manifest_digest": sha(manifest_path)}
+    code, activated_new = invoke(root, request=activate_new, operation="activate")
+    assert code == 0 and activated_new["rows"] == ["alpha-shadow"], activated_new
+    latest = {}
+    for line in (root / "ledger/schedules.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        latest[row["id"]] = row
+    assert latest["alpha-fetch"]["enabled"] and latest["alpha-fetch"]["hold"] == "shadow_active"
+    assert latest["alpha-shadow"]["enabled"] and latest["alpha-shadow"]["hold"] == "shadow_active"
+    held = dict(latest["alpha-fetch"])
+    held.update(event="schedule_updated", enabled=False,
+                hold="Fable audit: fixture hold")
+    with (root / "ledger/schedules.jsonl").open("a", encoding="utf-8") as out:
+        out.write(json.dumps(held) + "\n")
+    (root / "tasks/d").mkdir(parents=True)
+    (root / "specs/d.yaml").write_text("id: d\nmodel: local-reasoner\n")
+    (root / "grants/prod-d.yaml").write_text(
+        f"id: prod-d\nestate: prod-1\nrepo: {corpus}\npaths: [x]\n"
+        "gates: [true]\ncommit: false\nstatus: active\nexpiry: 2099-01-01T00:00:00Z\n")
+    (root / "grants/prior-d.yaml").write_text(
+        f"id: prior-d\nestate: dev\nrepo: {corpus}\npaths: [x]\n"
+        "gates: [true]\ncommit: false\nstatus: active\nexpiry: 2099-01-01T00:00:00Z\n")
+    added["corpora"]["alpha"]["write_authority"]["new"]["grants"].append("prod-d")
+    added["corpora"]["alpha"]["write_authority"]["prior"]["grants"].append("prior-d")
+    added["corpora"]["alpha"]["stages"].append({
+        "id": "alpha-held-sibling", "cron": "7 2 * * *", "timezone": "America/New_York",
+        "lane": "shadow", "setup_root": str(corpus), "spec": "specs/d.yaml", "task": "tasks/d",
+        "grant": "prod-d", "model": "local-reasoner", "external_effects": [],
+        "enabled": False, "hold": "migration_staged"})
+    manifest_path.write_text(json.dumps(added) + "\n")
+    held_request = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                    "request_key": "deploy-tag-3-alpha", "manifest_digest": sha(manifest_path)}
+    code, held_receipt = invoke(root, request=held_request)
+    assert code == 0 and held_receipt["rows_created"] == ["alpha-held-sibling"], held_receipt
+    activate_held = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                     "request_key": "deploy-tag-3-alpha-activate", "manifest_digest": sha(manifest_path)}
+    code, activated_held = invoke(root, request=activate_held, operation="activate")
+    assert code == 0 and activated_held["rows"] == ["alpha-held-sibling"], activated_held
+    latest = {}
+    for line in (root / "ledger/schedules.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        latest[row["id"]] = row
+    assert latest["alpha-fetch"]["enabled"] is False
+    assert latest["alpha-fetch"]["hold"] == "Fable audit: fixture hold"
+    assert latest["alpha-held-sibling"]["enabled"] and latest["alpha-held-sibling"]["hold"] == "shadow_active"
+    unhold = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+              "request_key": "deploy-tag-3-alpha-unhold-fetch", "manifest_digest": sha(manifest_path)}
+    code, unheld = invoke(root, request=unhold, operation="activate", schedule="alpha-fetch")
+    assert code == 0 and unheld["rows"] == ["alpha-fetch"], unheld
+    latest = {}
+    for line in (root / "ledger/schedules.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        latest[row["id"]] = row
+    assert latest["alpha-fetch"]["enabled"] and latest["alpha-fetch"]["hold"] == "shadow_active"
+
+    manifest_path.write_text(manifest_bytes)
+    # The prior estate holds the same stages before the new estate activates.
+    dev_rows = []
+    prior = {"prod-a": "prior-a", "prod-b": "prior-b"}
+    for row in rows:
+        row = dict(row); row["grant"] = prior[row["grant"]]
+        row.pop("model", None); row.pop("external_effects", None)
+        row.update(enabled=True, hold="shadow_active", source_enabled=True, estate="dev")
+        dev_rows.append(row)
+    (root / "ledger/schedules.jsonl").write_text("".join(json.dumps(r) + "\n" for r in dev_rows))
+    (root / "ESTATE").write_text("dev\n")
+    hold_request = {"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                    "request_key": "deploy-tag-1-alpha-hold", "manifest_digest": sha(manifest_path)}
+    code, held = invoke(root, request=hold_request, operation="hold")
+    assert code == 0 and held["event"] == "schedule_authority_held"
+    held_rows = [json.loads(x) for x in (root / "ledger/schedules.jsonl").read_text().splitlines()][-2:]
+    assert all(not r["enabled"] and r["hold"] == "authority_handoff_prod-1" for r in held_rows)
+
+    # Restore prod registration state for the conflict refusal below.
+    (root / "ESTATE").write_text("prod-1\n")
+    (root / "ledger/schedules.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    conflict_row = dict(rows[0]); conflict_row["cron"] = "1 2 * * *"; conflict_row["event"] = "schedule_updated"
+    with (root / "ledger/schedules.jsonl").open("a") as out: out.write(json.dumps(conflict_row) + "\n")
+    conflicted = (root / "ledger/schedules.jsonl").read_bytes()
+    code, refused = invoke(root, request={"actor_id": "director:automated:user:7", "actor_kind": "automated",
+                                         "request_key": "new-tag-alpha", "manifest_digest": sha(manifest_path)})
+    assert code != 0 and "schedule revision changed" in refused["error"]
+    assert (root / "ledger/schedules.jsonl").read_bytes() == conflicted
+
+print("check: one-corpus registration, authority hold and ordered activation are bound and idempotent")

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/../../../../modelgateway"
+go test ./internal/credentials ./internal/config ./internal/gateway/providers ./internal/gateway/server -run 'Test(Keychain|GatewayDoesNotLoadProviderCredentials|RequestKeychain|RequestCredential|AgentRouteAllowsDeferredKeychainCredential)' -count=1

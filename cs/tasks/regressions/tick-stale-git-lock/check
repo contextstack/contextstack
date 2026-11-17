@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import importlib.machinery
+import importlib.util
+import os
+import tempfile
+import time
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+# refusing live lab root as a write target: planted locks stay in
+# TemporaryDirectory. Sweep and the mocked commit pass run there.
+# tick resolves its shelves (dispatch.jsonl, tick-heartbeat, outbox) at import: give it a throwaway state
+# root first, or main() appends a real seat_snapshot and heartbeat to the live ledger (P5).
+STATE_DIR = scratch_dir(prefix="tick-stale-lock-state-")
+os.environ["LAB_STATE_ROOT"] = STATE_DIR.name
+os.environ.pop("LAB_TICK_HEARTBEAT", None)
+LIVE = [LAB / "ledger" / n for n in ("dispatch.jsonl", "tick-heartbeat")]
+live_before = [(p.stat().st_size, p.stat().st_mtime_ns) if p.exists() else None for p in LIVE]
+loader = importlib.machinery.SourceFileLoader("lab_tick_stale_lock", str(LAB / "ops/bin/tick"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+tick = importlib.util.module_from_spec(spec)
+loader.exec_module(tick)
+
+source = (LAB / "ops/bin/tick").read_text(encoding="utf-8")
+main_src = source.split("def main(", 1)[1]
+assert main_src.index("sweep_stale_locks()") < main_src.index("job_pull_pass()"), main_src[:400]
+
+
+def plant(lock, age=5, size=0):
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_bytes(b"\0" * size)
+    when = time.time() - age
+    os.utime(lock, (when, when))
+
+
+with scratch_dir(prefix="tick-stale-lock-") as raw:
+    root = Path(raw)
+    git = root / ".git"
+    (git / "objects").mkdir(parents=True)
+    runs = Path(STATE_DIR.name) / "runs"  # run workspaces live under the state root
+    (runs / "example/workspace/.git").mkdir(parents=True)
+    stale = git / "index.lock"
+    nested = git / "objects" / "maintenance.lock"
+    loose_object = git / "objects" / "ab" / "not-a-control-lock.lock"
+    workspace = runs / "example/workspace/.git/index.lock"
+    fresh = git / "HEAD.lock"
+    plant(stale, age=5, size=0)
+    plant(nested, age=5, size=0)
+    plant(loose_object, age=5, size=0)
+    plant(workspace, age=5, size=0)
+    plant(fresh, age=0.2, size=0)
+    calls = []
+    tick.LAB = root
+    tick.job_pull_pass = lambda: (
+        calls.append("pull") if not stale.exists() else (_ for _ in ()).throw(
+            AssertionError("stale lab .git lock still present at job pull"))
+    )
+    tick.void_watch_pass = lambda: None
+    tick.recover_orphaned_jobs = lambda: None
+    tick.shadow_pass = lambda: {}
+    tick.schedule_pass = lambda: "{}"
+    tick.audit_pass = lambda: None
+    tick.lab_count = lambda: 0  # this fixture has no runners; avoid a host-wide process scan
+    tick.lockf = lambda exclusive: None
+    tick.main()
+    assert calls == ["pull"], calls
+    assert not stale.exists(), "zero-byte lab index.lock survived"
+    assert not nested.exists(), "pid-dead nested .git lock survived"
+    assert loose_object.exists(), "immutable loose-object shard was traversed"
+    assert not workspace.exists(), "run workspace lock survived"
+    assert fresh.exists(), "lock younger than 2s was removed"
+
+assert str(tick.Q).startswith(os.path.realpath(STATE_DIR.name)), tick.Q
+assert any(Path(STATE_DIR.name).iterdir()), "tick wrote nothing to the throwaway state root"
+live_after = [(p.stat().st_size, p.stat().st_mtime_ns) if p.exists() else None for p in LIVE]
+assert live_after == live_before, "tick wrote the live ledger: %s" % [str(p) for p, a, b in zip(LIVE, live_before, live_after) if a != b]
+STATE_DIR.cleanup()
+
+print("check: tick sweeps stale control locks without walking loose-object shards; the live ledger untouched")

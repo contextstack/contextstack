@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""fs_read lists directory entries; files still read as before."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import json, os, subprocess, sys, tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+import _sandbox_policy  # noqa: E402
+ARGV = _sandbox_policy.tool_argv(LAB, "fs_read")  # cs-tools fs_read
+
+
+def run(cwd, payload):
+    return subprocess.run(ARGV, input=json.dumps(payload), text=True,
+                          capture_output=True, cwd=str(cwd))
+
+
+with scratch_dir(prefix="fs-read-dir-") as tmp:
+    root = Path(tmp)
+    (root / "tests").mkdir()
+    (root / "tests" / "app").mkdir()
+    (root / "tests" / "app" / "ExampleTest.php").write_text("<?php\n")
+    (root / "tests" / "Unit").mkdir()
+    (root / "README").write_text("hi\n")
+
+    r = run(root, {"path": "tests/app"})
+    assert r.returncode == 0, r.stderr
+    lines = [ln for ln in (r.stdout or "").splitlines() if ln]
+    assert "ExampleTest.php" in lines, lines
+    assert any(ln.endswith("/") or ln == "ExampleTest.php" for ln in lines)
+
+    r = run(root, {"path": "tests"})
+    assert r.returncode == 0, r.stderr
+    names = set((r.stdout or "").splitlines())
+    assert "app/" in names and "Unit/" in names, names
+
+    r = run(root, {"path": "README"})
+    assert r.returncode == 0 and (r.stdout or "").startswith("hi"), r.stdout
+
+    r = run(root, {"path": "missing"})
+    assert r.returncode != 0 and "not a file" in (r.stderr or r.stdout)
+
+print("check: fs_read lists directories; files unchanged")

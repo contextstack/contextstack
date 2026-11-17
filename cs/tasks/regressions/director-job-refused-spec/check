@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""director-job-refused-spec (client-web's first real job, 2026-11-11). goal.md has the contract.
+
+A fleet node runs a Director job whose spec the runner refuses (it has an unknown field). The real tick, the configured
+runner (CS_RUNNER_BIN, else the default Rust runner) and estate-split's stand-in Director:
+  ends      the tick does not crash: it exits non-zero with its JSON line, no traceback
+  row       the job's dispatch rows are running, then error, with the runner's reason (stop and error object)
+  closed    no running row is left open: the next tick admits nothing and recovers nothing
+  director  the job_terminal reached the Director: the job is error there, with the reason
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+sys.path.insert(0, str(LAB / "tasks/regressions/estate-split"))
+sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation-v2"))
+from _fake_director import FakeDirector  # noqa: E402
+from _fake_gateway import FakeGateway  # noqa: E402
+sys.path.append(str(LAB / "ops/bin"))
+from _runner import built_runner  # noqa: E402
+
+FAILED = []
+TOKEN = "fixture-node-token-" + "y" * 24
+SPEC = b"""id: hello
+model: local-coder
+system: prompts/system.md
+context: []
+tools: []
+mcp: []
+budget: {turns: 4, tool_calls: 0, usd: 0, seconds: 300}
+tasks: [tasks/hello]
+trials: 2
+surprise: true
+"""  # a spec the runner refuses: unknown fields are refused (SCHEMA.md)
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:700]) if detail else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def shelf(path):
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()] if path.is_file() else []
+
+
+def main():
+    scratch = Path(tempfile.mkdtemp(prefix="refused-spec-", suffix=".noindex"))
+    gateway = director = None
+    try:
+        node, state = scratch / "node", scratch / "state"
+        for d in ("ops/bin", "policy", "tools/bin", "hooks/bin", "scripts", "home", "tmp"):
+            (node / d).mkdir(parents=True, exist_ok=True)
+        for p in (LAB / "ops/bin").iterdir():
+            if p.is_file():
+                shutil.copy2(p, node / "ops/bin" / p.name)
+        # Admission probes the local model through the real gateway; this case is about a refused spec, not the
+        # DGX, so the probe is stubbed ready (a fake HOME and a scrubbed environment can never reach the gateway).
+        stub = node / "ops/bin/local-model-ready"
+        stub.write_text('#!/bin/sh\necho \'{"ok": true, "stub": true}\'\n', encoding="utf-8")
+        stub.chmod(0o755)
+        for rel in ("INVARIANTS.md", "policy/env.json", "scripts/checklib.sh"):
+            shutil.copy2(LAB / rel, node / rel)
+        (node / "ESTATE").write_text("node-fx\n", encoding="utf-8")
+        state.mkdir()
+        director = FakeDirector(scratch / "director", TOKEN)
+        gateway = FakeGateway([{"ok": {"text": "hello"}}], scratch)
+        (node / "policy/spool.json").write_text(json.dumps({"version": 1, "min_free_bytes": 0, "retention": "prune_acked",
+            "receiver": {"kind": "director", "url": director.url, "node": "fx", "token_env": "CS_FX_TOKEN",
+                         "installation": director.installation}}))
+        (node / "node.env").write_text("export CS_FX_TOKEN=%s\n" % TOKEN)
+        (node / "node.env").chmod(0o600)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(node / "home"), "TMPDIR": str(node / "tmp"),
+               "LANG": os.environ.get("LANG", "en_US.UTF-8"), "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(node),
+               "CSGATEWAY_ENDPOINT": gateway.endpoint, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+               "CS_RUNNER_BIN": str(built_runner(LAB))}
+
+        def tick():
+            r = subprocess.run([sys.executable, str(node / "ops/bin/tick")], input="{}", text=True, capture_output=True,
+                               cwd=str(node), env=env, timeout=180)
+            try:
+                return r.returncode, json.loads(r.stdout.strip().splitlines()[-1]), r.stderr
+            except (ValueError, IndexError):
+                return r.returncode, {"raw": r.stdout[-400:]}, r.stderr[-1500:]
+
+        director.offer("jobR", {"spec.yaml": (SPEC, 0o644), "prompts/system.md": (b"You are careful.\n", 0o644),
+                                "tasks/hello/goal.md": (b"Say hello.\n", 0o644)})
+        rc, out, err = tick()
+        expect(rc != 0 and out.get("ok") is False and "Traceback" not in err,
+               "ends: the tick finishes the job and exits with its line, no crash", (rc, out, err[-800:]))
+        rows = [r for r in shelf(state / "dispatch.jsonl") if r.get("director_job") == "jobR"]
+        states = [r.get("state") for r in rows]
+        term = rows[-1] if rows else {}
+        expect(states == ["pending", "running", "error"], "row: pending, running, then error", states)
+        expect("surprise" in str(term.get("stop")) and term.get("verdict") == "void"
+               and (term.get("error") or {}).get("class") == "node_config"
+               and (term.get("error") or {}).get("code") == "no_row" and "surprise" in (term.get("error") or {}).get("detail", ""),
+               "row: the runner's reason is in the stop and the error object", term)
+        expect(len(gateway.requests) == 0, "row: no model call, and no second trial after the refusal", len(gateway.requests))
+
+        rc, out, err = tick()
+        after = [r.get("state") for r in shelf(state / "dispatch.jsonl") if r.get("director_job") == "jobR"]
+        expect(rc == 0 and out.get("skip") == "empty" and after == states,
+               "closed: the next tick finds nothing pending and recovers nothing", (rc, out, after, err[-300:]))
+
+        job = director.jobs["jobR"]
+        expect(job["state"] == "error" and "surprise" in str((job["terminal"] or {}).get("stop")),
+               "director: the job_terminal reached the Director, error with the reason", job.get("terminal"))
+    finally:
+        for thing in (gateway, director):
+            if thing:
+                thing.close()
+        if not os.environ.get("REFUSED_SPEC_KEEP"):
+            shutil.rmtree(scratch, ignore_errors=True)
+        else:
+            print("kept", scratch)
+    print("\ncheck: director-job-refused-spec %d assertion(s) failed%s" % (len(FAILED), (": " + "; ".join(FAILED)) if FAILED else ""))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

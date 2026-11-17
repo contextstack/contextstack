@@ -1,0 +1,17 @@
+[package]
+name = "cs-tools"
+description = "CS core tools (fs_read, fs_edit, okf) as one multi-call binary, byte-for-byte ports of the Python and Ruby tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+libc = "0.2"
+libyaml-safer.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

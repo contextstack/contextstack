@@ -1,0 +1,19 @@
+{
+  "description": "Operator-only: delete settled run workspaces after a published evidence diff exists. Defaults to a no-write dry run. family selects corpus-*, exp-*, flowchart/director, probes, or other.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "apply": {
+        "type": "boolean",
+        "description": "Publish missing diffs and remove eligible workspaces. Defaults to false."
+      },
+      "family": {
+        "type": "string",
+        "enum": ["corpus-*", "exp-*", "flowchart/director", "probes", "other"]
+      },
+      "lab": {"type": "string"}
+    },
+    "required": [],
+    "additionalProperties": false
+  }
+}

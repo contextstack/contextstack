@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""estate-cutover-readers (goal.md): every shelf reader tolerates estate-cutover's estate_cutover rows.
+
+A fixture state root with representative rows on every shelf is cut over dev -> workstation by the real ops/bin/estate-cutover.
+Its twin is the same root with only the estate_cutover rows removed (the pre-cutover shelves under the same record).
+Every reader op, script and helper runs against both, from its own copy of the code; each must exit without a
+traceback and print the same thing on both, and the shelves the readers append to must end with the same rows.
+
+  check                     the fixture root (scripts/check; temp dirs only)
+  check --state-copy DIR    a COPY of a real state root (never ~/.contextstack itself); copied again, never written
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+REAL = Path.home() / ".contextstack"
+NOW = "2026-11-11T12:30:00+00:00"
+FX = None
+FAILED = []
+SHELVES = ("ledger", "dispatch", "schedules", "schedule-fires", "finalizations",
+           "estate-commit", "director-delivery", "operator-dispatch",
+           "workspace-pruned", "cli-provider-readiness")
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:900]) if detail else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def jsonl(rows):
+    return "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows)
+
+
+def fixture_state(state):
+    """Representative rows, shaped like the real shelves' rows, on every shelf; dev-era history."""
+    global FX
+    FX = str(state.parent / "fx")  # an enabled schedule's root: schedule-tick's stale scan reads it
+    Path(FX).mkdir()
+    run = lambda rid: "ledger/runs/" + rid
+    shelves = {
+        "ledger": [
+            {"ts": "2026-11-09T06:10:00Z", "exp": "fixture-9001", "spec": "specs/fx.yaml", "spec_sha": "s1", "task": "tasks/fx",
+             "task_sha": "t1", "trial": 1, "model": "local-coder", "verdict": "pass", "stop": "check", "cost_usd": 0,
+             "cost_class": "free_local", "est_usd": 0.02, "seconds": 40, "turns": 3, "tool_calls": 2,
+             "transcript": run("run-a"), "estate": "dev"},
+            {"ts": "2026-11-10T06:10:00Z", "exp": "fixture-9002", "spec": "specs/fx.yaml", "spec_sha": "s1", "task": "tasks/fx",
+             "task_sha": "t1", "trial": 1, "model": "local-coder", "verdict": "void", "stop": "budget:turns",
+             "cost_usd": 0, "seconds": 9, "turns": 8, "tool_calls": 7, "transcript": run("run-b"), "estate": "dev",
+             "executed_by": {"runner": {"kind": "rust", "path": "/nonexistent/runner", "sha256": "ab" * 32},
+                             "gateway": {"endpoint": "unix", "implementation": "rust", "version": "1"}}}],
+        "dispatch": [
+            {"ts": "2026-11-09T06:00:01Z", "id": "1", "spec": "specs/fx.yaml", "state": "pending", "pid": 0,
+             "lane": "shadow", "schedule_id": "fx-daily", "slot": "2026-11-09T06:00:00+00:00"},
+            {"ts": "2026-11-09T06:00:05Z", "id": "1", "spec": "specs/fx.yaml", "state": "running", "pid": 999999,
+             "lane": "shadow", "schedule_id": "fx-daily", "slot": "2026-11-09T06:00:00+00:00"},
+            {"ts": "2026-11-09T06:10:00Z", "id": "1", "spec": "specs/fx.yaml", "state": "done", "pid": 999999,
+             "lane": "shadow", "schedule_id": "fx-daily", "slot": "2026-11-09T06:00:00+00:00",
+             "transcript": run("run-a"), "verdict": "pass"},
+            {"ts": "2026-11-10T06:00:01Z", "id": "2", "spec": "specs/fx.yaml", "state": "pending", "pid": 0,
+             "lane": "shadow", "schedule_id": "fx-daily", "slot": "2026-11-10T06:00:00+00:00"},
+            {"ts": "2026-11-10T06:10:00Z", "id": "2", "spec": "specs/fx.yaml", "state": "error", "pid": 0,
+             "lane": "shadow", "schedule_id": "fx-daily", "slot": "2026-11-10T06:00:00+00:00",
+             "transcript": run("run-b"), "stop": "budget:turns"},
+            {"ts": "2026-11-10T06:11:00Z", "event": "seat_snapshot", "admission_locked": False, "occupied": 0,
+             "pool": "job_processes", "estate": "dev"}],
+        "schedules": [
+            {"id": "fx-daily", "enabled": True, "cron": "0 6 * * *", "timezone": "UTC", "grant": "g-fixture",
+             "task": "tasks/fx", "spec": "specs/fx.yaml", "root": FX, "lane": "shadow",
+             "source_enabled": True, "hold": None},
+            {"id": "fx-held", "enabled": False, "cron": "30 7 * * 1", "timezone": "UTC", "grant": "g-fixture",
+             "task": "tasks/fx", "spec": "specs/fx.yaml", "root": FX, "lane": "shadow",
+             "source_enabled": False, "hold": "migration"},
+            {"id": "fx-daily", "event": "schedule_updated", "enabled": True, "cron": "0 6 * * *", "timezone": "UTC",
+             "grant": "g-fixture", "task": "tasks/fx", "spec": "specs/fx.yaml", "root": FX,
+             "lane": "shadow", "source_enabled": True, "hold": None, "ts": "2026-11-08T00:00:00Z",
+             "actor_id": "operator:fixture", "actor_kind": "human", "estate": "dev"}],
+        "schedule-fires": [
+            {"id": "fx-daily", "job": "1", "lane": "shadow", "slot": "2026-11-09T06:00:00+00:00",
+             "ts": "2026-11-09T06:00:01Z"},
+            {"event": "firing_recorded", "id": "fx-daily", "slot": "2026-11-10T06:00:00+00:00",
+             "firing_id": "fx-daily@2026-11-10T06:00:00+00:00", "ts": "2026-11-10T06:00:00Z", "estate": "dev"},
+            {"id": "fx-daily", "job": "2", "lane": "shadow", "slot": "2026-11-10T06:00:00+00:00",
+             "ts": "2026-11-10T06:00:01Z", "estate": "dev"}],
+        "finalizations": [
+            {"event": "decision_opened", "decision_id": "d1", "run_id": "run-a", "evidence_sha": "e" * 64, "seq": 1,
+             "contract_version": "decision-v1", "ts": "2026-11-09T06:12:00Z"},
+            {"event": "finalize_decision", "decision_id": "d1", "finalization_id": "f1", "judgment_id": "j1",
+             "run_id": "run-a", "assessment": "usable", "landing": "none", "verdict": "pass", "seq": 3,
+             "contract_version": "lifecycle-v1", "actor_id": "operator:fixture", "actor_kind": "human",
+             "evidence_sha": "e" * 64, "ts": "2026-11-09T07:00:01Z"},
+            {"event": "finalize_outcome", "finalization_id": "f1", "run_id": "run-a", "state": "closed",
+             "landing": "none", "contract_version": "lifecycle-v1", "evidence_sha": "e" * 64,
+             "ts": "2026-11-09T07:00:02Z"}],
+        "estate-commit": [
+            {"event": "experiment_allocated", "id": "fixture-9002", "session": "fixture", "block": 1, "high": 9002,
+             "ok": True, "actor_id": "operator:fixture", "actor_kind": "human", "ts": "2026-11-09T05:00:00Z",
+             "estate": "dev"},
+            {"event": "estate_dirty_stale", "path": "specs/fx.yaml", "age_s": 4000, "reason": "dirty",
+             "state": "stale", "check_output": "", "ts": "2026-11-10T05:00:00Z"}],
+        "director-delivery": [
+            {"event": "director_operation_refused", "operation": "enqueue", "operation_grant": "g-fixture",
+             "reason": "fixture", "request_key": "k1", "ts": "2026-11-09T05:00:00Z", "estate": "dev"}],
+        "operator-dispatch": [
+            {"event": "dispatch_prepared", "request_key": "k1", "request_digest": "r" * 64, "spec_sha": "s1"}],
+        "workspace-pruned": [
+            {"event": "workspace_pruned", "run_id": "run-old", "family": "probes", "bytes_freed": 10,
+             "base_sha": "b" * 40, "evidence_sha": "e" * 64, "ts": "2026-11-08T00:00:00Z", "estate": "dev"}],
+        "cli-provider-readiness": [
+            {"event": "cli_provider_readiness", "live_ready": False, "blocked": ["fixture"], "experiments": [],
+             "versions": {}, "patch": None, "frozen_diff_sha256": None, "source_validation": None,
+             "independent_pi_frozen_check": None, "native_fake_model_checks": None, "same_opencode_pi_diff": None}],
+    }
+    assert set(shelves) == set(SHELVES)
+    for name, rows in shelves.items():
+        (state / (name + ".jsonl")).write_text(jsonl(rows), encoding="utf-8")
+    for rid in ("run-a", "run-b"):
+        (state / "runs" / rid / "stimulus").mkdir(parents=True)
+        (state / "runs" / rid / "terminal.json").write_text(json.dumps({"state": "done", "transcript": run(rid)}))
+        (state / "runs" / rid / "finalized.json").write_text(json.dumps({"ok": True}))
+    (state / "estate-cutover.json").write_text(json.dumps({"schema": "estate-cutover-v1", "estate": "dev",
+                                                            "historical_prefixes": {}}) + "\n")
+
+
+def code_copy(dest):
+    """The reader code as an install runs it: ops, scripts and the files they read, no tasks/."""
+    dest.mkdir()
+    for name in ("ops", "scripts", "tools", "grants", "schedules", "policy", "specs"):
+        if (LAB / name).is_dir():
+            shutil.copytree(LAB / name, dest / name, symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for name in ("INVARIANTS.md", "PINNED.md"):
+        if (LAB / name).is_file():
+            shutil.copy2(LAB / name, dest / name)
+    (dest / "grants").mkdir(exist_ok=True)  # the code root may ship no grants/ (2026-11-13)
+    (dest / "grants/g-fixture.yaml").write_text(
+        "id: g-fixture\nestate: dev\nrepo: %s\npaths: [tasks, specs]\ngates: [\"true\"]\n"
+        "commit: true\nstatus: active\nexpiry: 2999-01-01T00:00:00Z\n" % (FX or "/nonexistent/fx"))
+
+
+def strip_cutover(src, dest):
+    """dest = src with every estate_cutover row removed (every other byte kept)."""
+    shutil.copytree(src, dest, symlinks=True)
+    removed = 0
+    for path in sorted(dest.glob("*.jsonl")):
+        raw = path.read_bytes()
+        kept = [line for line in raw.splitlines(keepends=True)
+                if b'"estate_cutover"' not in line or json.loads(line).get("event") != "estate_cutover"]
+        removed += len(raw.splitlines()) - len(kept)
+        path.write_bytes(b"".join(kept))
+    return removed
+
+
+class Root:
+    """One state root and its own code copy; runs readers with only the install's roots set."""
+
+    def __init__(self, scratch, name, state, config):
+        self.state, self.code = state, scratch / ("code-" + name)
+        code_copy(self.code)
+        self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(scratch), "LANG": "C.UTF-8",
+                    "TZ": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
+                    "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(config)}
+
+    def run(self, argv, payload=None):
+        r = subprocess.run(argv, input=payload if isinstance(payload, str) else json.dumps(payload or {}), text=True,
+                           capture_output=True, cwd=str(self.code), env=self.env, timeout=300)
+        return r.returncode, r.stdout, r.stderr
+
+    def op(self, name, payload=None):
+        return self.run([sys.executable, str(self.code / "ops/bin" / name)], payload)
+
+    def helpers(self):
+        """The shelf-reading helpers ops import, called in one child with the roots set."""
+        return self.run([sys.executable, "-c", HELPERS, str(self.code)])
+
+
+HELPERS = r'''
+import json, sys, traceback
+from datetime import datetime, timezone
+from pathlib import Path
+code = Path(sys.argv[1]); sys.path.insert(0, str(code / "ops/bin"))
+from _estate_io import state_dir
+state, now, out = state_dir(code), datetime(2026, 11, 11, 12, 30, tzinfo=timezone.utc), {}
+def call(name, fn):
+    try:
+        out[name] = json.loads(json.dumps(fn(), sort_keys=True, default=str))
+    except Exception as error:
+        out[name] = {"raised": type(error).__name__, "error": str(error), "tb": traceback.format_exc()[-400:]}
+import _node_schedules, _void, _dispatch, _landing
+from _estate_io import read_jsonl
+call("_node_schedules.report (node-listen schedules step)", lambda: _node_schedules.report(state, {})[0])
+call("_node_schedules.rows", lambda: len(_node_schedules.rows(state)))
+call("_void.schedule_rows", lambda: _void.schedule_rows(state / "schedules.jsonl"))
+call("_dispatch.job_records", lambda: sorted(_dispatch.job_records(read_jsonl(state / "dispatch.jsonl", strict=True))))
+call("_dispatch.first_terminal", lambda: _dispatch.first_terminal(state / "dispatch.jsonl", "1"))
+call("_landing verdict/dispatch", lambda: [_landing._verdict_for_run(code, "run-a"), _landing._dispatch_exists(code, "1")])
+print(json.dumps(out, sort_keys=True))
+'''
+
+# (label, how to run it) — every reader op and script of a state shelf; payloads keep them read-only or dry-run,
+# except where the reader's real call appends (schedule-tick as node-listen runs it, void-watch, trigger-check,
+# and then the shelves they wrote are compared too.
+READERS = [
+    ("schedule-tick (dry run)", lambda r: r.op("schedule-tick", {"now": NOW, "dry_run": True, "scan_stale": False,
+                                                                "local_model_ready": True})),
+    ("schedule-tick (as node-listen runs it)", lambda r: r.op("schedule-tick", '{"missed_default": "skip"}')),
+    ("run-identity (latest row)", lambda r: r.op("run-identity", {})),
+    ("run-identity run-a", lambda r: r.op("run-identity", {"run_id": "run-a"})),
+    ("prune-workspaces (dry run)", lambda r: r.op("prune-workspaces", {})),
+    ("run-prune (dry run)", lambda r: r.op("run-prune", {})),
+    ("await 1", lambda r: r.op("await", {"id": "1", "timeout": 1})),
+    ("scripts/report", lambda r: r.run([sys.executable, str(r.code / "scripts/report"), str(r.state / "ledger.jsonl")], "")),
+    ("helpers (node-listen schedules, _void, _dispatch, _landing)", lambda r: r.helpers()),
+]
+KEPT = {NOW[:16]}
+STAMP = re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:?\d\d)?")
+
+
+def normal(text, root):
+    """Output with the root's paths and wall-clock instants masked; instants (to the minute) of the shelves'
+    domain rows and NOW are kept."""
+    for path, name in ((root.state, "<state>"), (root.code, "<code>")):
+        text = text.replace(os.path.realpath(path), name).replace(str(path), name)
+    text = STAMP.sub(lambda m: m.group(0) if m.group(0)[:16] in KEPT else "<now>", text)
+    return re.sub(r'"(scan_ms|elapsed_ms|seconds_since|age_s|age_seconds)": [0-9.]+', r'"\1": <n>', text)
+
+
+def domain_rows(state):
+    out = {}
+    for path in sorted(state.glob("*.jsonl")):
+        out[path.name] = [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                          if line.strip() and '"estate_cutover"' not in line]
+    return out
+
+
+def compare(cut, twin):
+    for label, call in READERS:
+        a, b = call(cut), call(twin)
+        crashed = [w for w, (_, _, err) in (("cut", a), ("twin", b)) if "Traceback" in err]
+        expect(not crashed, "%s: no traceback" % label, [(w, (a if w == "cut" else b)[2][-700:]) for w in crashed])
+        na = (a[0], normal(a[1], cut), normal(a[2], cut))
+        nb = (b[0], normal(b[1], twin), normal(b[2], twin))
+        if label.startswith("helpers"):
+            ha, hb = (json.loads(x[1] or "{}") for x in (na, nb))
+            for h in (ha, hb):  # a traceback's tail is cut at a length that differs with the root's path
+                h.update({k: dict(v, tb=None) for k, v in h.items() if isinstance(v, dict) and "raised" in v})
+            raised = {k: v for k, v in ha.items() if isinstance(v, dict) and v.get("raised") == "KeyError"}
+            expect(not raised, "helpers: no KeyError on the cut-over root", raised)
+            diff = sorted(k for k in set(ha) | set(hb) if ha.get(k) != hb.get(k))
+            expect(a[0] == 0 and not diff, "helpers: every helper returns the same on both roots",
+                   {k: (ha.get(k), hb.get(k)) for k in diff} or a[2][-500:])
+
+            continue
+        expect(na == nb, "%s: same exit and output with and without the cutover rows" % label,
+               {"cut": na, "twin": nb} if na != nb else "")
+    ra, rb = domain_rows(cut.state), domain_rows(twin.state)
+    shelves = sorted(n for n in set(ra) | set(rb) if [normal(x, cut) for x in ra.get(n, [])] !=
+                     [normal(x, twin) for x in rb.get(n, [])])
+    expect(not shelves, "the shelves the readers appended to hold the same domain rows on both roots",
+           {n: (ra.get(n, [])[-2:], rb.get(n, [])[-2:]) for n in shelves})
+
+
+def unit():
+    sys.path.insert(0, str(LAB / "ops/bin"))
+    import _estate_io
+    with scratch_dir(prefix="cutover-readers-unit-") as raw:
+        path = Path(raw) / "x.jsonl"
+        row = {"event": "estate_cutover", "from": "dev", "to": "workstation", "aliases": ["dev"], "estate": "workstation"}
+        path.write_text('{"id": "a"}\n' + json.dumps(row) + '\n[1]\n')
+        expect(_estate_io.read_jsonl(path, strict=True) == [{"id": "a"}, [1]]
+               and _estate_io.read_jsonl(path, strict=False) == [{"id": "a"}]
+               and list(_estate_io.iter_jsonl(path, strict=True, errors="strict", objects_only=False)) == [{"id": "a"}, [1]],
+               "read_jsonl/iter_jsonl skip estate_cutover rows and keep every other value as before")
+        expect(_estate_io.read_jsonl(path, strict=True, with_bookkeeping=True) == [{"id": "a"}, row, [1]],
+               "with_bookkeeping=True still yields them")
+
+
+def main(argv):
+    unit()
+    given = None
+    if argv[:1] == ["--state-copy"] and len(argv) == 2:
+        given = Path(os.path.realpath(argv[1]))
+        if (given.as_posix() + "/").startswith(os.path.realpath(REAL) + "/") or not given.is_dir():
+            print("refused: --state-copy takes a copy of a state root, never ~/.contextstack itself")
+            return 2
+    elif argv:
+        print(__doc__)
+        return 2
+    scratch = Path(os.path.realpath(tempfile.mkdtemp(prefix="cutover-readers-", suffix=".noindex")))
+    try:
+        state, config = scratch / "state", scratch / "config"
+        config.mkdir()
+        if (LAB.parent / "target/release").is_dir():  # <code>/../target/release/cs-tools, as in a release; check builds it
+            (scratch / "target").symlink_to(LAB.parent / "target")
+        if given is None:
+            state.mkdir()
+            fixture_state(state)
+            (config / "ESTATE").write_text("workstation\n")
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(scratch), "LAB_STATE_ROOT": str(state),
+                   "LAB_CONFIG_ROOT": str(config)}
+            r = subprocess.run([sys.executable, str(LAB / "ops/bin/estate-cutover")], text=True, capture_output=True,
+                               input=json.dumps({"estate": "workstation", "mode": "write"}), env=env, cwd=str(LAB))
+            out = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}")
+            expect(r.returncode == 0 and len(out.get("rows_appended", [])) == len(SHELVES),
+                   "the real estate-cutover cut the fixture over dev -> workstation, one row on each shelf",
+                   out or r.stderr[-500:])
+        else:
+            shutil.copytree(given, state, symlinks=True)
+            record = json.loads((state / "estate-cutover-v2.json").read_text())
+            (config / "ESTATE").write_text(record["estate"] + "\n")
+            import hashlib
+            (config / "estate-cutover-v2.sha256").write_text(
+                hashlib.sha256((state / "estate-cutover-v2.json").read_bytes()).hexdigest() + "\n")
+        KEPT.update(m.group(0)[:16] for rows in domain_rows(state).values() for line in rows
+                    for m in STAMP.finditer(line))
+        twin = scratch / "twin"
+        removed = strip_cutover(state, twin)
+        expect(removed >= 1, "the twin root is the cut-over root less its %d estate_cutover row(s)" % removed)
+        cut_root, twin_root = Root(scratch, "cut", state, config), Root(scratch, "twin", twin, config)
+        code, out, err = cut_root.op("estate-cutover", {"mode": "verify"})
+        expect(code == 0 and json.loads(out.strip().splitlines()[-1]).get("ok"),
+               "readers that must see the cutover rows still do: estate-cutover verify passes", (out + err)[-600:])
+        compare(cut_root, twin_root)
+        code, out, err = cut_root.op("estate-cutover", {"mode": "verify"})
+        expect(code == 0, "estate-cutover verify still passes after every reader ran (rows they appended say workstation)",
+               (out + err)[-600:])
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("\ncheck: estate-cutover-readers %d assertion(s) failed%s"
+          % (len(FAILED), (": " + "; ".join(FAILED)) if FAILED else ""))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

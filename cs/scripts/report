@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from _atomic_write import hardened_git_env
+
+def git(path, *args):
+    try:
+        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, env=hardened_git_env())
+        return (r.stdout or "").strip(), r.returncode
+    except Exception:
+        return "", 1
+
+def wallet_usd(row):
+    """Marginal dollars. Subscription and free_local are 0; never invent spend."""
+    cls = str(row.get("cost_class") or "")
+    cost = float(row.get("cost_usd") or 0)
+    if cls in ("free_local", "subscription"):
+        return 0.0
+    if cost == 12.34:
+        return 0.0  # PINNED 2026-09-01 synthetic test-echo
+    return cost
+
+
+def routing_est(row):
+    """API-equivalent shadow. New rows carry est_usd; pre-split falls back to cost_usd."""
+    if float(row.get("cost_usd") or 0) == 12.34:
+        return 0.0  # PINNED 2026-09-01 synthetic test-echo
+    if row.get("est_usd") is not None:
+        return float(row.get("est_usd") or 0)
+    return float(row.get("cost_usd") or 0)
+
+
+def pending_merges(ledger_path):
+    """Pass rows on work tasks whose latest workspace state is not yet
+    merged into the recorded repo. Latest run per task wins."""
+    latest = {}
+    repos = {}
+    with open(ledger_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if row.get('verdict') != 'pass' or 'tasks/work/' not in row.get('task', ''):
+                continue
+            lab_root = os.path.dirname(os.path.dirname(os.path.abspath(ledger_path)))
+            ws = os.path.join(lab_root, row.get('transcript', ''), 'workspace')
+            if not os.path.isdir(os.path.join(ws, '.git')):
+                continue
+            notes = os.path.join(row['task'], 'notes.md')
+            repo = ""
+            if os.path.isfile(notes):
+                for ln in open(notes):
+                    if ln.startswith('repo:'):
+                        repo = ln.split(':', 1)[1].split('(')[0].strip()
+            if not repo:
+                continue
+            head, _ = git(ws, "rev-parse", "HEAD")
+            if head:
+                repos[row['task']] = repo
+                latest[row['task']] = (head, row.get('spec', ''))
+    pend = []
+    for task, (head, spec) in sorted(latest.items()):
+        repo = repos[task]
+        _, rc = git(repo, "merge-base", "--is-ancestor", head, "HEAD")
+        if rc != 0:
+            pend.append((repo, task, spec, head))
+    return pend
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("Usage: report <ledger.jsonl>\n")
+        sys.exit(1)
+
+    ledger_path = sys.argv[1]
+    
+    # Dictionary to store stats per spec
+    spec_data = defaultdict(lambda: {
+        'runs': 0,
+        'passes': 0,
+        'cost_sum': 0.0,
+        'est_sum': 0.0,
+        'seconds_sum': 0.0
+    })
+    sub_month = defaultdict(float)
+
+    with open(ledger_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if str(row.get("cost_class") or "") == "subscription":
+                month = str(row.get("ts") or "")[:7]
+                if len(month) == 7:
+                    sub_month[month] += routing_est(row)
+            verdict = row.get('verdict')
+            if verdict not in ('pass', 'fail'):
+                continue
+            spec = row.get('spec', '')  # group by spec
+            spec_data[spec]['runs'] += 1
+            if verdict == 'pass':
+                spec_data[spec]['passes'] += 1
+                spec_data[spec]['cost_sum'] += wallet_usd(row)
+                spec_data[spec]['est_sum'] += routing_est(row)
+                spec_data[spec]['seconds_sum'] += row.get('seconds', 0)
+
+    print("spec\truns\tpass_rate\tcost_per_pass\test_per_pass\tseconds_per_pass")
+    for spec in sorted(spec_data.keys()):
+        stats = spec_data[spec]
+        runs = stats['runs']
+        passes = stats['passes']
+        pass_rate = (passes / runs) if runs > 0 else 0.0
+        cost_per_pass = (stats['cost_sum'] / passes) if passes > 0 else 0.0
+        seconds_per_pass = (stats['seconds_sum'] / passes) if passes > 0 else 0.0
+        est_per_pass = (stats['est_sum'] / passes) if passes > 0 else 0.0
+        print(f"{spec}\t{runs}\t{pass_rate:.2f}\t{cost_per_pass:.4f}\t{est_per_pass:.4f}\t{seconds_per_pass:.1f}")
+
+    for month in sorted(sub_month):
+        total = sub_month[month]
+        print("subscription utilization %s: %.4f/400 = %.4f" % (month, total, total / 400.0))
+
+    pend = pending_merges(ledger_path)
+    if pend:
+        print("\npending merges (apply in operator, or the copy-out is not done):")
+        for repo, branch, spec, head in pend:
+            print(f"  {branch}\t{head[:10]}\t{spec}\t→ {repo}")
+    else:
+        print("\npending merges: none")
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,6 @@
+{
+  "exit": 1,
+  "stdout": "{\"ok\":false,\"error\":\"action must be stamp, migrate, lint, or stale\"}\n",
+  "files": {},
+  "untouched": true
+}

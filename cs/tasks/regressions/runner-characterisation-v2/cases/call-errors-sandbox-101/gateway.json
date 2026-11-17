@@ -1,0 +1,22 @@
+[
+ {
+  "ok": {
+   "text": "a call the wrapper cannot confine",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

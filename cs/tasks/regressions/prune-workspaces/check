@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+import os
+
+# Direct module calls must not resolve the caller's estate.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+import importlib.machinery
+import importlib.util
+
+loader = importlib.machinery.SourceFileLoader("prune_workspaces", str(LAB / "ops/bin/prune-workspaces"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+
+def git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+
+
+def call(lab, payload):
+    result = subprocess.run([str(LAB / "ops/bin/prune-workspaces")],
+                            input=json.dumps(payload), text=True, capture_output=True,
+                            cwd=str(lab), env={**hermetic_env()})
+    body = json.loads(result.stdout.splitlines()[-1])
+    return result.returncode, body
+
+
+with scratch_dir(prefix="prune-workspaces-") as raw:
+    root = Path(raw)
+    assert mod.settled({"verdict": "pass", "exp": {"old": "arbitrary"}, "intent": "unregistered"})
+    assert mod.settled({"verdict": "pass"})
+    lab = root / "lab"
+    archive = lab / "specs/archive"
+    runs = lab / "ledger/runs"
+    archive.mkdir(parents=True)
+    runs.mkdir(parents=True)
+    (lab / "ESTATE").write_text("dev\n")
+    (archive / "exp-1900-workspace-retention.yaml").write_text(
+        "id: exp-1900\nverdict: fixture\n")
+    origin = root / "origin"
+    origin.mkdir()
+    git(origin, "init", "-b", "main")
+    git(origin, "config", "user.email", "lab@example.invalid")
+    git(origin, "config", "user.name", "Lab")
+    (origin / "note.txt").write_text("base\n")
+    git(origin, "add", "note.txt")
+    git(origin, "commit", "-qm", "base")
+    base = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "HEAD"], text=True).strip()
+
+    settled = runs / "20260916-120000-exp-1900-settled-t1"
+    unsettled = runs / "20260916-120100-exp-1900-open-t1"
+    for dest in (settled, unsettled):
+        subprocess.run(["git", "clone", "--quiet", str(origin), str(dest / "workspace")], check=True)
+    (settled / "workspace" / "note.txt").write_text("changed\n")
+    before = mod.tree_hash(settled / "workspace")
+    (settled / "transcript.md").write_text("ok\n")
+    (unsettled / "transcript.md").write_text("open\n")
+    write_jsonl(lab / "ledger/ledger.jsonl", [
+        {"exp": "fixture-1900", "verdict": "pass",
+         "transcript": "ledger/runs/" + settled.name},
+        {"exp": "fixture-1900",
+         "transcript": "ledger/runs/" + unsettled.name},
+    ])
+
+    code, dry = call(lab, {"lab": str(lab), "family": "exp-*", "apply": False})
+    assert code == 0, dry
+    assert (settled / "workspace").is_dir()
+    assert (unsettled / "workspace").is_dir()
+
+    code, applied = call(lab, {"lab": str(lab), "family": "exp-*", "apply": True})
+    assert code == 0, applied
+    assert not (settled / "workspace").exists(), applied
+    assert (unsettled / "workspace").is_dir(), "unsettled workspace was removed"
+    rows = [json.loads(line) for line in (lab / "ledger/workspace-pruned.jsonl").read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["run_id"] == settled.name, rows
+    rebuilt = mod.reconstruct(origin, rows[0]["base_sha"],
+                              settled / "evidence/candidate.diff")
+    assert rebuilt == before, (rebuilt, before)
+    assert applied["counts"]["pruned"] == 1
+    assert applied["counts"]["unsettled"] == 1
+
+print("check: prune-workspaces deletes settled workspaces and rebuilds the tree hash")

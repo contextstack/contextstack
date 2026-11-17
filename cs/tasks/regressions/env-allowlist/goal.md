@@ -1,0 +1,1 @@
+Incident gateway-env-2026-09-09: no credential-named environment variable may reach an executor check, preflight, model, git, lifecycle op, or runner hook. Plant fake parent credentials; test only isolated estates.

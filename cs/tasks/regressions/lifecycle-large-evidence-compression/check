@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+import gzip
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+CAPTURE = LAB / "ops/bin/capture-stimulus"
+PUBLISH = LAB / "ops/bin/publish-evidence"
+
+def op(binary, payload):
+    result = subprocess.run(
+        [str(binary)], input=json.dumps(payload), text=True,
+        capture_output=True, cwd=str(LAB),
+        env={**hermetic_env()},
+    )
+    if result.returncode:
+        raise AssertionError("%s failed: %s" %
+                             (binary.name, (result.stderr or result.stdout)[:400]))
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def git(cwd, *args):
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True,
+        env={**hermetic_env(), "GIT_TERMINAL_PROMPT": "0"},
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def fixture(root, name, payload):
+    task = root / ("task-" + name)
+    task.mkdir()
+    (task / "goal.md").write_text("preserve full evidence\n", encoding="utf-8")
+    check = task / "check"
+    check.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    check.chmod(0o755)
+    run_dir = root / name
+    ws = run_dir / "workspace"
+    ws.mkdir(parents=True)
+    git(ws, "init", "-q")
+    git(ws, "config", "user.email", "fixture@example.test")
+    git(ws, "config", "user.name", "Fixture")
+    (ws / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git(ws, "add", "seed.txt")
+    git(ws, "commit", "-qm", "seed")
+    op(CAPTURE, {"run_dir": str(run_dir), "run_id": name,
+                 "task": str(task), "adapter": "fixture", "workspace": str(ws)})
+    (ws / "archive.mhtml").write_text(payload, encoding="utf-8")
+    result = op(PUBLISH, {"run_dir": str(run_dir), "adapter": "fixture",
+                          "verdict": "pass", "stop": "done", "check_exit": 0})
+    manifest = json.loads((run_dir / "evidence/manifest.json").read_text())
+    return run_dir, ws, task, result, manifest
+
+
+root = Path(tempfile.mkdtemp(prefix="lifecycle-compressed-", suffix=".noindex"))
+try:
+    marker = "FULL-ARCHIVE-EVIDENCE-MARKER"
+    payload = marker + "\n" + ("chrome-mhtml-body-0123456789\n" * 210000)
+    run_dir, ws, task, result, manifest = fixture(root, "large", payload)
+    meta = manifest["diff"]
+    assert result["capture_state"] == "complete" and result["ready"] is True, result
+    assert meta["path"] == "candidate.diff.gz" and meta["compression"] == "gzip", meta
+    assert meta["truncated"] is False and meta["source_bytes"] > 4 * 1024 * 1024, meta
+    assert "MAX_ARCHIVE_BLOB = 64 << 20" in PUBLISH.read_text(encoding="utf-8")
+    assert "MAX_ARCHIVE_SOURCE = 256 << 20" in PUBLISH.read_text(encoding="utf-8")
+    blob = run_dir / "evidence" / meta["path"]
+    stored = blob.read_bytes()
+    assert hashlib.sha256(stored).hexdigest() == meta["sha256"]
+    source = gzip.decompress(stored)
+    assert len(source) == meta["source_bytes"] and marker.encode() in source
+    assert (run_dir / "ready_for_inspection").is_file()
+
+    sys.path.insert(0, str(LAB / "ops/bin"))
+    from _lifecycle_evidence import verify, read_gzip  # noqa: E402
+    data, err = verify(run_dir)
+    assert err is None and data, err
+    read_back = read_gzip(blob, meta["source_bytes"])
+    assert len(read_back) == len(source) and marker.encode() in read_back
+
+    # A small candidate keeps the historical plain path and is still readable.
+    small_dir, small_ws, small_task, _, small_manifest = fixture(
+        root, "small", "SMALL-EVIDENCE-MARKER\n")
+    small_meta = small_manifest["diff"]
+    assert small_meta["path"] == "candidate.diff"
+    assert small_meta["compression"] == "none" and small_meta["truncated"] is False
+    small_diff = (small_dir / "evidence" / small_meta["path"]).read_text(encoding="utf-8")
+    assert "SMALL-EVIDENCE-MARKER" in small_diff
+
+    # Stored-byte integrity is verified before decompression.
+    blob.write_bytes(stored[:-1] + bytes([stored[-1] ^ 1]))
+    data2, err2 = verify(run_dir)
+    assert err2 and "hash" in err2.lower(), err2
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+print("check: large lifecycle evidence is complete, compressed, hashed, and inspectable")

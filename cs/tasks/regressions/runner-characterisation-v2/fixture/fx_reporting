@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+# Fixture-only CS_TOOL_PREFIX: a wrapper that confines nothing but reports as cs-sandbox does
+# (--report-dir DIR: one DIR/<unix-ms>-<pid>.json per call; its effective policy reads and writes the workspace
+# only), so call-errors-sandbox-denied pins how finalize-run claims reports and how _errors reads a denial.
+import json
+import os
+import subprocess
+import sys
+import time
+
+words = sys.argv[1:]
+cut = words.index("--")
+opts, argv = words[:cut], words[cut + 1:]
+started = time.monotonic()
+done = subprocess.run(argv)
+code = done.returncode if done.returncode >= 0 else 128 - done.returncode
+if "--report-dir" in opts:
+    reports = opts[opts.index("--report-dir") + 1]
+    os.makedirs(reports, exist_ok=True)
+    ws = os.path.realpath(os.getcwd())
+    report = {"backend": "fixture", "tool": os.path.realpath(argv[0]), "args": argv[1:], "cwd": ws,
+              "effective_policy": {"workspace": ws, "read": [ws], "write": [ws], "net": "none", "tmp": "",
+                                   "write_env": {}},
+              "profile_sha256": "", "narrowed": [], "exit": done.returncode if done.returncode >= 0 else None,
+              "signal": -done.returncode if done.returncode < 0 else None,
+              "duration_ms": int((time.monotonic() - started) * 1000)}
+    name = "%d-%d.json" % (time.time_ns() // 1000000, os.getpid())
+    with open(os.path.join(reports, name), "w", encoding="utf-8") as out:
+        out.write(json.dumps(report, indent=2) + "\n")
+sys.exit(code)

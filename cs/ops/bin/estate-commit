@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""Two-tier automatic commits for the installation.
+Facts every tick (every artifacts/ subdirectory + scripts). Rules when check is green.
+Refusals and 30-minute dirty files write ledger/estate-commit.jsonl.
+"""
+from _estate_io import append_jsonl as append_shelf, estate_dir, state_dir, hardened_git_env
+import errno
+import fcntl
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+LAB = Path(os.environ.get("LAB_ESTATE_ROOT") or Path(__file__).resolve().parent.parent.parent)
+CHECK = Path(os.environ.get("LAB_ESTATE_CHECK") or LAB / "scripts/check")
+SHELVES = state_dir(LAB)
+DISPATCH = Path(os.environ.get("LAB_ESTATE_DISPATCH") or SHELVES / "dispatch.jsonl")
+ALERTS = Path(os.environ.get("LAB_ESTATE_ALERTS") or SHELVES / "estate-commit.jsonl")
+STATE = Path(os.environ.get("LAB_ESTATE_STATE") or SHELVES / "estate-commit-state.json")
+LOCK = Path(os.environ.get("LAB_ESTATE_LOCK") or SHELVES / "estate-commit.lock")
+# docs/dev evidence git; skipped if absent.
+EVIDENCE = Path(os.environ.get("LAB_ESTATE_EVIDENCE") or LAB.parent / "docs/dev")
+CADENCE_SECONDS = 600
+STALE_SECONDS = int(os.environ.get("LAB_ESTATE_STALE_SECONDS") or 1800)
+MAX_CHECK_OUTPUT = 4000
+
+
+def _load_classify():
+    path = Path(os.environ.get("LAB_ESTATE_CLASSIFY") or (LAB / "scripts/estate_classify.py"))
+    spec = importlib.util.spec_from_file_location("estate_classify", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    skip = getattr(mod, "skip_auto", lambda _path: False)
+    return mod.classify, skip
+
+
+classify, skip_auto = _load_classify()
+_PREFIX = None
+
+
+
+_GIT_IDENTITY = None
+
+
+def git_env():
+    global _GIT_IDENTITY
+    if _GIT_IDENTITY is None:
+        # The sole global-config read; inherited Git overrides cannot redirect it.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        saved = subprocess.run(
+            ["git", "config", "--global", "--null", "--get-regexp", r"^user\.(name|email)$"],
+            env=clean, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if saved.returncode not in (0, 1):
+            raise RuntimeError("cannot read owner identity: " + saved.stderr.strip())
+        values = dict(row.split("\n", 1) for row in saved.stdout.split("\0") if row)
+        _GIT_IDENTITY = {"GIT_" + role + "_" + field.upper(): values["user." + field]
+                         for role in ("AUTHOR", "COMMITTER") for field in ("name", "email")
+                         if "user." + field in values}
+    return hardened_git_env(extra=_GIT_IDENTITY)
+
+
+def git_run(args, **kwargs):
+    return subprocess.run(args, env=git_env(), **kwargs)
+
+
+def git_output(args, **kwargs):
+    return subprocess.check_output(args, env=git_env(), **kwargs)
+
+
+def repo_prefix():
+    """LAB's path inside its git toplevel: '' when LAB is the repo, 'cs/' in the monorepo."""
+    global _PREFIX
+    if _PREFIX is None:
+        _PREFIX = git_output(["git", "rev-parse", "--show-prefix"],
+                                          cwd=LAB, text=True).strip()
+    return _PREFIX
+
+
+def lab_paths(raw):
+    """porcelain and diff print toplevel-relative paths; keep LAB's own, LAB-relative."""
+    prefix = repo_prefix()
+    return sorted({path[len(prefix):] for path in raw
+                   if path.startswith(prefix) and len(path) > len(prefix)})
+
+
+def emit(value):
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def input_args():
+    try:
+        value = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as error:
+        raise ValueError("input must be JSON") from error
+    if not isinstance(value, dict) or any(key != "force" for key in value):
+        raise ValueError("input must be an object containing only force")
+    if "force" in value and not isinstance(value["force"], bool):
+        raise ValueError("force must be boolean")
+    return value
+
+
+def porcelain_paths():
+    result = git_run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=LAB, capture_output=True, check=True,
+    )
+    tokens = result.stdout.split(b"\0")
+    found = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token:
+            continue
+        status = token[:2].decode("ascii", errors="replace")
+        found.append(token[3:].decode("utf-8", errors="surrogateescape"))
+        if "R" in status or "C" in status:
+            if index < len(tokens) and tokens[index]:
+                found.append(tokens[index].decode("utf-8", errors="surrogateescape"))
+            index += 1
+    return lab_paths(found)
+
+
+def staged_paths():
+    # Whole index, not only LAB: git commit sweeps everything staged, so a
+    # foreign staged path still means a human is mid-commit and this pass skips.
+    raw = git_output(["git", "diff", "--cached", "--name-only", "-z"], cwd=LAB)
+    return sorted(path.decode("utf-8", errors="surrogateescape")
+                  for path in raw.split(b"\0") if path)
+
+
+def counts(paths):
+    result = Counter()
+    for path in paths:
+        result[path.split("/", 1)[0] if "/" in path else "docs"] += 1
+    return dict(sorted(result.items()))
+
+
+def now_ts():
+    raw = os.environ.get("LAB_ESTATE_NOW")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return stamp.timestamp()
+    return datetime.now(timezone.utc).timestamp()
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_state():
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            return value
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def write_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".estate-commit-", suffix=".tmp", dir=STATE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(json.dumps(state, sort_keys=True) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, STATE)
+        directory = os.open(STATE.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def append_jsonl(path, row):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    append_shelf(path, row, sort_keys=True, compact=True,
+                 sync=True, encoding='utf-8')
+
+
+def append_alert(event, reason, extra=None):
+    row = {
+        "ts": iso(now_ts()),
+        "event": event,
+        "state": "error",
+        "reason": reason,
+    }
+    if extra:
+        row.update(extra)
+    append_jsonl(ALERTS, row)
+    if event == "estate_commit_refused":
+        append_jsonl(DISPATCH, row)
+    return row
+
+
+def ledger_grew():
+    head = git_run(
+        ["git", "show", "HEAD:./ledger/ledger.jsonl"],
+        cwd=LAB, capture_output=True,
+    )
+    if head.returncode != 0:
+        return True
+    hn = head.stdout.count(b"\n")
+    working = LAB / "ledger/ledger.jsonl"
+    wn = working.read_bytes().count(b"\n") if working.is_file() else 0
+    return wn >= hn
+
+
+def validate_archives(paths):
+    """Reject verdict-less archive blobs at the durable facts write boundary."""
+    deleted = set(lab_paths(git_output(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=D"],
+        cwd=LAB, text=True).splitlines()))
+    for path in paths:
+        if not (path.startswith("specs/archive/") and Path(path).suffix in {".yaml", ".yml"}) or path in deleted:
+            continue
+        blob = git_output(["git", "show", ":./" + path], cwd=LAB, text=True)
+        values = [line[len("verdict:"):].strip() for line in blob.splitlines() if line.startswith("verdict:")]
+        value = values[0] if len(values) == 1 else ""
+        if value.startswith('"'):
+            try:
+                scalar, end = json.JSONDecoder().raw_decode(value)
+                rest = value[end:]
+                value = scalar if isinstance(scalar, str) and (not rest.strip() or (rest[0].isspace() and rest.lstrip().startswith("#"))) else ""
+            except ValueError:
+                value = ""
+        elif value.startswith("'"):
+            quoted = re.fullmatch(r"'((?:[^']|'')*)'(?:[ \t]+#.*)?", value)
+            value = quoted.group(1).replace("''", "'") if quoted else ""
+        else:
+            value = re.split(r"[ \t]+#", value, maxsplit=1)[0].strip()
+            if value.lower() in {"null", "~"} or value.startswith(tuple("#[]{}|>&*!%@`")):
+                value = ""
+        if not value.strip():
+            git_run(["git", "reset", "--quiet", "--", *paths], cwd=LAB, check=True)
+            append_alert("estate_commit_refused", "archive_verdict_missing",
+                         {"path": path, "check_output": "archive needs one nonempty verdict"})
+            raise RuntimeError("archive needs one nonempty verdict: " + path)
+
+
+def commit_paths(paths, message):
+    git_run(["git", "add", "--", *paths], cwd=LAB, check=True)
+    validate_archives(paths)
+    with tempfile.NamedTemporaryFile(mode="w+", prefix="estate-message-") as msg:
+        msg.write(message + "\n")
+        msg.flush()
+        if any(classify(path) == "rules" for path in paths):
+            subprocess.run([sys.executable, str(LAB / "scripts/ops-cap.py"), "commit-msg", msg.name],
+                           cwd=LAB, check=True, capture_output=True, text=True)
+        committed = git_run(
+            ["git", "-c", "core.hooksPath=/dev/null", "commit", "--no-verify", "-F", msg.name],
+            cwd=LAB, capture_output=True, text=True,
+        )
+    if committed.returncode != 0:
+        git_run(["git", "reset", "--quiet", "--", *paths], cwd=LAB,
+                       capture_output=True, check=False)
+        detail = (committed.stderr or committed.stdout or "git commit failed").strip()
+        raise RuntimeError(detail)
+    return git_output(["git", "rev-parse", "HEAD"], cwd=LAB, text=True).strip()
+
+
+def commit_evidence():
+    """docs/dev evidence: each artifacts/ subdirectory and scripts, every pass."""
+    if not (EVIDENCE / ".git").exists():
+        return ""
+    ignore = EVIDENCE / ".gitignore"
+    if ".DS_Store" not in (ignore.read_text(encoding="utf-8") if ignore.is_file() else ""):
+        with ignore.open("a", encoding="utf-8") as out:
+            out.write(".DS_Store\n")
+    # `git add artifacts` is fatal if any child is a nested git; add kids.
+    for name, force in (("scripts", True), ("artifacts", False)):
+        folder = EVIDENCE / name
+        if not folder.is_dir():
+            continue
+        kids = [f"{name}/{p.name}" for p in folder.iterdir() if not (p / ".git").exists()]
+        for child in ([name] + kids if force else kids):
+            flag = ["-f"] if force else []
+            git_run(["git", "add", *flag, "-A", "--", child], cwd=EVIDENCE,
+                           capture_output=True, check=False)
+    git_run(["git", "add", "--", ".gitignore"], cwd=EVIDENCE, capture_output=True, check=False)
+    staged = git_run(["git", "diff", "--cached", "--name-only"], cwd=EVIDENCE,
+                            capture_output=True, text=True).stdout.split()
+    if not staged:
+        return ""
+    done = git_run(["git", "-c", "core.hooksPath=/dev/null", "commit", "--no-verify", "-q", "-m",
+                           "chore: evidence facts (%d files)" % len(staged)],
+                          cwd=EVIDENCE, capture_output=True, text=True)
+    if done.returncode != 0:
+        append_alert("estate_commit_refused", "evidence_commit_failed",
+                     {"check_output": (done.stderr or done.stdout or "git commit failed").strip()})
+        return ""
+    return git_output(["git", "rev-parse", "HEAD"], cwd=EVIDENCE, text=True).strip()
+
+
+def track_dirty(state, dirty, ts):
+    since = dict(state.get("dirty_since") or {})
+    alerted = dict(state.get("stale_alerted") or {})
+    present = set(dirty)
+    for path in list(since):
+        if path not in present:
+            since.pop(path, None)
+            alerted.pop(path, None)
+    stale = []
+    for path in dirty:
+        since.setdefault(path, ts)
+        age = ts - float(since[path])
+        if age >= STALE_SECONDS and path not in alerted:
+            extra = {"path": path, "age_s": int(age),
+                     "check_output": f"{path} dirty for {int(age)}s"}
+            append_alert("estate_dirty_stale", "dirty_stale", extra)
+            alerted[path] = ts
+            stale.append(path)
+    state["dirty_since"] = since
+    state["stale_alerted"] = alerted
+    return stale
+
+
+def run_check():
+    check = subprocess.run([str(CHECK)], cwd=LAB, capture_output=True, text=True)
+    return check.returncode, ((check.stdout or "") + (check.stderr or ""))[:MAX_CHECK_OUTPUT]
+
+
+def main():
+    try:
+        args = input_args()
+    except ValueError as error:
+        print("estate-commit: " + str(error), file=sys.stderr)
+        return 1
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock = LOCK.open("a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                emit({"ok": True, "committed": False, "skip": "lock"})
+                return 0
+            raise
+        ts = now_ts()
+        estate_id = estate_dir(LAB) / "ESTATE"
+        if estate_id.exists() and estate_id.read_text().strip() == "prod-1":
+            try:
+                backup = subprocess.run([str(LAB / "ops/bin/evidence-backup")], cwd=LAB,
+                                        capture_output=True, text=True, timeout=120)
+                detail = json.loads(backup.stdout) if backup.returncode == 0 else {"error": backup.stderr[-2000:]}
+                append_alert("evidence_backup", "ok" if backup.returncode == 0 else "failed", {**detail, "state": "done" if backup.returncode == 0 else "error"})
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                append_alert("evidence_backup", "failed", {"error": str(error)})
+        state = read_state()
+        state["last_pass"] = ts
+        evidence_commit = commit_evidence()
+        if staged_paths():
+            write_state(state)
+            receipt = {"ok": True, "committed": False, "skip": "staged"}
+            if evidence_commit:
+                receipt["evidence_commit"] = evidence_commit
+            emit(receipt)
+            return 0
+        dirty = porcelain_paths()
+        track_dirty(state, dirty, ts)
+        facts = [path for path in dirty if classify(path) == "facts" and not skip_auto(path)]
+        rules = [path for path in dirty if classify(path) == "rules" and not skip_auto(path)]
+        receipt = {"ok": True, "committed": False}
+        if evidence_commit:
+            receipt["evidence_commit"] = evidence_commit
+
+        if facts:
+            if not ledger_grew():
+                append_alert("estate_commit_refused", "ledger_truncated",
+                             {"check_output": "ledger.jsonl rows < HEAD"})
+                write_state(state)
+                receipt.update({"refused": True, "reason": "ledger_truncated", "tier": "facts"})
+                emit(receipt)
+                return 0
+            by_directory = counts(facts)
+            rendered = ", ".join(f"{key}={value}" for key, value in by_directory.items())
+            commit = commit_paths(facts, f"chore: estate facts ({rendered})")
+            receipt.update({"committed": True, "facts_commit": commit,
+                            "facts_counts": by_directory, "commit": commit})
+
+        force = bool(args.get("force"))
+        last_rules = float(state.get("last_rules") or state.get("last_attempt") or 0)
+        if not force and ts - last_rules < CADENCE_SECONDS:
+            state["last_attempt"] = ts
+            write_state(state)
+            receipt["skip_rules"] = "cadence"
+            emit(receipt)
+            return 0
+
+        state["last_rules"] = ts
+        state["last_attempt"] = ts
+        if not rules:
+            write_state(state)
+            if not facts:
+                receipt["skip"] = "clean"
+                emit(receipt)
+                return 0
+            emit(receipt)
+            return 0
+
+        code, output = run_check()
+        if code != 0:
+            append_alert("estate_commit_refused", "check_failed",
+                         {"check_output": output, "paths": rules})
+            write_state(state)
+            receipt.update({"refused": True, "reason": "check_failed", "tier": "rules"})
+            emit(receipt)
+            return 0
+        by_directory = counts(rules)
+        rendered = ", ".join(f"{key}={value}" for key, value in by_directory.items())
+        commit = commit_paths(rules, f"chore: estate rules ({rendered})")
+        write_state(state)
+        receipt.update({"committed": True, "rules_commit": commit,
+                        "rules_counts": by_directory, "commit": commit})
+        emit(receipt)
+        return 0
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print("estate-commit: " + str(error), file=sys.stderr)
+        return 1
+    finally:
+        lock.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

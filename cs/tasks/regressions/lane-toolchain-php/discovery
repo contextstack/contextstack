@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Configuration precedence, limited discovery, symlinks and shell launchers."""
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from unittest.mock import patch
+HERE = Path(__file__).resolve().parent
+sys.path[:0] = [str(HERE.parents[2] / "ops/bin"), str(HERE.parent / "_lib")]
+from hermetic_env import hermetic_env
+import _toolchains
+
+with tempfile.TemporaryDirectory(dir="/tmp", prefix="toolchain-discovery-") as raw:
+    root = Path(raw).resolve()
+    wrapper, real = root / "Application Support/bin", root / "runtime/bin"
+    wrapper.mkdir(parents=True)
+    real.mkdir(parents=True)
+    php = real / "php"
+    php.write_text("#!/bin/sh\nexit 0\n")
+    php.chmod(0o755)
+    (wrapper / "php").write_text('#!/bin/sh\nPHP_BINARY="%s"\nexec "$PHP_BINARY" "$@"\n' % php)
+    (wrapper / "php").chmod(0o755)
+    (wrapper / "composer").symlink_to(php)
+    (wrapper / "unrelated").write_text("irrelevant")
+    config = root / "toolchains.json"
+    env = {**hermetic_env(), **{"HOME": str(root), "PATH": str(wrapper), "CS_REPOS_FILE": str(root / "repos.json")}}
+    with patch.dict(os.environ, env, clear=True):
+        assert _toolchains.config_file() == config
+        roots = _toolchains.discover()
+        assert str(wrapper) in roots and str(real) in roots, roots
+        config.write_text("[]")
+        _toolchains.discover.cache_clear()
+        assert _toolchains.discover() == (), "explicit empty config must suppress discovery"
+        config.write_text(json.dumps([{"name": "php", "bin": str(wrapper)}]))
+        _toolchains.discover.cache_clear()
+        assert str(real) in _toolchains.discover()
+        config.write_text('[{"name":"php","bin":"relative"}]')
+        _toolchains.discover.cache_clear()
+        try:
+            _toolchains.discover()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("relative toolchain accepted")
+        local = root / "local"
+        py = local / "share/uv/python"
+        bin_dir = local / "bin"
+        bin_dir.mkdir(parents=True)
+        py.mkdir(parents=True)
+        (bin_dir / "uv").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "uv").chmod(0o755)
+        config.write_text(json.dumps([{"name": "uv", "bin": str(bin_dir), "python": str(py)}]))
+        for fn in ("discover", "discover_path_dirs", "discover_sandbox_links"):
+            getattr(_toolchains, fn).cache_clear()
+        assert str(py) in _toolchains.discover() and str(bin_dir) not in _toolchains.discover()
+        assert str((bin_dir / "uv").resolve()) in [str(x) for x in _toolchains.discover_sandbox_links()]
+        cargo_bin = bin_dir / "cargo"
+        cargo_bin.write_text("#!" + sys.executable + "\nraise SystemExit(0)\n")
+        cargo_bin.chmod(0o755)
+        rustc = bin_dir / "rustc"
+        rustup = root / "rustup"
+        tc = rustup / "toolchains/fake"
+        reg = root / "cargo/registry"
+        tc.mkdir(parents=True)
+        reg.mkdir(parents=True)
+        rustc.write_text(
+            "#!" + sys.executable + "\n"
+            "import sys\n"
+            "if sys.argv[1:3] == ['--print', 'sysroot']:\n print(%r); raise SystemExit(0)\n"
+            % str(tc)
+        )
+        rustc.chmod(0o755)
+        config.write_text(json.dumps([
+            {"name": "uv", "bin": str(bin_dir), "python": str(py)},
+            {"name": "cargo", "bin": str(bin_dir), "rustup": str(rustup), "toolchain": str(tc), "registry": str(reg)},
+        ]))
+        for fn in ("discover", "discover_path_dirs", "discover_sandbox_links"):
+            getattr(_toolchains, fn).cache_clear()
+        roots = _toolchains.discover()
+        assert str(tc) in roots and str(reg) in roots and str(bin_dir) not in roots
+        links = [str(x) for x in _toolchains.discover_sandbox_links()]
+        assert str(cargo_bin.resolve()) in links and str(rustc.resolve()) in links
+print("lane-toolchain-discovery: PASS")

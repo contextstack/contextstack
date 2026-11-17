@@ -1,0 +1,5 @@
+{
+  "description": "Fixture-only screenshot tool. Args: {}.",
+  "schema": {"type": "object", "properties": {}},
+  "image_out": true
+}

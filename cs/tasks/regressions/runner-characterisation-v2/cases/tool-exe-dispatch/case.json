@@ -1,0 +1,4 @@
+{
+ "env": {"CS_TOOL_PREFIX": "<ESTATE>/fixture/fx_prefix --tag t1 --"},
+ "messages": true
+}

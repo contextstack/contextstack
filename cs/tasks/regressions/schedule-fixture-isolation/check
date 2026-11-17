@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+import json,os,shutil,subprocess,sys,tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+LAB=Path(__file__).resolve().parents[3]
+CHECKS=('scheduled-external-effect-authority',)
+with scratch_dir(prefix='schedule-isolation-') as raw:
+ root=Path(raw)/'lab';(root/'ledger').mkdir(parents=True)
+ shutil.copytree(LAB/'ops/bin',root/'ops/bin',ignore=shutil.ignore_patterns('__pycache__'))
+ (root/'scripts').mkdir();shutil.copy2(LAB/'scripts/estate-identity.py',root/'scripts/estate-identity.py')
+ (root/'ESTATE').write_text('prod-1\n')
+ (root/'ledger/estate-cutover.json').write_text(json.dumps({'schema':'estate-cutover-v1','estate':'prod-1','historical_prefixes':{}}))
+ helper=root/'tasks/regressions/_lib/hermetic_env.py';helper.parent.mkdir(parents=True)
+ shutil.copy2(LAB/'tasks/regressions/_lib/hermetic_env.py',helper)
+ shutil.copy2(LAB/'tasks/regressions/_lib/scratch.py',helper.with_name('scratch.py'))
+ for name in CHECKS:
+  target=root/'tasks/regressions'/name;shutil.copytree(LAB/'tasks/regressions'/name,target)
+ wrapper=Path(raw)/'guard.py'
+ wrapper.write_text('''import os,runpy,sys
+from pathlib import Path
+blocked=Path(sys.argv[1]).resolve()
+def audit(event,args):
+ if event=='open' and isinstance(args[0],(str,bytes,os.PathLike)) and Path(os.fsdecode(args[0])).resolve()==blocked:
+  raise AssertionError('regression read live schedule shelf instead of fixture')
+sys.addaudithook(audit)
+runpy.run_path(sys.argv[2],run_name='__main__')
+''')
+ shelf=root/'ledger/schedules.jsonl'
+ for state in ('absent','empty','smoke-only'):
+  if state=='empty':shelf.write_text('')
+  elif state=='smoke-only':shelf.write_text(json.dumps({'id':'probe-hello-smoke','estate':'prod-1','enabled':True,'cron':'0 6 * * *','timezone':'America/New_York'})+'\n')
+  before=shelf.read_bytes() if shelf.exists() else None
+  for name in CHECKS:
+   script=root/'tasks/regressions'/name/'check'
+   proc=subprocess.run([sys.executable,str(wrapper),str(shelf),str(script)],cwd=root,text=True,capture_output=True, env={**hermetic_env()})
+   assert proc.returncode==0,(state,name,proc.stdout,proc.stderr)
+  assert (shelf.read_bytes() if shelf.exists() else None)==before
+print('check: schedule authority regressions use fixture facts for absent, empty and smoke-only estates')

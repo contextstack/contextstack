@@ -1,0 +1,9 @@
+{
+  "exit": 1,
+  "stdout": "browser_fetch: host resolves to a non-public address: 127.0.0.1\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"url\": \"https://127.0.0.1/private\"}, \"name\": \"browser_fetch\"}\n",
+    "_evidence/manifest.jsonl": null
+  },
+  "untouched": true
+}

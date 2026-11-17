@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import json,os,shutil,subprocess,sys,tempfile
+from pathlib import Path
+LAB=Path(__file__).resolve().parents[3]
+# Metadata guards run independently of the host-only executor/Seatbelt fixture.
+sys.path.insert(0,str(LAB/'ops/bin'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '_lib'))
+from _cli_native import stage
+with scratch_dir(prefix='claude-login-identity-') as raw:
+ root=Path(raw).resolve();home=root/'personal';credential=home/'.claude/.credentials.json'
+ credential.parent.mkdir(parents=True);credential.write_text('fixture')
+ templates=json.loads((LAB/'ops/bin/executor-templates.json').read_text())
+ expected={name for name in templates if name.startswith('claude-code') or name=='claude-auth-context-probe'}
+ copied={name for name,template in templates.items() if '~/.claude/.credentials.json' in template.get('copies',{}).values()}
+ assert expected <= copied, 'Claude templates still link owner credentials'
+ for name,template in templates.items():
+  if '~/.claude/.credentials.json' not in template.get('copies',{}).values():continue
+  source=root/'public';source.write_text('public-fixture')
+  credential.unlink();os.link(source,credential)
+  private=root/name;private.mkdir()
+  for action in (lambda:stage(template,private,home),):
+   try:action()
+   except ValueError:pass
+   else:raise AssertionError('Claude hardlink accepted: '+name)
+  assert source.read_text()=='public-fixture'
+  source.unlink();credential.write_text('fixture')
+  from sandbox_profile import render_profile
+  rules=render_profile(home, tmpdir=private, login=template).splitlines()
+  for target in (credential,credential.parent):
+   assert '(deny file-write* file-link (literal %s))'%json.dumps(str(target)) in rules
+print('PASS: Claude login metadata guards and parent-entry protections')
+if '--offline' in sys.argv:raise SystemExit(0)
+with scratch_dir(prefix='claude-private-runtime-') as raw:
+ root=Path(raw).resolve();lab=root/'lab';ops=lab/'ops/bin';ops.mkdir(parents=True)
+ for p in (LAB/'ops/bin').iterdir():
+  if p.is_file():shutil.copy2(p,ops/p.name)
+ from native_runtime import stage_native_runtime
+ stage_native_runtime(ops)
+ (lab/'ESTATE').write_text('dev\n')  # finalize-run's node identity
+ home=root/'personal';bins=home/'.local/bin';bins.mkdir(parents=True)
+ (home/'Library/Keychains').mkdir(parents=True);(home/'Library/Keychains/guard').write_text('unchanged')
+ (home/'.claude').mkdir();(home/'.claude/guard').write_text('unchanged')
+ (home/'.claude.json').write_text('unchanged')
+ selected=root/'selected-runtime';selected.mkdir()
+ (bins/'claude').write_text('#!/bin/sh\necho stale-runtime >&2\nexit 91\n');(bins/'claude').chmod(0o755)
+ fake=selected/'claude'
+ fake.write_text('#!'+sys.executable+'\n'+'''import json,os
+from pathlib import Path
+home=Path.home()
+assert 'CLAUDE_CONFIG_DIR' not in os.environ, 'credential-store identity changed'
+assert 'OPENAI_API_KEY' not in os.environ
+(home/'.claude/projects').mkdir(parents=True,exist_ok=True)
+credential=home/'.claude/.credentials.json'
+if credential.exists():
+ assert not credential.is_symlink() and credential.stat().st_nlink == 1
+ assert credential.stat().st_mode & 0o777 == 0o600
+ value=json.loads(credential.read_text());value['claudeAiOauth']['refreshToken']='rotated-fixture'
+ credential.write_text(json.dumps(value))
+ if __import__('sys').platform == 'darwin':
+  target=Path('''+repr(str(home/'.claude/.credentials.json'))+''')
+  source=Path('hardlink-source');source.write_text('public-fixture')
+  for action in (lambda:target.write_text('unsafe'),lambda:target.chmod(0o644),
+                 lambda:source.replace(target),lambda:os.link(target,Path('credential-alias')),
+                 lambda:target.unlink()):
+   try:action()
+   except PermissionError:pass
+   else:raise AssertionError('real credential mutation permitted')
+  source.unlink()
+(home/'.claude.json').write_text('runtime only')
+(home/'.claude/projects/session').write_text('runtime only')
+assert home != Path('''+repr(str(home))+'''), 'personal HOME inherited'
+if __import__('sys').platform == 'darwin':
+ assert (home/'Library/Keychains').is_symlink(), 'login Keychain directory not linked'
+ assert (home/'Library/Keychains').resolve()==Path('''+repr(str(home/'Library/Keychains'))+'''), 'wrong Keychain source'
+ try:(home/'Library/Keychains/guard').write_text('unsafe')
+ except PermissionError:pass
+ else:raise AssertionError('personal Keychain writes permitted')
+if __import__('sys').platform == 'darwin':
+ try:Path('''+repr(str(home/'.claude/guard'))+''').write_text('unsafe')
+ except PermissionError:pass
+ else:raise AssertionError('personal writes permitted')
+Path('result.json').write_text(json.dumps({'home':str(home),'user':os.environ.get('USER')}))
+print(json.dumps({'type':'result','is_error':False,'result':'done'}))
+''');fake.chmod(0o755)
+ (ops/'executor-templates.json').write_text(json.dumps({'claude-fixture':{'binary':'claude','args':[],'cost_class':'subscription','auth':'subscription'}}))
+ task=lab/'tasks/fixture';task.mkdir(parents=True)
+ (task/'goal.md').write_text('Write result.json.\n')
+ (task/'check').write_text('#!'+sys.executable+'\nfrom pathlib import Path\nassert Path("result.json").is_file()\n');(task/'check').chmod(0o755)
+ env={k:v for k,v in os.environ.items() if k in ('PATH','USER','LANG','TMPDIR')}
+ env['PATH']=str(selected)+os.pathsep+env.get('PATH','')
+ env.update(HOME=str(home),OPENAI_API_KEY='fake-never-inherit',CLAUDE_CONFIG_DIR='/should-not-inherit')
+ r=subprocess.run([sys.executable,str(ops/'_executor.py')],input=json.dumps({'executor':'claude-fixture','task':str(task),'exp':'task-1763','timeout_s':15}),env=env,cwd=lab,capture_output=True,text=True,timeout=30)
+ assert r.stdout,(r.returncode,r.stderr)
+ receipt=json.loads(r.stdout.splitlines()[-1]);run=lab/receipt['transcript'];ws=run/'workspace'
+ assert r.returncode==0,(r.stdout,r.stderr,(run/'cli.log').read_text())
+ result=json.loads((ws/'result.json').read_text());runtime=Path(result['home'])
+ assert runtime.is_relative_to(run/'tmp') and not runtime.is_relative_to(ws)
+ assert result['user']==env.get('USER')
+ assert (home/'.claude/guard').read_text()=='unchanged'
+ assert (home/'.claude.json').read_text()=='unchanged'
+ assert not list(ws.rglob('session')), 'runtime state leaked into candidate'
+ assert receipt['stop']=='done' and receipt['cli_exit']==0
+ assert not any(p.is_symlink() for p in run.rglob('Keychains')), 'Keychain link left in run evidence'
+ # File-backed HOME uses the real Claude template declarations.
+ credentials=home/'.claude/.credentials.json';credentials.write_text(json.dumps({'claudeAiOauth':{'accountUuid':'owner-account','organizationUuid':'owner-org','refreshToken':'original-fixture'}}));credentials.chmod(0o600)
+ template=json.loads((LAB/'ops/bin/executor-templates.json').read_text())['claude-code-sonnet']
+ template.update(binary='claude',args=[])
+ (ops/'executor-templates.json').write_text(json.dumps({'claude-code-sonnet':template}))
+ r=subprocess.run([sys.executable,str(ops/'_executor.py')],input=json.dumps({'executor':'claude-code-sonnet','task':str(task),'exp':'task-1763','trial':99,'timeout_s':15}),env=env,cwd=lab,capture_output=True,text=True,timeout=30)
+ assert r.returncode==0,(r.stdout,r.stderr)
+ # Task-run copies are never written back (owner decision 2026-11-12); only the no-tools auth refresh writes back.
+ assert json.loads(credentials.read_text())['claudeAiOauth']['refreshToken']=='original-fixture'
+ credentials.unlink()
+ # Drive expiry recovery through the actual executor, not a copied predicate.
+ (ops/'executor-templates.json').write_text(json.dumps({'claude-fixture':{'binary':'claude','args':['--model','sonnet','--print','{{prompt}}'],'cost_class':'subscription','auth':'subscription'}}))
+ cases=[('Failed to authenticate: OAuth session expired and could not be refreshed',False,True),
+        ('OAuth access token has expired',False,True),
+        ('Failed to authenticate: HTTP 401',False,True),
+        ('Failed to authenticate: OAuth session expired and could not be refreshed',True,False),
+        ('Unrelated task failure',False,False),
+        ('Invalid API key / Please run /login',False,False)]
+ for trial,(message,refresh_fails,success) in enumerate(cases,2):
+  fake.write_text('#!'+sys.executable+'\n'+"MESSAGE="+repr(message)+"\nREFRESH_FAILS="+repr(refresh_fails)+"\nPERSONAL="+repr(str(home))+"\n"+'''import json,os,sys
+from pathlib import Path
+home=Path.home();tmp=Path(os.environ['TMPDIR']);record=tmp/'claude-home/attempts.json'
+assert 'OPENAI_API_KEY' not in os.environ and 'ANTHROPIC_API_KEY' not in os.environ
+assert 'CLAUDE_CONFIG_DIR' not in os.environ
+attempts=json.loads(record.read_text()) if record.exists() else []
+refresh=sys.argv[-1]=='Reply with exactly: AUTH_OK'
+attempts.append('refresh' if refresh else 'task');record.write_text(json.dumps(attempts))
+if refresh:
+ if (home/'.claude/settings.json').exists() or '--setting-sources' not in sys.argv or sys.argv[sys.argv.index('--setting-sources')+1]!='' or not json.loads(sys.argv[sys.argv.index('--settings')+1]).get('disableAllHooks'):
+  (tmp/'hook-canary').write_text('ran')
+ assert not home.is_relative_to(tmp) and home.name=='claude-refresh-home', ('refresh reused agent-writable home', home)
+ assert sys.argv[1:]==['--print','--output-format','text','--model','sonnet','--setting-sources','','--settings','{"disableAllHooks":true}','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--tools','','--disable-slash-commands','Reply with exactly: AUTH_OK']
+ if sys.platform=='darwin':
+  assert (home/'Library/Keychains').is_symlink()
+  for guard in (home/'Library/Keychains/guard', Path(PERSONAL)/'.claude/guard'):
+   try:guard.write_text('unsafe')
+   except PermissionError:pass
+   else:raise AssertionError('refresh escaped task sandbox: '+str(guard))
+ print('refresh refused' if REFRESH_FAILS else 'AUTH_OK')
+ raise SystemExit(1 if REFRESH_FAILS else 0)
+if len(attempts)==1:
+ for target_home in (home, tmp/'claude-refresh-home'):
+  (target_home/'.claude').mkdir(parents=True,exist_ok=True)
+  (target_home/'.claude/settings.json').write_text(json.dumps({'hooks':{'Stop':[{'hooks':[{'type':'command','command':'touch '+str(tmp/'hook-canary')}]}]}}))
+ if sys.platform=='darwin':
+  try:(tmp.parent/'claude-refresh-home').mkdir()
+  except PermissionError:pass
+  else:raise AssertionError('task sandbox permitted creating host-owned claude-refresh-home')
+ print(json.dumps({'type':'result','is_error':True,'result':MESSAGE}))
+ raise SystemExit(1)
+assert attempts==['task','refresh','task'], 'unbounded recovery'
+if sys.platform=='darwin':
+ try:(home/'Library/Keychains/guard').write_text('unsafe')
+ except PermissionError:pass
+ else:raise AssertionError('retry escaped task sandbox')
+Path('result.json').write_text('{}')
+print(json.dumps({'type':'result','is_error':False,'result':'done'}))
+''')
+  r=subprocess.run([sys.executable,str(ops/'_executor.py')],input=json.dumps({'executor':'claude-fixture','task':str(task),'exp':'task-1801','trial':trial,'timeout_s':15}),env=env,cwd=lab,capture_output=True,text=True,timeout=30)
+  row=json.loads(r.stdout.splitlines()[-1]);run=lab/row['transcript']
+  attempts=json.loads((run/'tmp/claude-home/attempts.json').read_text())
+  expected=['task'] if message in ('Unrelated task failure','Invalid API key / Please run /login') else ['task','refresh']+(['task'] if success else [])
+  assert attempts==expected,(message,attempts,expected)
+  assert (run/'tmp/claude-home/.claude/settings.json').is_file()
+  assert not (run/'tmp/hook-canary').exists(), 'planted hook in claude-home executed during refresh'
+  assert (row['stop']=='done' and row['cli_exit']==0)==success,row
+  assert (home/'Library/Keychains/guard').read_text()=='unchanged'
+  assert not any(p.is_symlink() for p in run.rglob('Keychains')), ('Keychain link left in run evidence', message)
+print('check: selected Claude runtime, private HOME and sandbox preserved; OAuth expiry recovery bounded and unrelated errors never refreshed')

@@ -1,0 +1,75 @@
+[
+ {
+  "ok": {
+   "text": "local",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ],
+   "model": "local-coder",
+   "cost": {
+    "currency": "USD",
+    "amount": "0.250000",
+    "class": "free_local"
+   }
+  }
+ },
+ {
+  "ok": {
+   "text": "subscription",
+   "tool_calls": [
+    {
+     "id": "2",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ],
+   "model": "claude-code",
+   "cost": {
+    "currency": "USD",
+    "amount": "0.500000",
+    "class": "subscription"
+   }
+  }
+ },
+ {
+  "ok": {
+   "text": "api charged",
+   "tool_calls": [
+    {
+     "id": "3",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ],
+   "model": "api-model",
+   "cost": {
+    "currency": "USD",
+    "amount": "0.125000",
+    "class": "api",
+    "charged": 0.0625
+   }
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": [],
+   "model": "api-model",
+   "cost": {
+    "currency": "USD",
+    "amount": "0.062500",
+    "class": "api"
+   }
+  }
+ }
+]

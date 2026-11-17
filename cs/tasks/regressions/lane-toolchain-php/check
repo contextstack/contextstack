@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Declared PHP works inside Seatbelt without opening sibling Library paths."""
+import ast
+import json
+import re
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+sys.path[:0] = [str(KIT / "ops/bin"), str(HERE.parent / "_lib")]
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+import _executor
+import _toolchains
+
+if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+    print("lane-toolchain-php: SKIP (requires --darwin-probe on macOS)")
+    raise SystemExit(0)
+
+with scratch_dir(dir="/tmp", prefix="lane-php-") as raw:
+    root = Path(raw).resolve()
+    home, ws, tmp = root / "home", root / "ws", root / "tmp"
+    wrapper = home / "Library/Application Support/Herd/bin"
+    real = home / "Library/Application Support/Herd/runtime/bin"
+    sibling = home / "Library/private/secret"
+    for directory in (wrapper, real, sibling.parent, ws, tmp):
+        directory.mkdir(parents=True)
+    sibling.write_text("private")
+    (real / "php").write_text('#!/bin/sh\nprintf "PHP_OK\\n"\n')
+    (real / "php").chmod(0o755)
+    (wrapper / "php").write_text('#!/bin/sh\nexec "%s/php" "$@"\n' % real)
+    (wrapper / "php").chmod(0o755)
+    config = root / "toolchains.json"
+    config.write_text(json.dumps([{"name": "php", "bin": str(wrapper)}]))
+    os.environ.update(HOME=str(home), CS_TOOLCHAINS_FILE=str(config))
+    import _executor
+    # The same pins the old source-extraction loader set, for the rest of this probe: the real helpers then read
+    # this fixture HOME and a minimal allowlist instead of the machine's.
+    _executor.HOME = home
+    _executor.PATH_FALLBACK = "/usr/bin:/bin"
+    _executor.KEEP_ENV = {"HOME"}
+    _executor.CRED_ENV = re.compile("SECRET")
+    _executor.fail = lambda msg: sys.exit(msg)
+    ns = {"allowlist_env": _executor.allowlist_env, "sandbox_cmd": _executor.sandbox_cmd}
+    env = {**hermetic_env(), **ns["allowlist_env"]([], tmp)}
+    command = 'php; ! /bin/cat "$1"; ! /usr/bin/touch "$2/forbidden"; ! /usr/bin/touch "$3/forbidden"'
+    cmd = ns["sandbox_cmd"]("/bin/sh", ["-c", command, "probe", str(sibling), str(wrapper), str(real)],
+                            ws, tmp, tmp / "profile.sb")
+    result = subprocess.run(cmd, env=env, cwd=ws, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and result.stdout.strip() == "PHP_OK", result
+    assert not (wrapper / "forbidden").exists() and not (real / "forbidden").exists()
+print("lane-toolchain-php: PASS")

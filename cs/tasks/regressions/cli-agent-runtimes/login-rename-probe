@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Issues #28/#57 host probe; compatible with the pre-fix staging API and templates."""
+import ast
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+OPS = Path(__file__).resolve().parents[3] / 'ops/bin'
+sys.path.insert(0, str(OPS))
+from _cli_native import stage, unstage
+
+
+def auth():
+    return json.dumps({'tokens': {'account_id': 'owner', 'refresh_token': 'decoy'}}).encode()
+
+
+with tempfile.TemporaryDirectory(prefix='login-rename-probe-') as raw:
+    root = Path(raw).resolve()
+    if '--darwin-probe' in sys.argv:
+        if sys.platform != 'darwin':
+            print('SKIP: issue #57 Seatbelt probe requires Darwin')
+        else:
+            capability = subprocess.run(['sandbox-exec', '-p', '(version 1)(allow default)', '/usr/bin/true'],
+                                        capture_output=True, text=True)
+            if capability.returncode != 0:
+                assert 'sandbox_apply: Operation not permitted' in capability.stderr
+                print('SKIP: issue #57 Seatbelt probe: sandbox_apply denied by outer sandbox')
+            else:
+                import _executor
+                for name in ('codex', 'pi', 'claude-code', 'claude-code-sonnet', 'claude-code-sonnet-planner', 'claude-code-opus', 'claude-code-opus-judge', 'claude-code-sonnet-patch', 'claude-auth-context-probe'):
+                    home = root / ('probe-' + name) / 'home'
+                    workspace, private = home.parent / 'workspace', home.parent / 'tmp'
+                    workspace.mkdir(parents=True)
+                    private.mkdir()
+                    rel = '.codex/auth.json' if name == 'codex' else '.pi/agent/auth.json' if name == 'pi' else '.claude/.credentials.json'
+                    source = home / rel
+                    source.parent.mkdir(parents=True)
+                    source.write_bytes(auth())
+                    template = json.loads((OPS / 'executor-templates.json').read_text())[name]
+                    _, links = stage(template, private, home)
+                    copied = private / ('codex-home/auth.json' if name == 'codex' else 'pi-agent/auth.json' if name == 'pi' else 'claude-home/.claude/.credentials.json')
+                    probe = private / 'probe.py'
+                    probe.write_text("""import json, os, sys
+from pathlib import Path
+source, copied = map(Path, sys.argv[1:])
+for target in (copied, source):
+    payload = Path('workspace-decoy.json')
+    payload.write_text(json.dumps({'tokens': {'account_id': 'attacker'}}))
+    try:
+        payload.replace(target)
+    except PermissionError:
+        assert target == source, 'private refresh rename denied'
+    else:
+        assert target == copied, 'workspace file replaced owner login'
+for operation in (lambda: source.write_text('forged'),
+                  lambda: source.chmod(0o644),
+                  lambda: source.unlink(),
+                  lambda: os.link(source, Path('credential-alias')),
+                  lambda: source.parent.rename(source.parent.with_name('stolen-login'))):
+    try:
+        operation()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('owner login mutation permitted')
+""")
+                    _executor.HOME = home
+                    ns = {'sandbox_cmd': _executor.sandbox_cmd}
+                    command = ns['sandbox_cmd'](sys.executable, [str(probe), str(source), str(copied)],
+                                                workspace, private, private / 'sandbox.sb',
+                                                caller=dict(deny_write_roots=[str(home / p[2:] if p.startswith('~/') else Path(p)) for p in template.get('deny_write', [])]), read_links=links,
+                                                login_writes=template)
+                    done = subprocess.run(command, cwd=workspace, capture_output=True, text=True)
+                    assert done.returncode == 0, (name, done.stderr)
+                    assert source.read_bytes() == auth()
+                    unstage(links)
+                print('PASS: Seatbelt denies owner login overwrite, chmod, rename, hardlink and unlink; private refresh works')

@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+# Operator-only evidence snapshot. Workspace git metadata is never authority.
+import json
+import re
+import sys
+from pathlib import Path
+
+from _harvest_git import git, initialize, repository
+
+
+def checked(ws, *args):
+    result = git(ws, *args)
+    if result.returncode:
+        sys.exit((result.stderr or result.stdout or "harvest git failed").strip())
+    return result.stdout
+
+
+a = json.load(sys.stdin)
+ws = Path(a["workspace"]).resolve(strict=True)
+slug, run_id = str(a["slug"]), str(a["run_id"])
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", slug):
+    sys.exit("bad task name for branch")
+if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id) or run_id in (".", ".."):
+    sys.exit("bad run id")
+# The run parent is host evidence, outside the sandbox's workspace write grant.
+# Setup seeds this repository before the agent starts; standalone harvest creates it.
+git_dir = repository(ws)
+if git_dir.is_symlink():
+    sys.exit("host harvest repository must not be a symlink")
+if not git_dir.exists():
+    initialize(ws)
+branch = "lab/%s-%s" % (slug, run_id)
+base = git(ws, "rev-parse", "--verify", "HEAD")
+if base.returncode == 0:
+    checked(ws, "update-ref", "refs/heads/" + branch, base.stdout.strip())
+checked(ws, "symbolic-ref", "HEAD", "refs/heads/" + branch)
+checked(ws, "add", "-A", "--", ".", ":(exclude).git", ":(exclude)**/.git",
+        ":(exclude).lab-*", ":(exclude).lab-*/**", ":(exclude)**/.lab-*", ":(exclude)**/.lab-*/**")
+checked(ws, "-c", "user.name=lab", "-c", "user.email=lab@local", "commit",
+        "--no-verify", "--allow-empty", "-m", "lab: %s (%s)" % (slug, run_id))
+print(json.dumps({"ok": True, "branch": branch, "git_dir": str(git_dir)}))

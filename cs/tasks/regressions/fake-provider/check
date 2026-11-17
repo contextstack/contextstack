@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Two real gateways, one loopback fake, independent dev/prod-1 shares."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import socket
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+TASK = Path(__file__).resolve().parent
+LAB = TASK.parents[2]
+# The Rust gateway scripts/check builds (the Go one is archived); $CSGATEWAY_BIN overrides it.
+GATEWAY = Path(os.environ.get('CSGATEWAY_BIN') or TASK.parents[3]/'target/release/cs-gateway')
+
+
+def wait_for(predicate, processes, seconds=15):
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        assert all(p.poll() is None for p in processes), 'fixture process exited'
+        try:
+            if predicate():
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(.02)
+    raise AssertionError('fixture readiness timed out')
+
+
+def request(url, body=None):
+    req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(),
+                                 headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        return error.code, json.load(error)
+
+
+with scratch_dir(prefix='estate-capacity-') as raw:
+    root = Path(raw)
+    # Capacity inputs come only from this fixture's models.json — never from the
+    # host gateway config, HOME, or a live CSAGENT_MODELS_CONFIG.
+    fixture_models = json.loads((TASK/'models.json').read_text())
+    shares = dict(fixture_models['deployments'][0]['capacity'])
+    assert shares == {'dev': 2, 'prod-1': 4}, shares
+    total = sum(shares.values())
+    home = root/'home'
+    home.mkdir()
+    # fake-paid is cost class api; this fixture tests capacity, so its HOME allows paid calls.
+    (home/'.contextstack/config/gateway').mkdir(parents=True)
+    (home/'.contextstack/config/gateway/limits.json').write_text('{"api_usd_per_day": 1000}')
+    path_bins = ['/usr/bin', '/bin', str(Path(sys.executable).parent)]
+    env = {
+        'HOME': str(home),
+        'USER': 'fixture',
+        'PATH': os.pathsep.join(path_bins),
+        'TMPDIR': str(root/'tmp'),
+        'LANG': 'C',
+        # never the host credential store (Keychain is per user, not per HOME).
+        'CSGATEWAY_CREDENTIALS': 'off',
+    }
+    (root/'tmp').mkdir()
+    binary = root/'csgateway'
+    shutil.copy2(GATEWAY, binary)
+    ready, log, release = root/'ready', root/'requests.jsonl', root/'release'
+    provider = subprocess.Popen([sys.executable, str(TASK/'server.py'), '--ready', str(ready), '--log', str(log), '--release', str(release)], env=env)
+    processes, outputs, gateways = [provider], [], {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=total)
+    try:
+        wait_for(ready.exists, processes)
+        upstream = ready.read_text()
+        for estate, share in shares.items():
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                port = sock.getsockname()[1]
+            cfg = json.loads(json.dumps(fixture_models))
+            cfg['estate'] = estate
+            cfg['deployments'][0]['endpoint'] = upstream+'/v1'
+            path = root/(estate+'.json')
+            path.write_text(json.dumps(cfg))
+            child_env = {**env, 'CSAGENT_MODELS_CONFIG': str(path), 'CSGATEWAY_PORT': str(port),
+                         'CSGATEWAY_AUTH_REQUIRED': 'false', 'CSGATEWAY_DISCOVERY_HEALTH': 'off', 'VLLM_ENDPOINT': upstream, 'OLLAMA_ENDPOINT': 'http://127.0.0.1:1'}
+            output = (root/(estate+'.log')).open('w+')
+            outputs.append(output)
+            processes.append(subprocess.Popen([str(binary)], cwd=root, env=child_env, stdout=output, stderr=output))
+            gateways[estate] = 'http://127.0.0.1:'+str(port)
+            wait_for(lambda url=gateways[estate]: request(url+'/v1/admission')[0] == 200, processes)
+        def call(estate):
+            # the agent route replaces retired /v1/llm/call; same model, same fake upstream.
+            return request(gateways[estate]+'/v1/agent/model.call', {
+                'schema_version': 'agent.gateway.model_call.v2', 'request_id': estate+'-'+str(time.monotonic_ns()),
+                'capability': {'kind': 'model.call', 'model_tier_hint': 'fake-paid'},
+                'messages': [{'role': 'user', 'content': estate}],
+                'budget': {'timeout_ms': 15000, 'max_output_tokens': 8}})
+        futures = [pool.submit(call, estate) for estate, share in shares.items() for _ in range(share)]
+        wait_for(lambda: log.exists() and len(log.read_text().splitlines()) == total, processes, seconds=60)
+        for estate, share in shares.items():
+            def active_matches(estate=estate, share=share):
+                status, body = request(gateways[estate]+'/v1/admission')
+                return status == 200 and body['deployments']['shared-fixture']['active'] == share
+            wait_for(active_matches, processes, seconds=15)
+            status, body = call(estate)
+            error = body.get('error') or {}
+            assert status == 200 and body['status'] == 'error' and error.get('code') == 'gateway.capacity_exhausted', body
+            assert 'queue_full' in error.get('message', '') and body['cost']['amount'] == '0.000000', body
+        assert len(log.read_text().splitlines()) == total, 'over-share request reached provider'
+        release.touch()
+        for future in futures:
+            status, body = future.result(timeout=15)
+            assert status == 200 and body['status'] == 'ok' and body['message']['content'] == 'canned completion', body
+            assert body['usage'] == {'input_tokens': 3, 'output_tokens': 2}, body
+            assert body['model'] == 'fake-paid' and body['cost']['class'] == 'api', body
+            assert abs(body['cost']['est_usd'] - 5*.01/1000) < 1e-12, body
+        for estate in gateways:
+            wait_for(lambda estate=estate: request(gateways[estate]+'/v1/admission')[1]['deployments']['shared-fixture']['active'] == 0, processes)
+        # the tiny max_cost_usd refusal retired with /v1/llm/call and its fixed
+        # CostPer1K*4 heuristic (Gateway V2.2 §5, option C; see notes.md). The agent route
+        # accepts and discards budget.max_usd (WIRE.md, pre-flight PARKED), so nothing replaces it here.
+        assert len(log.read_text().splitlines()) == total, 'refused or retired call contacted provider'
+        for output in outputs:
+            output.flush()
+            output.seek(0)
+            text = output.read()
+            assert 'queue_wait_ms' in text and 'per_call_latency_ms' in text
+        # Instrument acceptance: one real Lab run, one ledger row, no wallet
+        # charge, with the nonzero rate estimate and upstream request preserved.
+        runner = root/'lab-runner'
+        sys.path.append(str(LAB/'ops/bin'))
+        from _runner import built_runner  # the default Rust runner unless $CS_RUNNER_BIN
+        shutil.copy2(built_runner(LAB), runner)
+        estate = root/'lab'
+        ops, task = estate/'ops/bin', estate/'tasks/instrument'
+        ops.mkdir(parents=True)
+        task.mkdir(parents=True)
+        (estate/'ESTATE').write_text('dev\n')
+        for name in ('capture-stimulus', 'finalize-run', 'publish-evidence', '_estate_io.py', '_lifecycle_evidence.py', '_env_policy.py', '_roots.py', '_errors.py'):
+            shutil.copy2(LAB/'ops/bin'/name, ops/name)
+        (estate/'INVARIANTS.md').write_text('Isolated instrument fixture.\n')
+        (estate/'prompts').mkdir()
+        (estate/'prompts/test.md').write_text('Reply with the canned completion.\n')
+        (task/'goal.md').write_text('Reply with the canned completion.\n')
+        (task/'check').write_text('#!/bin/sh\nexit 0\n')
+        (task/'check').chmod(0o755)
+        (estate/'spec.yaml').write_text('id: fixture-paid\nmodel: fake-paid\nsystem: prompts/test.md\ncontext: []\ntools: []\nmcp: []\nbudget: {turns: 1, tool_calls: 0, usd: 1, seconds: 15}\ntasks: [tasks/instrument]\ntrials: 1\nhypothesis: "fixture-1738: fake paid transport instrumentation."\n')
+        child_env = {**env, 'CSGATEWAY_ENDPOINT': gateways['dev']+'/v1/agent/model.call'}
+        result = subprocess.run([str(runner), 'run', 'spec.yaml'], cwd=estate, env=child_env, text=True, capture_output=True, timeout=30)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        rows = [json.loads(line) for line in (estate/'ledger/ledger.jsonl').read_text().splitlines()]
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row['estate'] == 'dev', row
+        assert row['cost_class'] == 'api' and row['cost_usd'] == 0, row
+        assert row['est_basis'] == 'rate' and abs(row['est_usd'] - 5*.01/1000) < 1e-12, row
+        requests = [json.loads(line) for line in log.read_text().splitlines()]
+        assert len(requests) == 7 and requests[-1]['body']['model'] == 'fake-paid'
+        assert any('canned completion' in m['content'] for m in requests[-1]['body']['messages'])
+    finally:
+        release.touch()
+        pool.shutdown(wait=True, cancel_futures=True)
+        for process in reversed(processes):
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for output in outputs:
+            output.close()
+print('check: two gateways obey estate shares; one Lab fake-paid run records api, rate estimate, zero wallet charge and its upstream call')

@@ -1,0 +1,196 @@
+@import 'tailwindcss';
+@import '../../vendor/livewire/flux/dist/flux.css';
+
+@source '../views';
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../../vendor/livewire/flux-pro/stubs/**/*.blade.php';
+@source '../../vendor/livewire/flux/stubs/**/*.blade.php';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+    --font-sans: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+
+    --color-zinc-50: #fafafa;
+    --color-zinc-100: #f5f5f5;
+    --color-zinc-200: #e5e5e5;
+    --color-zinc-300: #d4d4d4;
+    --color-zinc-400: #a3a3a3;
+    --color-zinc-500: #737373;
+    --color-zinc-600: #525252;
+    --color-zinc-700: #404040;
+    --color-zinc-800: #262626;
+    --color-zinc-900: #171717;
+    --color-zinc-950: #0a0a0a;
+
+    /* The frame: the rail and thread panel sit a step darker than the main column, as in Codex, Claude and ChatGPT. */
+    --color-cs-main: #212121;
+    --color-cs-shell: #181818;
+    --color-cs-shell-light: #f9f9f9;
+    --color-cs-raised: #2a2a2a;
+
+    --color-accent: var(--color-neutral-800);
+    --color-accent-content: var(--color-neutral-800);
+    --color-accent-foreground: var(--color-white);
+}
+
+@layer theme {
+    .dark {
+        --color-accent: var(--color-white);
+        --color-accent-content: var(--color-white);
+        --color-accent-foreground: var(--color-neutral-800);
+    }
+}
+
+@layer base {
+
+    *,
+    ::after,
+    ::before,
+    ::backdrop,
+    ::file-selector-button {
+        border-color: var(--color-gray-200, currentColor);
+    }
+}
+
+[data-flux-field]:not(ui-radio, ui-checkbox) {
+    @apply grid gap-2;
+}
+
+[data-flux-label] {
+    @apply  !mb-0 !leading-tight;
+}
+
+input:focus[data-flux-control],
+textarea:focus[data-flux-control],
+select:focus[data-flux-control] {
+    @apply outline-hidden ring-2 ring-accent ring-offset-2 ring-offset-accent-foreground;
+}
+
+/* \[:where(&)\]:size-4 {
+    @apply size-4;
+} */
+
+/* Flux tables are whitespace-nowrap, so one long task title or usage note pushed the other columns off the window. */
+[data-flux-table] [data-flux-cell] {
+    white-space: normal;
+}
+
+[x-cloak] {
+    display: none !important;
+}
+
+/*
+ * Density: the references (Codex, Claude, ChatGPT) are tight because of rhythm, not small type. Table rows and
+ * cards lose their generous default padding; the type stays the same size.
+ */
+[data-flux-table] [data-flux-cell],
+[data-flux-table] [data-flux-column] {
+    padding-block: 0.5rem;
+}
+
+[data-flux-card] {
+    padding: 1rem 1.25rem;
+    border-radius: 0.875rem;
+}
+
+/*
+ * A code block in Markdown (App\Client\MarkdownHtml): a bar with the language and a copy button, then the code.
+ * Long lines wrap instead of scrolling sideways.
+ */
+.cs-code {
+    margin-block: 0.75rem;
+    overflow: hidden;
+    border-radius: 0.75rem;
+    border: 1px solid rgb(0 0 0 / 0.08);
+    background: rgb(0 0 0 / 0.03);
+}
+
+.dark .cs-code {
+    border-color: rgb(255 255 255 / 0.08);
+    background: rgb(255 255 255 / 0.04);
+}
+
+.cs-code-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.25rem 0.375rem 0 0.875rem;
+    font-size: 0.75rem;
+    line-height: 1.75rem;
+    color: var(--color-zinc-500);
+}
+
+.cs-code-copy {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-radius: 0.375rem;
+    padding: 0 0.5rem;
+    cursor: pointer;
+}
+
+.cs-code-copy:hover {
+    background: rgb(0 0 0 / 0.06);
+    color: var(--color-zinc-900);
+}
+
+.dark .cs-code-copy:hover {
+    background: rgb(255 255 255 / 0.08);
+    color: white;
+}
+
+.cs-code pre {
+    margin: 0;
+    padding: 0.25rem 0.875rem 0.75rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Coloured code (App\Client\CodeColour): each token has its light colour inline and its dark one as a variable. */
+.dark .cs-code pre.cs-coloured .token {
+    color: var(--phiki-dark-color) !important;
+}
+
+/*
+ * The composer: Flux's editor without its frame, sized like the text box it replaced. A code block typed or pasted
+ * into it looks like the ones in the thread.
+ */
+[data-cs-composer] [data-flux-editor] [data-slot="content"] {
+    min-height: 1.5rem;
+    max-height: 15rem;
+    overflow-y: auto;
+    padding: 0 0.375rem;
+    font-size: 15px;
+    line-height: 1.5rem;
+    color: inherit;
+}
+
+[data-cs-composer] [data-flux-editor] [data-slot="content"] p {
+    margin: 0;
+}
+
+[data-cs-composer] [data-flux-editor] [data-slot="content"] pre {
+    margin: 0.375rem 0;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.625rem;
+    background: rgb(0 0 0 / 0.05);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.dark [data-cs-composer] [data-flux-editor] [data-slot="content"] pre {
+    background: rgb(255 255 255 / 0.06);
+}
+
+[data-cs-composer] [data-flux-editor] [data-slot="content"] pre code {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+}

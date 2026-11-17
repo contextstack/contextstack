@@ -1,0 +1,14 @@
+{
+  "description": "Operator: prove a scheduled task's tracked setup link resolves to the hash-stamped prepared corpus checkout, and that tagged lane runtime (Playwright 1208 + browse) is present. Missing runtime is a $0 refusal; this op never installs a browser.",
+  "schema": {
+    "type": "object",
+    "required": ["task"],
+    "properties": {
+      "task": {"type": "string"},
+      "setup": {"type": "string"},
+      "expected_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+      "require_ready": {"type": "boolean"}
+    },
+    "additionalProperties": false
+  }
+}

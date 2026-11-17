@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Offline first-run audit steps 22–23/#9: recoverable, working hosted lead."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'scripts'))
+import cs_lead
+import cs_ui
+
+check_model = cs_lead.check_model
+
+
+class FakeOwner:
+    def __init__(self, url, credential):
+        self.credential = credential
+
+    def upload_files(self, files):
+        return [{'path': k, 'sha256': cs_lead.sha256(v), 'mode': 420} for k, v in sorted(files.items())]
+
+    def request(self, method, path, body=None, key=None):
+        calls.append((method, path, key))
+        if method == 'GET' and path == 'models':
+            return 200, {'models': models, 'default_model': 'codex'}, b''
+        if method == 'GET' and path == 'credentials':
+            return 200, {'credentials': credentials}, b''
+        if method == 'DELETE':
+            credentials[:] = [c for c in credentials if c['id'] != path.split('/')[-1]]
+            return 200, {}, b''
+        if path == 'credentials/lead':
+            if fail[0] == 'credential':
+                fail[0] = None
+                return 503, {}, b''
+            c = {'id': 'cred' + str(len(credentials)), 'conversation_id': body['conversation_id']}
+            credentials.append(c)
+            return 201, dict(c, credential_id=c['id'], token='secret'), b''
+        if path == 'me':
+            return 200, credentials[-1], b''
+        if method == 'POST' and path == 'conversations':
+            if key not in conversations:
+                conversations[key] = {'conversation_id': 'con_' + str(len(conversations)), **body}
+            if fail[0] == 'lost-create':
+                fail[0] = None
+                raise cs_lead.LeadError('lost response')
+            conv = dict(conversations[key])
+            if body.get('spec') == 'hosted-lead':
+                conv.update(lead=True, spec_version='bundle-hash')
+            return 201, {'conversation': conv}, b''
+        if method == 'GET' and path.startswith('conversations/'):
+            return 200, {'conversation': next(iter(conversations.values()))}, b''
+        if method == 'POST' and path.endswith('/turns'):
+            turns.setdefault(key, {'turn_id': 'turn' + str(len(turns))})
+            return 201, {'turn': turns[key]}, b''
+        if path.startswith('turns/'):
+            if fail[0] == 'wait':
+                return 200, {'turn': {'state': 'running'}}, b''
+            return 200, {'turn': {'state': 'done', 'reply': 'Hello! I checked the connection.'}}, b''
+        raise AssertionError((method, path))
+
+
+def run(root, **flags):
+    args = SimpleNamespace(config_root=str(root), director='http://fixture', credential_file=str(root / 'owner'),
+                           node='workstation', model=None, title=None, name=None, new=False, no_open=False,
+                           json=False, verbose=False, welcome_timeout=0)
+    vars(args).update(flags)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        cs_lead.create(args, cs)
+    return output.getvalue()
+
+
+with scratch_dir(prefix='cs-lead-create-') as tmp:
+    root = Path(tmp)
+    (root / 'config').mkdir()
+    (root / 'owner').write_text('owner')
+    (root / 'config/install.json').write_text(json.dumps({'default_model': 'codex'}))
+    cs = cs_lead.types_shim()
+    cs.ROOT, cs.CONFIG, cs.PLATFORM = root, root / 'config', 'macos'
+    models = [{'name': 'claude-code-sonnet', 'available': True, 'cost_class': 'subscription'}]
+    conversations, credentials, turns, calls, fail = {}, [], {}, [], [None]
+    with patch.object(cs_lead, 'OwnerClient', FakeOwner), patch.object(cs_lead, 'check_model') as probe, \
+         patch.object(cs_ui, 'issue_url', return_value='http://fixture/ui/#code=private'), \
+         patch.object(cs_ui, 'open_browser', return_value=True) as opener, patch('sys.stdin.isatty', return_value=True):
+        for available, expected in [
+            (['claude-code-opus', 'claude-code-sonnet'], 'claude-code-sonnet'),
+            (['codex', 'claude-code-sonnet-planner', 'claude-code-opus-judge',
+              'claude-code-sonnet-patch', 'claude-code-opus'], 'claude-code-opus'),
+        ]:
+            models[:] = [{'name': name, 'available': name in available, 'cost_class': 'subscription'}
+                         for name in set(available + ['claude-code-sonnet'])]
+            output = run(root, new=True)
+            assert probe.call_args.args[1] == expected
+            assert 'lead: using %s (signed in)' % cs_lead.LEAD_MODELS[expected] in output
+            cid = list(conversations.values())[-1]['conversation_id']
+            assert json.loads((root / 'state/lead-sessions' / cid / 'meta.json').read_text())['model'] == expected
+        models[:] = [{'name': 'codex', 'available': True, 'cost_class': 'subscription'}]
+        # Use the real check_model so the existing interactive login offer is exercised.
+        import cs_init
+        with patch.object(cs_lead, 'check_model', wraps=check_model), \
+             patch.object(cs_init.Init, 'probe', return_value={
+                 'name': 'claude', 'path': '/fixture/claude', 'signed_in': False, 'how': 'claude auth login'}), \
+             patch.object(cs_init.Init, 'offer_login', return_value=False) as login:
+            try:
+                run(root, new=True)
+                raise AssertionError('no ready lead must offer login')
+            except cs_lead.LeadError as error:
+                assert 'not ready' in str(error)
+            login.assert_called_once()
+        calls.clear()
+        output = run(root, new=True, model='codex')
+        assert probe.call_args.args[1] == 'codex'
+        assert not any(path == 'models' for _, path, _ in calls), '--model bypasses selection'
+        assert 'lead: using codex (requested with --model)' in output
+        # Reset the fake estate before recovery cases.
+        opener.reset_mock()
+        conversations.clear()
+        credentials.clear()
+        turns.clear()
+        (root / 'config/hosted-lead.json').unlink()
+        models[:] = [{'name': 'claude-code-sonnet', 'available': True, 'cost_class': 'subscription'}]
+        fail[0] = 'credential'
+        try:
+            run(root)
+            raise AssertionError('partial failure must be reported')
+        except cs_lead.LeadError:
+            pass
+        output = run(root)
+        assert len(conversations) == 1, 'credential failure must resume the same conversation'
+        assert len(turns) == 1 and 'Your lead says: Hello!' in output
+        assert 'Hosted lead ready on workstation (Claude Sonnet).' in output
+        assert opener.call_count == 1 and '&conversation=con_0' in opener.call_args.args[0]
+        assert probe.call_args.args[1] == 'claude-code-sonnet', 'prefer ready Sonnet over init default'
+        output = run(root)
+        assert 'Your hosted lead is already set up' in output
+        assert len(conversations) == 1 and len(turns) == 1
+        opener.reset_mock()
+        output = run(root, no_open=True)
+        assert not opener.called and 'http://fixture/ui/#code=' in output
+        assert 'Open this link' in output
+        (root / 'config/hosted-lead.json').unlink()
+        fail[0] = 'lost-create'
+        try:
+            run(root, new=True)
+        except cs_lead.LeadError:
+            pass
+        run(root)
+        assert len(conversations) == 2, 'lost response must replay persistent key'
+        assert len(turns) == 2
+        (root / 'config/hosted-lead.json').unlink()
+        fail[0] = 'wait'
+        try:
+            run(root, new=True)
+            raise AssertionError('wait must be bounded')
+        except cs_lead.LeadError as error:
+            assert 'resume waiting' in str(error)
+        fail[0] = None
+        run(root)
+        assert len(turns) == 3, 'resume waiting without another welcome'
+        # An interrupted mint may have returned a token that never reached disk.
+        record = json.loads((root / 'config/hosted-lead.json').read_text())
+        cs_lead.session_credential_path(root, record['conversation_id']).unlink()
+        before = len(credentials)
+        run(root)
+        assert len(credentials) == before and any(m == 'DELETE' for m, _, _ in calls)
+        output = run(root, json=True)
+        assert json.loads(output)['conversation_id'] and 'secret' not in output
+        with patch.object(cs_lead, 'check_model', side_effect=cs_lead.LeadError('sign in')):
+            before = len(conversations)
+            try:
+                run(root, new=True)
+            except cs_lead.LeadError:
+                pass
+            assert len(conversations) == before
+    # Exercise init's real Codex sign-in probe with an offline executable.
+    codex = root / 'codex'
+    codex.write_text('#!/bin/sh\necho "Logged in using fixture"\n')
+    codex.chmod(0o755)
+    with patch.dict(os.environ, CS_AGENT_PATH=str(root)):
+        cs_lead.check_model(cs, 'codex')
+        codex.write_text('#!/bin/sh\necho "Not logged in"\nexit 1\n')
+        with patch('sys.stdin.isatty', return_value=False):
+            try:
+                cs_lead.check_model(cs, 'codex')
+                raise AssertionError('unsigned model must fail')
+            except cs_lead.LeadError as error:
+                assert 'codex login' in str(error)
+    # Exercise the real cs ui opener with a stub executable, never a real browser.
+    stub = root / 'open'
+    stub.write_text('#!/bin/sh\nprintf invoked > "$OPEN_MARKER"\n')
+    stub.chmod(0o755)
+    with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.defpath, OPEN_MARKER=str(root / 'opened')):
+        assert cs_ui.open_browser('http://fixture/ui/#code=test', 'macos')
+    assert (root / 'opened').read_text() == 'invoked'
+print('cs-lead-create: ok (offline recovery, reuse, welcome, open, no-open, auth, JSON)')

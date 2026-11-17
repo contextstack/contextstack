@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Worktree + sparse + cloned installs keep a corpus workspace under 50 MB."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Directly imported estate helpers must see the same isolated roots as children.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+LAB = Path(__file__).resolve().parents[3]
+LIMIT = 50 * 1024 * 1024
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _setup_workspace import forget_worktree, materialize  # noqa: E402
+
+
+def git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, env={**hermetic_env()})
+
+
+def du_bytes(path):
+    out = subprocess.check_output(["du", "-sk", str(path)], text=True, env={**hermetic_env()})
+    return int(out.split()[0]) * 1024
+
+
+with scratch_dir(prefix="setup-workspace-") as raw:
+    root = Path(raw)
+    lab = root / "lab"
+    origin = root / "origin"
+    origin.mkdir(parents=True)
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.email", "fixture@example.test")
+    git(origin, "config", "user.name", "Fixture")
+    (origin / "composer.lock").write_text('{"packages":[]}\n')
+    (origin / "artisan").write_text("<?php\n")
+    (origin / "app").mkdir()
+    (origin / "app" / "ok.txt").write_text("app\n")
+    (origin / "tests").mkdir()
+    (origin / "tests" / "ok.txt").write_text("tests\n")
+    (origin / "public").mkdir()
+    (origin / "public" / "index.php").write_text("<?php\n")
+    (origin / "other").mkdir()
+    (origin / "other" / "huge.bin").write_bytes(b"H" * (40 * 1024 * 1024))
+    git(origin, "add", ".")
+    git(origin, "commit", "-qm", "base")
+    head = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "HEAD"], text=True, env={**hermetic_env()}).strip()
+
+    setup = lab / "ledger/setups/corpus"
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(setup)], check=True, env={**hermetic_env()})
+    git(setup, "update-ref", "refs/lab/base", head)
+    (setup / "public" / "build").mkdir(parents=True)
+    (setup / "public" / "build" / "manifest.json").write_text("{}\n")
+    vendor = setup / "vendor" / "pkg"
+    vendor.mkdir(parents=True)
+    (vendor / "blob").write_bytes(b"V" * (40 * 1024 * 1024))
+
+    task = lab / "tasks/work/corpus-cell"
+    task.mkdir(parents=True)
+    (task / "goal.md").write_text("cell\n")
+    (task / "notes.md").write_text("writes: app/*,tests/*\n")
+    (task / "setup").symlink_to(setup)
+
+    ws = lab / "ledger/runs/run-1/workspace"
+    materialize(task / "setup", ws, task=task, lab=lab)
+    assert (ws / "app" / "ok.txt").read_text() == "app\n"
+    assert (ws / "tests" / "ok.txt").read_text() == "tests\n"
+    assert (ws / "storage" / "framework" / "views").is_dir()
+    assert (ws / "public" / "build" / "manifest.json").read_text() == "{}\n"
+    assert not (ws / "other" / "huge.bin").exists()
+    assert (ws / "vendor").is_dir() and not (ws / "vendor").is_symlink()
+    blob = ws / "vendor" / "pkg" / "blob"
+    assert blob.is_file()
+    blob.write_bytes(b"mutated")
+    (ws / "vendor" / "COW").write_text("workspace")
+    assert (vendor / "blob").read_bytes()[:1] == b"V"
+    cache = next((lab / "ledger/setups/installs").glob("*/vendor"))
+    assert cache.is_dir() and not cache.is_symlink()
+    assert (cache / "pkg" / "blob").read_bytes()[:1] == b"V"
+    assert not (cache / "COW").exists()
+    assert not os.access(cache, os.W_OK)
+    size = du_bytes(ws)
+    assert size < LIMIT, "workspace %s bytes (cap 50 MB)" % size
+    published = subprocess.run(
+        [str(LAB / "ops/bin/setup-workspace")],
+        input=json.dumps({"setup": str(setup), "workspace": str(lab / "ledger/runs/run-2/workspace"),
+                          "task": str(task), "lab": str(lab)}),
+        text=True, capture_output=True, cwd=str(LAB),
+        env={**hermetic_env()},
+    )
+    assert published.returncode == 0, published.stderr
+    body = json.loads(published.stdout.splitlines()[-1])
+    assert body.get("ok") and body.get("tag")
+    forget_worktree(ws)
+    forget_worktree(lab / "ledger/runs/run-2/workspace")
+    installs = lab / "ledger/setups/installs"
+    for path in (*installs.rglob("*"), installs):
+        if path.exists() and not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() else 0o644)
+
+    plain = root / "plain-setup"
+    plain.mkdir()
+    (plain / "note.txt").write_text("plain\n")
+    (plain / "vendor" / "pkg").mkdir(parents=True)
+    (plain / "vendor" / "pkg" / "blob").write_bytes(b"V" * (40 * 1024 * 1024))
+    copied = root / "plain-ws"
+    materialize(plain, copied, lab=lab)
+    assert (copied / "note.txt").read_text() == "plain\n"
+    assert (copied / "vendor").is_dir() and not (copied / "vendor").is_symlink()
+    assert du_bytes(copied) < LIMIT
+    for path in (*installs.rglob("*"), installs):
+        if path.exists() and not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() else 0o644)
+
+print("check: corpus setup materializes as a worktree under 50 MB with cloned vendor")

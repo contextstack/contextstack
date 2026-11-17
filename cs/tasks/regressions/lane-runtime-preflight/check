@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+PREFLIGHT = LAB / "ops/bin/setup-preflight"
+
+
+def git(cwd, *args):
+    env = {**hermetic_env(), "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "f@example.test",
+           "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "f@example.test"}
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                          check=True, env=env)
+
+
+with scratch_dir(prefix="lane-runtime-preflight-") as raw:
+    root = Path(raw)
+    task = root / "task"
+    task.mkdir()
+    (task / "goal.md").write_text("fixture\n")
+    (task / "check").write_text("#!/bin/sh\nexit 0\n")
+    (task / "check").chmod(0o755)
+    prepared = root / "setup"
+    prepared.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(prepared)], check=True)
+    (prepared / "CORPUS.md").write_text("fixture\n")
+    git(prepared, "add", "CORPUS.md")
+    git(prepared, "commit", "-qm", "base")
+    git(prepared, "update-ref", "refs/lab/base", "HEAD")
+    head = git(prepared, "rev-parse", "HEAD").stdout.strip()
+    (task / "setup").symlink_to(prepared)
+    cache = root / "ms-playwright"
+    cache.mkdir()
+    browse = root / "missing-browse"
+    env = {**hermetic_env(), "PLAYWRIGHT_BROWSERS_PATH": str(cache), "LAB_BROWSE": str(browse),
+           "PATH": "/usr/bin:/bin"}
+    result = subprocess.run(
+        [str(PREFLIGHT)],
+        input=json.dumps({"task": str(task), "setup": str(prepared),
+                          "expected_head": head, "require_ready": True}),
+        text=True, capture_output=True, env=env)
+    assert result.returncode != 0, result.stdout
+    combined = (result.stderr or "") + (result.stdout or "")
+    assert "refusing at $0" in combined, combined
+    assert "1208" in combined or "browse" in combined, combined
+    assert "playwright" not in (result.stdout or "").lower() or "missing" in combined
+
+print("check: missing Playwright/browse is a $0 setup-preflight refusal")

@@ -1,0 +1,9 @@
+{
+  "exit": 1,
+  "stdout": "browser_fetch: gstack browse is unavailable; set LAB_BROWSE to its executable\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"url\": \"https://93.184.216.34/source\"}, \"name\": \"browser_fetch\"}\n",
+    "_evidence/manifest.jsonl": null
+  },
+  "untouched": true
+}

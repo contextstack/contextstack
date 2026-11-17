@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">ContextStack bounded stack mark</title>
+  <desc id="description">Three overlapping rounded frames representing bounded context layers.</desc>
+  <defs>
+    <linearGradient id="surface" x1="64" y1="448" x2="448" y2="64" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#06b6d4"/>
+      <stop offset="0.52" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="frame" x1="92" y1="420" x2="420" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ecfeff"/>
+      <stop offset="0.48" stop-color="#a5f3fc"/>
+      <stop offset="1" stop-color="#c7d2fe"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="#09090b"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#surface)" opacity="0.16"/>
+  <rect x="176" y="96" width="240" height="240" rx="52" fill="none" stroke="#818cf8" stroke-width="28" opacity="0.62"/>
+  <rect x="136" y="136" width="240" height="240" rx="52" fill="#09090b" stroke="#38bdf8" stroke-width="28" opacity="0.86"/>
+  <rect x="96" y="176" width="240" height="240" rx="52" fill="#09090b" stroke="url(#frame)" stroke-width="28"/>
+  <circle cx="292" cy="372" r="18" fill="#22d3ee"/>
+</svg>

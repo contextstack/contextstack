@@ -1,0 +1,15 @@
+[
+ {
+  "ok": {
+   "text": "local",
+   "tool_calls": [],
+   "model": "local-coder",
+   "cost": {
+    "currency": "USD",
+    "amount": "0.250000",
+    "class": "free_local"
+   },
+   "cost_numbers": false
+  }
+ }
+]

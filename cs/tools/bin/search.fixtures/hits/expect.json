@@ -1,0 +1,8 @@
+{
+  "exit": 0,
+  "stdout": "./a.txt:1:alpha\n./a.txt:3:gamma",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"pattern\": \"^(alpha|gamma)$\"}, \"name\": \"search\"}\n"
+  },
+  "untouched": true
+}

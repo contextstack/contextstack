@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""state-root-readers (CS phase 6 step 10). goal.md has the contract.
+
+  static    no op under ops/bin (nor a tools/bin tool) builds a path as <lab> / "ledger/..." any more: every shelf
+            goes through _estate_io.state_dir (or _roots); repo-tier tools that commit or classify the
+            git path ledger/ (estate-commit) are the named exception
+  relocate  with LAB_STATE_ROOT outside the checkout, run-identity reads
+            the relocated ledger and never creates <lab>/ledger
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+EXEMPT = {"estate-commit", "_roots.py", "_estate_io.py"}
+PAT = re.compile(r'''(Path\([A-Za-z_.]+\)|\b(?:LAB|lab|api\.LAB|root)\b)\s*/\s*["']ledger(?:/[^"'\n]*)?["']''')
+FAILED = []
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:600]) if detail else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def static():
+    found = []
+    tools = [t for t in (LAB / "tools/bin").iterdir() if t.is_file()]  # model tools too (P3)
+    for p in sorted(list((LAB / "ops/bin").iterdir()) + tools):
+        if not p.is_file() or p.name in EXEMPT or p.name.endswith(".json"):
+            continue
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            continue
+        found += ["%s:%d" % (p.name, i + 1) for i, l in enumerate(lines) if not l.lstrip().startswith("#") and PAT.search(l)
+                  and '__import__("pathlib")' not in l  # the guarded fallback: default layout where _estate_io predates state_dir
+                  and 'LAB_STATE_ROOT' not in l]  # a tool's default when no state root is set (the checkout layout)
+    expect(not found, "static: no shelf path is built under <lab>/ledger outside _estate_io/_roots", found)
+
+
+def relocate(scratch):
+    code, state = scratch / "lab", scratch / "state"
+    (code / "ops").mkdir(parents=True)
+    shutil.copytree(LAB / "ops/bin", code / "ops/bin", ignore=shutil.ignore_patterns("__pycache__"))
+    for name in ("INVARIANTS.md",):
+        shutil.copy2(LAB / name, code / name)
+    (code / "ESTATE").write_text("relocated\n")
+    (code / "specs").mkdir()
+    state.mkdir()
+    (state / "ledger.jsonl").write_text(json.dumps({"exp": "fixture-7001", "spec": "fx", "trial": 1, "verdict": "pass",
+                                                     "transcript": "ledger/runs/fx-run", "estate": "relocated", "executed_by": {"runner": {"kind": "fixture"}}}) + "\n")
+    (state / "dispatch.jsonl").write_text(json.dumps({"ts": "2026-11-10T00:00:00Z", "id": "1", "spec": "specs/fx.yaml",
+                                                       "state": "pending", "pid": 0, "lane": "production"}) + "\n")
+    (state / "schedules.jsonl").write_text("")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(scratch), "LAB_STATE_ROOT": str(state),
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def op(name, payload=None):
+        r = subprocess.run([sys.executable, str(code / "ops/bin" / name)], input=json.dumps(payload or {}), text=True,
+                           capture_output=True, cwd=str(code), env=env, timeout=120)
+        try:
+            return r.returncode, json.loads(r.stdout.strip().splitlines()[-1]), r.stderr
+        except (ValueError, IndexError):
+            return r.returncode, {}, r.stderr[-600:]
+
+    rc, out, err = op("run-identity")
+    expect(rc == 0 and out.get("run_id") == "fx-run" and out.get("source") == "row",
+           "relocate: run-identity reads the relocated ledger", (out, err))
+    expect(not (code / "ledger").exists(), "relocate: <lab>/ledger was never created",
+           sorted(p.name for p in code.iterdir()))
+
+
+def main():
+    static()
+    scratch = Path(tempfile.mkdtemp(prefix="state-root-readers-", suffix=".noindex"))
+    try:
+        relocate(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("\ncheck: state-root-readers %d assertion(s) failed%s" % (len(FAILED), (": " + "; ".join(FAILED)) if FAILED else ""))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

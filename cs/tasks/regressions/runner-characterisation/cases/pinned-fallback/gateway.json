@@ -1,0 +1,9 @@
+[
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": [],
+   "model": "fx-pinned-model"
+  }
+ }
+]

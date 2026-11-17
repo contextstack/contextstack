@@ -1,0 +1,242 @@
+{
+  "exit_code": 1,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "capture-stimulus",
+      "stdin": {
+        "adapter": "runner",
+        "hooks": [],
+        "prompts": [
+          "prompts/coder-min.md"
+        ],
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1",
+        "run_id": "<RUNSTAMP>-fx-budget-turns-fx-t1",
+        "runner_implementation": "<RUNNER>",
+        "runner_path": "<RUNNER_PATH>",
+        "spec": "specs/fx.yaml",
+        "spec_sha": "6c39e163e284bea9f05163835bd85a9f1dd42bde52728f6f2aaa9457bfc58fd2",
+        "task": "tasks/fx",
+        "tools": [
+          "fx_tool"
+        ],
+        "trial": 1,
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "publish-evidence",
+      "stdin": {
+        "adapter": "runner",
+        "check_exit": 1,
+        "check_output": "cat: hello.txt: No such file or directory\n",
+        "check_skipped": false,
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1",
+        "stop": "budget:turns",
+        "verdict": "fail"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "1.000000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-budget-turns",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.990000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          },
+          {
+            "content": "looping",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "mode": "echo"
+                },
+                "id": "1",
+                "name": "fx_tool"
+              }
+            ]
+          },
+          {
+            "content": "[fx_tool {\"mode\":\"echo\"}]\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
+            "role": "tool",
+            "tool_call_id": "1"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-budget-turns",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    }
+  ],
+  "rows": [
+    {
+      "cost_class": "api",
+      "cost_usd": 0.02,
+      "env_sha": "<ENV_SHA>",
+      "est_basis": "rate",
+      "est_usd": 0.02,
+      "estate": "dev",
+      "model": "fake-model",
+      "seconds": "<SECONDS>",
+      "spec": "fx-budget-turns",
+      "spec_sha": "6c39e163e284bea9f05163835bd85a9f1dd42bde52728f6f2aaa9457bfc58fd2",
+      "stimulus_sha": "<STIMULUS_SHA>",
+      "stop": "budget:turns",
+      "task": "tasks/fx",
+      "task_sha": "93cb431da1cef22a7d34a14d103f90ad3987451606e052447cbe9aa28fa171dc",
+      "tool_calls": 2,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 2,
+      "verdict": "fail"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-budget-turns-fx-t1",
+      "entries": [
+        "check.json",
+        "evidence",
+        "finalize.lock",
+        "finalized.json",
+        "messages.jsonl",
+        "ready_for_inspection",
+        "stimulus",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "frozen": {
+        "check": "#!/bin/sh\n[ \"$(cat hello.txt)\" = \"hello\" ]\n",
+        "goal.md": "Create hello.txt containing exactly: hello\n"
+      },
+      "transcript": "# fx-budget-turns · tasks/fx · trial 1\n\nmodel fake · budget 2 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nlooping\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n### turn 2\n\nlooping\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n---\nstop budget:turns · verdict **fail** · turns 2 · tools 2 · cost $0.0200\n",
+      "workspace": {}
+    }
+  ],
+  "stderr": [],
+  "stdout": [
+    "  tasks/fx                       t1  fail stop=budget:turns turns=2 tools=2 $0.0200"
+  ]
+}

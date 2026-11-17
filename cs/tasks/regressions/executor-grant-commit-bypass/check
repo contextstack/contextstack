@@ -1,0 +1,5 @@
+#!/bin/sh
+# Live mechanical gate: tasks/work/cli-executor-gates/check (mini lab tree).
+# This regression exists to name the audit row in notes.md.
+echo "check: notes-only; live gate is tasks/work/cli-executor-gates"
+exit 0

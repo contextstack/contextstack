@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+lab = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(lab / "ops/bin"))
+from _est import parse_usage
+
+
+def est(text, prompt="prompt"):
+    row = parse_usage(text, prompt, 0.01)
+    return row["est_usd"], row["est_basis"], row.get("input_tokens"), row.get("output_tokens"), row.get("cache_creation_tokens")
+
+
+probe = '{"type":"result","total_cost_usd":0.168047,"usage":{"input_tokens":2,"cache_creation_input_tokens":41745,"output_tokens":10}}'
+got = est(probe)
+if got != (0.168047, "api_list", 2, 10, 41745):
+    raise SystemExit("check: metered lost to formula: %s %s %s %s %s" % got)
+
+no_meter = '{"usage":{"input_tokens":2,"cache_creation_input_tokens":41745,"output_tokens":10}}'
+est_usd, basis, _, _, _ = est(no_meter)
+if basis != "rate" or abs(est_usd - 0.41757) > 1e-9:
+    raise SystemExit("check: rate fallback missed cache-creation: %s %s" % (est_usd, basis))
+
+old = (2 + 10) * 0.01 / 1000.0
+if 0.168047 / old < 1400:
+    raise SystemExit("check: 1400x ratio drifted: %s" % (0.168047 / old))
+
+est_usd, basis, _, _, _ = est("not json", "x" * 1000)
+if (est_usd, basis) != (0.01, "chars"):
+    raise SystemExit("check: chars fallback unlabeled: %s %s" % (est_usd, basis))
+print("check: est-meter 1400x ok")

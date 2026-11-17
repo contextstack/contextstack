@@ -1,0 +1,149 @@
+[
+  {
+    "kind": "toolchain",
+    "request": {
+      "toolchains": {
+        "cargo_configured": false,
+        "read_roots": [],
+        "proxy_paths": []
+      }
+    },
+    "expected": [],
+    "name": "unconfigured",
+    "oracle": "_toolchains.toolchain_rules"
+  },
+  {
+    "kind": "toolchain",
+    "request": {
+      "toolchains": {
+        "cargo_configured": true,
+        "read_roots": [
+          "/typed home+[test]/.rustup",
+          "/typed home+[test]/.cargo/registry"
+        ],
+        "proxy_paths": [
+          "/typed home+[test]/.cargo/bin/cargo"
+        ]
+      }
+    },
+    "expected": [
+      "(deny file-write* (subpath \"/typed home+[test]/.rustup\"))",
+      "(deny file-write* (subpath \"/typed home+[test]/.cargo/registry\"))",
+      "(deny file-write* (literal \"/typed home+[test]/.cargo/bin/cargo\"))",
+      "(allow file-read-metadata (literal \"/typed home+[test]/.cargo/bin\"))",
+      "(allow file-read-metadata (literal \"/typed home+[test]/.cargo\"))"
+    ],
+    "name": "cargo configured",
+    "oracle": "_toolchains.toolchain_rules"
+  },
+  {
+    "kind": "toolchain",
+    "request": {
+      "toolchains": {
+        "cargo_configured": false,
+        "read_roots": [
+          "/typed home+[test]/uv python"
+        ],
+        "proxy_paths": [
+          "/typed home+[test]/.local/bin/uv"
+        ]
+      }
+    },
+    "expected": [
+      "(deny file-write* (subpath \"/typed home+[test]/uv python\"))",
+      "(deny file-write* (literal \"/typed home+[test]/.local/bin/uv\"))",
+      "(allow file-read-metadata (literal \"/typed home+[test]/.local/bin\"))",
+      "(allow file-read-metadata (literal \"/typed home+[test]/.local\"))"
+    ],
+    "name": "uv",
+    "oracle": "_toolchains.toolchain_rules"
+  },
+  {
+    "kind": "toolchain",
+    "request": {
+      "toolchains": {
+        "cargo_configured": false,
+        "read_roots": [
+          "/typed home+[test]/php"
+        ],
+        "proxy_paths": []
+      }
+    },
+    "expected": [
+      "(deny file-write* (subpath \"/typed home+[test]/php\"))"
+    ],
+    "name": "php",
+    "oracle": "_toolchains.toolchain_rules"
+  },
+  {
+    "kind": "caller",
+    "request": {
+      "lane": {
+        "common_git_dir": "/typed home+[test]/repo \"git\"",
+        "own_worktree": "/typed home+[test]/own",
+        "own_git_dir": "/typed home+[test]/repo \"git\"/worktrees/own",
+        "other_worktrees": [
+          "/typed home+[test]/z",
+          "/typed home+[test]/own",
+          "/typed home+[test]/a"
+        ],
+        "ref_paths": [
+          "/typed home+[test]/repo \"git\"/refs/heads/lane/own",
+          "/typed home+[test]/repo \"git\"/logs/refs/heads/lane/own"
+        ]
+      }
+    },
+    "expected": [
+      "(deny file-write* (subpath \"/typed home+[test]/repo \\\"git\\\"\"))",
+      "(deny file-write* (subpath \"/typed home+[test]/a\"))",
+      "(deny file-write* (subpath \"/typed home+[test]/z\"))",
+      "(allow file-write* (subpath \"/typed home+[test]/own\"))",
+      "(allow file-write* (subpath \"/typed home+[test]/repo \\\"git\\\"/worktrees/own\"))",
+      "(allow file-write* (subpath \"/typed home+[test]/repo \\\"git\\\"/objects\"))",
+      "(allow file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/refs/heads/lane/own\"))",
+      "(allow file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/refs/heads/lane/own.lock\"))",
+      "(allow file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/logs/refs/heads/lane/own\"))",
+      "(allow file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/logs/refs/heads/lane/own.lock\"))",
+      "(allow file-read* (subpath \"/typed home+[test]/own\"))",
+      "(allow file-read* (subpath \"/typed home+[test]/repo \\\"git\\\"/worktrees/own\"))",
+      "(allow file-read* (subpath \"/typed home+[test]/repo \\\"git\\\"\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/config\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/config.lock\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/config.worktree\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/config.worktree.lock\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/commondir\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/commondir.lock\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/gitdir\"))",
+      "(deny file-write* (literal \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/gitdir.lock\"))",
+      "(deny file-write* (subpath \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/info\"))",
+      "(deny file-write* (subpath \"/typed home+[test]/repo \\\"git\\\"/worktrees/own/hooks\"))"
+    ],
+    "name": "lane with absent ref files and quoted git paths",
+    "oracle": "_lanes.sandbox_rules"
+  },
+  {
+    "kind": "caller",
+    "request": {
+      "deny_write_roots": [
+        "/typed home+[test]/config"
+      ],
+      "run_protection": {
+        "run_root": "/run",
+        "workspace": "/workspace",
+        "tmpdir": "/tmp/private",
+        "refresh_write_paths": [
+          "/run/refresh"
+        ]
+      }
+    },
+    "expected": [
+      "(deny file-write* (subpath \"/typed home+[test]/config\"))",
+      "(deny file-write* (subpath \"/run\"))",
+      "(allow file-write* (subpath \"/workspace\"))",
+      "(allow file-write* (subpath \"/tmp/private\"))",
+      "(allow file-write* (subpath \"/run/refresh\"))"
+    ],
+    "name": "caller denies and refresh run protection",
+    "oracle": "_harness_usage.deny_write_rules and _executor caller extras"
+  }
+]

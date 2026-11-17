@@ -1,0 +1,11 @@
+{
+  "runtime": "python3",
+  "sandbox": {"net": "all"},
+  "description": "Fetch one public HTTPS URL. Saves the complete response bytes and provenance metadata under _evidence/; validates redirects and blocks local/private destinations.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {"url": {"type": "string", "description": "Public HTTPS URL to fetch."}},
+    "required": ["url"],
+    "additionalProperties": false
+  }
+}

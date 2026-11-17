@@ -1,0 +1,28 @@
+{
+  "impl": "rust",
+  "source": "gateway/",
+  "build": [
+    "sh",
+    "-c",
+    "cargo build --release -q -p cs-gateway && cp ../target/release/cs-gateway \"$0\"",
+    "{out}"
+  ],
+  "upstream_env": {
+    "ollama": "OLLAMA_ENDPOINT",
+    "vllm": "VLLM_ENDPOINT"
+  },
+  "ca_env": [
+    "SSL_CERT_FILE"
+  ],
+  "env": {},
+  "disable_endpoints": [],
+  "capabilities": {
+    "tls_intercept": true
+  },
+  "_notes": [
+    "build: run from gateway/, builds the workspace's release binary and copies it to the runner's {out}. CSGATEWAY_BIN=<repo>/target/release/cs-gateway skips it.",
+    "upstream_env: the same variables as Go (the Rust gateway reads Go's environment contract unchanged).",
+    "ca_env: rustls with native roots honours SSL_CERT_FILE on every platform (no GODEBUG equivalent is needed).",
+    "disable_endpoints: none. vllm-spark2 is not compiled in (G5 moved it to a host overlay file), so nothing local needs guarding."
+  ]
+}

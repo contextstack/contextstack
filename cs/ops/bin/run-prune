@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Prune workspace clones for terminal scheduled runs; keep run evidence."""
+import json
+import os
+import shutil
+import sys
+import tempfile
+import subprocess
+import time
+from pathlib import Path
+
+from _estate_io import state_dir
+
+TERMINAL_STATES = {"done", "error", "operator_close", "cancelled"}
+
+
+def evidence_resolvable(run_dir):
+    """(ok, reason) — the frozen copy must be readable and whole before prune."""
+    manifest = run_dir / "evidence/manifest.json"
+    if not manifest.is_file():
+        return False, "no published evidence"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, "evidence manifest unreadable"
+    if data.get("capture_state") != "complete":
+        return False, "evidence incomplete"
+    blob = run_dir / "evidence" / str((data.get("diff") or {}).get("path") or "")
+    if not blob.is_file():
+        return False, "candidate diff blob missing"
+    if not (run_dir / "stimulus/manifest.json").is_file():
+        return False, "stimulus manifest missing"
+    if not (run_dir / "ready_for_inspection").is_file():
+        return False, "run was never ready for inspection"
+    return True, ""
+
+
+def dir_size(path):
+    total = 0
+    for entry in path.rglob("*"):
+        if entry.is_file() and not entry.is_symlink():
+            try:
+                total += entry.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def selected_runs(dispatch_path, runs_root):
+    selected, seen = [], set()
+    if not dispatch_path.is_file():
+        return selected
+    runs_root = runs_root.resolve()
+    for raw in dispatch_path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if not isinstance(row.get("schedule_id"), str) or not row["schedule_id"]:
+            continue
+        if row.get("state") not in TERMINAL_STATES:
+            continue
+        transcript = row.get("transcript")
+        if not isinstance(transcript, str) or not transcript:
+            continue
+        try:
+            run_dir = (runs_root.parent.parent / transcript).resolve()
+        except OSError:
+            continue
+        if run_dir.parent != runs_root or run_dir in seen:
+            continue
+        seen.add(run_dir)
+        selected.append(run_dir)
+    return selected
+
+
+def preserve_manifest(source, destination):
+    fd, tmp = tempfile.mkstemp(prefix=".landing-manifest.", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(source.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main():
+    root = Path(__file__).resolve().parent.parent.parent
+    raw = sys.stdin.read().strip()
+    try:
+        args = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        print(json.dumps({"error": "invalid JSON on stdin"}))
+        return 1
+    if not isinstance(args, dict) or set(args) - {"apply"}:
+        print(json.dumps({"error": "expected only optional boolean apply"}))
+        return 1
+    apply_value = args.get("apply", False)
+    if not isinstance(apply_value, bool):
+        print(json.dumps({"error": "apply must be boolean"}))
+        return 1
+
+    runs = selected_runs(state_dir(root) / "dispatch.jsonl", state_dir(root) / "runs")
+    pruned = preserved = missing = before = after = 0
+    unresolved = []
+    for run_dir in runs:
+        workspace = run_dir / "workspace"
+        if not workspace.is_dir() or workspace.is_symlink():
+            missing += 1
+            continue
+        size = dir_size(workspace)
+        before += size
+        if not apply_value:
+            after += size
+            continue
+        # Never delete the only copy: a run captured under the lifecycle
+        # contract must have resolvable published evidence before its
+        # workspace goes. Otherwise the candidate diff is lost for good.
+        if (run_dir / "stimulus/manifest.json").is_file():
+            kept, why = evidence_resolvable(run_dir)
+            if not kept:
+                unresolved.append({"run": run_dir.name, "reason": why})
+                after += size
+                continue
+        manifest = workspace / "_evidence/run-manifest.json"
+        if manifest.is_file():
+            try:
+                preserve_manifest(manifest, run_dir / "landing-manifest.json")
+            except OSError:
+                after += size
+                continue
+            preserved += 1
+        shutil.rmtree(workspace)
+        pruned += 1
+    if apply_value and pruned:
+        (state_dir(root) / "last-prune").write_text(
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "\n")
+
+    print(json.dumps({
+        "mode": "apply" if apply_value else "dry-run",
+        "selected": len(runs),
+        "pruned": pruned,
+        "preserved_manifests": preserved,
+        "missing_workspaces": missing,
+        "unresolved_evidence": unresolved,
+        "bytes_before": before,
+        "bytes_after": after,
+    }, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

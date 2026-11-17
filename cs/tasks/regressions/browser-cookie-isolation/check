@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+CANARY = "ESTATE_COOKIE_CANARY_7e95d3b2"
+
+
+def fetch(workspace, state, fake, log, url="https://tasks.google.com/tasks/", fail_goto=False,
+          visibility=None):
+    env = {**hermetic_env(), "LAB_BROWSE": str(fake), "LAB_BROWSER_STATE": str(state),
+           "LAB_FAKE_LOG": str(log), "LAB_COOKIE_CANARY": CANARY,
+           "LAB_FAKE_FAIL_GOTO": "1" if fail_goto else "0",
+           "LAB_FAKE_URL": "https://accounts.google.com/signin" if "tasks.google.com" in url
+                           else url}
+    if visibility:
+        env["LAB_BROWSER_VISIBILITY"] = visibility
+    return subprocess.run(
+        [str(LAB / "tools/bin/browser_fetch")],
+        input=json.dumps({"url": url, "archive": True}),
+        text=True, cwd=workspace, env=env, capture_output=True,
+    )
+
+
+with scratch_dir(prefix="browser-cookie-isolation-") as raw:
+    root = Path(raw)
+    run = root / "run"
+    workspace = run / "workspace"
+    setup = root / "setup"
+    state = root / "operator-state"
+    for path in (workspace, setup, state):
+        path.mkdir(parents=True)
+    fake = root / "browse"
+    fake.write_text("""#!/bin/sh
+set -eu
+echo "$(dirname "$BROWSE_STATE_FILE")|$*" >> "$LAB_FAKE_LOG"
+if [ "$1" = "--headed" ]; then shift; fi
+case "$1" in
+  goto) mkdir -p "$(dirname "$BROWSE_STATE_FILE")"; printf '{"pid":1}\n' > "$BROWSE_STATE_FILE"; [ "$LAB_FAKE_FAIL_GOTO" = 1 ] && exit 9; echo "Navigated to $2 (200)" ;;
+  wait) echo "Page loaded" ;;
+  url) echo "$LAB_FAKE_URL" ;;
+  cookie-import-browser)
+    mkdir -p "$(dirname "$BROWSE_STATE_FILE")/chromium-profile/Default"
+    printf '%s' "$LAB_COOKIE_CANARY" > "$(dirname "$BROWSE_STATE_FILE")/session-state.json"
+    printf '%s' "$LAB_COOKIE_CANARY" > "$(dirname "$BROWSE_STATE_FILE")/chromium-profile/Default/Cookies"
+    echo "Imported cookie $LAB_COOKIE_CANARY" ;;
+  js) printf 'Authenticated Google Tasks fixture.\\n' > "$4"; echo written ;;
+  archive) printf 'fixture mhtml archive' > "$2"; echo archived ;;
+  stop) (sleep 0.1; rm -f "$BROWSE_STATE_FILE") >/dev/null 2>&1 & echo stopped ;;
+  *) exit 2 ;;
+esac
+""")
+    fake.chmod(0o755)
+    log = root / "browse.log"
+
+    for forbidden in (workspace / "browser-state", setup / "browser-state"):
+        result = fetch(workspace, forbidden, fake, log)
+        assert result.returncode != 0, "cookie-bearing state accepted inside workspace/setup"
+
+    result = fetch(workspace, state, fake, log)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt.get("archive_omitted") == "authenticated_session"
+    assert "archive_path" not in receipt
+    (run / "transcript.md").write_text(result.stdout + result.stderr, encoding="utf-8")
+    auth_state = state / "google-auth"
+    assert CANARY.encode() in (auth_state / "session-state.json").read_bytes()
+    assert CANARY.encode() in (auth_state / "chromium-profile/Default/Cookies").read_bytes()
+    assert not any("|archive " in line for line in log.read_text().splitlines())
+
+    for url, partition in (("https://x.com/example", "x-auth-chrome"),
+                           ("https://www.linkedin.com/in/example/", "linkedin-auth-chrome")):
+        authenticated = fetch(workspace, state, fake, log, url)
+        assert authenticated.returncode == 0, authenticated.stderr
+        authenticated_receipt = json.loads(authenticated.stdout)
+        assert authenticated_receipt.get("auth") == "local_browser_cookie_import"
+        assert "archive_path" not in authenticated_receipt
+        assert CANARY.encode() in (state / partition / "session-state.json").read_bytes()
+
+    failed = fetch(workspace, state, fake, log, "https://x.com/failing", fail_goto=True)
+    assert failed.returncode != 0, "failed navigation unexpectedly passed"
+
+    headed = fetch(workspace, state, fake, log, "https://x.com/debug", visibility="headed")
+    assert headed.returncode == 0, headed.stderr
+
+    public = fetch(workspace, state, fake, log, "https://example.com/article")
+    assert public.returncode == 0, public.stderr
+    public_receipt = json.loads(public.stdout)
+    assert public_receipt.get("auth") is None
+    assert public_receipt.get("archive_path"), "public browsing lost archive support"
+    roots = {line.split("|", 1)[0] for line in log.read_text().splitlines()}
+    assert str((state / "google-auth").resolve()) in roots
+    assert str((state / "x-auth-chrome").resolve()) in roots
+    assert str((state / "linkedin-auth-chrome").resolve()) in roots
+    assert str((state / "public").resolve()) in roots
+    lines = log.read_text().splitlines()
+    assert sum(line.endswith("|--headed stop") for line in lines) == 5
+    assert sum(line.endswith("|stop") for line in lines) == 1
+    assert not any(state.glob("*/state.json")), "browser state survived completed teardown"
+
+    source = (LAB / "tools/bin/browser_fetch").read_text(encoding="utf-8")
+    assert "--headed" in source and "Google Chrome.app" in source
+    assert 'LAB_BROWSER_ENGINE' in source and 'LAB_BROWSER_VISIBILITY' in source
+    assert 'LAB_BROWSER_KEEP_OPEN' in source
+    assert 'str(os.getpid())' in source
+    assert 'while state_file.exists()' in source
+    assert 'stop_browser(*cleanup)' in source
+
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+    subprocess.run(["git", "-c", "user.name=lab", "-c", "user.email=lab@local",
+                    "commit", "--allow-empty", "-q", "-m", "base"], cwd=workspace, check=True)
+    harvested = subprocess.run(
+        [str(LAB / "ops/bin/harvest")],
+        input=json.dumps({"workspace": str(workspace), "slug": "cookie-canary",
+                          "run_id": "regression"}),
+        text=True, cwd=LAB, capture_output=True,
+     env={**hermetic_env()})
+    assert harvested.returncode == 0, harvested.stderr
+    branch = json.loads(harvested.stdout)["branch"]
+
+    for tree in (run, setup):
+        for path in tree.rglob("*"):
+            if path.is_file() and CANARY.encode() in path.read_bytes():
+                raise AssertionError("cookie canary leaked into " + str(path))
+    # Harvest commits into its host-owned repo beside the workspace.
+    import sys
+    sys.path.insert(0, str(LAB / "ops/bin"))
+    from _harvest_git import repository
+    repo = repository(workspace)
+    def harvested_git(*args):
+        return subprocess.run(["git", "--git-dir=" + str(repo), *args], check=True, capture_output=True)
+    listed = harvested_git("ls-tree", "-r", "--name-only", branch).stdout.decode().splitlines()
+    assert listed, "harvest branch is empty"
+    for rel in listed:
+        content = harvested_git("show", branch + ":" + rel).stdout
+        assert CANARY.encode() not in content, "cookie canary leaked into harvest branch"
+
+print("check: browser cookies stay outside runs, setup, evidence, spill, and harvest")

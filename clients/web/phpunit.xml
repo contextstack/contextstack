@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+>
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <!-- A fixed, test-only key (not a secret): lanes have no .env, and the real one must never be copied into them. -->
+        <env name="APP_KEY" value="base64:C65M2V6rA/gw09gSphIAjJrV0RIH8fg7alQmcuPz9YI="/>
+        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+        <env name="CACHE_STORE" value="array"/>
+        <!-- client-web keeps no database: a connection that does not exist, so any use of one fails the test. -->
+        <env name="DB_CONNECTION" value="none"/>
+        <env name="MAIL_MAILER" value="array"/>
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        <env name="SESSION_DRIVER" value="array"/>
+        <env name="DIRECTOR_URL" value="http://director.test"/>
+        <env name="DIRECTOR_LOCAL_CREDENTIAL" value="/nonexistent/client-web-tests/local-credential"/>
+        <env name="CLIENT_WEB_SETTINGS" value="/nonexistent/client-web-tests/connection.json"/>
+    </php>
+</phpunit>

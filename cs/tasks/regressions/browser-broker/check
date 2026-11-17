@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""browser-broker regression (goal.md). Offline: a fake Chrome on the debugging pipe, no real browser."""
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+REPO = LAB.parent
+BROKER = LAB / "ops/bin/browser-broker"
+TOOL = LAB / "tools/bin/browser_session"
+FAKE = HERE / "fake-chrome"
+WRAPPER = Path(os.environ.get("CS_SANDBOX_BIN") or REPO / "target/release/cs-sandbox")
+SETS = {"public": ["https://example.com"], "other": ["https://other.example"]}
+FAILED = []
+BROKERS = []  # every broker started, each the leader of its own process group
+PROBE = """#!%s
+import json, os, socket, sys
+mode, arg = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else ""
+def unix(path):
+    s = socket.socket(socket.AF_UNIX); s.settimeout(20); s.connect(path); return s
+try:
+    if mode == "env":
+        print(json.dumps(sorted(k for k in os.environ if k.startswith("CS_SOCKET_")))); sys.exit(0)
+    if mode == "granted":
+        s = unix(os.environ["CS_SOCKET_BROWSER_PUBLIC"])
+        s.sendall(b'{"verb": "open", "url": "https://example.com/"}\\n')
+        print("granted " + json.loads(s.makefile().readline())["text"].strip())
+    elif mode == "unix":
+        unix(arg); print("connected")
+    elif mode == "tcp":
+        socket.create_connection(("127.0.0.1", int(arg)), timeout=5); print("connected")
+    elif mode == "dns":
+        socket.create_connection(("example.com", 443), timeout=5); print("connected")
+except Exception as error:
+    print("refused %%s" %% type(error).__name__)
+"""
+
+
+def expect(ok, what, detail=None):
+    print(("ok   " if ok else "FAIL ") + what + ("" if ok or detail is None else " : %r" % (detail,)))
+    if not ok:
+        FAILED.append(what)
+
+
+def ask(path, payload):
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(20)
+    s.connect(str(path))
+    s.sendall(payload if isinstance(payload, bytes) else json.dumps(payload).encode() + b"\n")
+    return json.loads(s.makefile("rb").readline())
+
+
+def fake_log(path):
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def start(root, cfg, log, extra=(), env=None):
+    # Own session and process group: a terminal ^C reaches only this check, which stops the broker in order.
+    proc = subprocess.Popen([sys.executable, str(BROKER), "serve", "--root", str(root), "--config", str(cfg),
+                             "--chrome", str(FAKE), *extra], env={**hermetic_env(), 'FAKE_CHROME_LOG': str(log), **(env or {})},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    BROKERS.append(proc)
+    deadline = time.time() + 20
+    while time.time() < deadline and proc.poll() is None:
+        if all((root / "sockets" / (n + ".sock")).is_socket() for n in SETS):
+            return proc, json.loads(proc.stdout.readline())
+        time.sleep(0.05)
+    return proc, None
+
+
+def stop(proc):
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    return proc.returncode
+
+
+def survivors(needle):
+    """Pids (other than ours) whose command line names `needle`: a broker or its Chrome for this run's root."""
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    rows = (line.strip().split(None, 1) for line in out.splitlines())
+    return [int(r[0]) for r in rows if len(r) == 2 and needle in r[1] and int(r[0]) != os.getpid()]
+
+
+def reap(root):
+    """Stop every broker this run started (its whole process group: SIGTERM, then SIGKILL), then make sure
+    nothing naming the run's root survives. Chrome sits in its own group and exits when the broker's pipe
+    closes; anything still alive after 10 s is killed and reported. Returns the pids that had to be killed."""
+    for proc in BROKERS:
+        if proc.poll() is not None:
+            continue  # already reaped: its pid (and group id) may belong to someone else now
+        for sig, wait in ((signal.SIGTERM, 15), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(proc.pid, sig)
+                proc.wait(timeout=wait)
+                break
+            except ProcessLookupError:
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    deadline, left = time.time() + 10, survivors(str(root))
+    while left and time.time() < deadline:
+        time.sleep(0.2)
+        left = survivors(str(root))
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return left
+
+
+def on_signal(signum, _frame):
+    raise SystemExit(128 + signum)  # unwinds main's finally: reap and remove the root
+
+
+def refuses(root, cfg, needle, what, extra=(), env=None):
+    r = subprocess.run([sys.executable, str(BROKER), "serve", "--root", str(root), "--config", str(cfg),
+                        "--chrome", str(FAKE), *extra], capture_output=True, text=True, timeout=30,
+                       env={**hermetic_env(), **(env or {})})
+    expect(r.returncode == 1 and needle in r.stderr, what, r.stderr)
+
+
+def wrapped(policy, ws, argv, stdin="", reports=None):
+    cmd = [str(WRAPPER), "--policy", str(policy), "--cwd", str(ws)]
+    cmd += ["--report-dir", str(reports)] if reports else []
+    env = {k: v for k, v in hermetic_env().items() if k != "LAB_BROWSER_BROKER_EXEC"}
+    return subprocess.run(cmd + ["--", *map(str, argv)], input=stdin, capture_output=True, text=True,
+                          timeout=60, env=dict(env, LAB_CODE_ROOT=str(LAB)))
+
+
+def broker_contract(root, cfg, log):
+    proc, ready = start(root, cfg, log)
+    expect(ready is not None and ready.get("chrome") == "FakeChrome/1" and ready.get("chrome_sandbox") is True,
+           "broker starts on the pipe and serves each set, Chrome's sandbox on",
+           None if ready else proc.stderr.read())
+    if ready is None:
+        stop(proc)
+        return None
+    pub, other = root / "sockets/public.sock", root / "sockets/other.sock"
+    modes = [oct(p.stat().st_mode & 0o777) for p in (pub, other, root / "sockets", root / "agent-profile")]
+    expect(modes == ["0o600", "0o600", "0o700", "0o700"], "sockets 0600, socket dir and profile 0700", modes)
+    argv = fake_log(log)[0]["argv"]
+    expect("--remote-debugging-pipe" in argv and "--user-data-dir=%s" % (root / "agent-profile") in argv
+           and "--headless" in argv and "--use-mock-keychain" in argv and "--password-store=basic" in argv
+           and (root / "keychain-mode").read_text() == "mock\n" and not any("sandbox" in a or "remote-debugging-port" in a for a in argv),
+           "chrome argv: pipe, the dedicated profile, headless, mock keychain by default (recorded), no --no-sandbox or port", argv)
+    r = ask(pub, {"verb": "open", "url": "https://example.com/"})
+    expect(r.get("ok") and r.get("text") == "Example fixture page.\n" and r.get("status") == 200
+           and r.get("navigations") == ["https://example.com/"], "open: an allowlisted page returns its text", r)
+    r = ask(pub, {"verb": "open", "url": "https://example.com/in"})
+    expect(r.get("ok") and r.get("navigations") == ["https://example.com/in", "https://example.com/"],
+           "open: an in-set redirect is followed and both hops are recorded", r)
+    before = sum(1 for e in fake_log(log) if e.get("method") == "Target.createTarget")
+    r = ask(pub, {"verb": "open", "url": "https://other.example/"})
+    after = sum(1 for e in fake_log(log) if e.get("method") == "Target.createTarget")
+    expect(not r.get("ok") and "not in set public" in r.get("error", "") and before == after,
+           "open: another set's origin is refused before any tab opens", (r, before, after))
+    r = ask(other, {"verb": "open", "url": "https://other.example/"})
+    expect(r.get("ok") and r.get("set") == "other", "the other set's socket serves only its own origins", r)
+    r = ask(pub, {"verb": "open", "url": "https://example.com/out"})
+    failed = [e for e in fake_log(log) if e.get("method") == "Fetch.failRequest"]
+    expect(not r.get("ok") and "ERR_BLOCKED_BY_CLIENT" in r.get("error", "") and len(failed) == 1
+           and failed[0]["params"]["errorReason"] == "BlockedByClient",
+           "open: a redirect hop off the set is failed in Chrome (Fetch.failRequest) and refused", (r, failed))
+    r = ask(pub, {"verb": "open", "url": "https://example.com/spoof"})
+    expect(not r.get("ok") and "left set public" in r.get("error", "") and "text" not in r,
+           "open: a final URL off the set returns no text", r)
+    r = ask(pub, {"verb": "open", "url": "https://example.com/popup"})
+    closed = [e["params"]["targetId"] for e in fake_log(log) if e.get("method") == "Target.closeTarget"]
+    expect(r.get("ok") and "POPUP" in closed, "open: a window the page opened is closed with the tab", closed)
+    for payload, needle, what in ((b'{"verb": "evaluate", "expression": "document.cookie"}\n', "unknown verb", "a verb other than open"),
+                                  (b"x" * 70000 + b"\n", "exceeds", "an oversized request"),
+                                  (b"not json\n", "bad request", "a malformed request"),
+                                  ({"verb": "open", "url": "http://example.com/"}, "not in set", "an http URL")):
+        r = ask(pub, payload)
+        expect(not r.get("ok") and needle in r.get("error", ""), "refused: " + what, r)
+    rows = [json.loads(line) for line in (root / "log/broker.jsonl").read_text().splitlines()]
+    expect(len(rows) == 11 and all({"ts", "set", "verb", "ok", "ms"} <= set(r) for r in rows)
+           and rows[4]["blocked"] == ["https://evil.example/"] if len(rows) > 4 else False,
+           "log: one row per request, blocked hops named", len(rows))
+    return proc
+
+
+def lifecycle(root, cfg, log, proc):
+    refuses(root, cfg, "is live", "a second broker on a live socket refuses to start")
+    code = stop(proc)
+    expect(code == 0 and not any((root / "sockets").iterdir()) and fake_log(log)[-1].get("method") == "Browser.close",
+           "SIGTERM closes Chrome (Browser.close) and removes the sockets", (code, list((root / "sockets").iterdir())))
+    stale = socket.socket(socket.AF_UNIX)
+    stale.bind(str(root / "sockets/public.sock"))
+    stale.close()
+    proc, ready = start(root, cfg, log)
+    expect(ready is not None, "a stale socket is replaced")
+    stop(proc)
+    (root / "sockets/public.sock").write_text("not a socket")
+    refuses(root, cfg, "is not a socket", "a non-socket at the socket path refuses startup and is kept")
+    (root / "sockets/public.sock").unlink()
+    os.chmod(root / "sockets", 0o777)
+    refuses(root, cfg, "not group/world-writable", "a world-writable socket directory refuses startup")
+    os.chmod(root / "sockets", 0o700)
+    refuses(Path(tempfile.gettempdir()) / "bbr-outside", cfg, "must lie under", "a root outside ~/.contextstack refuses")
+    refuses(root, cfg, "would make its cookies unreadable", "a mock-keychain profile refuses a --keychain start",
+            ["--keychain"])
+    (root / "keychain-mode").rename(root / "keychain-mode.kept")
+    (root / "agent-profile/Local State").write_text("{}")  # a profile Chrome has used
+    refuses(root, cfg, "no keychain-mode record", "a used profile with no keychain-mode record refuses")
+    (root / "keychain-mode.kept").rename(root / "keychain-mode")
+    fresh = root.parent / "fresh"
+    proc, ready = start(fresh, cfg, log, ["--keychain"])
+    expect(ready is not None and (fresh / "keychain-mode").read_text() == "keychain\n"
+           and "--use-mock-keychain" not in [e for e in fake_log(log) if "argv" in e][-1]["argv"],
+           "--keychain on a fresh profile uses the OS keychain and records it", fake_log(log)[-3:])
+    stop(proc)
+    # A Chrome that exits before the first CDP write (as a blocked sandbox does, faster than the broker under load)
+    # is a closed pipe the sandbox fallback handles, never a BrokenPipeError crash: forced here with closed pipes.
+    probe = ("import importlib.machinery as m, importlib.util as u, os, sys\n"
+             "l = m.SourceFileLoader('bb', sys.argv[1]); b = u.module_from_spec(u.spec_from_loader('bb', l)); l.exec_module(b)\n"
+             "r, w = os.pipe(); r2, w2 = os.pipe(); os.close(r); os.close(w2)\n"
+             "try: b.CDP(w, r2).call('Browser.getVersion', timeout=5)\n"
+             "except b.BrokerError as e: print(e)\n")
+    r = subprocess.run([sys.executable, "-c", probe, str(BROKER)], capture_output=True, text=True, timeout=30, env={**hermetic_env()})
+    expect(r.stdout.strip() == "chrome closed the debugging pipe", "a Chrome gone before the first write is a closed pipe",
+           (r.stdout, r.stderr[-300:]))
+    blocked = {"FAKE_CHROME_NO_SANDBOX": "1"}
+    nosb = root.parent / "nosandbox"
+    refuses(nosb, cfg, "pass --allow-no-chrome-sandbox", "a host that blocks Chrome's sandbox refuses startup", env=blocked)
+    expect(not survivors(str(nosb)) and not (nosb / "sockets/public.sock").exists(),
+           "the refusal leaves no Chrome and no socket", survivors(str(nosb)))
+    proc, ready = start(nosb, cfg, log, ["--allow-no-chrome-sandbox"], env=blocked)
+    argvs = [e["argv"] for e in fake_log(log) if "argv" in e]
+    expect(ready is not None and ready.get("chrome_sandbox") is False and "--no-sandbox" not in argvs[-2]
+           and "--no-sandbox" in argvs[-1] and "WARNING" in (proc.stderr.readline() if proc.stderr else ""),
+           "--allow-no-chrome-sandbox: tries the sandbox, then retries with --no-sandbox and says so", (ready, argvs[-2:]))
+    stop(proc)
+    proc, ready = start(root.parent / "sandbox-ok", cfg, log, ["--allow-no-chrome-sandbox"])
+    expect(ready is not None and ready.get("chrome_sandbox") is True and "--no-sandbox" not in
+           [e for e in fake_log(log) if "argv" in e][-1]["argv"],
+           "--allow-no-chrome-sandbox on a host whose sandbox works keeps it on", ready)
+    stop(proc)
+
+
+def confinement(root, cfg, log):
+    if not WRAPPER.is_file():
+        print("skip: %s not built; confinement half not run" % WRAPPER)
+        return
+    proc, ready = start(root, cfg, log)
+    try:
+        expect(ready is not None, "broker restarts for the confinement half")
+        ws = root / "ws"
+        ws.mkdir()
+        host = json.loads((LAB / "policy/sandbox.json").read_text())
+        host.update(allow_net=["none"], sockets={"browser-public": str(root / "sockets/public.sock"),
+                                                 "browser-other": str(root / "sockets/other.sock"),
+                                                 "browser-absent": str(root / "sockets/absent.sock")})
+        host.pop("profiles", None)
+        policy = root / "policy.json"
+        policy.write_text(json.dumps(host))
+        r = wrapped(policy, ws, [TOOL], '{"url": "https://example.com"}')
+        out = json.loads(r.stdout) if r.returncode == 0 else {}
+        expect(out.get("ok") and out.get("renderer") == "chrome-cdp-broker" and (ws / out.get("body_path", "x")).is_file(),
+               "wrapped browser_session reaches its set's socket and writes evidence", (r.stdout, r.stderr))
+        # A set is a symlink browser_<set> -> browser_session with its own descriptor (the wrapper reads <name>.json).
+        for sub_dir, socket_name in (("granted", "browser-other"), ("sneaky", "browser-public")):
+            (ws / sub_dir).mkdir()
+            (ws / sub_dir / "browser_other").symlink_to(TOOL)
+            (ws / sub_dir / "browser_other.json").write_text(json.dumps(
+                {"runtime": "python3", "sandbox": {"net": "none", "sockets": [socket_name]}}))
+        r = wrapped(policy, ws, [ws / "granted/browser_other"], '{"url": "https://other.example/"}')
+        out = json.loads(r.stdout) if r.returncode == 0 else {}
+        expect(out.get("set") == "other" and out.get("preview") == "Other set page.\n",
+               "a set's symlinked name with its own descriptor reaches that set", (r.stdout, r.stderr))
+        r = wrapped(policy, ws, [ws / "sneaky/browser_other"], '{"url": "https://other.example/"}')
+        expect(r.returncode == 1 and "no browser broker socket granted for set other" in r.stderr,
+               "the name alone grants nothing: a descriptor asking for another socket cannot reach the set", r.stderr)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        for name, request in (("probe", ["browser-public", "browser-absent", "browser-unlisted"]), ("bare", [])):
+            (ws / name).write_text(PROBE % sys.executable)
+            (ws / name).chmod(0o755)
+            (ws / (name + ".json")).write_text(json.dumps({"sandbox": {"net": "none", "sockets": request}}))
+        reports = root / "reports"
+        run = lambda *a: wrapped(policy, ws, [ws / a[0], *a[1:]], reports=reports).stdout.strip()
+        expect(run("probe", "env") == '["CS_SOCKET_BROWSER_PUBLIC"]', "only the granted socket is named to the tool",
+               run("probe", "env"))
+        expect(run("probe", "granted") == "granted Example fixture page.", "the probe speaks to the granted socket")
+        expect(run("probe", "unix", root / "sockets/other.sock").startswith("refused"),
+               "another set's socket the host lists is unreachable")
+        expect(run("probe", "unix", Path.home() / ".contextstack/gateway/csgateway.sock").startswith("refused"),
+               "the gateway's socket path is unreachable")
+        expect(run("probe", "tcp", port).startswith("refused"), "TCP to a live 127.0.0.1 port is refused")
+        expect(run("probe", "dns", "").startswith("refused"), "the internet (example.com:443) is unreachable")
+        expect(run("bare", "unix", root / "sockets/public.sock").startswith("refused"),
+               "without the request, the broker's socket is unreachable")
+        listener.close()
+        narrowed = [n for f in sorted(reports.iterdir()) for n in json.loads(f.read_text())["narrowed"]]
+        socket_narrowings = sorted({(n["capability"], n["requested"]) for n in narrowed if n["capability"] == "socket"})
+        expect(socket_narrowings == [("socket", "browser-absent"), ("socket", "browser-unlisted")],
+               "an absent and an unlisted socket are narrowed and reported", socket_narrowings)
+    finally:
+        stop(proc)
+
+
+def interrupted(signum):
+    """Run this check with --hold (it starts a broker and waits), interrupt it, and require that no broker,
+    no Chrome and no temp root survive."""
+    child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--hold"], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, start_new_session=True, env={**hermetic_env()})
+    try:
+        held = json.loads(child.stdout.readline() or "{}")
+        root = held.get("root") or "/nonexistent"
+        before = survivors(root)
+        child.send_signal(signum)
+        child.wait(timeout=60)
+        after = survivors(root)
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+    name = signal.Signals(signum).name
+    expect(held.get("broker") in before and len(before) >= 2 and not after and not Path(root).exists(),
+           "%s mid-run stops the broker and its Chrome and removes the temp root" % name,
+           (held, before, after, child.stderr.read()[-400:]))
+
+
+def main():
+    hold = sys.argv[1:] == ["--hold"]
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, on_signal)
+    state = Path.home() / ".contextstack/tmp"
+    state.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="bbr-", dir=state, suffix=".noindex")).resolve()
+    left = []
+    try:
+        cfg = root / "browser.json"
+        cfg.write_text(json.dumps({"version": 1, "chrome": {}, "sets": SETS}))
+        broker = root / "broker"
+        if hold:
+            proc, ready = start(broker, cfg, root / "chrome.log")
+            print(json.dumps({"root": str(root), "broker": proc.pid if ready else None}), flush=True)
+            time.sleep(60)
+            return 0
+        proc = broker_contract(broker, cfg, root / "chrome.log")
+        if proc is not None:
+            lifecycle(broker, cfg, root / "chrome.log", proc)
+            confinement(broker, cfg, root / "chrome.log")
+    finally:
+        left = reap(root)
+        shutil.rmtree(root, ignore_errors=True)
+    if hold:
+        return 0
+    expect(not left, "no broker or Chrome outlives the run", left)
+    interrupted(signal.SIGINT)
+    interrupted(signal.SIGTERM)
+    print("browser-broker: " + ("FAIL " + ", ".join(FAILED) if FAILED else "ok"))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

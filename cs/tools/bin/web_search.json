@@ -1,0 +1,14 @@
+{
+  "runtime": "python3",
+  "sandbox": {"net": "all"},
+  "description": "Search the public web through DuckDuckGo HTML. Returns up to ten public HTTPS results and saves the raw search response under _evidence/.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": {"type": "string", "description": "Search query, 1-300 characters."},
+      "count": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}
+    },
+    "required": ["query"],
+    "additionalProperties": false
+  }
+}

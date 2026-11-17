@@ -1,0 +1,119 @@
+{
+  "exit_code": 1,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "capture-stimulus",
+      "stdin": {
+        "adapter": "runner",
+        "hooks": [],
+        "prompts": [
+          "prompts/coder-min.md"
+        ],
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-gateway-unreachable-fx-t1",
+        "run_id": "<RUNSTAMP>-fx-gateway-unreachable-fx-t1",
+        "runner_implementation": "<RUNNER>",
+        "runner_path": "<RUNNER_PATH>",
+        "spec": "specs/fx.yaml",
+        "spec_sha": "db46c33ee8a069e83f5eada50142b6c077a7b3933bb2a7c76ad7578b13bea3b0",
+        "task": "tasks/fx",
+        "tools": [
+          "fx_tool"
+        ],
+        "trial": 1,
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-gateway-unreachable-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-gateway-unreachable-fx-t1"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "publish-evidence",
+      "stdin": {
+        "adapter": "runner",
+        "check_exit": 0,
+        "check_output": "",
+        "check_skipped": true,
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-gateway-unreachable-fx-t1",
+        "stop": "error: gateway unreachable: Post \"http://127.0.0.1:1\": dial tcp 127.0.0.1:1: connect: connection refused",
+        "verdict": "void"
+      }
+    }
+  ],
+  "requests": [],
+  "rows": [
+    {
+      "cost_class": "",
+      "cost_usd": 0,
+      "env_sha": "<ENV_SHA>",
+      "est_basis": "rate",
+      "est_usd": 0,
+      "estate": "dev",
+      "model": "fake",
+      "seconds": "<SECONDS>",
+      "spec": "fx-gateway-unreachable",
+      "spec_sha": "db46c33ee8a069e83f5eada50142b6c077a7b3933bb2a7c76ad7578b13bea3b0",
+      "stimulus_sha": "<STIMULUS_SHA>",
+      "stop": "error: gateway unreachable: Post \"http://127.0.0.1:1\": dial tcp 127.0.0.1:1: connect: connection refused",
+      "task": "tasks/fx",
+      "task_sha": "93cb431da1cef22a7d34a14d103f90ad3987451606e052447cbe9aa28fa171dc",
+      "tool_calls": 0,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-gateway-unreachable-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 1,
+      "verdict": "void"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-gateway-unreachable-fx-t1",
+      "entries": [
+        "check.json",
+        "evidence",
+        "finalize.lock",
+        "finalized.json",
+        "messages.jsonl",
+        "ready_for_inspection",
+        "stimulus",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "frozen": {
+        "check": "#!/bin/sh\n[ \"$(cat hello.txt)\" = \"hello\" ]\n",
+        "goal.md": "Create hello.txt containing exactly: hello\n"
+      },
+      "transcript": "# fx-gateway-unreachable · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n**ERROR** gateway unreachable: Post \"http://127.0.0.1:1\": dial tcp 127.0.0.1:1: connect: connection refused\n\n---\nstop error: gateway unreachable: Post \"http://127.0.0.1:1\": dial tcp 127.0.0.1:1: connect: connection refused · verdict **void** · turns 1 · tools 0 · cost $0.0000\n",
+      "workspace": {}
+    }
+  ],
+  "stderr": [],
+  "stdout": [
+    "  tasks/fx                       t1  void stop=error: gateway unreachable: Post \"http://127.0.0.1:1\": dial tcp 127.0.0.1:1: connect: connection refused turns=1 tools=0 $0.0000"
+  ]
+}

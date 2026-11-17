@@ -1,0 +1,12 @@
+{
+  "description": "Operator harvest: commit the run workspace onto lab/<task>-<runid>. Never add .lab-*. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "workspace": {"type": "string", "description": "Absolute path to the run workspace."},
+      "slug": {"type": "string", "description": "Task directory basename."},
+      "run_id": {"type": "string", "description": "Ledger run id."}
+    },
+    "required": ["workspace", "slug", "run_id"]
+  }
+}

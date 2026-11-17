@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Real executor templates for cursor-agent (and its --model templates), antigravity, gemini-cli and codex,
+each binary swapped for a fake that records its environment, proves where it can write and prints canned
+stream-json (goal.md)."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+# Exercise the terminal contract before platform-specific sandbox probes.
+sys.path.insert(0, str(HERE.parents[2] / "ops/bin"))
+from _cli_native import terminal_stop
+final_fixture = (HERE / "cursor-final.jsonl").read_text()
+assert terminal_stop("cursor_result", final_fixture) is None
+assert terminal_stop("cursor_result", final_fixture.rstrip("\n")) is None
+assert terminal_stop("result_event", final_fixture) == "native_terminal_missing"
+for invalid in ("", final_fixture[:len(final_fixture) // 2],
+                final_fixture + '{"type":',
+                final_fixture + '{"type":"tool_call"}\n',
+                '{"type":"thinking","subtype":"completed"}\n'):
+    assert terminal_stop("cursor_result", invalid) == "native_terminal_missing"
+
+# Includes Claude file-login staging, refresh, isolation, and symlink refusal.
+subprocess.run([sys.executable, str(HERE / "read-denies")], check=True, env={**hermetic_env()})
+subprocess.run([sys.executable, str(HERE / "login-copies")], check=True, env={**hermetic_env()})
+LAB_SRC = HERE.parents[2]
+OPS = LAB_SRC / "ops/bin"
+GW_MODELS = LAB_SRC.parent / "gateway" / "models.json"
+CURSOR_MODELS = {
+    "cursor-sol": "gpt-5.6-sol-high",
+    "cursor-codex": "gpt-5.3-codex-high",
+    "cursor-composer": "composer-2.5",
+    "cursor-grok": "grok-4.7-high",
+    "cursor-sonnet": "claude-sonnet-5-thinking-high",
+}
+AGY_MODELS = {
+    "antigravity-hydrogen": "gemini-4-hydrogen-high",
+}
+COPY = ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py",
+        "_yaml.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_job_reason.py",
+        "_cli_native.py", "_harness_usage.py", "_run_record.py", "_env_policy.py", "_errors.py", "capture-stimulus", "publish-evidence",
+        "harvest", "finalize-run")
+FAKE = """#!%(python)s
+import json, os, sys
+from pathlib import Path
+stdin, devnull = os.fstat(0), os.stat("/dev/null")
+report = {"argv": sys.argv[1:], "env": {k: os.environ.get(k) for k in %(keys)r}, "wrote": {},
+          "stdin_devnull": (stdin.st_dev, stdin.st_ino) == (devnull.st_dev, devnull.st_ino)}
+for name in %(writable)r:
+    path = Path(os.environ[name]) / "probe"
+    try:
+        path.write_text("ok")
+        report["wrote"][name] = True
+    except OSError:
+        report["wrote"][name] = False
+home_env, prefix = %(link_root)r
+base = Path(os.environ.get(home_env, "/nonexistent"))
+if prefix:
+    base = base / prefix
+for link in %(links)r:
+    p = base / link
+    report.setdefault("links", {})[link] = [p.is_symlink(), str(p.resolve()) if p.exists() else None]
+    try:
+        p.write_text("tampered")
+        report.setdefault("link_writable", []).append(link)
+    except OSError:
+        pass
+home = Path(os.environ["HOME"])
+if os.environ.get("CODEX_HOME") and sys.platform == "darwin":
+    try:
+        (home / ".claude/.credentials.json").read_bytes()
+    except PermissionError:
+        report["claude_login_denied"] = True
+    else:
+        raise AssertionError("Codex can read Claude credentials")
+report["keychains"] = str((home / "Library/Keychains").resolve()) if (home / "Library/Keychains").exists() else None
+Path("agent-report.json").write_text(json.dumps(report))
+print(open(%(fixture)r).read(), end="", flush=True)
+"""
+KEYS = ["HOME", "CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR", "GEMINI_CLI_HOME", "CODEX_HOME", "TMPDIR", "TMP", "TEMP",
+        "CURSOR_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"]
+CURSOR_OK = [
+    {"type": "system", "subtype": "init", "apiKeySource": "login", "session_id": "s", "model": "Auto"},
+    {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "q"}]}, "session_id": "s"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]}},
+    {"type": "result", "subtype": "success", "is_error": False, "duration_ms": 9, "duration_api_ms": 9,
+     "result": "Done.", "session_id": "s", "request_id": "r",
+     "usage": {"inputTokens": 120, "outputTokens": 30, "cacheReadTokens": 900, "cacheWriteTokens": 10}}]
+AGY_OK = [
+    {"event": "init", "conversation_id": "c", "init": {"cwd": ".", "tools": [], "permission_mode": "always-proceed"}},
+    {"event": "step_update", "conversation_id": "c", "step_index": 1, "state": "ACTIVE", "step_type": "agent_response",
+     "text_delta": "An"},
+    {"event": "step_update", "conversation_id": "c", "step_index": 1, "state": "DONE", "step_type": "agent_response",
+     "text_delta": "ti."},
+    {"event": "result", "result": {"conversation_id": "c", "status": "SUCCESS", "response": "Anti.", "num_turns": 1,
+     "usage": {"input_tokens": 50, "output_tokens": 7, "thinking_tokens": 3, "cache_read_tokens": 5,
+               "total_tokens": 65}}}]
+GEMINI_OK = [
+    {"type": "init", "session_id": "s", "model": "gemini-3-pro"},
+    {"type": "message", "role": "assistant", "content": "Gem.", "delta": True},
+    {"type": "result", "status": "success", "stats": {"input_tokens": 9, "output_tokens": 2, "cached": 0}}]
+CODEX_OK = [
+    {"type": "thread.started", "thread_id": "11111111-1111-1111-1111-111111111111"},
+    {"type": "item.completed", "item": {"id": "1", "type": "agent_message", "text": "ok"}},
+    {"type": "turn.completed", "usage": {"input_tokens": 11, "cached_input_tokens": 0, "output_tokens": 2,
+                                         "reasoning_output_tokens": 0}}]
+
+
+def lines(events):
+    return "".join(json.dumps(e) + "\n" for e in events)
+
+
+def run(root, name, executor, binary, fixture, writable=(), links=(), link_root=("GEMINI_CLI_HOME", ".gemini"),
+        personal=None):
+    lab, home = root / name, root / (name + "-home")
+    ops, task, fake = lab / "ops/bin", lab / "tasks/fixture", root / (name + "-bin")
+    for path in (ops, task, lab / "ledger", fake, home / "Library/Keychains"):
+        path.mkdir(parents=True, exist_ok=True)
+    for rel, text in (personal or {}).items():
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(text)
+    for f in COPY:
+        shutil.copy2(OPS / f, ops / f)
+    from native_runtime import stage_native_runtime
+    stage_native_runtime(ops)
+
+    for module in sorted(OPS.glob("_*.py")):  # direct imports between ops/bin modules: ship every sibling module
+        if not (ops / module.name).exists():
+            shutil.copy2(module, ops / module.name)
+    (root / (name + ".fixture")).write_text(fixture)
+    exe = fake / binary
+    exe.write_text(FAKE % {"python": sys.executable, "keys": KEYS, "writable": list(writable), "links": list(links),
+                           "link_root": link_root, "fixture": str(root / (name + ".fixture"))})
+    exe.chmod(0o755)
+    tmpl = json.loads((OPS / "executor-templates.json").read_text())[executor]
+    (ops / "executor-templates.json").write_text(json.dumps({executor: dict(tmpl, binary=str(exe))}))
+    (lab / "ESTATE").write_text("dev\n")
+    (task / "goal.md").write_text("Do nothing.\n")
+    (task / "check").write_text("#!/bin/sh\nexit 0\n")
+    (task / "check").chmod(0o755)
+    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_", "CSGATEWAY_"))}
+    env.update(HOME=str(home), CURSOR_API_KEY="sk-canary", GEMINI_API_KEY="sk-canary", GOOGLE_API_KEY="sk-canary",
+               OPENAI_API_KEY="sk-canary", CS_TOOLS_BIN=str(LAB_SRC.parent / "target/release/cs-tools"))
+    order = json.dumps({"executor": executor, "task": "tasks/fixture", "exp": "task-fixture", "trial": 1,
+                        "timeout_s": 60})
+    done = subprocess.run([sys.executable, str(ops / "_executor.py")], cwd=lab, env=env, input=order, text=True,
+                          capture_output=True, timeout=120)
+    assert "Traceback" not in done.stderr, done.stderr
+    rows = [json.loads(x) for x in (lab / "ledger/ledger.jsonl").read_text().splitlines()]
+    assert len(rows) == 1, rows
+    run_dir = lab / rows[0]["transcript"]
+    ws = run_dir / "workspace"
+    report = json.loads((ws / "agent-report.json").read_text()) if (ws / "agent-report.json").is_file() else None
+    leftovers = [p for p in run_dir.rglob("*") if p.is_symlink() and not str(p.resolve()).startswith(str(run_dir))]
+    assert not leftovers, ("links into personal files kept in run evidence", leftovers)
+    assert "sk-canary" not in (run_dir / "cli.log").read_text()
+    return done, rows[0], report, run_dir, home
+
+
+with scratch_dir(prefix="cli-agent-runtimes-") as raw:
+    root = Path(raw).resolve()
+
+    # cursor-agent: headless flags, private config/data dirs it can write, no API key, usage from result.usage.
+    done, row, rep, run_dir, home = run(root, "cursor", "cursor-agent", "cursor-agent", lines(CURSOR_OK),
+                                        writable=("CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR"))
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    for flag in ("--print", "--force", "--trust", "stream-json"):
+        assert flag in rep["argv"], rep["argv"]
+    assert "--model" not in rep["argv"], rep["argv"]  # Auto: no --model
+    assert rep["env"]["CURSOR_API_KEY"] is None and rep["env"]["HOME"] == str(home), rep["env"]
+    for k in ("CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR"):
+        assert rep["env"][k].startswith(str(run_dir / "tmp")) and rep["wrote"][k], rep
+    assert (row["input_tokens"], row["output_tokens"], row["cache_read_tokens"], row["cache_creation_tokens"],
+            row["reported_model"]) == (120, 30, 900, 10, "Auto"), row
+    assert json.loads((run_dir / "messages.jsonl").read_text().splitlines()[-1])["text"] == "Done."
+    for broken, stop in ((CURSOR_OK[:3], "native_terminal_missing"),
+                         (CURSOR_OK[:3] + [dict(CURSOR_OK[3], is_error=True)], "native_terminal_error")):
+        done, row, *_ = run(root, "cursor-" + stop, "cursor-agent", "cursor-agent", lines(broken))
+        assert done.returncode != 0 and (row["verdict"], row["stop"]) == ("fail", stop), row
+
+    # Real Cursor final shape: workstation run 20261112-152840-cursor-composer-sec-config-symlinks-t1.
+    final = (HERE / "cursor-final.jsonl").read_text()
+    for suffix, stream in (("newline", final), ("eof", final.rstrip("\n"))):
+        done, row, *_ = run(root, "cursor-final-" + suffix, "cursor-agent", "cursor-agent", stream)
+        assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    event = json.loads(final)
+    for suffix, stream in (
+        ("thinking", lines([{"type": "thinking", "subtype": "completed"}])),
+        ("cut", final[:len(final) // 2]),
+        ("tool", lines([dict(event, message={"role": "assistant", "content": [
+            {"type": "tool_use", "id": "redacted", "name": "shell", "input": {}}]})])),
+        ("trailing-tool", final + lines([{"type": "tool_call", "subtype": "started"}])),
+        ("malformed-tail", final + '{"type":'),
+        ("no-session", lines([{k: v for k, v in event.items() if k != "session_id"}]))):
+        done, row, *_ = run(root, "cursor-final-" + suffix, "cursor-agent", "cursor-agent", stream)
+        assert done.returncode != 0 and row["stop"] == "native_terminal_missing", row
+
+    # cursor-* model templates: each passes --model <id>, and models.json admits them on the cursor CLI pool.
+    gw = json.loads(GW_MODELS.read_text())
+    admitted = {m["name"] for m in gw["models"] if m.get("cli_binary") == "cursor-agent"}
+    pool = next(d for d in gw["deployments"] if d["id"] == "cli-cursor-agent")["models"]
+    assert admitted >= set(CURSOR_MODELS) | {"cursor-agent"} and set(pool) >= set(CURSOR_MODELS) | {"cursor-agent"}, \
+        (admitted, pool)
+    for name, model_id in CURSOR_MODELS.items():
+        done, row, rep, *_ = run(root, name, name, "cursor-agent", lines(CURSOR_OK),
+                                 writable=("CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR"))
+        assert done.returncode == 0 and row["verdict"] == "pass", (name, row, done.stderr)
+        argv = rep["argv"]
+        assert "--model" in argv and argv[argv.index("--model") + 1] == model_id, (name, argv)
+
+    # antigravity: private HOME with the Keychains linked in (link gone afterwards), no Gemini keys, deltas streamed.
+    done, row, rep, run_dir, home = run(root, "agy", "antigravity", "agy", lines(AGY_OK), writable=("HOME",))
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    assert rep["env"]["HOME"].startswith(str(run_dir / "tmp")) and rep["wrote"]["HOME"], rep
+    assert rep["keychains"] == str((home / "Library/Keychains").resolve()), rep
+    assert rep["env"]["GEMINI_API_KEY"] is None and rep["env"]["GOOGLE_API_KEY"] is None, rep["env"]
+    assert "--dangerously-skip-permissions" in rep["argv"] and rep["argv"][-2] == "--print", rep["argv"]
+    assert (row["input_tokens"], row["output_tokens"], row["reasoning_tokens"], row["cache_read_tokens"]) == \
+        (50, 10, 3, 5), row
+    events = [json.loads(x)["payload"]["delta"] for x in (run_dir / "events.jsonl").read_text().splitlines()]
+    assert events == ["An", "ti.", ""], events
+    assert json.loads((run_dir / "messages.jsonl").read_text().splitlines()[-1])["text"] == "Anti."
+    failed = AGY_OK[:3] + [{"event": "result", "result": {"status": "ERROR", "error": "Authentication required"}}]
+    done, row, *_ = run(root, "agy-error", "antigravity", "agy", lines(failed))
+    assert done.returncode != 0 and (row["verdict"], row["stop"]) == ("fail", "native_terminal_error"), row
+
+    # antigravity-* model templates: each passes --model <id>, and models.json admits them on the agy CLI pool.
+    gw = json.loads(GW_MODELS.read_text())
+    admitted = {m["name"] for m in gw["models"] if m.get("cli_binary") == "agy"}
+    pool = next(d for d in gw["deployments"] if d["id"] == "cli-antigravity")["models"]
+    assert admitted >= set(AGY_MODELS) | {"antigravity"} and set(pool) >= set(AGY_MODELS) | {"antigravity"}, \
+        (admitted, pool)
+    for name, model_id in AGY_MODELS.items():
+        done, row, rep, *_ = run(root, name, name, "agy", lines(AGY_OK), writable=("HOME",))
+        assert done.returncode == 0 and row["verdict"] == "pass", (name, row, done.stderr)
+        argv = rep["argv"]
+        assert "--model" in argv and argv[argv.index("--model") + 1] == model_id, (name, argv)
+        assert "--model" not in json.loads((OPS / "executor-templates.json").read_text())["antigravity"]["args"], \
+            "base antigravity must stay model-default"
+
+    # gemini-cli: GEMINI_CLI_HOME it can write, login files linked read-only, a missing one skipped.
+    personal = {".gemini/settings.json": '{"security":{"auth":{"selectedType":"oauth-personal"}}}',
+                ".gemini/oauth_creds.json": "fixture-creds"}
+    done, row, rep, run_dir, home = run(root, "gemini", "gemini-cli", "gemini", lines(GEMINI_OK),
+                                        writable=("GEMINI_CLI_HOME",),
+                                        links=("settings.json", "oauth_creds.json", "google_accounts.json"),
+                                        personal=personal)
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    assert rep["env"]["GEMINI_CLI_HOME"].startswith(str(run_dir / "tmp")) and rep["wrote"]["GEMINI_CLI_HOME"], rep
+    assert rep["links"]["settings.json"] == [True, str(home / ".gemini/settings.json")], rep["links"]
+    assert rep["links"]["oauth_creds.json"][0] and rep["links"]["google_accounts.json"] == [False, None], rep
+    if sys.platform == "darwin":
+        # the sandbox's ~/.gemini write-deny holds through the links; an absent file is created privately
+        assert rep.get("link_writable") == ["google_accounts.json"], rep
+    done, row, *_ = run(root, "gemini-nores", "gemini-cli", "gemini", lines(GEMINI_OK[:2]), personal=personal)
+    assert (row["verdict"], row["stop"]) == ("fail", "native_terminal_missing"), row
+
+    # codex: private CODEX_HOME + sibling TMPDIR (PATH aliases), auth.json copied with guarded host refresh write-back, outer sandbox owns
+    # seatbelt so the CLI's own sandbox is bypassed; profile still denies ~/.codex.
+    personal = {".codex/auth.json": '{"tokens":{"access_token":"fixture-token"}}',
+                ".claude/.credentials.json": "dummy-claude-fixture"}
+    codex_template = json.loads((OPS / "executor-templates.json").read_text())["codex"]
+    assert codex_template["copies"] == {"{{tmp}}/codex-home/auth.json": "~/.codex/auth.json"}, codex_template
+    done, row, rep, run_dir, home = run(root, "codex", "codex", "codex", lines(CODEX_OK),
+                                        writable=("CODEX_HOME", "TMPDIR"), links=("auth.json",),
+                                        link_root=("CODEX_HOME", ""), personal=personal)
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    assert "--dangerously-bypass-approvals-and-sandbox" in rep["argv"] and "--ignore-user-config" in rep["argv"], \
+        rep["argv"]
+    assert "--json" in rep["argv"] and "--skip-git-repo-check" in rep["argv"], rep["argv"]
+    assert rep["stdin_devnull"], rep
+    assert rep["env"]["OPENAI_API_KEY"] is None and rep["env"]["HOME"] == str(home), rep["env"]
+    if sys.platform == "darwin":
+        assert rep["claude_login_denied"]
+    codex_home, tmpdir = Path(rep["env"]["CODEX_HOME"]), Path(rep["env"]["TMPDIR"])
+    assert codex_home == run_dir / "tmp/codex-home" and rep["wrote"]["CODEX_HOME"], rep
+    assert tmpdir == run_dir / "tmp/os-tmp" and rep["wrote"]["TMPDIR"], rep
+    assert tmpdir != codex_home and not str(codex_home).startswith(str(tmpdir) + os.sep), (codex_home, tmpdir)
+    assert rep["env"]["TMP"] == rep["env"]["TEMP"] == str(tmpdir), rep["env"]
+    assert rep["links"]["auth.json"] == [False, str(codex_home / "auth.json")], rep["links"]
+    if sys.platform == "darwin":
+        # the owner 2026-11-11: an agent may write exactly its own login file (token refresh); nothing else.
+        assert rep.get("link_writable") == ["auth.json"], rep
+        profile = (run_dir / "sandbox.sb").read_text()
+        assert '(deny file-write* (subpath "%s/.codex"))' % home in profile, profile
+        run_tmp_allow = '(allow file-write* (subpath "%s"))' % (run_dir / "tmp")
+        # The run dir is denied (host evidence), then only its tmp tree is reopened after that deny.
+        run_dir_deny = '(deny file-write* (subpath %s))' % json.dumps(str(run_dir.resolve()))
+        assert run_dir_deny in profile and run_tmp_allow in profile, profile
+        assert profile.rindex(run_tmp_allow) > profile.index(run_dir_deny), profile
+        login_allow = '(allow file-write* (literal %s))' % json.dumps(str(home / '.codex/auth.json'))
+        assert login_allow not in profile
+        assert '(deny file-write* file-link (literal %s))' % json.dumps(str(home / '.codex/auth.json')) in profile
+        assert '(deny file-read* (subpath %s))' % json.dumps(str(home / '.pi/agent/auth.json')) in profile
+        assert '(allow file-write* (subpath "%s/.codex"))' % home not in profile
+        assert not any(str(path) in profile for path in (codex_home, tmpdir)), profile
+    assert (row["input_tokens"], row["output_tokens"]) == (11, 2), row
+    assert json.loads((run_dir / "messages.jsonl").read_text().splitlines()[-1])["text"] == "ok"
+
+print("check: cursor-agent (and cursor-* --model templates), antigravity, gemini-cli and codex templates get "
+      "writable private runtimes, no API keys, login links that never reach evidence, usage from their own "
+      "reports, gateway admission for each cursor and antigravity model template, and fail without their completion receipt")

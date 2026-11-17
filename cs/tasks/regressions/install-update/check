@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""Offline public install/update contract; fake installer, isolated HOME, localhost only."""
+import hashlib
+import io
+import re
+import sys
+import tarfile
+import functools
+import http.server
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import shlex
+import subprocess
+import tempfile
+import threading
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+SCRIPTS = Path(__file__).resolve().parents[3] / 'scripts'
+spec = importlib.util.spec_from_file_location('node_publish', SCRIPTS / 'node_publish.py')
+publisher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(publisher)
+
+
+class Quiet(http.server.SimpleHTTPRequestHandler):
+    redirects = []
+    requests = []
+
+    def do_GET(self):
+        self.requests.append(self.path)
+        prefix = '/releases/latest/download/'
+        if self.path.startswith(prefix):
+            self.redirects.append(self.path)
+            self.send_response(302)
+            self.send_header('Location', '/' + self.path[len(prefix):])
+            self.end_headers()
+            return
+        super().do_GET()
+
+    def log_message(self, *args):
+        pass
+
+
+with scratch_dir(prefix='install-update-') as tmp:
+    root = Path(tmp)
+    home, public, bundle = (root / n for n in ('home', 'public', 'bundle'))
+    for path in (home, public, bundle):
+        path.mkdir()
+    # Lay Python out as a real bundle does: uv's install-only archive under python/<build>/ (2026-11-12: install.sh
+    # assumed an unpacked python/bin/python3, which only this fixture had, and every real curl | sh failed). The
+    # archived interpreter is a shim to the test interpreter; copying a macOS framework binary alone breaks its
+    # relative shared-library lookup after extraction.
+    staging = root / 'python-staging'
+    shim = staging / 'python/bin/python3'
+    shim.parent.mkdir(parents=True)
+    shim.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
+    shim.chmod(0o755)
+    archive = bundle / 'python/20251028/cpython-3.13.9+20251028-aarch64-apple-darwin-install_only_stripped.tar.gz'
+    archive.parent.mkdir(parents=True)
+    import tarfile
+    with tarfile.open(archive, 'w:gz') as packed:
+        packed.add(staging / 'python', arcname='python')
+    scripts = bundle / 'release/cs/scripts'
+    scripts.mkdir(parents=True)
+    for name in ('cs', 'cs_update.py', 'cs_releases_manifest.py'):
+        shutil.copy2(SCRIPTS / name, scripts / name)
+    # cs init is tested separately. This shim records invocation then dispatches updates to real cs.
+    (scripts / 'cs').rename(scripts / 'cs-real')
+    (scripts / 'cs').write_text('''#!/bin/sh
+if [ "$1" = init ]; then echo init >> "$HOME/init-calls"; exit 0; fi
+exec python3 "$(dirname "$0")/cs-real" "$@"
+''')
+    (scripts / 'cs').write_text((scripts / 'cs').read_text().replace('exec python3 ', 'exec ' + __import__('shlex').quote(sys.executable) + ' '))
+    (scripts / 'cs').chmod(0o755)
+    (scripts / 'node-install').write_text('''#!/bin/sh
+set -eu
+[ "$1" = install ]
+printf "%s\\n" "$@" > "$HOME/install-args"
+id=$(PYTHON_FOR_FIXTURE -c 'import json,sys; print(json.load(open(sys.argv[1]))["release"])' "$2/bundle.json")
+mkdir -p "$HOME/.contextstack/releases/$id"
+cp -R "$2/release/." "$HOME/.contextstack/releases/$id/"
+rm -f "$HOME/.contextstack/current"
+ln -s "releases/$id" "$HOME/.contextstack/current"
+echo "$id" >> "$HOME/installs"
+''')
+    (scripts / 'node-install').write_text((scripts / 'node-install').read_text().replace('PYTHON_FOR_FIXTURE', shlex.quote(sys.executable)))
+    import platform
+    target = ('macos' if platform.system() == 'Darwin' else 'linux') + '-' + ('aarch64' if platform.machine() in ('arm64', 'aarch64') else 'x86_64')
+
+    manifest_rows = []
+
+    def publish_manifest():
+        text = json.dumps({'releases': manifest_rows}, indent=2) + '\n'
+        sys.path.insert(0, str(SCRIPTS))
+        import cs_releases_manifest as manifest_check
+        manifest_check.parse_entries(text.encode())
+        (public / 'RELEASES.json').write_text(text)
+
+    def release(version, channel='stable', commit='abc123'):
+        (bundle / 'bundle.json').write_text(json.dumps({'release': version, 'lab_commit': commit, 'target': target}))
+        if re.fullmatch(r'v(0|[1-9][0-9]*)\..*', version):
+            manifest_rows[:] = [row for row in manifest_rows if row['tag'] != version]
+            manifest_rows.append({
+                'tag': version,
+                'commit': commit,
+                'channel': 'pre' if channel == 'latest' else 'stable',
+            })
+            publish_manifest()
+        return publisher.publish(bundle, public, channel)
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Quiet, directory=str(public)))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_port
+    env = {
+        **hermetic_env(), "HOME": str(home),
+        "CS_INSTALL_BASE": f"http://127.0.0.1:{port}",
+        "CS_RELEASES_MANIFEST_URL": f"http://127.0.0.1:{port}/RELEASES.json",
+        "CS_INSTALL_DEV": "1", "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    for key in ('LAB_STATE_ROOT', 'CSGATEWAY_ENDPOINT'):
+        env.pop(key, None)
+
+    tools = root / 'tools'
+    tools.mkdir()
+    for name in ('sh', 'curl', 'tar', 'gzip', 'uname', 'shasum', 'sha256sum', 'awk', 'df',
+                 'mktemp', 'rm', 'mkdir', 'cp', 'ln'):
+        executable = shutil.which(name)
+        if executable:
+            (tools / name).symlink_to(executable)
+    assert not (tools / 'python3').exists()
+    real_uname = shutil.which('uname')
+
+    def write_fake_uname(system, machine):
+        (tools / 'uname').unlink(missing_ok=True)
+        (tools / 'uname').write_text(
+            f'''#!/bin/sh
+case "$1" in
+  -s) echo {system} ;;
+  -m) echo {machine} ;;
+  *) exec {real_uname} "$@" ;;
+esac
+'''
+        )
+        (tools / 'uname').chmod(0o755)
+
+    def restore_uname():
+        (tools / 'uname').unlink(missing_ok=True)
+        (tools / 'uname').symlink_to(real_uname)
+
+
+    def run(*args, ok=True, setup_preflight=False):
+        child_env = dict(env)
+        if str(SCRIPTS / 'install.sh') in args:
+            # Transport/update fixtures use native bundles, including Linux developer hosts.
+            # Keep setup refusal cases unforced so they exercise the public default.
+            if not setup_preflight and target != 'macos-aarch64' and '--force-platform' not in args:
+                args = (*args, '--force-platform')
+            child_env['PATH'] = str(tools)
+            child_env['TMPDIR'] = str(root)
+        result = subprocess.run(args, env=child_env, capture_output=True, text=True)
+        assert (result.returncode == 0) == ok, result.stdout + result.stderr
+        return result.stdout + result.stderr
+
+    try:
+        sys.path.insert(0, str(SCRIPTS))
+        import _install_setup as install_setup
+        assert install_setup.INIT_SETUP_TARGETS == frozenset({'macos-aarch64'})
+        for pair in (('Linux', 'x86_64'), ('Darwin', 'x86_64')):
+            assert install_setup.init_setup_refusal(*pair) is not None
+        requests_before = len(Quiet.requests)
+        write_fake_uname('Linux', 'x86_64')
+        output = run('sh', str(SCRIPTS / 'install.sh'), ok=False, setup_preflight=True)
+        assert install_setup.init_setup_refusal('Linux', 'x86_64')[0] in output, output
+        assert len(Quiet.requests) == requests_before, Quiet.requests
+        write_fake_uname('Darwin', 'x86_64')
+        output = run('sh', str(SCRIPTS / 'install.sh'), ok=False, setup_preflight=True)
+        assert 'Intel processor' in output, output
+        assert len(Quiet.requests) == requests_before, Quiet.requests
+        restore_uname()
+        curl_real = shutil.which('curl')
+        (tools / 'curl').unlink(missing_ok=True)
+        output = run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        assert 'curl is required' in output, output
+        (tools / 'curl').symlink_to(curl_real)
+        real_df = shutil.which('df')
+        (tools / 'df').unlink(missing_ok=True)
+        (tools / 'df').write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  -kP)\n"
+            '    echo "Filesystem 1024-blocks Used Available Capacity Mounted on"\n'
+            '    echo "map 1000000 900000 100 99% /"\n'
+            "    ;;\n"
+            "  *)\n"
+            f'    exec {real_df!r} "$@"\n'
+            "    ;;\n"
+            "esac\n"
+        )
+        (tools / 'df').chmod(0o755)
+        output = run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        assert 'not enough free disk space' in output, output
+        (tools / 'df').unlink(missing_ok=True)
+        (tools / 'df').symlink_to(real_df)
+
+        # A download cut anywhere before the final invocation must execute nothing.
+        source = (SCRIPTS / 'install.sh').read_text()
+        assert source.rstrip().endswith('main "$@"')
+        prefixes = [source[:source.index('base=${CS_INSTALL_BASE')], source[:source.rindex('main "$@"')]]
+        for prefix in prefixes:
+            partial = root / 'partial.sh'
+            partial.write_text(prefix)
+            result = subprocess.run(['sh', str(partial)], env=env, capture_output=True, text=True)
+            assert not result.stdout and not (home / '.contextstack/current').exists()
+        env.pop('CS_INSTALL_DEV')
+        assert 'requires CS_INSTALL_DEV=1' in run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        env['CS_INSTALL_DEV'] = '1'
+        release('v1.0.0')
+        output = run('sh', str(SCRIPTS / 'install.sh'))
+        assert 'WARNING: CS_INSTALL_DEV=1' in output
+        assert output.index('Downloading ContextStack v1.0.0 (') < output.index('Verifying…') < output.index('Installing…')
+        assert '\x1b' not in output and '\r' not in output
+        current = home / '.contextstack/current'
+        assert current.resolve().name == 'v1.0.0'
+        assert (home / 'init-calls').read_text() == 'init\n'
+        cs = str(current / 'cs/scripts/cs')
+        release('v2.0.0')
+        env.pop('CS_INSTALL_DEV')
+        output = run(cs, 'update', '--check', ok=False)
+        assert 'requires CS_INSTALL_DEV=1' in output, output
+        env['CS_INSTALL_DEV'] = '1'
+        output = run(cs, 'update', '--check')
+        assert 'WARNING: CS_INSTALL_DEV=1' in output
+        assert 'Installed: v1.0.0' in output and 'available (stable): v2.0.0' in output
+        assert current.resolve().name == 'v1.0.0'
+        run(cs, 'update')
+        assert current.resolve().name == 'v2.0.0'
+        assert (home / '.contextstack/releases/v1.0.0').is_dir()
+        run('sh', str(SCRIPTS / 'install.sh'), '--link-dir', str(home / 'custom bin'), '--yes')
+        assert (home / 'install-args').read_text().splitlines()[-3:] == ['--link-dir', str(home / 'custom bin'), '--yes']
+        assert current.resolve().name == 'v2.0.0'
+        manifest_rows[:] = [{'tag': 'v1.0.0', 'commit': 'abc123', 'channel': 'stable'}]
+        publish_manifest()
+        release('v1.0.0')
+        assert 'downgrade refused' in run(cs, 'update', ok=False)
+        assert current.resolve().name == 'v2.0.0'
+        run(cs, 'update', '--allow-downgrade')
+        assert current.resolve().name == 'v1.0.0'
+        release('v2.0.0')
+        run(cs, 'update')
+        release('v3.0.0-rc.1', 'latest')
+        output = run(cs, 'update', '--check')
+        assert 'available (stable): v2.0.0' in output
+        assert current.resolve().name == 'v2.0.0'
+        run(cs, 'update', '--pre')
+        assert current.resolve().name == 'v3.0.0-rc.1'
+        release('v3.0.0')
+        run(cs, 'update')
+        release('v3.0.0-rc.2', 'latest')
+        assert 'downgrade refused' in run(cs, 'update', '--channel', 'pre', ok=False)
+        manifest_rows[:] = [{'tag': 'v2.0.0', 'commit': 'abc123', 'channel': 'stable'}]
+        publish_manifest()
+        release('v2.0.0')
+        run(cs, 'update', '--allow-downgrade')
+        release('v3.0.0', 'latest')
+        assert 'available (latest): v3.0.0' in run(cs, 'update', '--channel', 'latest', '--check')
+        index = release('v3.0.0')
+        archive = public / index['platforms'][target]['tarball']
+        archive.write_bytes(b'corrupt')
+        assert 'sha256' in run(cs, 'update', ok=False)
+        assert 'sha256' in run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        assert current.resolve().name == 'v2.0.0'
+        # A sidecar mismatch also refuses an otherwise intact archive.
+        index = release('v3.0.0')
+        archive = public / index['platforms'][target]['tarball']
+        sidecar = public / (archive.name + '.sha256')
+        sidecar.write_text('0' * 64 + '  ' + archive.name + '\n')
+        assert 'sha256' in run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        assert 'sha256' in run(cs, 'update', ok=False)
+        sidecar.unlink()
+        assert '404' in run(cs, 'update', ok=False)
+        assert current.resolve().name == 'v2.0.0'
+        # Valid hashes must not allow a path traversal through extraction.
+        with tarfile.open(archive, 'w:gz') as tar:
+            member = tarfile.TarInfo('../escaped')
+            member.size = 4
+            tar.addfile(member, io.BytesIO(b'evil'))
+        checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+        sidecar.write_text(checksum + '  ' + archive.name + '\n')
+        (public / 'stable.txt').write_text(f'{target} v3.0.0 abc123 {archive.name} {checksum}\n')
+        assert 'unsafe archive member' in run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        assert not list(root.rglob('escaped'))
+        assert current.resolve().name == 'v2.0.0'
+        assert (home / 'installs').read_text().splitlines() == ['v1.0.0', 'v2.0.0', 'v2.0.0', 'v1.0.0', 'v2.0.0', 'v3.0.0-rc.1', 'v3.0.0', 'v2.0.0']
+        # GitHub-shaped URLs redirect once to the fixture assets.
+        release('v4.0.0')
+        env['CS_INSTALL_BASE'] += '/releases/latest/download'
+        run('sh', str(SCRIPTS / 'install.sh'))
+        assert current.resolve().name == 'v4.0.0'
+        assert 'available (stable): v4.0.0' in run(cs, 'update', '--check')
+        assert any(path.endswith('stable.txt') for path in Quiet.redirects)
+        assert any(path.endswith('.tar.gz') for path in Quiet.redirects)
+        assert any(path.endswith('stable.json') for path in Quiet.redirects)
+        sys.path.insert(0, str(SCRIPTS))
+        update_spec = importlib.util.spec_from_file_location('cs_update', SCRIPTS / 'cs_update.py')
+        updater = importlib.util.module_from_spec(update_spec)
+        update_spec.loader.exec_module(updater)
+        previous = os.environ.pop('CS_INSTALL_BASE', None)
+        previous_dev = os.environ.pop('CS_INSTALL_DEV', None)
+        try:
+            github = 'https://github.com/contextstack/contextstack/releases/'
+            assert updater.base_url('stable') == github + 'latest/download'
+            assert updater.base_url('latest') == github + 'download/channel-latest'
+            import cs_releases_manifest as manifest_check
+            # Installer, updater and release manifest must agree on the public host.
+            assert manifest_check.GITHUB_RELEASES == github.rstrip('/')
+            assert manifest_check.MANIFEST_DEFAULT == 'https://raw.githubusercontent.com/contextstack/contextstack/main/RELEASES.json'
+            for channel in ('stable', 'latest'):
+                assert f'{channel}) default_base={updater.base_url(channel)} ;;' in source
+            assert f'DOC_URL={github.removesuffix("/releases/")}#documentation' in source
+            assert install_setup.LINUX_FOLLOW_URL == github.removesuffix('/releases/') + '#documentation'
+            os.environ['CS_INSTALL_BASE'] = env['CS_INSTALL_BASE']
+            try:
+                updater.base_url('latest')
+            except ValueError as error:
+                assert 'requires CS_INSTALL_DEV=1' in str(error)
+            else:
+                raise AssertionError('custom base accepted without development flag')
+            os.environ['CS_INSTALL_DEV'] = '1'
+            assert updater.base_url('latest') == env['CS_INSTALL_BASE']
+            try:
+                updater.SecureRedirect().redirect_request(
+                    __import__('urllib.request', fromlist=['Request']).Request(github), None, 302, '', {}, 'http://127.0.0.1/file')
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('HTTPS downgrade accepted')
+        finally:
+            os.environ.pop('CS_INSTALL_BASE', None)
+            os.environ.pop('CS_INSTALL_DEV', None)
+            if previous_dev is not None:
+                os.environ['CS_INSTALL_DEV'] = previous_dev
+            if previous is not None:
+                os.environ['CS_INSTALL_BASE'] = previous
+        env['CS_INSTALL_BASE'] = f'http://127.0.0.1:{port}'
+        env['CS_RELEASES_MANIFEST_URL'] = f'http://127.0.0.1:{port}/RELEASES.json'
+        # Configured pre channel and explicit stable override use only fixture assets.
+        release('v5.0.0-rc.1', 'latest')
+        config = home / '.contextstack/config/install.json'
+        config.parent.mkdir(exist_ok=True)
+        config.write_text(json.dumps({'channel': 'pre'}))
+        run(cs, 'update')
+        assert current.resolve().name == 'v5.0.0-rc.1'
+        release('v6.0.0-rc.1', 'latest')
+        output = run(cs, 'update', '--channel', 'stable', '--check')
+        assert 'v6.0.0-rc.1' not in output
+        config.unlink()
+        # Offline local bundles compare release ids before invoking the installer.
+        release('v4.0.0')
+        assert 'downgrade refused' in run(cs, 'update', '--bundle', str(bundle), ok=False)
+        run(cs, 'update', '--bundle', str(bundle), '--allow-downgrade')
+        assert current.resolve().name == 'v4.0.0'
+        release('20261112-abcdef')
+        run(cs, 'update', '--bundle', str(bundle), '--allow-downgrade')
+        release('20261111-abcdef')
+        assert 'downgrade refused' in run(cs, 'update', '--bundle', str(bundle), ok=False)
+        run(cs, 'update', '--bundle', str(bundle), '--allow-downgrade')
+        assert current.resolve().name == '20261111-abcdef'
+        assert updater.version_key('v1.10.0') > updater.version_key('v1.9.0')
+        assert updater.version_key('v1.0.0-rc.10') > updater.version_key('v1.0.0-rc.2')
+        assert updater.version_key('v1.0.0') > updater.version_key('v1.0.0-rc.10')
+        # Capture default shell URLs without allowing any non-local network request.
+        env.pop('CS_INSTALL_BASE')
+        for channel, path in [('stable', 'latest/download'), ('latest', 'download/channel-latest')]:
+            # A shell function needs no executable fixture (some sandboxes deny those).
+            result = subprocess.run(['sh', '-c',
+                'curl() { printf "%s\\n" "$@" > "$HOME/curl-args"; return 1; }; installer=$1; shift; . "$installer"',
+                'fixture', str(SCRIPTS / 'install.sh'), '--channel', channel],
+                env=env, capture_output=True, text=True)
+            assert result.returncode != 0
+            args = (home / 'curl-args').read_text()
+            assert github + path + '/' + channel + '.txt' in args
+            assert '--proto\n=https' in args
+            assert '--retry\n3\n--retry-delay\n2\n--connect-timeout\n15' in args
+            assert '--silent' in args and '--progress-bar' not in args
+        import pty
+        master, slave = pty.openpty()
+        try:
+            result = subprocess.run(['sh', '-c',
+                'curl() { printf "%s\\n" "$@" > "$HOME/curl-args"; return 1; }; installer=$1; shift; . "$installer"',
+                'fixture', str(SCRIPTS / 'install.sh')], env=env,
+                stdout=subprocess.PIPE, stderr=slave, stdin=subprocess.DEVNULL)
+            args = (home / 'curl-args').read_text()
+            assert result.returncode != 0 and '--progress-bar' in args and '--silent' not in args
+        finally:
+            os.close(slave)
+            os.close(master)
+        env['CS_INSTALL_BASE'] = 'http://example.com'
+        assert 'requires HTTPS' in run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        env['CS_INSTALL_BASE'] = f'http://127.0.0.1:{port}'
+        env['CS_RELEASES_MANIFEST_URL'] = f'http://127.0.0.1:{port}/RELEASES.json'
+        env['CS_INSTALL_DEV'] = '1'
+        release('v10.0.0')
+        release('v11.0.0')
+        release('v10.0.0')
+        output = run(cs, 'update', '--check', ok=False)
+        assert 'differs from RELEASES.json' in output, output
+        release('v11.0.0')
+        index = release('v12.0.0', commit='feedface')
+        tampered = dict(index)
+        tampered['commit'] = 'decafbad'
+        (public / 'stable.json').write_text(json.dumps(tampered, indent=2) + '\n')
+        assert 'not listed in RELEASES.json' in run(cs, 'update', '--check', ok=False)
+        (public / 'stable.json').write_text(json.dumps(index, indent=2) + '\n')
+        env['CS_RELEASES_MANIFEST_URL'] = env['CS_INSTALL_BASE'] + '/stable.json'
+        assert 'must be RELEASES.json' in run(cs, 'update', '--check', ok=False)
+
+        (tools / 'curl').unlink()
+        (tools / 'curl').symlink_to(curl_real)
+        write_fake_uname('Linux', 'x86_64')
+        (bundle / 'bundle.json').write_text(
+            json.dumps({'release': 'v99.0.0', 'lab_commit': 'abc123', 'target': 'linux-x86_64'})
+        )
+        publisher.publish(bundle, public, 'stable')
+        Quiet.redirects.clear()
+        env['CS_INSTALL_BASE'] = f'http://127.0.0.1:{port}/releases/latest/download'
+        output = run('sh', str(SCRIPTS / 'install.sh'), '--force-platform', '--yes')
+        assert 'developer test hosts' in output, output
+        assert any(path.endswith('stable.txt') for path in Quiet.redirects), Quiet.redirects
+        assert (home / 'init-calls').read_text().endswith('init\n')
+        restore_uname()
+        env['CS_RELEASES_MANIFEST_URL'] = f'http://127.0.0.1:{port}/RELEASES.json'
+        print('PASS: offline install, repair, check, update, channels, retained release, no host Python, traversal refusal, checksum refusal, GitHub defaults and redirect, manifest trust anchor, install preflight refusals, --force-platform')
+    finally:
+        server.shutdown()
+        server.server_close()
+
+# 7th pass #60: a node on a date-based local release (20261112-<sha>) updates to semver without
+# --allow-downgrade; a date-based id never counts as newer than a semver release.
+import argparse as _argparse
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+import cs_update as _cs_update
+_plain = _argparse.Namespace(pre=False, channel="stable", allow_downgrade=False)
+_cs_update.release_policy("v1.0.0", "20261112-d5567b60c", _plain)
+try:
+    _cs_update.release_policy("20261112-d5567b60c", "v1.0.0", _plain, local=True)
+except ValueError as _error:
+    assert "downgrade refused" in str(_error), _error
+else:
+    raise AssertionError("a date-based build replaced a semver release without --allow-downgrade")
+print("install-update: date-based ids are older than semver")
+
+# Exercise the local update path, including retained installed metadata.
+from unittest.mock import patch as _patch
+with tempfile.TemporaryDirectory(prefix='update-build-time-') as _tmp:
+    _home = Path(_tmp)
+    _current = _home / '.contextstack/current'
+    _bundle = _home / 'bundle'
+    _current.parent.mkdir(parents=True)
+    _bundle.mkdir()
+    _args = _argparse.Namespace(pre=False, channel='stable', allow_downgrade=False, bundle=_bundle, check=True)
+    _high, _low = '20261116-c04dce5f3', '20261116-8a98e1469'
+    def _check_build(candidate, installed, candidate_time=None, installed_time=None, refused=False):
+        _meta = {'release': candidate, 'target': _cs_update.host_target()}
+        if candidate_time is not None:
+            _meta['created'] = candidate_time
+        (_bundle / 'bundle.json').write_text(json.dumps(_meta))
+        # Installed ids come from the current symlink's destination name.
+        _release = _home / '.contextstack/releases' / installed
+        _release.mkdir(parents=True, exist_ok=True)
+        _retained = _release / 'bundle.json'
+        if installed_time is None:
+            _retained.unlink(missing_ok=True)  # legacy installations retained no bundle metadata
+        else:
+            _retained.write_text(json.dumps({'release': installed, 'created': installed_time}))
+        _current.symlink_to(_release, target_is_directory=True)
+        with _patch.object(_cs_update.Path, 'home', return_value=_home):
+            try:
+                assert _cs_update.run(_args) == 0
+                assert not refused, 'older build accepted'
+            except ValueError as error:
+                assert refused and 'downgrade refused' in str(error), error
+            finally:
+                _current.unlink()
+    for _candidate, _installed in ((_low, _high), (_high, _low)):
+        _check_build(_candidate, _installed, '2026-11-16T12:00:00+00:00', '2026-11-16T11:00:00Z')
+        _check_build(_candidate, _installed, '2026-11-16T10:00:00+00:00', '2026-11-16T11:00:00Z', refused=True)
+        _check_build(_candidate, _installed)
+        _check_build(_candidate, _installed, '2026-11-16T10:00:00+00:00')
+        _check_build(_candidate, _installed, installed_time='2026-11-16T11:00:00Z')
+    _check_build('20261115-ffff', _low, refused=True)
+    _check_build('20261117-0000', _high)
+print('install-update: development builds order by creation time, with date-only legacy fallback')

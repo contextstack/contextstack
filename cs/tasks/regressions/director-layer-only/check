@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""director-layer-only (Director.Plan step 8; outline v1.5 decision 5): reads git's index of the
+checkout (tracked files only) and writes nothing.
+
+1. NODE code names no bot at all, in a path or in its text (BOT: bot, bots, bot-x, bot_x, BotX; not robot, bottom).
+2. A grant's ops: list names no bot op.
+3. The rest of the kit's machinery (MACHINE) carries no bot-turn identifier (TURN). Prose, history and the
+   Laravel app's own regressions are out of scope: they leave with the old Director.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SELF = Path(__file__).resolve()
+NODE = re.compile(r"^(harness|sandbox|tools|gateway|tests/director-spec|tests/gateway-spec)/"
+                  r"|^cs/(ops|scripts|hooks|policy|schedules)/|^cs/triggers\.yaml$|^gateway/models\.json$")
+MACHINE = re.compile(r"^cs/(tools|grants)/|^cs/tasks/regressions/[^/]+/(?!goal\.md$|notes\.md$)[^/]+$"
+                     r"|^docs/dev/scripts/")
+BOT = re.compile(r"(?<![A-Za-z0-9])(?:[Bb][Oo][Tt][Ss]?(?![A-Za-z0-9])|[Bb]ot(?=[A-Z]))")
+TURN = re.compile(r"(?i)(?<![a-z0-9])bot[-_ ]?turns?(?![a-z0-9])|BotTurn|bot_ceiling|director:bot:")
+OPS = re.compile(r"^ops:.*$", re.M)
+# The Laravel app's own bot code leaves with the old Director, not here: its expired write grants and the
+# regressions that run its test suite in a Director checkout.
+LARAVEL = re.compile(r"^cs/grants/g-director-messaging-|^cs/tasks/regressions/director-project-references/")
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def problems(repo):
+    out = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, check=True).stdout
+    found = []
+    for rel in (p for p in out.decode("utf-8", "replace").split("\0") if p):
+        path = repo / rel
+        if path.resolve() == SELF or path.is_symlink() or not path.is_file():
+            continue
+        node, machine = NODE.match(rel), MACHINE.match(rel)
+        if not (node or machine):
+            continue
+        if node and BOT.search(rel):
+            found.append("%s: a node path names a bot" % rel)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if node:
+            found += ["%s:%d names a bot below the Director" % (rel, line_of(text, m.start())) for m in BOT.finditer(text)]
+        elif rel.startswith("cs/grants/"):
+            found += ["%s:%d grants a bot op" % (rel, line_of(text, m.start())) for m in OPS.finditer(text) if BOT.search(m.group(0))]
+        if machine and not LARAVEL.match(rel):
+            found += ["%s:%d names bot-turn machinery" % (rel, line_of(text, m.start())) for m in TURN.finditer(text)]
+    return found
+
+
+def self_test():
+    """Planted bot code fails in each place the guard watches; history and look-alikes pass."""
+    with scratch_dir(prefix="director-layer-only-") as raw:
+        repo = Path(raw)
+        files = {"cs/ops/bin/bot-turn": "#!/bin/sh\n", "cs/ops/bin/_executor.py": 'turn = tmpl.get("bot_turn")\n',
+                 "tests/director-spec/harness/node.py": "elif operation == 'chat': principal = 'director:bot:1:2'\n",
+                 "harness/src/run.rs": "// a BotSession is resumed here\n", "cs/grants/g-ops.yaml": "ops: [estate-read, bot-turn]\n",
+                 "cs/tasks/regressions/x/check": 'templates = {"chat": {"bot_ceiling": 1}}\n',
+                 "cs/ops/bin/robots": "# robots.txt, the bottom of the bottle\n",
+                 "cs/tasks/regressions/x/goal.md": "Bot turns left the node.\n",
+                 "cs/specs/archive/exp-1.yaml": "verdict: bot-turn retired\n",
+                 "cs/tools/bin/topic": '("Bot / Crawler / Edge", {"bot-traffic"})\n',
+                 "cs/grants/g-director-messaging-x.yaml": "paths:\n  - app/Messaging/Lab/BotTurnAction.php\n"}
+        for rel, text in files.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        got = problems(repo)
+        want = ["cs/ops/bin/bot-turn: a node path", "cs/ops/bin/_executor.py:1 names a bot",
+                "tests/director-spec/harness/node.py:1 names a bot", "harness/src/run.rs:1 names a bot",
+                "cs/grants/g-ops.yaml:1 grants a bot op", "cs/grants/g-ops.yaml:1 names bot-turn",
+                "cs/tasks/regressions/x/check:1 names bot-turn"]
+        assert len(got) == len(want) and all(any(g.startswith(w) for g in got) for w in want), got
+
+
+if __name__ == "__main__":
+    self_test()
+    repo = Path(subprocess.run(["git", "-C", str(SELF.parent), "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True, check=True).stdout.strip())
+    found = problems(repo)
+    for line in found:
+        print("director-layer-only: " + line, file=sys.stderr)
+    sys.exit(1 if found else 0)

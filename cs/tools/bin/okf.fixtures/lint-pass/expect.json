@@ -1,0 +1,6 @@
+{
+  "exit": 0,
+  "stdout": "{\"ok\":true,\"action\":\"lint\",\"version\":\"0.2\",\"files\":3,\"concepts\":2,\"errors\":[],\"warnings\":[],\"duplicate_groups\":[]}\n",
+  "files": {},
+  "untouched": true
+}

@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+KIT = Path(__file__).resolve().parents[3]
+OPS = KIT / "ops/bin"
+
+with scratch_dir(prefix="executor-import-") as raw:
+    root = Path(raw)
+    stamp = root / "imported"
+    subprocess_marker = root / "subprocess-started"
+    code = f"""
+import subprocess
+import sys
+from pathlib import Path
+
+ops = Path({str(OPS)!r})
+stamp = Path({str(stamp)!r})
+subprocess_marker = Path({str(subprocess_marker)!r})
+if len(sys.argv) != 1:
+    sys.exit(2)
+sys.path.insert(0, str(ops))
+for name in ("run", "Popen", "check_output", "call", "check_call"):
+    def _forbid(*_a, **_k):
+        subprocess_marker.write_text("started")
+        raise SystemExit(9)
+    setattr(subprocess, name, _forbid)
+import _executor
+assert _executor.sandbox_cmd and _executor.allowlist_env
+stamp.write_text("ok")
+"""
+    done = subprocess.run([sys.executable, "-c", code], env={}, cwd=root, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, (done.returncode, done.stderr, done.stdout)
+    assert stamp.read_text() == "ok"
+    assert not subprocess_marker.exists()
+    assert list(root.iterdir()) == [stamp], sorted(p.name for p in root.iterdir())
+
+print("executor-import: PASS")

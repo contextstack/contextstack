@@ -1,0 +1,6 @@
+{
+ "messages": true,
+ "env": {
+  "CS_TOOL_PREFIX": "<ESTATE>/fixture/fx_unenforceable --"
+ }
+}

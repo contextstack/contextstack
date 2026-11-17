@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""HOME is private unless declared. --darwin-probe is host-only; all secrets are decoys."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import ast
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import socket
+import errno
+import sys
+import tempfile
+from unittest.mock import patch
+
+KIT = Path(__file__).resolve().parents[3]
+OPS = KIT / 'ops/bin'
+sys.path.insert(0, str(OPS))
+
+import _executor  # noqa: E402
+
+# This check describes the shared-cache rules without host toolchains; never read the machine's own toolchains.json.
+os.environ['CS_TOOLCHAINS_FILE'] = str(Path(__import__('tempfile').mkdtemp(prefix='no-toolchains-')) / 'toolchains.json')
+import _cli_native as native
+from sandbox_profile import render_profile
+
+
+ns = {'sandbox_cmd': _executor.sandbox_cmd}
+templates = json.loads((OPS / 'executor-templates.json').read_text())
+DECOYS = ('.zsh_history', '.git-credentials', '.npmrc', '.docker/config.json', '.kube/config',
+          'Library/Application Support/Google/Chrome/Default/Cookies', '.newsecret/token')
+probe_requested = '--darwin-probe' in sys.argv
+probe = probe_requested and sys.platform == 'darwin'
+if probe:
+    capability = subprocess.run(['/usr/bin/sandbox-exec', '-p', '(version 1)(allow default)', '/usr/bin/true'],
+                                env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True, timeout=10)
+    if capability.returncode:
+        assert 'sandbox_apply: Operation not permitted' in capability.stderr, capability.stderr
+        print('SKIP: host must run --darwin-probe (nested Seatbelt is unavailable)')
+        probe = False
+
+with scratch_dir(prefix='hra-', dir='/private/tmp' if sys.platform == 'darwin' else None) as raw:
+    root = Path(raw).resolve()
+    home = root / 'home'
+    # Keep granted roots beneath HOME to prove the exception actually overrides its deny.
+    ws, private, stimulus, runtime = [home / name for name in ('workspace', 'tmp', 'stimulus', 'runtime')]
+    for path in (ws, private, stimulus, runtime):
+        path.mkdir(parents=True)
+        (path / 'public').write_text('public fixture')
+    # HOME-installed launchers need every hop and the payload, without exposing
+    # sibling launchers or a top-level personal directory.
+    bin_dir = home / '.local/bin'
+    bin_dir.mkdir(parents=True)
+    version = home / '.local/share/example/versions/v1'
+    payload = version / 'bin/example'
+    payload.parent.mkdir(parents=True)
+    payload.write_text('#!/usr/bin/python3\nprint("fixture")\n')
+    current = home / '.local/share/example/current'
+    current.symlink_to('versions/v1/bin/example')
+    launcher = bin_dir / 'example'
+    launcher.symlink_to('../share/example/current')
+    literal = lambda path: '(allow file-read* (literal %s))' % json.dumps(str(path))
+    subtree = lambda path: '(allow file-read* (subpath %s))' % json.dumps(str(path))
+    data_rules = lambda rules: [rule for rule in rules if rule.startswith('(allow file-read* ')]
+    def executable_grants(binary):
+        text = render_profile(home, ws, private, binary=binary, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin')})
+        baseline = render_profile(home, ws, private)
+        return [line for line in text.splitlines() if line not in baseline.splitlines()]
+    executable_rules = executable_grants(launcher)
+    assert data_rules(executable_rules) == [literal(launcher), literal(current), literal(payload), subtree(version)]
+    assert subtree(bin_dir) not in executable_rules
+    assert subtree(home / '.local') not in executable_rules
+    # A directory symlink is a hop too; resources come from the version root,
+    # even when the executable is nested in bin/.
+    linked_dir = home / '.local/linked-version'
+    linked_dir.symlink_to('share/example/versions/v1', target_is_directory=True)
+    assert data_rules(executable_grants(linked_dir / 'bin/example')) == [
+        literal(linked_dir), literal(payload), subtree(version)]
+    # Claude installs versions/<v> as a file, so its parent versions/ must
+    # never become an allowance covering every installed executable.
+    claude_version = home / '.local/share/claude/versions/v1'
+    claude_version.parent.mkdir(parents=True)
+    claude_version.write_text('fixture executable')
+    claude_launcher = bin_dir / 'claude'
+    claude_launcher.symlink_to('../share/claude/versions/v1')
+    claude_rules = executable_grants(claude_launcher)
+    assert data_rules(claude_rules) == [literal(claude_launcher), literal(claude_version),
+                                      subtree(claude_version)]
+    assert subtree(claude_version.parent) not in claude_rules
+    assert '(allow file-read-metadata (literal %s))' % json.dumps(str(claude_version.parent)) in claude_rules
+    script = bin_dir / 'script'
+    script.write_text('#!/usr/bin/python3\nprint("fixture")\n')
+    assert data_rules(executable_grants(script)) == [literal(script)]
+    for parent in (home, home / '.pi', home / '.grok'):
+        parent.mkdir(exist_ok=True)
+        direct = parent / 'direct-script'
+        direct.write_text('#!/usr/bin/python3\n')
+        assert data_rules(executable_grants(direct)) == [literal(direct)]
+    external = root / 'external-cli'
+    external.write_text('#!/usr/bin/python3\n')
+    assert executable_grants(external) == []
+    # A system-installed JS bundle can relaunch a HOME-installed interpreter.
+    node = home / 'private-node/bin/node'
+    node.parent.mkdir(parents=True)
+    node.write_bytes(b'fixture binary')
+    node.chmod(0o755)
+    node_link = bin_dir / 'node'
+    node_link.symlink_to(node)
+    external.write_text('#!/usr/bin/env node\n')
+    with patch.dict(os.environ, {'PATH': str(bin_dir)}):
+        node_rules = executable_grants(external)
+    assert data_rules(node_rules) == [literal(node_link), literal(node)]
+    assert subtree(node.parent) not in node_rules
+    assert subtree(node.parent.parent) not in node_rules
+    assert templates['pi']['home_reads'] == ['~/.pi/agent/install']
+    assert templates['pi']['interpreters'] == ['node']
+    _executor.HOME = home
+    pi_profile = root / 'pi.sb'
+    with patch.object(sys, 'platform', 'darwin'), patch.dict(os.environ, {'PATH': str(bin_dir)}):
+        ns['sandbox_cmd']('/bin/sh', [], ws, private, pi_profile, login_writes=templates['pi'])
+    assert literal(node) in pi_profile.read_text()
+    assert subtree(node.parent) not in pi_profile.read_text()
+    external_link = bin_dir / 'external'
+    external_link.symlink_to(external)
+    with patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+        assert executable_grants(external_link) == []
+    # The production builder passes the selected executable through the one
+    # HOME policy generator, including a directly installed script's literal.
+    script_profile = root / 'script.sb'
+    _executor.HOME = home
+    with patch.object(sys, 'platform', 'darwin'):
+        ns['sandbox_cmd'](str(script), [], ws, private, script_profile)
+    assert literal(script) in script_profile.read_text()
+    assert subtree(bin_dir) not in script_profile.read_text()
+    _executor.HOME = home
+    # A root containing HOME would silently undo the boundary; fail closed.
+    for broad in (home, home.parent, Path('/')):
+        try:
+            render_profile(home, ws, private, read_roots=(broad,))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(('HOME-containing root accepted', broad))
+    for malformed in ('/usr', 'relative', '{{workspace}}/anything'):
+        try:
+            native.declared_home_reads({'home_reads': [malformed]}, home, private)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(('invalid declaration accepted', malformed))
+    assert native.declared_home_reads({'home_reads': ['~/declared', '{{tmp}}/staged']}, home, private) == [
+        home / 'declared', private / 'staged']
+    scoped = render_profile(home, ws, private, home_reads=(home / '.ssh',)).splitlines()
+    ssh_grant = subtree(home / '.ssh')
+    ssh_deny = '(deny file-read* (subpath %s))' % json.dumps(str(home / '.ssh'))
+    assert scoped.index(ssh_grant) < scoped.index(ssh_deny), 'explicit grants must retain secret denies'
+    assert scoped.index(subtree(ws)) < scoped.index(r'(deny file-read* file-write* file-link (regex #"/\.env$"))' )
+    assert not any('(deny file-read* (subpath "/usr' in rule for rule in scoped)
+    for relative in native.SHARED_HOME_READS:
+        assert subtree(home / relative) in scoped, ('missing shared cache', relative)
+    for relative in DECOYS:
+        target = home / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('decoy only')
+    release = home / '.contextstack/releases/fixture'
+    release.mkdir(parents=True)
+    (release / 'public').write_text('installed tools')
+    (home / '.contextstack/current').symlink_to(release, target_is_directory=True)
+    # A granted directory must not reopen the existing secret deny rules.
+    if probe:
+        (ws / '.env').write_text('decoy env')
+    if probe:
+        (ws / '.env.example').write_text('public example')
+    cache_fixtures = []
+    for relative in native.SHARED_HOME_READS:
+        cache = home / relative
+        cache.mkdir(parents=True, exist_ok=True)
+        fixture = cache / 'public'
+        fixture.write_text('toolchain cache fixture')
+        cache_fixtures.append(fixture)
+    (ws / 'escaped-secret').symlink_to(home / '.newsecret/token')
+    probe_code = '''import json,sys
+from pathlib import Path
+spec=json.loads(sys.argv[1])
+for raw in spec['denied']:
+    try: Path(raw).read_bytes()
+    except PermissionError: pass
+    else: raise AssertionError('private HOME read allowed: '+raw)
+for raw in spec['allowed']:
+    assert Path(raw).read_bytes(), ('declared read blocked',raw)
+'''
+    # Bind decoys only: never inspect or connect to an existing host socket.
+    listeners = []
+    socket_paths = [home / '.docker/run/docker.sock', home / '.cua/x.sock',
+                    root / 'x.sock', root / 'com.apple.launchd.fixture/Listeners']
+    # Exercise the actual /private/tmp and /var/run namespaces when writable.
+    socket_dirs = []
+    for parent in (('/private/tmp', '/var/run') if probe else ()):
+        try:
+            directory = scratch_dir(prefix='cs-socket-', dir=parent)
+        except (PermissionError, FileNotFoundError):
+            continue
+        socket_dirs.append(directory)
+        socket_paths.append(Path(directory.name) / 'x.sock')
+        if parent == '/private/tmp':
+            socket_paths.append(Path(directory.name) / 'com.apple.launchd.fixture/Listeners')
+    for path in (socket_paths if probe else ()):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        listener.listen(32)
+        listeners.append(listener)
+    profiles = {}
+    for name, template in templates.items():
+        assert isinstance(template.get('home_reads'), list), (name, 'home_reads must be explicit')
+        run_tmp = private / name
+        run_tmp.mkdir()
+        # Only declared readable paths are synthesized; no real HOME source is examined.
+        declared = []
+        for raw_path in template['home_reads']:
+            expanded = str(raw_path).replace('{{tmp}}', str(run_tmp))
+            target = home / expanded[2:] if expanded.startswith('~/') else Path(expanded)
+            assert target.is_absolute(), (name, raw_path)
+            target.mkdir(parents=True, exist_ok=True)
+            fixture = target / 'public'
+            fixture.write_text('declared fixture')
+            declared.append(fixture)
+        profile = root / (name + '.sb')
+        with patch.object(sys, 'platform', 'darwin'):
+            # login_writes carries template metadata in the production executor too.
+            ns['sandbox_cmd']('/usr/bin/true', [], ws, run_tmp, profile,
+                              login_writes=template, read_roots=(stimulus, runtime))
+        text = profile.read_text()
+        assert template.get('sockets_allow') == [], (name, 'new exceptions require evidence and positive probes')
+        assert '(deny network-outbound (require-all (remote unix-socket) (require-not (literal "/private/var/run/mDNSResponder"))))' in text, (name, 'missing Unix default deny')
+        deny = '(deny file-read* (subpath %s))' % json.dumps(str(home))
+        assert deny in text, (name, 'HOME must be blanket denied')
+        assert text.index(deny) < text.index('(allow file-read*'), (name, 'HOME deny must precede grants')
+        for path in (ws, run_tmp, stimulus, runtime, home / '.contextstack/current'):
+            assert json.dumps(str(path)) in text, (name, 'missing read root', path)
+        for fixture in declared:
+            assert json.dumps(str(fixture.parent)) in text, (name, 'missing declared path', fixture)
+        # No profile should need an ever-growing enumeration of these filenames.
+        assert '.newsecret' not in text, (name, 'new secrets must be denied structurally')
+        profiles[name] = (profile, [ws / 'public', stimulus / 'public', runtime / 'public',
+                                   home / '.contextstack/current/public', ws / '.env.example', *declared, *cache_fixtures])
+    # Exercise the other launch paths, with the same decoy HOME and narrow grants.
+    from _muse import sandbox_command
+    from _cli_adapter import command as adapter_command
+    lane_git = home / 'repo-git'
+    lane_git.mkdir()
+    (lane_git / 'public').write_text('git fixture')
+    lane_grants = dict(caller_grants=[dict(path=str(lane_git), access='read'),
+                                     dict(path=str(private), access='read_write')])
+    with patch.object(sys, 'platform', 'darwin'):
+        muse_cmd = sandbox_command([sys.executable], ws, home, extra=lane_grants)
+        adapter_cmd = adapter_command({'auth': 'none'}, sys.executable, ws, private, home, (), [],
+                                      extra=lane_grants)
+    for label, command in (('muse', muse_cmd), ('profiled-adapter', adapter_cmd)):
+        assert command[2].index(deny) < command[2].index(subtree(lane_git))
+        profile = root / (label + '.sb')
+        profile.write_text(command[2])
+        profiles[label] = (profile, [ws / 'public', lane_git / 'public', private / 'public'])
+    import _lead_host as lead_host
+    lead_host._load_sandbox_cmd = lambda: _executor.sandbox_cmd
+    from _lead_host import sandbox_builder as lead_sandbox_builder
+    lead_ns = {'sandbox_builder': lead_sandbox_builder}
+    session = home / '.contextstack/state/lead-sessions/con_fixture/home' if probe else runtime / 'session'
+    session.mkdir(parents=True)
+    (session / 'public').write_text('own runtime fixture')
+    lead_profile = root / 'lead.sb'
+    with patch.object(sys, 'platform', 'darwin'):
+        lead_ns['sandbox_builder'](ws, private, lead_profile, write_roots=(session,))(sys.executable, [])
+    lead_text = lead_profile.read_text()
+    assert deny in lead_text
+    assert subtree(session) in lead_text
+    profiles['lead'] = (lead_profile, [ws / 'public', session / 'public'])
+    if probe:
+        socket_probe = """import socket,errno,json,sys
+for path in json.loads(sys.argv[1]):
+    with socket.socket(socket.AF_UNIX) as client:
+        try: client.connect(path)
+        except OSError as exc:
+            assert exc.errno == errno.EPERM, (path, exc.errno)
+        else: raise AssertionError('Unix socket reachable: '+path)
+assert socket.getaddrinfo('example.com', 443), 'DNS resolution failed'
+"""
+        for name, (profile, _) in profiles.items():
+            done = subprocess.run(['/usr/bin/sandbox-exec', '-f', str(profile), sys.executable,
+                                   '-c', socket_probe, json.dumps(list(map(str, socket_paths)))],
+                                  cwd=ws, env={'HOME': str(home), 'PATH': '/usr/bin:/bin'},
+                                  capture_output=True, text=True, timeout=30)
+            assert done.returncode == 0, (name, 'Unix sockets/DNS', done.stderr)
+        print('PASS: every template denies decoy Unix sockets with EPERM and resolves DNS')
+    for listener in listeners:
+        listener.close()
+    for directory in socket_dirs:
+        directory.cleanup()
+    if probe:
+        denied = [str(home / rel) for rel in DECOYS] + [str(ws / '.env'), str(ws / 'escaped-secret')]
+        for name, (profile, allowed) in profiles.items():
+            spec = json.dumps({'denied': denied, 'allowed': list(map(str, allowed))})
+            done = subprocess.run(['/usr/bin/sandbox-exec', '-f', str(profile), sys.executable,
+                                   '-c', probe_code, spec], cwd=ws,
+                                  env={'HOME': str(home), 'PATH': '/usr/bin:/bin'},
+                                  capture_output=True, text=True, timeout=20)
+            assert done.returncode == 0, (name, done.returncode, done.stderr)
+        print('PASS: every template denies HOME decoys and reads its declared paths under Seatbelt')
+    elif not probe_requested or sys.platform != 'darwin':
+        print('SKIP: actual Seatbelt probe; lead runs check --darwin-probe on Darwin')
+print('PASS: HOME profile ordering, declared roots, every template, and centralized rule rendering')

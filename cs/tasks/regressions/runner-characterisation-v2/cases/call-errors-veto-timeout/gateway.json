@@ -1,0 +1,54 @@
+[
+ {
+  "ok": {
+   "text": "three calls that fail three ways",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fs_write",
+     "args": {
+      "path": "deny-hello.txt",
+      "content": "hello"
+     }
+    },
+    {
+     "id": "2",
+     "name": "fx_tool",
+     "args": {
+      "mode": "kill"
+     }
+    },
+    {
+     "id": "3",
+     "name": "fx_tool",
+     "args": {
+      "mode": "fail",
+      "out": "plain failure",
+      "code": 3
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "writing",
+   "tool_calls": [
+    {
+     "id": "4",
+     "name": "fs_write",
+     "args": {
+      "path": "hello.txt",
+      "content": "hello"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

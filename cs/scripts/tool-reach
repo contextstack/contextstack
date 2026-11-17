@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""tool-reach — read-only reachability of lab tools, hooks, ops and scripts.
+
+Plan.CS.v2.1 §7: a tool or helper is removable when nothing reachable from
+the roots depends on it. This computes that graph and prints JSON (or a table
+with --summary). It never writes. Heuristics are commented inline; every
+guess leans conservative (an extra edge keeps a node alive; a missed edge
+would wrongly condemn one). --no-sweeps drops specs/sweeps + specs/judgments
+from the root set (both archived to specs/archive in the 2026-11-09 prune, so
+the default root set is the same unless the directories reappear). --unreachable prints the
+unreachable nodes one per line (scripts/check rule 1c). --manifest prints
+tools/manifest.json: the tools/bin executables a non-fixture root reaches under
+--no-sweeps, plus the operator-named utilities and per-tool "requires" notes
+read from the committed manifest itself ("operator_roots", "requires_manual");
+regenerate with `scripts/tool-reach --manifest > tools/manifest.json`. Fixture
+checks that hand off to a sibling script (CHECK.py, verify.py) are scanned
+together with that script.
+"""
+import json, os, re, stat, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[1]
+REPO = LAB.parent
+BIN_DIRS = ["tools/bin", "hooks/bin", "ops/bin", "scripts", "scripts/hooks"]
+IDENT = r"[A-Za-z0-9_.-]+"
+
+
+def rel(p): return str(Path(p).resolve().relative_to(LAB))
+def read(p):
+    try: return Path(p).read_text(encoding="utf-8", errors="replace")
+    except OSError: return ""
+
+
+# ---- nodes -----------------------------------------------------------------
+# Node = any non-descriptor file under the bin dirs. ".json" beside an
+# executable of the same stem is its descriptor (attached, not a node); a
+# ".json" with no such sibling is a runtime data asset (recorded, not pruned),
+# unless it is a runtime exe descriptor: then the tool is the node
+# tools/bin/<name>, an executable with no file of its own, kind of its "bin".
+def exe_bin(p):
+    try: d = json.loads(read(p) or "null")
+    except ValueError: return None
+    return d.get("bin") if isinstance(d, dict) and d.get("runtime") == "exe" and d.get("bin") else None
+
+
+def collect_nodes():
+    nodes, descriptors, assets = {}, {}, set()
+    for d in BIN_DIRS:
+        for p in sorted((LAB / d).iterdir()) if (LAB / d).is_dir() else []:
+            if not p.is_file() or p.name == "__pycache__" or p.name == "tool-reach": continue  # skip self
+            if p.suffix == ".json":
+                exe = p.with_suffix("")
+                if not exe.is_file() and exe_bin(p):
+                    nodes[rel(exe)] = {"kind": "executable", "dir": d, "shebang": "", "bin": exe_bin(p)}
+                (descriptors.__setitem__(rel(exe), rel(p)) if exe.is_file() or exe_bin(p) else assets.add(rel(p)))
+                continue
+            x = bool(p.stat().st_mode & stat.S_IXUSR)
+            kind = "executable" if x else ("helper" if p.suffix in (".py", ".sh") else "unclassified")
+            nodes[rel(p)] = {"kind": kind, "dir": d, "shebang": read(p).split("\n", 1)[0][:60]}
+    return nodes, descriptors, assets
+
+
+# ---- edges -----------------------------------------------------------------
+RE_IMPORT = re.compile(r"^\s*(?:from|import)\s+(_?\w+)", re.M)
+RE_PATH = re.compile(r"(?:tools/bin|ops/bin|hooks/bin|scripts/hooks|scripts)/(" + IDENT + ")")
+RE_SIB = re.compile(r"/\s*[\"'](" + IDENT + r")[\"']")            # HERE / "name"
+RE_SPLIT = re.compile(r"\"(tools|ops|hooks)\"\s*/\s*\"bin\"\s*/\s*\"(" + IDENT + r")\"")
+RE_TOOL_ARGV = re.compile(r"tool_argv\([^,()]*,\s*[\"'](" + IDENT + r")[\"']")  # _sandbox_policy.tool_argv(LAB, "okf")
+# Dynamic: a bin-dir join whose last part is an identifier/expression, or an
+# f-string under a bin dir. Such a file gets an edge to EVERY node basename it
+# mentions as a complete string literal (conservative; flagged dynamic_refs).
+RE_DYN = re.compile(r"\b(?:HERE|here)\s*/\s*(?![\"'])[A-Za-z_(]|\"bin\"\s*/\s*(?![\"'])[A-Za-z_(]|bin/\{")
+RE_ASSET = re.compile(r"[\"'](prompts/[^\"' ]+|triggers\.yaml|PINNED\.md)[\"']")
+RE_LITERAL = re.compile(r"[\"'](" + IDENT + r")[\"']")
+RE_CALL = re.compile(r"name[\"']?\]?\)?\s*(?:==|:)\s*[\"'](" + IDENT + r")[\"']")
+RE_SIBLING_PY = re.compile(r"\b([A-Za-z_][\w-]*\.py)\b")
+# External commands a tool execs: shutil.which("x"), a literal argv[0] in a
+# subprocess call, or an absolute /bin path. Scanned over the tool and the
+# tools/bin helpers it imports (transitively).
+RE_WHICH = re.compile(r"shutil\.which\(\s*[\"']([A-Za-z0-9_.-]+)[\"']")
+RE_ARGV0 = re.compile(r"(?:subprocess\.(?:run|Popen|check_output|check_call|call)|Popen)\(\s*\[\s*[\"']([^\"']+)[\"']")
+RE_ABSBIN = re.compile(r"[\"'](/(?:usr/)?(?:local/)?s?bin/[A-Za-z0-9_.-]+)[\"']")
+
+
+def resolve(name, nodes, dirs):
+    """Basename -> node paths in the given dirs (helpers may lack/have .py)."""
+    out = []
+    for d in dirs:
+        for cand in (f"{d}/{name}", f"{d}/{name}.py"):
+            if cand in nodes: out.append(cand)
+    return out
+
+
+def edges_for(path, text, nodes, assets, bydir):
+    """Edges from one file. Returns (targets:set, assets:set, dynamic:bool)."""
+    here = os.path.dirname(path)
+    other = [d for d in BIN_DIRS if re.search(d.replace("/", r"[/\"'\s]*"), text)]
+    t, a = set(), set()
+    # 1. Python imports of _helpers (and bare sibling modules such as
+    #    video_source_registry). Same dir first; else any bin dir the file
+    #    names (sys.path.insert(... "ops/bin")).
+    for m in RE_IMPORT.findall(text):
+        if m in ("__future__",): continue
+        hit = resolve(m, nodes, [here]) or (resolve(m, nodes, other) if m.startswith("_") else [])
+        t.update(hit)
+    # 2. Literal paths: tools/bin/x, ops/bin/x, scripts/x, runpy/importlib by path.
+    for m in RE_PATH.finditer(text):
+        t.update(resolve(m.group(1), nodes, BIN_DIRS) if "/" not in m.group(0).rsplit("/", 1)[0] else
+                 [n for n in (m.group(0), m.group(0) + ".py") if n in nodes])
+    # 3. Sibling joins HERE / "x", and "tools" / "bin" / "x".
+    for m in RE_SIB.findall(text): t.update(resolve(m, nodes, [here]))
+    for d, m in RE_SPLIT.findall(text): t.update(resolve(m, nodes, [f"{d}/bin"]))
+    # 3b. A tool exec'd through its descriptor: tool_argv(LAB, "name") (okf as cs-tools).
+    for m in RE_TOOL_ARGV.findall(text): t.update(resolve(m, nodes, ["tools/bin"]))
+    # 4. Dynamic construction: any node basename quoted anywhere in the file.
+    dyn = bool(RE_DYN.search(text))
+    if dyn:
+        for lit in set(RE_LITERAL.findall(text)):
+            t.update(resolve(lit, nodes, [here] + other))
+    # 5. Runtime assets by literal relative path (recorded, not pruned).
+    for m in RE_ASSET.findall(text): a.add(m)
+    for asset in assets:
+        if os.path.basename(asset) in text: a.add(asset)
+    t.discard(path)
+    return t, a, dyn
+
+
+# ---- roots -----------------------------------------------------------------
+def spec_fields(text):
+    """Tiny YAML reader for tools:/post_turn:/mcp:/model: (inline or block lists)."""
+    out, key = {"tools": [], "post_turn": [], "mcp": [], "model": None}, None
+    for line in text.splitlines():
+        m = re.match(r"^(tools|post_turn|mcp|model):\s*(.*)$", line)
+        if m:
+            key, v = m.group(1), m.group(2).strip()
+            if key == "model": out["model"] = v.split("#")[0].strip() or None; key = None
+            elif v.startswith("["): out[key] = [x.strip() for x in v.strip("[]").split(",") if x.strip()]; key = None
+            continue
+        if key and re.match(r"^\s+-\s+", line): out[key].append(line.split("-", 1)[1].strip())
+        elif key and line and not line.startswith(" "): key = None
+    return out
+
+
+def spec_roots(spec_rel, nodes, templates, src):
+    f = spec_fields(read(LAB / spec_rel))
+    names = [f"tools/bin/{t}" for t in f["tools"]] + [f"hooks/bin/{h}" for h in f["post_turn"]] + \
+            [f"tools/bin/{m}" for m in f["mcp"]]
+    # model: naming an executor template whose binary lives under lab.
+    b = templates.get(f["model"] or "", {}).get("binary", "")
+    bp = Path(os.path.expanduser(b)) if b else None
+    if bp and bp.is_absolute() and str(bp).startswith(str(LAB)) and bp.exists(): names.append(rel(bp))
+    found = [n for n in names if n in nodes]
+    missing = [(src, n) for n in names if n not in nodes]
+    return found, missing
+
+
+def last_state(path, key):
+    last = {}
+    for line in read(path).splitlines():
+        if not line.strip(): continue
+        r = json.loads(line)
+        if key in r: last[r.get("id")] = r
+    return last
+
+
+def collect_roots(nodes, with_sweeps):
+    roots, sources, missing = {}, {}, []
+    def add(kind, names, src):
+        roots.setdefault(kind, set()).update(names); sources.setdefault(kind, set()).add(src)
+    tpl_path = LAB / "ops/bin/executor-templates.json"
+    templates = json.loads(read(tpl_path) or "{}")
+    # (a) live specs. specs/*.yaml is the lead's definition. specs/sweeps and
+    # specs/judgments were archived 2026-11-09 (prune); the kinds stay so an
+    # absent or empty dir globs to nothing, and --no-sweeps drops them anyway.
+    globs = [("spec", "specs/*.yaml")] + ([("spec_sweep", "specs/sweeps/*.yaml"),
+                                           ("spec_judgment", "specs/judgments/*.yaml")] if with_sweeps else [])
+    for kind, g in globs:
+        for s in sorted(LAB.glob(g)):
+            f, miss = spec_roots(rel(s), nodes, templates, rel(s)); add(kind, f, rel(s)); missing += miss
+    # (b) pending dispatch jobs, (c) enabled schedules (latest revision per id).
+    for r in last_state(LAB / "ledger/dispatch.jsonl", "state").values():
+        if r.get("state") == "pending" and (LAB / r["spec"]).is_file():
+            f, miss = spec_roots(r["spec"], nodes, templates, "job " + r["id"]); add("job", f, r["spec"]); missing += miss
+    for r in last_state(LAB / "ledger/schedules.jsonl", "cron").values():
+        if r.get("enabled") and (LAB / r["spec"]).is_file():
+            f, miss = spec_roots(r["spec"], nodes, templates, "schedule " + r["id"]); add("schedule", f, r["spec"]); missing += miss
+    # (d) hooks: spec-declared by name, so all are roots.
+    add("hook", [n for n in nodes if n.startswith("hooks/bin/")], "hooks/bin/*")
+    # (e) dispatcher runtime: the named ops, launchd plists + loop-watcher
+    # scripts, and the ops the runner calls (harness/src: op(root, "x")).
+    add("dispatcher", [f"ops/bin/{n}" for n in ("tick", "schedule-tick", "enqueue", "close", "executor") if f"ops/bin/{n}" in nodes], "ops/bin (named)")
+    # The gateway's models.json names lab_executor (ops/bin/_executor.py): the
+    # indirect call behind ops/bin/executor's POST /v1/ai/lab-execute.
+    for p in list(REPO.glob("loop-watcher/*.sh")) + list(REPO.glob("loop-watcher/*.plist")) + \
+             list(LAB.glob("ops/launchd/*.plist")) + [REPO / "gateway/models.json"]:
+        add("dispatcher", [x for m in RE_PATH.finditer(read(p)) for x in resolve(m.group(1), nodes, BIN_DIRS)], str(p.relative_to(REPO)))
+    for p in sorted(REPO.glob("harness/src/*.rs")):
+        add("dispatcher", [f"ops/bin/{m}" for m in re.findall(r"\bop\(\s*(?:self\.)?root,\s*\"([a-z-]+)\"", read(p)) if f"ops/bin/{m}" in nodes], str(p.relative_to(REPO)))
+    # (f) OPERATOR.md names the ops a human runs by hand: a documented entry
+    # point, kept as its own kind so it can be weighed separately.
+    add("operator_doc", [x for m in RE_PATH.finditer(read(LAB / "OPERATOR.md")) for x in resolve(m.group(1), nodes, BIN_DIRS)], "OPERATOR.md")
+    # (i) scripts/check and the git hooks that run it; the rule scripts they
+    # name become reachable through ordinary edges.
+    add("check", ["scripts/check"] + [n for n in nodes if n.startswith("scripts/hooks/")], "scripts/check, scripts/hooks/*")
+    # (h) fixtures: every tasks/**/check (depth 1-2). Literal paths plus, for
+    # checks that name a bin dir, quoted node basenames (they often build
+    # LAB / "tools/bin" / name from a tuple). Helper imports resolve by name.
+    for p in sorted(LAB.glob("tasks/*/check")) + sorted(LAB.glob("tasks/*/*/check")):
+        text = read(p); names = set()
+        # A check that hands off to a sibling script (CHECK.py, verify.py, ...)
+        # is scanned together with it; setup/ trees are frozen copies, not followed.
+        for sib in set(RE_SIBLING_PY.findall(text)):
+            if (p.parent / sib).is_file(): text += "\n" + read(p.parent / sib)
+        for m in RE_PATH.finditer(text): names.update(resolve(m.group(1), nodes, BIN_DIRS))
+        dirs = [d for d in ("tools/bin", "ops/bin", "hooks/bin") if d in text or f'"{d.split("/")[0]}" / "bin"' in text]
+        if dirs:
+            for lit in set(RE_LITERAL.findall(text)): names.update(resolve(lit, nodes, dirs))
+        for m in RE_IMPORT.findall(text):
+            if m.startswith("_"): names.update(resolve(m, nodes, dirs or ["ops/bin", "tools/bin"]))
+        # Call-log assertions (row["name"] == "tool", '"name": "tool"') name a
+        # tool the check expects a run to have called; counted as fixture reach.
+        for m in RE_CALL.findall(text): names.update(resolve(m, nodes, ["tools/bin"]))
+        if names: add("fixture", names, rel(p))
+    return roots, sources, missing
+
+
+# ---- traversal -------------------------------------------------------------
+def compute(with_sweeps):
+    nodes, descriptors, assets = collect_nodes()
+    edges, asset_refs, dynamic = {}, {}, []
+    for n in nodes:
+        t, a, dyn = edges_for(n, read(LAB / n), nodes, assets, None)
+        edges[n] = sorted(t); asset_refs[n] = sorted(a)
+        if dyn: dynamic.append(n)
+    for exe, d in descriptors.items():          # descriptor -> executable
+        edges.setdefault(exe, [])
+    roots, sources, missing = collect_roots(nodes, with_sweeps)
+    reach = {}
+    for kind, start in roots.items():
+        seen, stack = set(), list(start)
+        while stack:
+            n = stack.pop()
+            if n in seen: continue
+            seen.add(n); stack.extend(edges.get(n, []))
+        for n in seen: reach.setdefault(n, set()).add(kind)
+    reachable = {n: sorted(k) for n, k in sorted(reach.items())}
+    fixture_only = sorted(n for n, k in reachable.items() if k == ["fixture"])
+    unreachable = sorted(n for n in nodes if n not in reachable)
+    counts = {"nodes": len(nodes), "reachable": len(reachable), "fixture_only": len(fixture_only),
+              "unreachable": len(unreachable), "dynamic_refs": len(dynamic), "descriptors": len(descriptors),
+              "assets": len(assets)}
+    for d in BIN_DIRS:
+        counts[d] = {"nodes": sum(n.startswith(d + "/") and n.count("/") == d.count("/") + 1 for n in nodes),
+                     "unreachable": sum(n.startswith(d + "/") and n.count("/") == d.count("/") + 1 for n in unreachable)}
+    return {"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "with_sweeps": with_sweeps,
+            "roots": {k: sorted(v) for k, v in sorted(roots.items())},
+            "root_sources": {k: sorted(v) for k, v in sorted(sources.items())},
+            "edges": {k: v for k, v in sorted(edges.items()) if v}, "reachable": reachable,
+            "fixture_only": fixture_only, "unreachable": unreachable, "dynamic_refs": sorted(dynamic),
+            "asset_refs": {k: v for k, v in sorted(asset_refs.items()) if v}, "assets": sorted(assets),
+            "descriptors": descriptors, "nodes": nodes,
+            "unresolved_root_refs": sorted(set(missing)),
+            "undescribed_executables": sorted(n for n, m in nodes.items() if m["kind"] == "executable"
+                                              and n.split("/")[0] in ("tools", "ops") and n not in descriptors
+                                              and not os.path.basename(n).startswith("_")),
+            "unclassified": sorted(n for n, m in nodes.items() if m["kind"] == "unclassified"), "counts": counts}
+
+
+# ---- manifest --------------------------------------------------------------
+def runtime_of(shebang):
+    """'#!/usr/bin/env python3' -> python3; '#!/bin/bash' -> bash; else None."""
+    parts = shebang[2:].split() if shebang.startswith("#!") else []
+    if parts and os.path.basename(parts[0]) == "env": parts = parts[1:]
+    return os.path.basename(parts[0]) if parts else None
+
+
+def requires_of(tool, out):
+    """External commands exec'd by the tool or the tools/bin helpers it imports;
+    a runtime exe tool requires its descriptor's bin."""
+    seen, stack, cmds = set(), [tool], set()
+    if out["nodes"][tool].get("bin"): cmds.add(out["nodes"][tool]["bin"])
+    while stack:
+        n = stack.pop()
+        if n in seen: continue
+        seen.add(n); text = read(LAB / n)
+        cmds.update(RE_WHICH.findall(text))
+        cmds.update(os.path.basename(c) for c in RE_ARGV0.findall(text) if not c.startswith("{"))
+        cmds.update(os.path.basename(c) for c in RE_ABSBIN.findall(text))
+        stack.extend(e for e in out["edges"].get(n, []) if e.startswith("tools/bin/") and e.endswith(".py"))
+    return cmds
+
+
+def manifest(out):
+    """The node image: tools/bin executables a non-fixture root reaches under
+    --no-sweeps, plus the operator-named utilities. Hand-held fields come from
+    the committed manifest (operator_roots, requires_manual); no timestamp, so
+    the output is stable until the tree changes."""
+    prior = json.loads(read(LAB / "tools/manifest.json") or "{}")
+    op = prior.get("operator_roots") or {}
+    manual = prior.get("requires_manual") or {}
+    if not op.get("names"): sys.exit("tools/manifest.json: operator_roots.names is missing; the generator copies it through")
+    kinds = {}
+    for n, k in out["reachable"].items():
+        if n.startswith("tools/bin/") and out["nodes"][n]["kind"] == "executable":
+            non_fixture = [x for x in k if x != "fixture"]
+            if non_fixture: kinds[n] = non_fixture
+    for name in op["names"]:
+        n = f"tools/bin/{name}"
+        if n not in out["nodes"]: sys.exit(f"operator_roots names {name}: not in tools/bin")
+        kinds[n] = sorted(set(kinds.get(n, [])) | {"operator_roots"})
+    tools = []
+    for n in sorted(kinds):
+        name = os.path.basename(n)
+        if n not in out["descriptors"]: sys.exit(f"{n}: no descriptor; a manifest tool is a file pair")
+        runtime = "exe" if out["nodes"][n].get("bin") else runtime_of(out["nodes"][n]["shebang"])
+        tools.append({"name": name, "descriptor": out["descriptors"][n], "runtime": runtime,
+                      "reached_from": kinds[n], "requires": sorted(requires_of(n, out) | set(manual.get(name, [])))})
+    return {"version": 2,
+            "source": "scripts/tool-reach --manifest (reachability under --no-sweeps; regenerate: scripts/tool-reach --manifest > tools/manifest.json)",
+            "reviewed_by": "the owner, 2026-11-08: node image = tools reached from live specs, hooks, dispatcher, operator and Director without specs/sweeps and specs/judgments as roots, plus operator_roots (vault review record §8)",
+            "roots_counted": sorted(set(x for k in kinds.values() for x in k)),
+            "operator_roots": op, "requires_manual": manual, "tools": tools}
+
+
+def main():
+    with_sweeps = "--no-sweeps" not in sys.argv and "--manifest" not in sys.argv
+    out = compute(with_sweeps)
+    counts, unreachable, fixture_only, dynamic, missing = (out["counts"], out["unreachable"], out["fixture_only"],
+                                                           out["dynamic_refs"], out["unresolved_root_refs"])
+    if "--manifest" in sys.argv:
+        json.dump(manifest(out), sys.stdout, indent=2, ensure_ascii=False); print()
+    elif "--unreachable" in sys.argv:
+        for n in unreachable: print(n)
+    elif "--summary" in sys.argv:
+        print(f"tool-reach {out['generated']}  (sweeps/judgments as roots: {with_sweeps})")
+        print(f"{'dir':<14}{'nodes':>6}{'unreach':>8}")
+        for d in BIN_DIRS: print(f"{d:<14}{counts[d]['nodes']:>6}{counts[d]['unreachable']:>8}")
+        print(f"{'total':<14}{counts['nodes']:>6}{counts['unreachable']:>8}   fixture-only {counts['fixture_only']}, dynamic {counts['dynamic_refs']}")
+        for k, v in out["roots"].items(): print(f"root {k:<14}{len(v):>4} direct  from {len(out['root_sources'][k])} source(s)")
+        for title, lst in (("UNREACHABLE", unreachable), ("FIXTURE-ONLY", fixture_only), ("DYNAMIC", sorted(dynamic))):
+            print(f"\n{title} ({len(lst)})"); [print("  " + n) for n in lst]
+        if missing: print("\nUNRESOLVED ROOT REFS"); [print(f"  {s}: {n}") for s, n in sorted(set(missing))]
+    else:
+        json.dump(out, sys.stdout, indent=1, sort_keys=False); print()
+
+
+if __name__ == "__main__":
+    main()

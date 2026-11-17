@@ -1,0 +1,8 @@
+{
+  "exit": 124,
+  "stdout": {
+    "contains": [
+      "exec: timed out after 3 s; output so far:"
+    ]
+  }
+}

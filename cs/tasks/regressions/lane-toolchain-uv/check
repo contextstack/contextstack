@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""uv and its Python dir are readable in Seatbelt; writes and sibling ~/.local paths are denied."""
+import ast
+import json
+import re
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+sys.path[:0] = [str(KIT / "ops/bin"), str(HERE.parent / "_lib")]
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+import _executor
+import _toolchains
+
+if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+    print("lane-toolchain-uv: SKIP (requires --darwin-probe on macOS)")
+    raise SystemExit(0)
+
+with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
+    root = Path(raw).resolve()
+    home, ws, tmp = root / "home", root / "ws", root / "tmp"
+    local_bin = home / ".local/bin"
+    python_dir = home / ".local/share/uv/python"
+    sibling = home / ".local/share/other/secret"
+    for directory in (local_bin, python_dir, sibling.parent, ws, tmp):
+        directory.mkdir(parents=True)
+    sibling.write_text("private")
+    (python_dir / "cpython-test/bin").mkdir(parents=True)
+    py = python_dir / "cpython-test/bin/python3"
+    py.write_text('#!/bin/sh\nprintf "PY_OK\\n"\n')
+    py.chmod(0o755)
+    uv = local_bin / "uv"
+    uv.write_text(
+        "#!" + sys.executable + "\n"
+        "import os, sys\n"
+        "if sys.argv[1:3] == [\"python\", \"dir\"]:\n"
+        " print(%r)\n"
+        " raise SystemExit(0)\n"
+        "if sys.argv[1:3] == [\"cache\", \"dir\"]:\n"
+        " print(os.environ.get(\"UV_CACHE_DIR\", \"\"))\n"
+        " raise SystemExit(0)\n"
+        'if sys.argv[1:] == [\"version\"]:\n print(\"uv 0.0.0\")\n raise SystemExit(0)\n'
+        % str(python_dir)
+    )
+    uv.chmod(0o755)
+    (local_bin / "other-shim").write_text("sibling\n")
+    config = root / "toolchains.json"
+    config.write_text(json.dumps([{"name": "uv", "bin": str(local_bin), "python": str(python_dir)}]))
+    os.environ.update(HOME=str(home), CS_TOOLCHAINS_FILE=str(config))
+    _toolchains.discover.cache_clear()
+    _toolchains.discover_path_dirs.cache_clear()
+    _toolchains.discover_sandbox_links.cache_clear()
+    assert str(python_dir) in _toolchains.discover()
+    assert str(local_bin) not in _toolchains.discover()
+    assert str(uv.resolve()) in [str(p) for p in _toolchains.discover_sandbox_links()]
+    env_probe = _toolchains.uv_lane_env(tmp)
+    assert env_probe["UV_CACHE_DIR"].startswith(str(tmp))
+    assert env_probe["UV_NO_CONFIG"] == "1"
+    assert env_probe["UV_PYTHON_INSTALL_DIR"] == str(python_dir.resolve()), env_probe
+    assert env_probe["UV_PYTHON_DOWNLOADS"] == "never" and "UV_DATA_DIR" not in env_probe, env_probe
+    import _executor
+    # The same pins the old source-extraction loader set, for the rest of this probe: the real helpers then read
+    # this fixture HOME and a minimal allowlist instead of the machine's.
+    _executor.HOME = home
+    _executor.PATH_FALLBACK = "/usr/bin:/bin"
+    _executor.KEEP_ENV = {"HOME"}
+    _executor.CRED_ENV = re.compile("SECRET")
+    _executor.fail = lambda msg: sys.exit(msg)
+    ns = {"allowlist_env": _executor.allowlist_env, "sandbox_cmd": _executor.sandbox_cmd}
+    child = {**hermetic_env(), **ns["allowlist_env"]([], tmp, ws)}
+    assert child["UV_CACHE_DIR"] == str(tmp / "uv-cache")
+    command = (
+        'uv version; uv cache dir; ! /bin/cat "$1"; ! /usr/bin/touch "$2/forbidden"; '
+        '! /bin/sh -c \'printf x >> "$4"\''
+    )
+    cmd = ns["sandbox_cmd"](
+        "/bin/sh",
+        ["-c", command, "probe", str(sibling), str(python_dir), str(local_bin), str(uv)],
+        ws, tmp, tmp / "profile.sb",
+    )
+    profile_text = (tmp / "profile.sb").read_text()
+    # Toolchain code stats the uv folder inside a lane (the fake home under /tmp hides a missing grant).
+    assert '(allow file-read-metadata (literal %s))' % json.dumps(str(local_bin.resolve())) in profile_text, profile_text
+    result = subprocess.run(cmd, env=child, cwd=ws, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and "uv 0.0.0" in result.stdout, result
+    cache_line = [line for line in result.stdout.splitlines() if str(tmp / "uv-cache") in line]
+    assert cache_line, result.stdout
+    assert sibling.read_text() == "private"
+    assert not (python_dir / "forbidden").exists()
+    # The fake home sits under /tmp, which lanes may write, so its .local/bin is writable here; the real
+    # ~/.local/bin is outside every write grant. What this change must guard is the uv binary itself.
+    assert uv.read_text().startswith("#!"), "uv binary was modified"
+
+    templates = json.loads((KIT / "ops/bin/executor-templates.json").read_text())
+    tmpl = templates["cursor-composer"]
+    from _cli_native import stage as stage_native
+    sandbox_caller = dict(deny_write_roots=[str(home / p[2:] if p.startswith("~/") else Path(p)) for p in tmpl.get("deny_write", [])])
+    native_env, native_links = stage_native(tmpl, tmp, home)
+    cli_env = {**child, **native_env}
+    assert str(uv.resolve().parent) in cli_env["PATH"].split(os.pathsep), cli_env["PATH"]
+    native_cmd = ns["sandbox_cmd"](
+        "/bin/sh",
+        ["-c", "uv version; ! /bin/cat \"$1\"", "native", str(sibling)],
+        ws, tmp, tmp / "native-agent.sb",
+        read_links=native_links, login_writes=tmpl, read_roots=(), caller=sandbox_caller,
+    )
+    native_result = subprocess.run(native_cmd, env=cli_env, cwd=ws, capture_output=True, text=True, timeout=30)
+    assert native_result.returncode == 0 and "uv 0.0.0" in native_result.stdout, native_result
+    check_script = ws / "stimulus" / "check"
+    check_script.parent.mkdir(parents=True, exist_ok=True)
+    check_script.write_text("#!/bin/sh\nuv version\n")
+    check_script.chmod(0o755)
+    check_cmd = ns["sandbox_cmd"](
+        str(check_script), [], ws, tmp, tmp / "check-native.sb",
+        read_links=native_links, login_writes=tmpl, read_roots=(check_script.parent,), caller=sandbox_caller,
+    )
+    check_result = subprocess.run(check_cmd, env=cli_env, cwd=ws, capture_output=True, text=True, timeout=30)
+    assert check_result.returncode == 0 and "uv 0.0.0" in check_result.stdout, check_result
+print("lane-toolchain-uv: PASS")

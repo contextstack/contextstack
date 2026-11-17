@@ -1,0 +1,25 @@
+[package]
+name = "cs-sandbox"
+description = "OS confinement wrapper for CS tool calls: policy JSON to a Seatbelt profile (macOS) or a bwrap mount plan plus seccomp (Linux)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+# Linux backend only (phase 3b): the seccomp filter, compiled in pure Rust and handed to bwrap by fd.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["fs", "pipe"] }
+seccompiler = "0.5"
+
+[dev-dependencies]
+tempfile.workspace = true
+libc = "0.2"
+
+[lints]
+workspace = true

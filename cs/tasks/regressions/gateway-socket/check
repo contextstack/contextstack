@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""gateway-socket regression (goal.md). Real csgateway, no provider keys, no ledger writes."""
+import http.client
+import json
+import os
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+REPO = LAB.parent
+WRAPPER = Path(os.environ.get("CS_SANDBOX_BIN") or REPO / "target/release/cs-sandbox")
+RUNTIME_READ = {
+    "macos": ["/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/private/var/select", "/dev"],
+    "linux": ["/usr", "/bin", "/lib", "/lib64", "/etc"],
+}
+# One tool, one sandboxed process: the gateway over the socket, then TCP to the live port and :9200.
+TOOL = """#!/bin/sh
+body=$(/usr/bin/curl -sS --max-time 5 --unix-socket "$CS_GATEWAY_SOCKET" \\
+  -H "Authorization: Bearer $GW_TOKEN" http://gateway/v1/models) && echo "unix ok $body" || echo "unix failed"
+for port in "$GW_PORT" 9200; do
+  if /usr/bin/curl -sS --max-time 3 -o /dev/null "http://127.0.0.1:$port/v1/capabilities" 2>/dev/null; then
+    echo "tcp $port connected"; else echo "tcp $port refused"; fi
+done
+"""
+FAILED = []
+
+
+def expect(ok, what, detail=None):
+    print(("ok   " if ok else "FAIL ") + what + ("" if ok or detail is None else " : %r" % (detail,)))
+    if not ok:
+        FAILED.append(what)
+
+
+class UnixHTTP(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__("gateway", timeout=5)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.connect(self.path)
+
+
+def over_socket(sock, path, token):
+    c = UnixHTTP(sock)
+    c.request("GET", path, headers={"Authorization": "Bearer " + token} if token else {})
+    r = c.getresponse()
+    out = (r.status, r.read())
+    c.close()
+    return out
+
+
+def over_tcp(port, path, token):
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path))
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def norm(resp):
+    """(status, body) with providers_active sorted: the gateway emits it in map order (not transport)."""
+    status, body = resp if isinstance(resp, tuple) else (200, resp)
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return status, body
+    if isinstance(value, dict) and isinstance(value.get("providers_active"), list):
+        value["providers_active"].sort()
+    return status, value
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def sandboxed(root, ws, sock, env, net):
+    (ws / "tool.json").write_text(json.dumps({"sandbox": {"net": net}}))
+    return subprocess.run([str(WRAPPER), "--policy", str(root / "policy.json"), "--cwd", str(ws), "--",
+                           str(ws / "tool")], env=dict(env, CS_GATEWAY_SOCKET=str(sock)),
+                          capture_output=True, text=True, timeout=30)
+
+
+def main():
+    # The Rust gateway scripts/check builds (the Go one is archived); $CSGATEWAY_BIN overrides it.
+    prebuilt = Path(os.environ.get("CSGATEWAY_BIN") or REPO / "target/release/cs-gateway")
+    if not prebuilt.is_file():
+        print("skip: %s is not built (cargo build --release -p cs-gateway)" % prebuilt)
+        return 0
+    state = Path.home() / ".contextstack/tmp"
+    state.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="gws-", dir=state, suffix=".noindex")).resolve()
+    proc = None
+    try:
+        binary = root / "csgateway"
+        shutil.copy2(prebuilt, binary)
+        (root / "models.json").write_text('{"models": [], "deployments": []}\n')
+        sock, port, token = root / "gw" / "gw.sock", free_port(), secrets.token_hex(16)
+        env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY") and k != "CSGATEWAY_KEYCHAIN_PROVIDERS"}
+        gw_env = dict(env, CSGATEWAY_CREDENTIALS='off', CSGATEWAY_PORT=str(port), CSGATEWAY_DISCOVERY_HEALTH='off', CSGATEWAY_AUTH_TOKEN=token, CSGATEWAY_SOCKET=str(sock),
+                      CSAGENT_MODELS_CONFIG=str(root / "models.json"), CSAGENT_BIND="127.0.0.1")
+        log = open(root / "gateway.log", "w")
+        proc = subprocess.Popen([str(binary)], cwd=root, env=gw_env, stdout=log, stderr=subprocess.STDOUT)
+        deadline = time.time() + 20
+        while time.time() < deadline and proc.poll() is None:
+            try:
+                if sock.is_socket() and over_tcp(port, "/v1/health", "")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+        expect(proc.poll() is None and sock.is_socket(), "gateway serves TCP and the socket",
+               (root / "gateway.log").read_text()[-800:])
+        if FAILED:
+            return 1
+        expect(oct(sock.stat().st_mode & 0o777) == "0o600", "socket is 0600", oct(sock.stat().st_mode))
+
+        # 1. Same response over the socket as over TCP, auth included.
+        for path, tok in (("/v1/models", token), ("/v1/models", ""), ("/v1/models", "wrong"), ("/v1/capabilities", "")):
+            t, s = over_tcp(port, path, tok), over_socket(str(sock), path, tok)
+            expect(norm(t) == norm(s), "%s token=%s: socket == TCP (%d)" % (path, "set" if tok == token else tok or "none", t[0]),
+                   (t, s))
+        expect(over_socket(str(sock), "/v1/models", "")[0] == 401, "socket without token is 401")
+        expect(over_socket(str(sock), "/v1/models", token)[0] == 200, "socket with token is 200")
+
+        # 2. Through the release cs-sandbox: net gateway reaches the socket and no TCP.
+        if not WRAPPER.is_file():
+            print("skip: %s not built; sandbox half not run" % WRAPPER)
+        else:
+            ws = root / "ws"
+            ws.mkdir()
+            (ws / "tool").write_text(TOOL)
+            (ws / "tool").chmod(0o755)
+            (root / "policy.json").write_text(json.dumps(
+                {"version": 1, "runtime_read": RUNTIME_READ, "allow_net": ["none", "gateway"]}))
+            tool_env = dict(env, GW_TOKEN=token, GW_PORT=str(port), TMPDIR=str(root))
+            models = over_tcp(port, "/v1/models", token)[1].decode().strip()
+            r = sandboxed(root, ws, sock, tool_env, "gateway")
+            lines = r.stdout.splitlines()
+            first = lines[0] if lines else ""
+            expect(r.returncode == 0 and first.startswith("unix ok ") and norm(first[8:]) == norm(models),
+                   "net gateway: the tool's HTTP call over the socket succeeds, same body as TCP", (r.stdout, r.stderr))
+            expect("tcp %d refused" % port in lines, "net gateway: TCP to the live gateway port fails", r.stdout)
+            expect("tcp 9200 refused" in lines, "net gateway: TCP to 127.0.0.1:9200 fails", r.stdout)
+            r = sandboxed(root, ws, sock, tool_env, "none")
+            expect(r.stdout.splitlines()[:1] == ["unix failed"], "control: net none cannot reach the socket", r.stdout)
+
+        # 3. Clean shutdown removes the socket.
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=15)
+        expect(not sock.exists(), "SIGTERM removes the socket")
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(root, ignore_errors=True)
+    print("gateway-socket: " + ("FAIL " + ", ".join(FAILED) if FAILED else "ok"))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

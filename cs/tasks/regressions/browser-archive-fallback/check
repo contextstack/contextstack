@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+ROOT = Path(__file__).resolve().parents[3]
+tool = ROOT / "tools/bin/browser_fetch"
+assert tool.is_file()
+with scratch_dir(prefix="browser-archive-fallback-") as raw:
+    root = Path(raw); fake = root / "browse"
+    fake.write_text("""#!/bin/sh
+set -eu
+case "$2" in
+  goto) echo "Navigated to $3 (200)" ;;
+  wait) echo "Page loaded" ;;
+  url) echo "https://93.184.216.34/source" ;;
+  js) case "$3" in *querySelectorAll*) printf '[{"text":"Detail","href":"https://93.184.216.34/detail"}]' > "$5" ;; *) printf 'Rendered evidence.\\n' > "$5" ;; esac; echo written ;;
+  archive) if [ "$LAB_ARCHIVE_MODE" = fail ]; then exit 9; else : > "$3"; echo archived; fi ;;
+  *) exit 2 ;;
+esac
+""")
+    fake.chmod(0o755)
+    for mode, expected in (("fail", "capture_failed"), ("empty", "empty_or_exceeds_limit")):
+        workspace = root / mode; workspace.mkdir()
+        state = root / (mode + "-state"); state.mkdir()
+        env = {**hermetic_env(), "LAB_BROWSE": str(fake), "LAB_BROWSER_STATE": str(state),
+               "LAB_BROWSER_ENGINE": "chrome", "LAB_BROWSER_VISIBILITY": "headed",
+               "LAB_ARCHIVE_MODE": mode}
+        payload = json.dumps({"url": "https://93.184.216.34/source", "archive": True, "links": True})
+        result = subprocess.run([str(tool)], input=payload, text=True, cwd=workspace,
+                                env=env, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        row = json.loads(result.stdout)
+        assert row["archive_omitted"] == expected and "archive_path" not in row
+        assert (workspace / row["body_path"]).is_file() and (workspace / row["links_path"]).is_file()
+        receipt = json.loads((workspace / row["evidence"]).read_text())
+        assert receipt["archive_omitted"] == expected and receipt["sha256"] == row["sha256"]
+print("check: optional browser archive failure preserves grounded text and links")

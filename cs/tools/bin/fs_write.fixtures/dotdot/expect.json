@@ -1,0 +1,8 @@
+{
+  "exit": 1,
+  "stdout": "path escapes workspace: sub/../../escape.txt\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"content\": \"h\", \"path\": \"sub/../../escape.txt\"}, \"name\": \"fs_write\"}\n"
+  },
+  "untouched": true
+}

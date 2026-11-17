@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Socket temp lifecycle regression; only subprocesses and directories owned by this test."""
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+OPS = Path(__file__).resolve().parents[3] / 'ops/bin'
+CHILD = r'''
+import os, re, signal, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import _lead_host as lead
+import _lead_socket as sockets
+# The outer hosted-agent sandbox denies cs-lead-* even in fixture directories.
+# Only substitute its basename prefix; exercise the real lifecycle/sweep code.
+assert sockets.temporary_socket_dir(Path('cs-lead-%s-' % os.getuid() + 'a'*16))
+assert not sockets.temporary_socket_dir(Path('cs-lead-%s-' % os.getuid() + 'a'*16 + '-extra'))
+sockets.TEMP_SOCKET_PATTERN = re.compile(r'fixture-socket-%s-[0-9a-f]{16}' % os.getuid())
+root, mode = Path(sys.argv[2]), sys.argv[3]
+lead.require_host_sandbox = lambda value: False
+lead.start_wake = lambda *args: None
+lead.sessions_root = lambda state: state / 'fixture-sessions'
+lead.socket_file = lambda *args: root / ('fixture-socket-%s-' % os.getuid() + 'a'*16) / 'socket'
+lead.SERVE_POLL_S = .01
+if mode == 'setup-error':
+    def error(*args, **kwargs): raise RuntimeError('fixture setup crash')
+    lead.start_wake = error
+if mode == 'normal':
+    lead.serve_should_exit = lambda *args, **kwargs: 'fixture'
+elif mode == 'error':
+    def error(*args, **kwargs): raise RuntimeError('fixture crash')
+    lead.serve_should_exit = error
+else:
+    lead.serve_should_exit = lambda *args, **kwargs: None
+lead.serve_loop('fixture', root / 'config', root / 'state', model='stub', cli_binary='unused', sandbox=False)
+'''
+
+
+def start(root, mode):
+    return subprocess.Popen([sys.executable, '-c', CHILD, str(OPS), str(root), mode],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def wait_socket(proc, path):
+    deadline = time.monotonic() + 5
+    while not path.is_socket():
+        assert proc.poll() is None, 'serve exited before binding'
+        assert time.monotonic() < deadline, 'serve did not bind'
+        time.sleep(.01)
+
+
+with tempfile.TemporaryDirectory(prefix='lead-cleanup-check-', dir='/tmp') as tmp:
+    root = Path(tmp).resolve()
+    socket_dir = root / ('fixture-socket-%s-' % os.getuid() + 'a'*16)
+    for mode, rc in [('normal', 0), ('error', 1), ('setup-error', 1)]:
+        proc = start(root, mode)
+        assert proc.wait(timeout=5) == rc
+        assert not socket_dir.exists(), mode + ' left a cs-lead directory'
+    proc = start(root, 'wait')
+    try:
+        wait_socket(proc, socket_dir / 'socket')
+        proc.terminate()
+        proc.wait(timeout=5)
+        assert not socket_dir.exists(), 'SIGTERM left a cs-lead directory'
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    proc = start(root, 'wait')
+    wait_socket(proc, socket_dir / 'socket')
+    proc.kill()
+    proc.wait()
+    assert socket_dir.exists(), 'crash fixture must leave recoverable state'
+    # Another dead owner's directory, a live owner's, malformed names and symlinks.
+    stale = root / ('fixture-socket-%s-' % os.getuid() + 'b'*16)
+    stale.mkdir(mode=0o700)
+    (stale / 'owner.pid').write_text(str(proc.pid))
+    (stale / 'serve.lock').touch(mode=0o600)
+    live = root / ('fixture-socket-%s-' % os.getuid() + 'c'*16)
+    live.mkdir(mode=0o700)
+    (live / 'owner.pid').write_text(str(os.getpid()))
+    (live / 'serve.lock').touch(mode=0o600)
+    malformed = root / (stale.name + '-extra')
+    malformed.mkdir()
+    link = root / ('fixture-socket-%s-' % os.getuid() + 'd'*16)
+    link.symlink_to(stale, target_is_directory=True)
+    import fcntl
+    locked = root / ('fixture-socket-%s-' % os.getuid() + 'e'*16)
+    locked.mkdir(mode=0o700)
+    (locked / 'owner.pid').write_text(str(proc.pid))
+    lock_stream = (locked / 'serve.lock').open('w')
+    fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    legacy = root / ('fixture-socket-%s-' % os.getuid() + 'f'*16)
+    legacy.mkdir(mode=0o700)
+    old_legacy = root / ('fixture-socket-%s-' % os.getuid() + 'f0f0f0f0f0f0f0f0')
+    old_legacy.mkdir(mode=0o700)
+    os.utime(old_legacy, (time.time() - 90000, time.time() - 90000))
+    proc = start(root, 'normal')
+    assert proc.wait(timeout=5) == 0
+    assert locked.exists(), 'sweep removed a locked serve during startup'
+    lock_stream.close()
+    assert legacy.exists() and not list(legacy.iterdir()), 'sweep removed a fresh legacy directory'
+    assert not old_legacy.exists(), 'sweep did not remove an old empty legacy directory'
+    assert not stale.exists(), 'serve startup did not sweep a dead owner'
+    assert not socket_dir.exists(), 'crashed serve directory survived restart'
+    assert live.exists(), 'sweep removed a live owner'
+    assert malformed.exists() and link.is_symlink(), 'sweep matched unsafe names or links'
+print('lead socket cleanup: normal/error/SIGTERM/crash/stale sweep pass')

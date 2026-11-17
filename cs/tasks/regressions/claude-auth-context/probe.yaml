@@ -1,0 +1,8 @@
+id: claude-auth-context-probe
+model: claude-auth-context-probe
+system: prompts/coder-min.md
+tools: []
+budget: {turns: 1, tool_calls: 0, usd: 0, seconds: 30}
+tasks: [tasks/regressions/claude-auth-context]
+trials: 1
+hypothesis: "fixture-1764: claude-auth-context-probe captures actual isolated child metadata with a fake CLI, no Claude invocation or credential export."

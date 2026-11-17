@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""finalize-run recovery contract (Plan.CS.v2.1 §4).
+
+The two tests the plan makes part of the op's definition, plus the pending
+alert and the tick seam:
+  concurrent   two finalizers on one run dir: one row, one evidence record,
+               one finalized.json; the loser reports pending, never finalized
+  kill-retry   FINALIZE_RUN_CRASH_AFTER each of check|transcript|publish|row,
+               then a retry: the original check.json verdict is kept (the
+               workspace is broken in between so a rerun would fail), no
+               second row or record, finalization completes
+  estate       missing ESTATE refuses the row -> pending
+               raises exactly one finalization_pending alert whose age grows
+               across evaluations and never resets; the third retry (ESTATE
+               restored) clears it
+  publish      publish-evidence failure keeps the row, records finalize.error,
+               leaves finalized.json absent; the retry publishes, no second row
+  marker       complete manifest present, ready_for_inspection absent (the crash
+               window inside publish-evidence): the retry re-publishes the
+               marker and finalizes; both present, or an incomplete capture's
+               manifest (never marked): the retry calls publish-evidence never
+  mismatch     check.json whose stimulus_sha differs from terminal.json's (or is
+               empty against a frozen one): pending, reason names both hashes,
+               nothing appended; a matching file is reused, never rerun
+  env          the check inherits only the runner's child allowlist
+  v2 row: the appended row is row_version 2; a clean run has no
+               error and no call_errors; finalized.json names error_class
+  envelope     the outbox holds <run_id>.json binding the row and every file by
+               sha256; a kill after it and a retry reuse it; a tampered envelope
+               is pending and never overwritten
+  enospc       ENOSPC before the row writes finalize.error class spool_full, the
+               alert shows it; the retry after space returns appends one v2 row
+  durable      terminal.json and the run dir are fsync'd on entry, before any
+               step, and the outputs are those of an unobserved run
+  tick         a runner exit 3 yields a dispatch TERMINAL row with
+               stop finalization_pending, code 3, whether no row landed
+               (estate) or the finalizer's row did and publish failed
+               (publish); completion is withheld; the next tick's sweep
+               finishes the dir and appends nothing twice; (publish) a
+               later tick's age sweep removes an old report cell dir no run
+               can claim and keeps a young one, one whose report cwd is a
+               pending run's workspace, and one holding a torn report
+
+Template: one real run dir, produced by the runner (default Rust) with a stub
+finalize-run that exits 3 (terminal.json and messages.jsonl on disk, no
+transcript.md: the op renders it, nothing finalized). Every test copies the template estate. Isolated
+estates only; lab/ledger is never written. $CS_RUNNER_BIN overrides the
+default Rust runner.
+"""
+import hashlib
+import json
+import threading
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import clone_tree
+from hermetic_env import hermetic_env
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+CHAR = LAB / "tasks/regressions/runner-characterisation-v2"  # the fake gateway that speaks the current wire
+sys.path.insert(0, str(CHAR))
+from _fake_gateway import FakeGateway  # noqa: E402
+sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation"))
+from _harness import install_exe  # noqa: E402 runtime exe tools
+
+REAL_TOOLS = ("fs_read", "fs_write", "exec", "_calllog.py")
+REAL_OPS = ("setup-workspace", "capture-stimulus", "publish-evidence", "finalize-run")
+OP_HELPERS = ("_estate_io.py", "_roots.py", "_lifecycle_evidence.py", "_harvest_git.py", "_setup_workspace.py", "_corpus_contract.py", "_workspace_setup.py", "_env_policy.py", "_runner.py", "_errors.py")
+ROW_KEYS = {"ts", "spec", "spec_sha", "task_sha", "env_sha", "stimulus_sha", "model", "task",
+            "trial", "verdict", "stop", "cost_usd", "est_usd", "est_basis", "cost_class", "turns",
+            "tool_calls", "seconds", "transcript", "estate", "row_version", "executed_by"}  # execution identity
+SPEC_ID = "fx-recovery"
+TASK_REL = "tasks/create-file"
+SPEC = """id: %s
+model: fake
+system: prompts/coder-min.md
+context: []
+tools: [fs_read, fs_write, exec]
+post_turn: []
+mcp: []
+budget: {turns: 5, tool_calls: 10, usd: 1, seconds: 30}
+tasks: [%s]
+trials: 1
+hypothesis: "fixture-1971: finalize-run recovery contract"
+""" % (SPEC_ID, TASK_REL)
+GATEWAY = [
+    {"ok": {"text": "writing the file",
+            "tool_calls": [{"id": "1", "name": "fs_write",
+                            "args": {"path": "hello.txt", "content": "hello"}}]}},
+    {"ok": {"text": "done", "tool_calls": []}},
+]
+FOOTER = "\n---\nstop done · verdict **pass** · turns 2 · tools 1 · cost $0.0200\n"
+STUB_FINALIZE = ('#!/bin/sh\necho \'{"ok": false, "state": "pending", "reason": "fixture stub"}\'\n'
+                 'exit 3\n')
+FAILING_PUBLISH = "#!/bin/sh\necho 'publish-evidence: fixture boom' >&2\nexit 1\n"
+SLOW_PUBLISH = ('#!/bin/sh\nsleep 1.5\nexec "$(dirname "$0")/publish-evidence.real"\n')
+COUNTING_PUBLISH = ('#!/bin/sh\necho called >> "$(dirname "$0")/../../fixture/publish-calls"\n'
+                    'exec "$(dirname "$0")/publish-evidence.real"\n')
+# the stub logs every call so the fixture can see whether completion fired.
+FAKE_LAB = """#!/usr/bin/env python3
+# Fixture runner: execution ends, finalization is left pending (exit 3). With
+# FINALIZE the real finalize-run is called as the runner calls it; the estate's
+# publisher fails, so the row lands and finalized.json does not (by design).
+import json, shutil, subprocess, sys
+from pathlib import Path
+estate = Path(__file__).resolve().parent
+src = next((estate / "fixture/template-runs").iterdir())
+dst = estate / "ledger/runs" / src.name
+shutil.copytree(src, dst)
+if __FINALIZE__:
+    subprocess.run([str(estate / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(dst)}),
+                   text=True, capture_output=True, cwd=str(estate))
+sys.stderr.write("lab: finalization pending: %s\\n" % dst)
+sys.exit(3)
+"""
+PRIOR_ROWS = [
+    {"ts": "2026-11-07T00:00:00Z", "exp": "other-task", "spec": "fx-other", "model": "fake",
+     "task": "tasks/other", "trial": 1, "verdict": "pass", "stop": "done",
+     "transcript": "ledger/runs/20261107-000000.000000000-fx-other-other-t1", "estate": "dev"},
+    {"ts": "2026-11-07T00:01:00Z", "exp": "fixture-1971", "spec": SPEC_ID, "model": "fake",
+     "task": TASK_REL, "trial": 1, "verdict": "fail", "stop": "done",
+     "transcript": "ledger/runs/20261107-000100.000000000-%s-create-file-t1" % SPEC_ID, "estate": "dev"},
+]
+
+
+class Report:
+    def __init__(self):
+        self.failed = []
+
+    def expect(self, cond, label, detail=""):
+        print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)) if detail else ""))
+        if not cond:
+            self.failed.append(label)
+        return cond
+
+
+def copy_exec(src, dst):
+    shutil.copy2(src, dst)
+    if not dst.name.endswith((".json", ".py")):
+        dst.chmod(0o755)
+
+
+def runner_binary(scratch):
+    """$CS_RUNNER_BIN if set, else the default Rust runner (_runner.built_runner)."""
+    sys.path.insert(0, str(LAB / "ops/bin"))
+    from _runner import built_runner
+    return built_runner(LAB).resolve()
+
+
+def clean_env(estate, **extra):
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(estate / "home"),
+           "TMPDIR": str(estate / "tmp"), "LANG": os.environ.get("LANG", "en_US.UTF-8")}
+    env.update(extra)
+    return env
+
+
+def build_template(scratch, binary):
+    """A real run dir left at the terminal.json boundary: the stub finalizer exits 3."""
+    estate = scratch / "template"
+    for d in ("ledger", "prompts", "tools/bin", "hooks/bin", "ops/bin", "specs", "tasks",
+              "fixture", "home", "tmp"):
+        (estate / d).mkdir(parents=True)
+    (estate / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
+    (estate / "ESTATE").write_text("dev\n", encoding="utf-8")
+    shutil.copy2(LAB / "prompts/coder-min.md", estate / "prompts/coder-min.md")
+    for name in REAL_TOOLS:
+        if not (LAB / "tools/bin" / name).is_file() and (LAB / "tools/bin" / (name + ".json")).is_file():
+            install_exe(LAB / "tools/bin" / (name + ".json"), LAB, estate)
+            continue
+        copy_exec(LAB / "tools/bin" / name, estate / "tools/bin" / name)
+        if (LAB / "tools/bin" / (name + ".json")).is_file():
+            shutil.copy2(LAB / "tools/bin" / (name + ".json"), estate / "tools/bin" / (name + ".json"))
+    for name in REAL_OPS + OP_HELPERS:
+        copy_exec(LAB / "ops/bin" / name, estate / "ops/bin" / name)
+    (estate / "ops/bin/finalize-run").write_text(STUB_FINALIZE, encoding="utf-8")
+    shutil.copytree(LAB / TASK_REL, estate / TASK_REL)
+    (estate / TASK_REL / "check").chmod(0o755)
+    (estate / "specs/fx.yaml").write_text(SPEC, encoding="utf-8")
+    with open(estate / "ledger/ledger.jsonl", "w", encoding="utf-8") as f:
+        for row in PRIOR_ROWS:
+            f.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+    gateway = FakeGateway(GATEWAY, estate)
+    try:
+        proc = subprocess.run([str(binary), "run", "specs/fx.yaml"], cwd=str(estate),
+                              env=clean_env(estate, CSGATEWAY_ENDPOINT=gateway.endpoint),
+                              text=True, capture_output=True, timeout=120)
+    finally:
+        gateway.stop.set()
+        gateway.close()
+    runs = sorted((estate / "ledger/runs").iterdir())
+    if proc.returncode != 3 or len(runs) != 1 or not (runs[0] / "terminal.json").is_file():
+        raise SystemExit("check: template run did not stop at terminal.json: rc=%d stdout=%r stderr=%r"
+                         % (proc.returncode, proc.stdout, proc.stderr))
+    if "finalization pending" not in proc.stderr or (runs[0] / "check.json").exists():
+        raise SystemExit("check: stub finalizer did not leave the dir untouched: %r" % proc.stderr)
+    if not (runs[0] / "messages.jsonl").is_file() or (runs[0] / "transcript.md").exists():
+        raise SystemExit("check: the runner must leave messages.jsonl and no transcript.md: %s"
+                         % sorted(e.name for e in runs[0].iterdir()))
+    copy_exec(LAB / "ops/bin/finalize-run", estate / "ops/bin/finalize-run")
+    return estate
+
+
+class Fixture:
+    def __init__(self, scratch, template):
+        self.scratch, self.template, self.n = scratch, template, 0
+
+    def fresh(self, name):
+        self.n += 1
+        estate = self.scratch / ("%02d-%s" % (self.n, name))
+        clone_tree(self.template, estate)
+        return estate
+
+
+def run_dir_of(estate):
+    return sorted((estate / "ledger/runs").iterdir())[0]
+
+
+def rows_of(estate):
+    path = estate / "ledger/ledger.jsonl"
+    if not path.is_file():
+        return []
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def finalize(estate, run_dir=None, env=None, **extra):
+    r = subprocess.run([str(estate / "ops/bin/finalize-run")], cwd=str(estate),
+                       env=env or clean_env(estate, **extra),
+                       input=json.dumps({"run_dir": str(run_dir or run_dir_of(estate))}),
+                       text=True, capture_output=True, timeout=120)
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        out = {}
+    return r.returncode, out, r.stderr
+
+
+def entries(run_dir):
+    return sorted(e.name for e in run_dir.iterdir())
+
+
+def footer_count(run_dir):
+    if not (run_dir / "transcript.md").is_file():  # the render step has not run yet
+        return 0
+    return (run_dir / "transcript.md").read_text(encoding="utf-8").count("\n---\nstop ")
+
+
+
+
+def test_happy(rep, fx):
+    estate = fx.fresh("happy")
+    run_dir = run_dir_of(estate)
+    before = rows_of(estate)
+    rc, out, err = finalize(estate)
+    rows = rows_of(estate)
+    rep.expect(rc == 0 and out.get("state") == "finalized" and out.get("ok") is True,
+               "happy: finalize-run exits 0 finalized", (rc, out, err[-300:]))
+    rep.expect(out.get("verdict") == "pass" and out.get("stop") == "done" and out.get("row_appended") is True
+               and out.get("publish") == "ok", "happy: reply carries verdict pass, stop done, row appended, publish ok", out)
+    rep.expect(len(rows) == len(before) + 1, "happy: exactly one row appended", (len(before), len(rows)))
+    line = rows[-1]
+    row = json.loads(line)
+    rep.expect(set(row) == ROW_KEYS, "happy: row has exactly the v2 field set", sorted(set(row) ^ ROW_KEYS))
+    rep.expect(line == json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+               "happy: row bytes are sorted-key compact JSON (Go encoder form)", line[:120])
+    rep.expect(row["estate"] == "dev" and row["verdict"] == "pass" and row["stop"] == "done"
+               and row["transcript"] == "ledger/runs/" + run_dir.name and row["spec"] == SPEC_ID,
+               "happy: row content", row)
+    rep.expect(isinstance(row["trial"], int) and isinstance(row["turns"], int) and isinstance(row["cost_usd"], float)
+               and row["cost_usd"] == 0.02 and row["est_basis"] == "rate", "happy: row value types as Go wrote them",
+               {k: type(v).__name__ for k, v in row.items()})
+    text = (run_dir / "transcript.md").read_text(encoding="utf-8")
+    rep.expect(text.endswith(FOOTER) and footer_count(run_dir) == 1, "happy: transcript ends with the footer, once",
+               repr(text[-120:]))
+    rep.expect(text.startswith("# %s · " % SPEC_ID) and "\n### turn 1\n\nwriting the file\n" in text
+               and '\n`fs_write {"content":"hello","path":"hello.txt"}`\n\n```\nwrote hello.txt (5 bytes)\n```\n' in text
+               and "\n### turn 2\n\ndone\n" in text,
+               "happy: the body was rendered from messages.jsonl (header, turns, tool block)", repr(text[:200]))
+    check = json.loads((run_dir / "check.json").read_text(encoding="utf-8"))
+    rep.expect(check == {"verdict": "pass", "exit_code": 0, "output": "", "skipped": False, "window": 60,
+                         "stimulus_sha": row["stimulus_sha"]}, "happy: check.json persisted", check)
+    done = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8"))
+    rep.expect(row["row_version"] == 2 and "error" not in row and "call_errors" not in row
+               and done_error_class(run_dir) is None, "v2 row: row_version 2, a clean run has no error and no call_errors",
+               row)
+    rep.expect(done.get("steps") == {"check": "ran", "render": "rendered", "transcript": "appended", "publish": "ok",
+                                     "row": "appended", "envelope": "written"}
+               and done.get("scan_rows") == len(before) and isinstance(done.get("scan_ms"), (int, float))
+               and done.get("verdict") == "pass", "happy: finalized.json records steps and the ledger scan cost", done)
+    ev = json.loads((run_dir / "evidence/manifest.json").read_text(encoding="utf-8"))
+    rep.expect(ev.get("check", {}).get("verdict") == "pass" and (run_dir / "ready_for_inspection").is_file()
+               and ev.get("transcript", {}).get("bytes") == len(text.encode()),
+               "happy: evidence record binds the check result and the footered transcript", ev.get("transcript"))
+    rep.expect(entries(run_dir) == ["check.json", "evidence", "finalize.lock", "finalized.json", "messages.jsonl",
+                                    "ready_for_inspection", "stimulus", "terminal.json", "transcript.md", "workspace"],
+               "happy: run-dir entries", entries(run_dir))
+    rc2, out2, _ = finalize(estate)
+    rep.expect(rc2 == 0 and out2.get("state") == "finalized" and out2.get("row_appended") is False
+               and rows_of(estate) == rows and (run_dir / "transcript.md").read_text(encoding="utf-8") == text,
+               "happy: second call is idempotent (no row, no footer, finalized)", out2)
+
+
+def done_error_class(run_dir):
+    done = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8"))
+    return done.get("error_class", "absent")
+
+
+def envelope_of(estate, run_dir):
+    path = estate / "ledger/outbox" / (run_dir.name + ".json")
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+
+def test_envelope(rep, fx):
+    estate = fx.fresh("envelope")
+    run_dir = run_dir_of(estate)
+    rc, out, err = finalize(estate)
+    env = envelope_of(estate, run_dir)
+    line = rows_of(estate)[-1].encode("utf-8")
+    paths = [f["path"] for f in env.get("files", [])]
+    rep.expect(rc == 0 and env.get("envelope_version") == 1 and env.get("event_id") == "run_finalized:" + run_dir.name
+               and env.get("run_id") == run_dir.name and env.get("transcript") == "ledger/runs/" + run_dir.name
+               and env.get("row_sha256") == hashlib.sha256(line).hexdigest() and env.get("row_version") == 2
+               and env.get("error_class") is None, "envelope: outbox/<run_id>.json binds the event, the row bytes", env)
+    want = {"terminal.json", "messages.jsonl", "check.json", "transcript.md", "stimulus/manifest.json",
+            "evidence/manifest.json"}
+    rep.expect(want <= set(paths) and paths == sorted(paths) and not any(
+                   x.startswith(("workspace/", "finalized.json", "finalize.")) for x in paths)
+               and all(hashlib.sha256((run_dir / f["path"]).read_bytes()).hexdigest() == f["sha256"]
+                       and (run_dir / f["path"]).stat().st_size == f["bytes"] for f in env["files"]),
+               "envelope: files cover the record, stimulus and evidence by size and sha256; never workspace or finalized.json",
+               paths)
+    row = json.loads(line)
+    usage = env.get("usage") or {}
+    rep.expect(set(usage) == {"input_tokens", "output_tokens", "est_usd", "est_basis", "charged_usd", "source"}
+               and usage.get("est_usd") == row.get("est_usd") and usage.get("charged_usd") == row.get("cost_usd")
+               and (usage.get("source") or {}).get("model") == (row.get("model") or None),
+               "envelope: usage (node protocol 1) carries the row's est_usd, its cost_usd as charged_usd, and the model", usage)
+    rep.expect(env.get("envelope_sha256") == hashlib.sha256("".join(
+                   "%s:%s\n" % (f["path"], f["sha256"]) for f in env["files"]).encode()).hexdigest(),
+               "envelope: envelope_sha256 is over the sorted path:sha256 lines")
+    # A tampered envelope (another run's hashes under this name) is pending and never overwritten.
+    estate = fx.fresh("envelope-mismatch")
+    run_dir = run_dir_of(estate)
+    rc, _, _ = finalize(estate, FINALIZE_RUN_CRASH_AFTER="envelope")
+    path = estate / "ledger/outbox" / (run_dir.name + ".json")
+    rep.expect(rc == 137 and path.is_file() and not (run_dir / "finalized.json").exists(),
+               "kill after envelope: the envelope is on disk, no finalized.json", entries(run_dir))
+    good = path.read_bytes()
+    rc2, out2, _ = finalize(estate)
+    done = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8")) if rc2 == 0 else {}
+    rep.expect(rc2 == 0 and done.get("steps", {}).get("envelope") == "existing" and path.read_bytes() == good
+               and len(rows_of(estate)) == len(PRIOR_ROWS) + 1,
+               "kill after envelope: the retry reuses it (existing), one row, finalized", done.get("steps"))
+    (run_dir / "finalized.json").unlink()
+    path.write_text(json.dumps({**json.loads(good), "envelope_sha256": "0" * 64}), encoding="utf-8")
+    tampered = path.read_bytes()
+    rc3, out3, _ = finalize(estate)
+    rep.expect(rc3 == 3 and "differs from the recomputed" in out3.get("reason", "") and path.read_bytes() == tampered
+               and not (run_dir / "finalized.json").exists(),
+               "envelope mismatch: pending, reason names both hashes, the envelope is not overwritten", out3)
+
+
+def test_enospc(rep, fx, scratch):
+    estate = fx.fresh("enospc")
+    run_dir = run_dir_of(estate)
+    before = len(rows_of(estate))
+    rc, out, _ = finalize(estate, FINALIZE_RUN_ENOSPC_BEFORE="row")
+    error = json.loads((run_dir / "finalize.error").read_text(encoding="utf-8")) if (run_dir / "finalize.error").is_file() else {}
+    rep.expect(rc == 3 and out.get("state") == "pending" and "No space left" in out.get("reason", "")
+               and error.get("class") == "spool_full" and len(rows_of(estate)) == before
+               and not (run_dir / "finalized.json").exists(),
+               "enospc: finalize.error class spool_full, no row, pending", (rc, out, error))
+    rc2, out2, _ = finalize(estate)
+    rows = [json.loads(l) for l in rows_of(estate)[before:]]
+    rep.expect(rc2 == 0 and out2.get("state") == "finalized" and len(rows) == 1 and rows[0].get("row_version") == 2,
+               "enospc: the retry after space returns appends exactly one version 2 row", (rc2, out2, rows))
+    estate = fx.fresh("enospc-envelope")
+    run_dir = run_dir_of(estate)
+    rc, out, _ = finalize(estate, FINALIZE_RUN_ENOSPC_BEFORE="envelope")
+    error = json.loads((run_dir / "finalize.error").read_text(encoding="utf-8")) if (run_dir / "finalize.error").is_file() else {}
+    rep.expect(rc == 3 and error.get("class") == "spool_full" and len(rows_of(estate)) == len(PRIOR_ROWS) + 1
+               and not (estate / "ledger/outbox" / (run_dir.name + ".json")).exists(),
+               "enospc before the envelope: the row stands, no envelope, class spool_full", (rc, error))
+    rc2, _, _ = finalize(estate)
+    rep.expect(rc2 == 0 and len(rows_of(estate)) == len(PRIOR_ROWS) + 1 and envelope_of(estate, run_dir),
+               "enospc before the envelope: the retry writes it and appends nothing", rc2)
+
+
+FSYNC_WRAP = r"""
+import atexit, fcntl, json, os, runpy, sys
+log, real = [], os.fsync
+def path_of(fd):
+    if hasattr(fcntl, "F_GETPATH"):
+        return fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0].decode()
+    return os.readlink("/proc/self/fd/%d" % fd)
+def fsync(fd):
+    log.append(path_of(fd))
+    return real(fd)
+os.fsync = fsync
+atexit.register(lambda: open(os.environ["FSYNC_LOG"], "w").write(json.dumps(log)))
+script = sys.argv[1]
+sys.argv = [script]
+sys.path.insert(0, os.path.dirname(script))
+runpy.run_path(script, run_name="__main__")
+"""
+
+
+def test_durable_entry(rep, fx):
+    """S0: terminal.json and the run dir are fsync'd before any step; nothing else changes."""
+    plain, watched = fx.fresh("durable-plain"), fx.fresh("durable-watched")
+    finalize(plain)
+    log = watched / "fixture/fsync-log.json"
+    r = subprocess.run([sys.executable, "-c", FSYNC_WRAP, str(watched / "ops/bin/finalize-run")], cwd=str(watched),
+                       env=clean_env(watched, FSYNC_LOG=str(log)), text=True, capture_output=True, timeout=120,
+                       input=json.dumps({"run_dir": str(run_dir_of(watched))}))
+    synced = json.loads(log.read_text()) if log.is_file() else []
+    run_dir = os.path.realpath(run_dir_of(watched))
+    rep.expect(r.returncode == 0 and synced[:2] == [os.path.join(run_dir, "terminal.json"), run_dir],
+               "durable: terminal.json then the run dir are the first fsyncs, before any step writes", synced[:3])
+
+    def view(estate):
+        d = run_dir_of(estate)
+        row = json.loads(rows_of(estate)[-1])
+        row.pop("ts")
+        done = json.loads((d / "finalized.json").read_text())
+        return (row, (d / "check.json").read_text(), (d / "transcript.md").read_text(), entries(d),
+                done["steps"], done.get("error_class"))
+    rep.expect(view(plain) == view(watched), "durable: row, check.json, transcript, entries and steps are unchanged")
+
+
+def test_concurrent(rep, fx):
+    estate = fx.fresh("concurrent")
+    run_dir = run_dir_of(estate)
+    ops = estate / "ops/bin"
+    copy_exec(ops / "publish-evidence", ops / "publish-evidence.real")
+    (ops / "publish-evidence").write_text(SLOW_PUBLISH, encoding="utf-8")
+    before = len(rows_of(estate))
+    payload = json.dumps({"run_dir": str(run_dir)})
+    procs = [subprocess.Popen([str(ops / "finalize-run")], cwd=str(estate), env=clean_env(estate),
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for _ in range(2)]
+    import threading
+    results = [None, None]
+    def finish(i, proc):
+        out, err = proc.communicate(input=payload, timeout=120)
+        try:
+            results[i] = (proc.returncode, json.loads(out.strip().splitlines()[-1]))
+        except (ValueError, IndexError):
+            results[i] = (proc.returncode, {"raw": out, "stderr": err})
+    threads = [threading.Thread(target=finish, args=(i, p)) for i, p in enumerate(procs)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    winners = [r for r in results if r[0] == 0 and r[1].get("state") == "finalized"]
+    losers = [r for r in results if r[0] == 3 and r[1].get("state") == "pending"]
+    rep.expect(len(winners) == 1 and len(losers) == 1, "concurrent: one finalized, one pending", results)
+    rep.expect(all(r[1].get("state") != "finalized" for r in losers) and
+               losers[0][1].get("reason") == "another finalizer holds the lock" if losers else False,
+               "concurrent: the loser names the lock and never claims finalized", results)
+    rep.expect(len(rows_of(estate)) == before + 1, "concurrent: exactly one row", len(rows_of(estate)) - before)
+    rep.expect((run_dir / "evidence/manifest.json").is_file() and footer_count(run_dir) == 1
+               and (run_dir / "finalized.json").is_file() and not (run_dir / "finalize.error").exists(),
+               "concurrent: one evidence record, one footer, one finalized.json, no finalize.error",
+               entries(run_dir))
+
+
+def test_kill_retry(rep, fx):
+    for step in ("check", "transcript", "publish", "row"):  # envelope: test_envelope
+        estate = fx.fresh("kill-" + step)
+        run_dir = run_dir_of(estate)
+        before = len(rows_of(estate))
+        rc, out, err = finalize(estate, FINALIZE_RUN_CRASH_AFTER=step)
+        rep.expect(rc == 137 and not (run_dir / "finalized.json").exists(),
+                   "kill after %s: op died at the boundary, no finalized.json" % step, (rc, err[-200:]))
+        check_before = (run_dir / "check.json").read_bytes()
+        reached = {"check": 0, "transcript": 1, "publish": 2, "row": 3}[step]
+        rep.expect((run_dir / "transcript.md").exists() == (reached >= 1)  # rendered and footered together
+                   and footer_count(run_dir) == (1 if reached >= 1 else 0)
+                   and (run_dir / "evidence/manifest.json").is_file() == (reached >= 2)
+                   and len(rows_of(estate)) - before == (1 if reached >= 3 else 0),
+                   "kill after %s: exactly the completed steps are on disk" % step, entries(run_dir))
+        # A rerun of the check would now FAIL; the retry must keep the persisted pass.
+        (run_dir / "workspace/hello.txt").unlink()
+        rc2, out2, err2 = finalize(estate)
+        rep.expect(rc2 == 0 and out2.get("state") == "finalized" and out2.get("verdict") == "pass",
+                   "kill after %s: retry completes with the original verdict" % step, (rc2, out2, err2[-200:]))
+        rep.expect((run_dir / "check.json").read_bytes() == check_before,
+                   "kill after %s: check.json byte-identical, never rerun" % step)
+        rows = [json.loads(l) for l in rows_of(estate)[before:]]
+        rep.expect(len(rows) == 1 and rows[0]["verdict"] == "pass" and footer_count(run_dir) == 1
+                   and (run_dir / "evidence/manifest.json").is_file() and (run_dir / "finalized.json").is_file(),
+                   "kill after %s: one row, one footer, one record, finalized" % step, (len(rows), entries(run_dir)))
+        if step == "row":
+            done = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8"))
+            rep.expect(done["steps"]["row"] == "existing" and done["steps"]["publish"] == "ok"
+                       and done["steps"]["check"] == "existing" and done["steps"]["render"] == "existing"
+                       and done["steps"]["transcript"] == "existing" and done["steps"]["envelope"] == "written",
+                       "kill after row: the retry found every step's output and appended nothing", done["steps"])
+
+
+def test_estate(rep, fx):
+    estate = fx.fresh("estate-missing")
+    run_dir = run_dir_of(estate)
+    before = len(rows_of(estate))
+    (estate / "ESTATE").unlink()
+    rc, out, err = finalize(estate)
+    rep.expect(rc == 3 and out.get("state") == "pending" and "ESTATE" in out.get("reason", ""),
+               "estate: missing ESTATE refuses the row -> pending", (rc, out))
+    rep.expect(len(rows_of(estate)) == before and (run_dir / "check.json").is_file() and footer_count(run_dir) == 1
+               and (run_dir / "evidence/manifest.json").is_file() and not (run_dir / "finalized.json").exists(),
+               "estate: no row; check, footer and evidence exist; no finalized.json", entries(run_dir))
+    error = json.loads((run_dir / "finalize.error").read_text(encoding="utf-8"))
+    rep.expect("ESTATE" in error.get("error", "") and error.get("ts"), "estate: finalize.error names ESTATE", error)
+    (estate / "ESTATE").write_text("dev\n", encoding="utf-8")
+    rc3, out3, _ = finalize(estate)
+    rep.expect(rc3 == 0 and out3.get("state") == "finalized" and out3.get("row_appended") is True
+               and len(rows_of(estate)) == before + 1 and (run_dir / "finalized.json").is_file(),
+               "estate: retry after ESTATE is restored appends the row and finalizes", (rc3, out3))
+
+
+def test_publish_failure(rep, fx):
+    estate = fx.fresh("publish-failure")
+    run_dir = run_dir_of(estate)
+    ops = estate / "ops/bin"
+    copy_exec(ops / "publish-evidence", ops / "publish-evidence.real")
+    (ops / "publish-evidence").write_text(FAILING_PUBLISH, encoding="utf-8")
+    before = len(rows_of(estate))
+    rc, out, _ = finalize(estate)
+    rep.expect(rc == 3 and out.get("state") == "pending" and "publish-evidence failed" in out.get("reason", "")
+               and out.get("verdict") == "pass", "publish: failure -> pending, verdict still reported", (rc, out))
+    rep.expect(len(rows_of(estate)) == before + 1 and not (run_dir / "evidence").exists()
+               and not (run_dir / "finalized.json").exists() and "boom" in (run_dir / "finalize.error").read_text(),
+               "publish: row appended anyway, no record, no finalized.json, finalize.error holds the publisher's text",
+               entries(run_dir))
+    copy_exec(ops / "publish-evidence.real", ops / "publish-evidence")
+    rc2, out2, _ = finalize(estate)
+    rep.expect(rc2 == 0 and out2.get("state") == "finalized" and out2.get("row_appended") is False
+               and len(rows_of(estate)) == before + 1 and (run_dir / "evidence/manifest.json").is_file(),
+               "publish: retry publishes, appends no second row, finalizes", (rc2, out2))
+
+
+def test_publish_marker(rep, fx):
+    """Item 1: the publish skip is keyed on ready_for_inspection, not on the manifest."""
+    for marker in (False, True):
+        name = "marker-" + ("kept" if marker else "lost")
+        estate = fx.fresh(name)
+        run_dir = run_dir_of(estate)
+        before = len(rows_of(estate))
+        rc, _, _ = finalize(estate, FINALIZE_RUN_CRASH_AFTER="publish")
+        rep.expect(rc == 137 and (run_dir / "evidence/manifest.json").is_file()
+                   and (run_dir / "ready_for_inspection").is_file(),
+                   "%s: killed after a complete publish (manifest and marker on disk)" % name, entries(run_dir))
+        if not marker:  # the crash window between the manifest rename and the marker write
+            (run_dir / "ready_for_inspection").unlink()
+        ops = estate / "ops/bin"
+        copy_exec(ops / "publish-evidence", ops / "publish-evidence.real")
+        (ops / "publish-evidence").write_text(COUNTING_PUBLISH, encoding="utf-8")
+        rc2, out2, err2 = finalize(estate)
+        calls = estate / "fixture/publish-calls"
+        called = calls.read_text(encoding="utf-8").count("called") if calls.is_file() else 0
+        rep.expect(rc2 == 0 and out2.get("state") == "finalized" and out2.get("publish") == "ok"
+                   and len(rows_of(estate)) == before + 1 and (run_dir / "finalized.json").is_file(),
+                   "%s: retry finalizes with publish ok and one row" % name, (rc2, out2, err2[-200:]))
+        rep.expect(called == (0 if marker else 1),
+                   "%s: retry calls publish-evidence %s" % (name, "never" if marker else "once"), called)
+        ready = (json.loads((run_dir / "ready_for_inspection").read_text(encoding="utf-8"))
+                 if (run_dir / "ready_for_inspection").is_file() else {})
+        ev = json.loads((run_dir / "evidence/manifest.json").read_text(encoding="utf-8"))
+        rep.expect(bool(ready) and ready.get("evidence_sha") == ev.get("evidence_sha") and ready.get("run_id") == ev.get("run_id"),
+                   "%s: ready_for_inspection present, naming the manifest's evidence_sha" % name, ready)
+    # An incomplete capture (here: a frozen input drifted) never gets a marker; its manifest is complete output.
+    estate = fx.fresh("marker-incomplete")
+    run_dir = run_dir_of(estate)
+    before = len(rows_of(estate))
+    with (run_dir / "stimulus/goal.md").open("a", encoding="utf-8") as goal:
+        goal.write("\ndrifted after the run\n")
+    rc, _, _ = finalize(estate, FINALIZE_RUN_CRASH_AFTER="publish")
+    ev = json.loads((run_dir / "evidence/manifest.json").read_text(encoding="utf-8"))
+    rep.expect(rc == 137 and ev.get("capture_state") == "incomplete" and "frozen input drift" in ev.get("incomplete_reasons", [])
+               and not (run_dir / "ready_for_inspection").exists(),
+               "marker-incomplete: publish-evidence recorded an incomplete capture and wrote no marker", ev.get("incomplete_reasons"))
+    ops = estate / "ops/bin"
+    copy_exec(ops / "publish-evidence", ops / "publish-evidence.real")
+    (ops / "publish-evidence").write_text(COUNTING_PUBLISH, encoding="utf-8")
+    rc2, out2, err2 = finalize(estate)
+    rep.expect(rc2 == 0 and out2.get("state") == "finalized" and out2.get("publish") == "ok"
+               and len(rows_of(estate)) == before + 1 and not (estate / "fixture/publish-calls").exists()
+               and not (run_dir / "ready_for_inspection").exists(),
+               "marker-incomplete: retry finalizes with publish ok, calls publish-evidence never, no marker", (rc2, out2, err2[-200:]))
+
+
+def test_stimulus_mismatch(rep, fx):
+    """Item 4: a check.json for another stimulus is a fixture failure, never a rerun."""
+    estate = fx.fresh("stimulus-mismatch")
+    run_dir = run_dir_of(estate)
+    before = len(rows_of(estate))
+    frozen = json.loads((run_dir / "terminal.json").read_text(encoding="utf-8"))["stimulus_sha"]
+    wrong = "f" * len(frozen)
+    persisted = {"verdict": "pass", "exit_code": 0, "output": "", "skipped": False, "window": 60}
+    rep.expect(len(frozen) == 64, "mismatch: the template froze a stimulus_sha", frozen)
+    for ran in (wrong, ""):
+        (run_dir / "check.json").write_text(json.dumps({**persisted, "stimulus_sha": ran}), encoding="utf-8")
+        rc, out, _ = finalize(estate)
+        reason = out.get("reason", "")
+        rep.expect(rc == 3 and out.get("state") == "pending" and ('"%s"' % ran) in reason and frozen in reason
+                   and "not a rerun" in reason,
+                   "mismatch (%s): pending, reason names both hashes" % (ran[:8] or "empty"), (rc, out))
+        error = (json.loads((run_dir / "finalize.error").read_text(encoding="utf-8"))
+                 if (run_dir / "finalize.error").is_file() else {})
+        rep.expect(len(rows_of(estate)) == before and not (run_dir / "finalized.json").exists()
+                   and not (run_dir / "transcript.md").exists() and not (run_dir / "evidence").exists()
+                   and frozen in error.get("error", "") and ran in error.get("error", ""),
+                   "mismatch (%s): nothing appended or rendered; finalize.error holds the reason"
+                   % (ran[:8] or "empty"), entries(run_dir))
+    (run_dir / "check.json").write_text(json.dumps({**persisted, "stimulus_sha": frozen}), encoding="utf-8")
+    check_before = (run_dir / "check.json").read_bytes()
+    (run_dir / "workspace/hello.txt").unlink()  # a rerun would FAIL; the matching file must be reused
+    rc2, out2, _ = finalize(estate)
+    done = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8")) if rc2 == 0 else {}
+    rep.expect(rc2 == 0 and out2.get("state") == "finalized" and out2.get("verdict") == "pass"
+               and (run_dir / "check.json").read_bytes() == check_before and done.get("steps", {}).get("check") == "existing"
+               and len(rows_of(estate)) == before + 1,
+               "mismatch: a matching check.json is reused as existing, one row, finalized", (rc2, out2))
+
+
+def test_refusals(rep, fx):
+    estate = fx.fresh("refusals")
+    rc, out, _ = finalize(estate, run_dir=estate / "ledger")
+    rep.expect(rc == 2 and out.get("ok") is False, "refusal: a dir outside ledger/runs", (rc, out))
+    rc, out, _ = finalize(estate, run_dir=estate / "ledger/runs/../../ESTATE")
+    rep.expect(rc == 2, "refusal: a path escaping ledger/runs", (rc, out))
+    bare = estate / "ledger/runs/20261108-000000.000000000-bare-x-t1"
+    bare.mkdir()
+    rc, out, _ = finalize(estate, run_dir=bare)
+    rep.expect(rc == 2 and "terminal.json" in out.get("error", "") and entries(bare) == [],
+               "refusal: no terminal.json means execution has not ended; nothing written", (rc, out))
+
+
+def test_env(rep, fx):
+    estate = fx.fresh("env")
+    run_dir = run_dir_of(estate)
+    (run_dir / "stimulus/check").write_text("#!/bin/sh\nenv > env.txt\n", encoding="utf-8")
+    rc, out, _ = finalize(estate, CS_FIXTURE_SECRET_TOKEN="must-not-inherit", OPENAI_API_KEY="x")
+    names = {line.split("=", 1)[0] for line in (run_dir / "workspace/env.txt").read_text().splitlines()}
+    rep.expect(rc == 0 and "PATH" in names and not names & {"CS_FIXTURE_SECRET_TOKEN", "OPENAI_API_KEY"},
+               "env: the check sees only the runner's child allowlist", sorted(names))
+
+
+def test_tick(rep, fx, mode):
+    """mode estate: the runner leaves no row (ESTATE missing refuses it). mode publish: the
+    runner's own finalize-run fails at publish, so a ledger row IS present, finalized.json is
+    not, and the runner exits 3 (item 5): tick must still report finalization_pending and
+    withhold completion, finalization stays pending until the sweep succeeds."""
+    publish = mode == "publish"
+    estate = fx.fresh("tick-" + mode)
+    template_run = run_dir_of(estate)
+    (estate / "fixture/template-runs").mkdir()
+    shutil.move(str(template_run), str(estate / "fixture/template-runs" / template_run.name))
+    ops = estate / "ops/bin"
+    if publish:
+        copy_exec(ops / "publish-evidence", ops / "publish-evidence.real")
+        (ops / "publish-evidence").write_text(FAILING_PUBLISH, encoding="utf-8")
+    else:
+        (estate / "ESTATE").unlink()  # the first finalize attempt must refuse the row
+    for source in (LAB / "ops/bin").iterdir():
+        if source.is_file() and not (ops / source.name).exists():
+            shutil.copy2(source, ops / source.name)
+    for name in ("estate-commit", "corpus-audit", "void-watch"):
+        (ops / name).write_text("#!/bin/sh\necho '{\"ok\":true,\"skip\":\"fixture\"}'\n", encoding="utf-8")
+        (ops / name).chmod(0o755)
+    (ops / "local-model-ready").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (ops / "local-model-ready").chmod(0o755)
+    (estate / "grants").mkdir()
+    (estate / "lab").write_text(FAKE_LAB.replace("__FINALIZE__", repr(publish)), encoding="utf-8")
+    (estate / "lab").chmod(0o755)
+
+    # The stub runner is named, not found: the default is the Rust runner beside the code root.
+    git_env = clean_env(estate, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", CS_RUNNER_BIN=str(estate / "lab"))
+    subprocess.run(["git", "init", "-q", str(estate)], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(estate), "-c", "user.name=Fixture", "-c", "user.email=f@example.invalid",
+                    "commit", "--allow-empty", "-qm", "fixture"], check=True, env=git_env)
+
+    def op(name, payload):
+        return subprocess.run([sys.executable, str(ops / name)], input=json.dumps(payload), text=True,
+                              capture_output=True, cwd=str(estate), env=git_env, timeout=120)
+
+    tag = "tick-%s" % mode
+    lane = "production" if publish else "probe"
+    enq = op("enqueue", {"spec": "specs/fx.yaml", "lane": lane, "task": TASK_REL, "note": "recovery"})
+    rep.expect(enq.returncode == 0, "%s: job enqueued on lane %s" % (tag, lane), enq.stderr[-300:])
+    jid = json.loads(enq.stdout.strip().splitlines()[-1])["id"]
+    tick1 = op("tick", {})
+    out1 = json.loads(tick1.stdout.strip().splitlines()[-1]) if tick1.stdout.strip() else {}
+    rep.expect("Traceback" not in tick1.stderr and out1.get("code") == 3 and out1.get("ok") is False,
+               "%s: runner exit 3 is reported as code 3" % tag, (out1, tick1.stderr[-400:]))
+    dispatch = [json.loads(l) for l in (estate / "ledger/dispatch.jsonl").read_text().splitlines() if l.strip()]
+    terminal = [r for r in dispatch if str(r.get("id") or r.get("job")) == jid and r.get("state") in {"done", "error"}]
+    run_name = template_run.name
+    rep.expect(len(terminal) == 1 and terminal[0]["state"] == "error" and terminal[0]["code"] == 3
+               and terminal[0]["verdict"] == "void" and terminal[0]["stop"] == "finalization_pending"
+               and terminal[0]["run_id"] == run_name and terminal[0]["transcript"] == "ledger/runs/" + run_name,
+               "%s: dispatch TERMINAL row state error, code 3, stop finalization_pending, run_id/transcript" % tag,
+               terminal)
+    expected_rows = len(PRIOR_ROWS) + (1 if publish else 0)
+    rows1 = [json.loads(l) for l in rows_of(estate)]
+    rep.expect(len(rows1) == expected_rows and (not publish or rows1[-1]["transcript"] == "ledger/runs/" + run_name),
+               "%s: %s" % (tag, "the finalizer's own row is present, nothing invented beside it" if publish
+                           else "no ledger row yet (the fact is not invented)"), len(rows1))
+    run_dir = estate / "ledger/runs" / run_name
+    error = json.loads((run_dir / "finalize.error").read_text(encoding="utf-8")) if (run_dir / "finalize.error").is_file() else {}
+    rep.expect(bool(error) and not (run_dir / "finalized.json").exists()
+               and (("publish-evidence failed" in error.get("error", "")) if publish else ("ESTATE" in error.get("error", ""))),
+               "%s: the first retry ran and recorded its error" % tag, (error, entries(run_dir)))
+    # Next tick: the cause is repaired, the dir is past the grace window -> the sweep finishes it.
+    if publish:
+        copy_exec(ops / "publish-evidence.real", ops / "publish-evidence")
+    else:
+        (estate / "ESTATE").write_text("dev\n", encoding="utf-8")
+    old = time.time() - 120
+    os.utime(run_dir / "terminal.json", (old, old))
+    tick2 = op("tick", {})
+    out2 = json.loads(tick2.stdout.strip().splitlines()[-1]) if tick2.stdout.strip() else {}
+    rep.expect("Traceback" not in tick2.stderr and out2.get("finalize_sweep") == {"attempted": 1, "finalized": 1, "pending": 0},
+               "%s: the sweep reports attempted 1, finalized 1, pending 0" % tag, (out2, tick2.stderr[-400:]))
+    rows = [json.loads(l) for l in rows_of(estate)]
+    rep.expect(len(rows) == len(PRIOR_ROWS) + 1 and rows[-1]["verdict"] == "pass"
+               and rows[-1]["transcript"] == "ledger/runs/" + run_name and (run_dir / "finalized.json").is_file()
+               and (run_dir / "ready_for_inspection").is_file(),
+               "%s: the sweep leaves exactly one ledger row, finalized.json and the inspection marker" % tag,
+               rows[-1] if rows else None)
+    tick3 = op("tick", {})
+    out3 = json.loads(tick3.stdout.strip().splitlines()[-1]) if tick3.stdout.strip() else {}
+    rep.expect("finalize_sweep" not in out3 and len(rows_of(estate)) == len(rows),
+               "%s: nothing left to sweep, nothing appended, completion never fired" % tag, out3)
+    if publish:
+        test_orphan_sweep(rep, estate, run_dir, op)
+
+
+def test_orphan_sweep(rep, estate, finalized_run, op):
+    """Report cell dirs a dead runner left (follow-up): tick's sweep removes only old, unclaimed ones."""
+    cells, pending = estate / "ledger/sandbox-reports", estate / "ledger/runs/fx-pending"
+    pending.mkdir()
+    (pending / "terminal.json").write_text("{}", encoding="utf-8")  # young: inside the finalize grace, never attempted
+    gone = str(finalized_run / "workspace")  # its run is finalized: nothing will claim this cwd again
+    plan = {"old-orphan": (gone, 48), "young-orphan": (gone, 1), "old-claimed": (str(pending / "workspace"), 48),
+            "old-torn": (None, 48)}
+    for name, (cwd, hours) in plan.items():
+        (cells / name).mkdir(parents=True)
+        report = cells / name / "1-1.json"
+        report.write_text(json.dumps({"cwd": cwd, "tool": "/x", "backend": "fake"}) if cwd else '{"cwd": "/', encoding="utf-8")
+        old = time.time() - hours * 3600
+        os.utime(report, (old, old))
+        os.utime(cells / name, (old, old))
+    tick = op("tick", {})
+    out = json.loads(tick.stdout.strip().splitlines()[-1]) if tick.stdout.strip() else {}
+    rep.expect("Traceback" not in tick.stderr and out.get("finalize_sweep") == {
+        "attempted": 0, "finalized": 0, "pending": 0, "orphans_removed": 1, "orphans_kept": 2},
+        "orphan sweep: tick reports 1 removed, 2 kept (claimed, torn); the young dir is not a candidate",
+        (out, tick.stderr[-400:]))
+    left = sorted(p.name for p in cells.iterdir())
+    rep.expect(left == ["old-claimed", "old-torn", "young-orphan"],
+               "orphan sweep: the old unclaimed dir is gone; young, claimed and torn remain", left)
+
+
+def main():
+    keep = "--keep" in sys.argv[1:]
+    scratch = Path(tempfile.mkdtemp(prefix="finalize-run-recovery-", suffix=".noindex"))
+    rep = Report()
+    started = time.monotonic()
+    try:
+        binary = runner_binary(scratch)
+        template = build_template(scratch, binary)
+        if LAB == template.resolve() or LAB in template.resolve().parents:
+            raise SystemExit("check: refusing live lab root")
+        fx = Fixture(scratch, template)
+        test_happy(rep, fx)
+        test_durable_entry(rep, fx)
+        test_envelope(rep, fx)
+        test_enospc(rep, fx, scratch)
+        test_concurrent(rep, fx)
+        test_kill_retry(rep, fx)
+        test_estate(rep, fx)
+        test_publish_failure(rep, fx)
+        test_publish_marker(rep, fx)
+        test_stimulus_mismatch(rep, fx)
+        test_refusals(rep, fx)
+        test_env(rep, fx)
+        test_tick(rep, fx, "estate")
+        test_tick(rep, fx, "publish")
+        if keep:
+            print("estates kept at %s" % scratch)
+    finally:
+        if not keep:
+            shutil.rmtree(scratch, ignore_errors=True)
+    print()
+    print("check: finalize-run-recovery %d assertion(s) failed%s, %.1fs"
+          % (len(rep.failed), (": " + "; ".join(rep.failed)) if rep.failed else "", time.monotonic() - started))
+    return 1 if rep.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

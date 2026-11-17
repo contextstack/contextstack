@@ -1,0 +1,1 @@
+Completed job-process cleanup is idempotent: a timeout or a normal exit runs the sweep once, and a signal the OS denies still raises instead of being hidden. Real process regression from the retained manager archive traceback. Since the setsid sweep, cleanup is `_job_memory.JobProcesses` (pid sweep), not a single `killpg`.

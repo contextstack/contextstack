@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import importlib.util
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+# refusing live lab root as a write target: planted files stay in
+# TemporaryDirectory. The live-tree scan only reads git ls-files / porcelain.
+CLASSIFY = LAB / "scripts/estate_classify.py"
+assert CLASSIFY.is_file()
+
+spec = importlib.util.spec_from_file_location("estate_classify", CLASSIFY)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+PLANTED = (
+    ("grants/g-example.yaml", "rules"),
+    ("tasks/sweeps/example/goal.md", "rules"),
+    ("tasks/sweeps/example/check", "rules"),
+    ("tasks/sweeps/example/notes.md", "rules"),
+    ("tasks/work/example/goal.md", "rules"),
+    ("tasks/work/example/check", "rules"),
+    ("tasks/work/example/notes.md", "rules"),
+    ("tasks/judgments/example/goal.md", "facts"),
+    ("tasks/judgments/example/check", "facts"),
+    ("tasks/judgments/example/notes.md", "facts"),
+    ("specs/archive/example.yaml", "facts"),
+    ("specs/sweeps/example.yaml", "facts"),
+    ("specs/example.yaml", "rules"),
+    ("scripts/example.py", "rules"),
+    ("ops/bin/example", "rules"),
+    ("tools/bin/example", "rules"),
+    ("hooks/example", "rules"),
+    ("prompts/example.md", "rules"),
+    ("prompts/packs/example.md", "facts"),
+    ("docs/dev/example.md", "facts"),
+    ("ledger/ledger.jsonl", "facts"),
+    ("ledger/CHANGELOG.md", "facts"),
+    ("tasks/regressions/example/notes.md", "rules"),
+    (".gitignore", "rules"),
+    ("INVARIANTS.md", "rules"),
+    ("internal/lab/example.go", "rules"),
+    ("cmd/lab/example.go", "rules"),
+)
+
+with scratch_dir(prefix="estate-classify-") as raw:
+    root = Path(raw)
+    for rel, expected in PLANTED:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("planted\n")
+        got = mod.classify(rel)
+        assert got == expected, f"{rel}: want {expected}, got {got}"
+        assert got in ("facts", "rules"), f"{rel} third bucket: {got}"
+        assert mod.is_rules(rel) == (expected == "rules"), rel
+        if hasattr(mod, "skip_auto"):
+            skipped = rel.endswith(".go") or rel.startswith(("internal/", "cmd/"))
+            assert bool(mod.skip_auto(rel)) == skipped, rel
+
+# Receipt provenance is exact and estate-scoped, including archived local cells.
+with scratch_dir(prefix="estate-receipts-") as raw:
+    root = Path(raw); (root / "ledger").mkdir(); (root / "ESTATE").write_text("prod-1")
+    sid = "exp-900-flowchart-delivery"
+    cell = {"id": sid, "spec": "specs/"+sid+".yaml", "task": "tasks/work/"+sid,
+            "grant": "g-fixture", "grant_digest": "a"*64}
+    common = {"estate": "prod-1", "actor_id": "director:human:user:1", "actor_kind": "human",
+              "request_id": "r1", "intent_id": "i1", "request_digest": "b"*64}
+    authored = dict(common, event="cell_authored", cell=cell)
+    completed = dict(common, event="delivery_completed", operation="delivery-author", result={"ok": True, "cell": cell})
+    shelf = root / "ledger/director-delivery.jsonl"
+    def write(*rows): shelf.write_text("".join(json.dumps(r)+"\n" for r in rows))
+    write(authored); assert not mod.receipted_paths(root), "incomplete action is not authority"
+    write(authored, dict(completed, estate="dev")); assert not mod.receipted_paths(root)
+    write(authored, dict(completed, actor_id="other")); assert not mod.receipted_paths(root)
+    write(authored, completed)
+    expected = {cell["spec"], *[cell["task"]+"/"+n for n in ("goal.md", "check", "notes.md")]}
+    assert mod.receipted_paths(root) == expected
+    check = root / cell["task"] / "check"; check.parent.mkdir(parents=True); check.symlink_to("/tmp")
+    assert cell["task"]+"/check" not in mod.receipted_paths(root), "receipt cannot authorize a symlink"
+    archive = "specs/archive/"+sid+".yaml"; (root / archive).parent.mkdir(parents=True)
+    (root / archive).write_text("verdict: rejected\n")
+    row = {"event": "spec_archived", "estate": "prod-1", "source_spec": cell["spec"],
+           "spec": archive, "judgment_id": "j1", "actor_id": common["actor_id"]}
+    (root / "ledger/finalizations.jsonl").write_text(json.dumps(row)+"\n")
+    assert archive in mod.receipted_paths(root)
+    (root / "ledger/finalizations.jsonl").write_text(json.dumps(dict(row, estate="dev"))+"\n")
+    assert archive not in mod.receipted_paths(root)
+    # template archives are facts, but their tagged source remains rules.
+    template = "tasks/work/template/"+sid+".yaml"
+    (root / "ledger/finalizations.jsonl").write_text(json.dumps(dict(row, source_spec=template))+"\n")
+    assert archive in mod.receipted_paths(root), "task-template archive lacks receipt admission"
+    assert template not in mod.receipted_paths(root), "archive must not grant edits to a tagged template"
+    for invalid in ("tasks/work/template/other.yaml", "tasks/work/../"+sid+".yaml"):
+        (root / "ledger/finalizations.jsonl").write_text(json.dumps(dict(row, source_spec=invalid))+"\n")
+        assert archive not in mod.receipted_paths(root), "invalid template source accepted"
+    # The installed older land op has no spec_archived event. Its completed
+    # Director archive receipt still proves an archive of this settled cell.
+    outcome = {"event": "finalize_outcome", "estate": "prod-1", "finalization_id": "f1", "state": "no_destination_effect"}
+    (root / "ledger/finalizations.jsonl").write_text(json.dumps(outcome)+"\n")
+    prepared = dict(common, event="finalization_prepared", cell_id=sid, payload={"finalization_id": "f1"})
+    archived = dict(common, event="delivery_completed", operation="delivery-archive", cell_id=sid,
+                    result={"ok": True, "spec": archive, "judgment": {"judgment_id": "j1", "finalization_id": "f1"}})
+    write(authored, completed, prepared, archived)
+    assert archive in mod.receipted_paths(root), "completed Director archive was mistaken for unreceipted drift"
+    write(authored, completed, prepared, dict(archived, cell_id="foreign-cell"))
+    assert archive not in mod.receipted_paths(root), "foreign cell cannot confer archive authority"
+
+# Six session-authored archives with same-estate grant-bearing dispatch rows
+# are facts, including their deleted live-spec source names.
+with scratch_dir(prefix="estate-session-archives-") as raw:
+    root = Path(raw); (root / "ledger").mkdir(); (root / "ESTATE").write_text("prod-1")
+    names = [
+        "exp-1929-assesskit-e2-remote-disk.yaml",
+        "exp-1929-assesskit-e2-restore-force.yaml",
+        "exp-1929-assesskit-e2-schedule.yaml",
+        "exp-1929-assesskit-e2-scheduler-heartbeat.yaml",
+        "exp-1929-assesskit-e2.yaml",
+        "exp-1929-factory-gap-fs-read-list-dirs.yaml",
+    ]
+    rows = []
+    expected = set()
+    for index, name in enumerate(names):
+        source = "specs/" + name
+        archive = "specs/archive/" + name
+        path = root / archive
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("verdict: rejected\n")
+        rows.append({"id": str(index), "estate": "prod-1", "grant": "g-assesskit",
+                     "spec": source, "state": "done"})
+        expected.update((source, archive))
+    (root / "ledger/dispatch.jsonl").write_text("".join(json.dumps(row)+"\n" for row in rows))
+    assert mod.receipted_paths(root) == expected, "granted session archives were not admitted as facts"
+    rows[0]["estate"] = "dev"
+    rows[1]["grant"] = ""
+    rows[2]["spec"] = "specs/sweeps/" + names[2]
+    (root / "ledger/dispatch.jsonl").write_text("".join(json.dumps(row)+"\n" for row in rows))
+    admitted = mod.receipted_paths(root)
+    for name in names[:3]:
+        assert "specs/archive/" + name not in admitted, "inexact dispatch provenance was accepted"
+    symlink = root / "specs/archive" / names[3]
+    symlink.unlink(); symlink.symlink_to(root / "specs/archive" / names[4])
+    assert "specs/archive/" + names[3] not in mod.receipted_paths(root), "archive symlink was accepted"
+
+# Live tree: tracked + porcelain (git status never lists ignored files).
+tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=LAB).split(b"\0")
+tracked = [p.decode("utf-8", errors="surrogateescape") for p in tracked if p]
+porcelain = subprocess.check_output(
+    ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=LAB,
+)
+found = []
+tokens = porcelain.split(b"\0")
+index = 0
+while index < len(tokens):
+    token = tokens[index]
+    index += 1
+    if not token:
+        continue
+    status = token[:2].decode("ascii", errors="replace")
+    found.append(token[3:].decode("utf-8", errors="surrogateescape"))
+    if "R" in status or "C" in status:
+        if index < len(tokens) and tokens[index]:
+            found.append(tokens[index].decode("utf-8", errors="surrogateescape"))
+        index += 1
+other = []
+for path in sorted(set(tracked) | set(found)):
+    tier = mod.classify(path)
+    if tier not in ("facts", "rules"):
+        other.append((path, tier))
+assert other == [], other[:20]
+
+print("check: estate classifier is two-tier on planted dirs and the live tree")

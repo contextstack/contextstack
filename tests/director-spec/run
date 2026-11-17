@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""director-spec: the Director's black-box contract suites (NODE-PROTOCOL.md, CLIENT-API.md; Director.Plan step 1).
+
+  run                                  both sides: Director cases against the Rust Director, node cases against
+                                       the stand-in
+  run --side director [--impl rust|fake] [--director-bin PATH] [--no-build]
+  run --side node [--node-client DIR]
+  run --side client                    the Client API (CLIENT-API.md) against the Rust Director
+  run --list | --area A | --case ID | --json FILE | --keep | -v
+
+The Rust Director is the binary named by --director-bin, else $DIRECTOR_BIN, else target/release/cs-director, which
+`run` builds first (cargo build --release -p cs-director; a no-op when it is current) unless --no-build is given.
+The Laravel app's node API, the old protocol-1 reference, was retired with Director.Plan step 8.
+
+The node client is the directory holding job-pull and spool-send: --node-client, else $DIRECTOR_SPEC_NODE_CLIENT,
+else NODE_CLIENT below.
+Exit 0 when every selected case passes.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SPEC = Path(__file__).resolve().parent
+REPO = SPEC.parent.parent
+NODE_CLIENT = REPO / "cs/ops/bin"
+sys.path.insert(0, str(SPEC))
+sys.dont_write_bytecode = True
+
+from harness import targets  # noqa: E402
+from harness.run import CASES, Ctx, run_cases  # noqa: E402
+import cases  # noqa: E402,F401  (registers every case)
+
+
+def default_binary(no_build):
+    """target/release/cs-director, built first with cargo (a no-op when it is current) unless no_build."""
+    binary = REPO / "target/release/cs-director"
+    if not no_build:
+        if shutil.which("cargo") is None:
+            if not binary.is_file():
+                raise SystemExit("director-spec: no cargo to build %s (pass --director-bin or $DIRECTOR_BIN)" % binary)
+        else:
+            print("director-spec: cargo build --release -p cs-director", flush=True)
+            built = subprocess.run(["cargo", "build", "--release", "-p", "cs-director", "--quiet"], cwd=str(REPO))
+            if built.returncode != 0:
+                raise SystemExit("director-spec: cargo build --release -p cs-director failed")
+    return str(binary)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--side", choices=("director", "node", "client", "both"), default="both")
+    ap.add_argument("--impl", default=os.environ.get("DIRECTOR_SPEC_IMPL", "rust"), choices=("rust", "fake"),
+                    help="the Director under test: rust (default) | fake")
+    ap.add_argument("--director-bin", default=os.environ.get("DIRECTOR_BIN"),
+                    help="the Rust Director's binary; $DIRECTOR_BIN, else target/release/cs-director (built first)")
+    ap.add_argument("--no-build", action="store_true", help="use target/release/cs-director as it is; do not run cargo")
+    ap.add_argument("--node-client", default=os.environ.get("DIRECTOR_SPEC_NODE_CLIENT") or str(NODE_CLIENT))
+    ap.add_argument("--area", action="append")
+    ap.add_argument("--case", action="append")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--json", help="write per-case results here")
+    ap.add_argument("--keep", action="store_true", help="keep the temp dir (server log, node roots)")
+    ap.add_argument("-v", action="store_true")
+    a = ap.parse_args()
+
+    sides = ("director", "node") if a.side == "both" else (a.side,)
+    selected = [c for c in CASES if c.side in sides and (not a.area or c.area in a.area) and (not a.case or c.id in a.case)]
+    if a.list:
+        for c in selected:
+            only = "[%s]" % ",".join(c.impls) if c.impls else ""
+            print("%-8s %-10s %-34s %-6s %s" % (c.side, c.area, c.id, only, c.doc))
+        print("%d case(s)" % len(selected))
+        return 0
+    # Protocol-2 Director cases name the targets that speak it (rust); others skip them, and say so.
+    skipped = [c for c in selected if c.side == "director" and c.impls and a.impl not in c.impls]
+    selected = [c for c in selected if c not in skipped]
+    if skipped:
+        print("director side: %d protocol-2 case(s) skipped: %s speaks protocol 1 only" % (len(skipped), a.impl))
+    tmp = Path(tempfile.mkdtemp(prefix="director-spec-"))
+    started, results, target = time.time(), [], None
+    try:
+        director_cases = [c for c in selected if c.side == "director"]
+        client_cases = [c for c in selected if c.side == "client"]
+        if client_cases and a.impl != "rust":
+            raise SystemExit("director-spec: the client cases target the Rust Director only (--impl rust)")
+        if director_cases or client_cases:
+            binary = a.director_bin or (None if a.impl != "rust" else default_binary(a.no_build))
+            target = targets.make(a.impl, tmp, binary)
+        if director_cases:
+            print("director side: %s at %s" % (a.impl, target.url))
+            results += run_cases(director_cases, lambda c: Ctx(c.id, target=target), a.v)
+        if client_cases:
+            print("client side: %s at %s" % (a.impl, target.url))
+            results += run_cases(client_cases, lambda c: Ctx(c.id, target=target), a.v)
+        node_cases = [c for c in selected if c.side == "node"]
+        if node_cases:
+            from harness.node import NodeRig
+            client = Path(a.node_client).resolve()
+            if not (client / "job-pull").is_file() or not (client / "spool-send").is_file():
+                raise SystemExit("director-spec: %s holds no job-pull and spool-send (--node-client)" % client)
+            print("node side: %s against the stand-in Director" % client)
+            results += run_cases(node_cases, lambda c: Ctx(c.id, rig=NodeRig(client, tmp / ("node-" + c.id))), a.v)
+    finally:
+        if target is not None:
+            target.close()
+        if a.keep:
+            print("kept: %s" % tmp)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if a.json:
+        Path(a.json).write_text(json.dumps(results, indent=2) + "\n")
+    counts = {}
+    for r in results:
+        counts[r["result"]] = counts.get(r["result"], 0) + 1
+    label = "+".join(sides) + (" (%s)" % a.impl if {"director", "client"} & set(sides) else "")
+    print("director-spec %s: %d case(s) in %.1fs: %s" % (label, len(results), time.time() - started,
+                                                       ", ".join("%s %d" % kv for kv in sorted(counts.items()))))
+    return 1 if any(r["result"] != "pass" for r in results) or not results else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

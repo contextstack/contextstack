@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import importlib.machinery,importlib.util,json,sys,tempfile,types
+from pathlib import Path
+import os
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct ops imports and calls must not resolve the caller's estate either.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+lab=Path(__file__).resolve().parents[3];sys.path.insert(0,str(lab/'ops/bin'))
+loader=importlib.machinery.SourceFileLoader('quoted_tick',str(lab/'ops/bin/tick'))
+spec=importlib.util.spec_from_loader(loader.name,loader);tick=importlib.util.module_from_spec(spec);loader.exec_module(tick)
+with scratch_dir() as raw:
+ root=Path(raw);(root/'specs').mkdir();tick.LAB=root;tick.TEMPLATES={'fake-cli':{}}
+ calls=[];holds=[];tick.child_env=lambda *a,**k:{};tick.ledger_size=lambda:0
+ tick.hold_schedule=lambda name,reason:holds.append((name,reason))
+ def invoke(argv,**kw):
+  if argv[0].endswith('/executor'):task=json.loads(kw['input'])['task']
+  else:
+   assert argv[0]==str(root.parent/'target/release/cs-harness') and (root/argv[-1]).is_file() and '-trial' in argv  # one cell per call
+   task=argv[argv.index('-task')+1]
+  calls.append(task);return types.SimpleNamespace(returncode=0)
+ teed=tick.run_teed
+ tick.run_teed=lambda *a,**kw:teed(*a,run=invoke,**kw)
+ tick.execution_row=lambda *a,**k:{'transcript':'ledger/runs/fixture','verdict':'pass'}
+ cases=[('[tasks/a, tasks/b]',['tasks/a','tasks/b']),
+        (json.dumps(['tasks/a','tasks/with space','tasks/comma,name','tasks/雪']),['tasks/a','tasks/with space','tasks/comma,name','tasks/雪']),
+        ("['tasks/a', 'tasks/b']",['tasks/a','tasks/b'])]
+ for model in ['fake-api','fake-cli']:
+  for listing,expected in cases:
+   (root/'specs/fixture.yaml').write_text(f'id: fixture\nmodel: {model}\ntasks: {listing}\ntrials: 2\nhypothesis: fixture-1767 fixture\n')
+   calls.clear();code,row=tick.run_spec('specs/fixture.yaml')
+   assert code==0 and calls==expected*2,(model,listing,calls)
+ (root/'specs/fixture.yaml').write_text('id: fixture\nmodel: fake-api\ntasks: [tasks/a, tasks/b]\ntrials: 3\n')
+ tick.execution_row=lambda *a,**k:{'transcript':'ledger/runs/fixture','verdict':'void','stop':'error: capture-stimulus: exit status 1','turns':0}
+ def failed_invoke(argv,**kw):
+  invoke(argv,**kw);return types.SimpleNamespace(returncode=1)
+ tick.run_teed=lambda *a,**kw:teed(*a,run=failed_invoke,**kw)
+ calls.clear();code,_=tick.run_spec('specs/fixture.yaml','fixture-schedule')
+ assert code==1
+ assert len(calls)==1 and holds==[('fixture-schedule','capture-stimulus')],(calls,holds)
+ tick.execution_row=lambda *a,**k:{'transcript':'ledger/runs/fixture','verdict':'fail','stop':'budget exhausted'}
+ calls.clear();tick.run_spec('specs/fixture.yaml')
+ assert len(calls)==6,'ordinary failure silently suppressed later trials'
+print('check: quoted task identities survive both real dispatch adapters; stimulus void holds once')

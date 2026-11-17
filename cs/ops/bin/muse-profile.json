@@ -1,0 +1,10 @@
+{
+  "binary": "~/.local/bin/muse-bin-1.0.3-R2198.1",
+  "settings": {
+    "schema_version": 1
+  },
+  "max_model_steps": 24,
+  "reasoning_effort": "high",
+  "home_mode": "private_home_keychain_link",
+  "model": "muse-spark-1.3-contributor"
+}

@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Release gate waits for gateway and Director before trial jobs (goal.md)."""
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from scratch import scratch_dir  # noqa: E402
+from hermetic_env import hermetic_env  # noqa: E402
+
+problems = []
+
+
+# Port 1 (tcpmux) is privileged and never bound here, so polling it can't reach another test's server. Guessing a
+# "free" port (port + 50) once hit the gateway suite's egress proxy under the parallel full check.
+CLOSED_PORT = 1
+GATEWAY_DELAY_S = 2.0
+# service_wait polls every 0.5s; time.sleep and monotonic can finish slightly early under load.
+LOWER_BOUND_EPSILON_S = 0.2
+
+
+def expect(cond, msg):
+    print(("ok   " if cond else "FAIL ") + msg)
+    if not cond:
+        problems.append(msg)
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class CsShim:
+    def __init__(self, home):
+        self.HOME = Path(home)
+        self.ROOT = self.HOME / ".contextstack"
+        self.CONFIG = self.ROOT / "config"
+
+    def run(self, argv, timeout=10):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return subprocess.CompletedProcess(argv, 127, "", str(error))
+
+    def curl(self, url, unix=None, timeout=3):
+        argv = ["curl", "-sS", "-m", str(timeout), "-o", "-", "-w", "\n%{http_code}"]
+        r = self.run(argv + (["--unix-socket", unix] if unix else []) + [url], timeout + 2)
+        body, _, code = (r.stdout or "").rpartition("\n")
+        return (int(code) if code.strip().isdigit() else 0), body
+
+    def gateway_get(self, path):
+        sock = self.ROOT / "gateway/csgateway.sock"
+        if sock.is_socket():
+            code, body = self.curl("http://localhost" + path, unix=str(sock))
+            if code:
+                return code, body
+        return 0, ""
+
+    def node_release(self):
+        record_path = self.CONFIG / "install.json"
+
+        def load_record():
+            return json.loads(record_path.read_text(encoding="utf-8"))
+
+        return SimpleNamespace(
+            load_record=load_record,
+            DIRECTOR_RS_DATA=self.ROOT / "state/director",
+            DIRECTOR_RS_LISTEN="127.0.0.1:8790",
+        )
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/v1/health"):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"healthy"}')
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class DirectorHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/api/v1/client/jobs"):
+            self.send_response(401)
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def start_server(handler, host="127.0.0.1", port=0):
+    server = ThreadingHTTPServer((host, port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def layout(home, director_port):
+    root = home / ".contextstack"
+    rel = root / "releases/fixture"
+    cs = rel / "cs"
+    cs.mkdir(parents=True)
+    venv = cs / ".venv/bin"
+    venv.mkdir(parents=True)
+    (venv / "python3").symlink_to(sys.executable)
+    scripts = cs / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    for src in (KIT / "scripts").iterdir():
+        if src.is_file():
+            dst = scripts / src.name
+            if not dst.exists():
+                dst.symlink_to(src.resolve())
+    shutil = __import__("shutil")
+    shutil.copytree(KIT / "policy", cs / "policy", dirs_exist_ok=True)
+    ops = cs / "ops/bin"
+    ops.mkdir(parents=True)
+    shutil.copy2(KIT / "ops/bin/executor-templates.json", ops / "executor-templates.json")
+  # cs requires current to be a symlink into releases/.
+    current = root / "current"
+    if current.exists() or current.is_symlink():
+        current.unlink()
+    current.symlink_to(rel)
+    (root / "config").mkdir(parents=True)
+    (root / "state/director").mkdir(parents=True, mode=0o700)
+    (root / "state/director/local-credential").write_text("fixture", encoding="utf-8")
+    (root / "config/install.json").write_text(
+        json.dumps({"director_rs_listen": ["127.0.0.1:%d" % director_port], "director": "http://127.0.0.1:%d" % director_port}),
+        encoding="utf-8")
+
+
+def load_init_smoke(home, director_port, gateway_port):
+    os.environ["HOME"] = str(home)
+    os.environ["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % gateway_port
+    for name in list(sys.modules):
+        if name in ("cs_init", "cs_smoke"):
+            del sys.modules[name]
+    cs = CsShim(home)
+    init_mod = load_module("cs_init", KIT / "scripts/cs_init.py")
+    smoke = load_module("cs_smoke", KIT / "scripts/cs_smoke.py")
+    init = init_mod.Init(cs, SimpleNamespace(director_listen="127.0.0.1:%d" % director_port, verbose=False))
+    return cs, init_mod, smoke, init
+
+
+def main():
+    director_srv, _ = start_server(DirectorHandler)
+    director_port = director_srv.server_address[1]
+
+    with scratch_dir(prefix="release-smoke-wait-", dir="/tmp") as tmp:
+        home = Path(tmp)
+        layout(home, director_port)
+
+        gw_srv = ThreadingHTTPServer(("127.0.0.1", 0), GatewayHandler)
+        gw_port = gw_srv.server_address[1]
+
+        gateway_serving = threading.Event()
+
+        def late_gateway():
+            time.sleep(GATEWAY_DELAY_S)
+            threading.Thread(
+                target=lambda: (gateway_serving.set(), gw_srv.serve_forever()),
+                daemon=True,
+            ).start()
+
+        threading.Thread(target=late_gateway, daemon=True).start()
+        cs, init_mod, smoke, init = load_init_smoke(home, director_port, gw_port)
+        t0 = time.monotonic()
+        reason = smoke.service_wait(init, 10)
+        elapsed = time.monotonic() - t0
+        expect(reason is None, "service_wait passes once a delayed gateway answers: %r (%.1fs)" % (reason, elapsed))
+        min_wait = GATEWAY_DELAY_S - 0.5 - LOWER_BOUND_EPSILON_S
+        expect(
+            elapsed + LOWER_BOUND_EPSILON_S >= min_wait,
+            "service_wait returned before delayed gateway (~%.1fs, elapsed %.1fs)"
+            % (GATEWAY_DELAY_S, elapsed),
+        )
+        # Fails if service_wait treats the gateway as up before the delayed listener actually started.
+        expect(
+            gateway_serving.wait(timeout=5.0),
+            "gateway never began serving after the intentional delay",
+        )
+
+        os.environ["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % CLOSED_PORT
+        init = init_mod.Init(cs, SimpleNamespace(director_listen="127.0.0.1:%d" % director_port, verbose=False))
+        t0 = time.monotonic()
+        reason = smoke.service_wait(init, 3)
+        elapsed = time.monotonic() - t0
+        expect(reason == "the gateway never came up within 3s", "missing gateway reason: %r" % reason)
+        expect(
+            elapsed + LOWER_BOUND_EPSILON_S >= 2.5,
+            "service_wait polls until gateway timeout (%.1fs)" % elapsed,
+        )
+
+        os.environ["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % gw_port
+        init = init_mod.Init(cs, SimpleNamespace(director_listen="127.0.0.1:%d" % CLOSED_PORT, verbose=False))
+        reason = smoke.service_wait(init, 3)
+        expect(reason == "the Director never came up within 3s", "missing director reason: %r" % reason)
+
+    director_srv.shutdown()
+    director_srv.server_close()
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
+        sys.exit(1)
+    print("PASS release-smoke-wait: gate polls gateway and Director before trial jobs")
+
+
+if __name__ == "__main__":
+    main()

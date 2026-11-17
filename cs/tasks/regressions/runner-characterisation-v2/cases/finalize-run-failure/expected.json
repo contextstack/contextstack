@@ -1,0 +1,294 @@
+{
+  "exit_code": 3,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "capture-stimulus",
+      "stdin": {
+        "adapter": "runner",
+        "hooks": [],
+        "prompts": [
+          "prompts/coder-min.md"
+        ],
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-finalize-run-failure-fx-t1",
+        "run_id": "<RUNSTAMP>-fx-finalize-run-failure-fx-t1",
+        "runner_implementation": "<RUNNER>",
+        "runner_path": "<RUNNER_PATH>",
+        "spec": "specs/fx.yaml",
+        "spec_sha": "3dddb5028d8260112f91d718fb9d44a3469ee052f02676c82143b8e5989c4708",
+        "task": "tasks/fx",
+        "tools": [
+          "fs_read",
+          "fs_write",
+          "exec"
+        ],
+        "trial": 1,
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-finalize-run-failure-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-finalize-run-failure-fx-t1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "1.000000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-finalize-run-failure",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Read a file or list a directory. Args: {path, offset?, limit?}. On a directory, returns one entry per line (directories end with /). On a file, offset is a 1-indexed line number; limit is a max line count. Output is truncated to 2000 lines or 50KB (whichever is hit first). When truncated, the observation starts with 'lines 1-N of M — re-read with offset' so the next read is directed, not blind.",
+            "name": "fs_read",
+            "schema": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of lines to read.",
+                  "type": "integer"
+                },
+                "offset": {
+                  "description": "Line number to start reading from (1-indexed).",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Path to the file or directory, relative to the workspace.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
+            "schema": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Run a command (argv array, no shell) in the workspace. Absolute paths and '..' in argv are denied. Host writes are denied: macOS sandbox-exec (file-write* only under cwd); Linux equivalent is `bwrap --ro-bind / / --bind $PWD $PWD --chdir $PWD` (bubblewrap). There is NO shell: `cd` and `&&` do not work as argv — for compound commands or subdirectories use {cmd: [\"sh\", \"-c\", \"cd subdir && make test\"]}. Args: {cmd: [...]}. Output is truncated to 2000 lines or 50KB (whichever is hit first); when clipped, the full output is written to .lab-out/<n>.txt and that path is named in the observation so it can be fs_read back.",
+            "name": "exec",
+            "schema": {
+              "properties": {
+                "cmd": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "cmd"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.990000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          },
+          {
+            "content": "writing",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "content": "hello",
+                  "path": "hello.txt"
+                },
+                "id": "1",
+                "name": "fs_write"
+              }
+            ]
+          },
+          {
+            "content": "[fs_write {\"content\":\"hello\",\"path\":\"hello.txt\"}]\nwrote hello.txt (5 bytes)",
+            "role": "tool",
+            "tool_call_id": "1"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-finalize-run-failure",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Read a file or list a directory. Args: {path, offset?, limit?}. On a directory, returns one entry per line (directories end with /). On a file, offset is a 1-indexed line number; limit is a max line count. Output is truncated to 2000 lines or 50KB (whichever is hit first). When truncated, the observation starts with 'lines 1-N of M — re-read with offset' so the next read is directed, not blind.",
+            "name": "fs_read",
+            "schema": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of lines to read.",
+                  "type": "integer"
+                },
+                "offset": {
+                  "description": "Line number to start reading from (1-indexed).",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Path to the file or directory, relative to the workspace.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
+            "schema": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Run a command (argv array, no shell) in the workspace. Absolute paths and '..' in argv are denied. Host writes are denied: macOS sandbox-exec (file-write* only under cwd); Linux equivalent is `bwrap --ro-bind / / --bind $PWD $PWD --chdir $PWD` (bubblewrap). There is NO shell: `cd` and `&&` do not work as argv — for compound commands or subdirectories use {cmd: [\"sh\", \"-c\", \"cd subdir && make test\"]}. Args: {cmd: [...]}. Output is truncated to 2000 lines or 50KB (whichever is hit first); when clipped, the full output is written to .lab-out/<n>.txt and that path is named in the observation so it can be fs_read back.",
+            "name": "exec",
+            "schema": {
+              "properties": {
+                "cmd": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "cmd"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    }
+  ],
+  "rows": [],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-finalize-run-failure-fx-t1",
+      "entries": [
+        "messages.jsonl",
+        "stimulus",
+        "terminal.json",
+        "workspace"
+      ],
+      "frozen": {
+        "check": "#!/bin/sh\n[ \"$(cat hello.txt)\" = \"hello\" ]\n",
+        "goal.md": "Create hello.txt containing exactly: hello\n"
+      },
+      "workspace": {
+        ".lab-calls.jsonl": "{\"args\": {\"content\": \"hello\", \"path\": \"hello.txt\"}, \"name\": \"fs_write\"}\n",
+        "hello.txt": "hello"
+      }
+    }
+  ],
+  "stderr": [
+    "lab: finalization pending: <ESTATE>/ledger/runs/<RUNSTAMP>-fx-finalize-run-failure-fx-t1",
+    "lab: tasks/fx — finalize-run: exit status 1; inspect the run and retry finalization"
+  ],
+  "stdout": [
+    "  tasks/fx                       t1       stop=done turns=2 tools=1 $0.0200"
+  ]
+}

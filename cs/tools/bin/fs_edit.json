@@ -1,0 +1,42 @@
+{
+  "runtime": "exe",
+  "bin": "target/release/cs-tools",
+  "args": ["fs_edit"],
+  "sandbox": {"net": "none"},
+  "provenance": "Rust port in cs-tools (tools/src/fs_edit.rs) of the Python tool removed here, itself ported from pi packages/agent/src/harness/tools/edit.ts (prepareArguments + exact unique non-overlapping original-file match). Output is a unified diff (CPython difflib, ported in tools/src/difflib.rs), not a byte count. Also refuses a path whose real location leaves the workspace (tools/README.md).",
+  "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes. Args: {path, edits:[{oldText,newText}]}. Also accepts edits as a JSON string, a single {oldText,newText} object, or legacy flat oldText/newText.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {"type": "string", "description": "Path to the file to edit, relative to the workspace."},
+      "edits": {
+        "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "oldText": {"type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},
+                "newText": {"type": "string", "description": "Replacement text for this targeted edit."}
+              },
+              "required": ["oldText", "newText"]
+            }
+          },
+          {"type": "string"},
+          {
+            "type": "object",
+            "properties": {
+              "oldText": {"type": "string"},
+              "newText": {"type": "string"}
+            },
+            "required": ["oldText", "newText"]
+          }
+        ]
+      },
+      "oldText": {"type": "string", "description": "Legacy flat form; wrapped into edits."},
+      "newText": {"type": "string", "description": "Legacy flat form; wrapped into edits."}
+    },
+    "required": ["path"]
+  }
+}

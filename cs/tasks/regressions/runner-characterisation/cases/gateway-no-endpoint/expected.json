@@ -1,0 +1,12 @@
+{
+ "exit_code": 2,
+ "ops": [],
+ "requests": [],
+ "rows": [],
+ "run_dirs_distinct": true,
+ "runs": [],
+ "stderr": [
+  "lab: no gateway endpoint: set CSGATEWAY_ENDPOINT"
+ ],
+ "stdout": []
+}

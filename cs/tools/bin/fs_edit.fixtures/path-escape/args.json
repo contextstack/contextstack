@@ -1,0 +1,9 @@
+{
+  "path": "../a.txt",
+  "edits": [
+    {
+      "oldText": "a",
+      "newText": "b"
+    }
+  ]
+}

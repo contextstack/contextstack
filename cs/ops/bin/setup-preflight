@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Prove a scheduled task consumes the prepared corpus setup before a model runs."""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parent.parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from _workspace_setup import metadata
+from _estate_io import hardened_git_env
+
+PLAYWRIGHT_REVISIONS = ("1208",)
+
+
+def git(cwd, *args):
+    result = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=hardened_git_env())
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout or "git failed").strip())
+    return result.stdout.strip()
+
+
+def resolve(value):
+    path = Path(str(value))
+    return path if path.is_absolute() else LAB / path
+
+
+def playwright_revision_ok(cache, revision):
+    root = Path(cache) / ("chromium_headless_shell-" + revision)
+    if not root.is_dir():
+        return False
+    return any(path.is_file() and os.access(path, os.X_OK) and path.name in
+               ("chrome-headless-shell", "headless_shell")
+               for path in root.rglob("*"))
+
+
+def lane_runtime_missing():
+    """Refuse at $0 when this estate declared tagged runtime and it is absent.
+
+    Isolated fixture copies of lab have neither PLAYWRIGHT_BROWSERS_PATH nor
+    ../.estate/runtime; they must not consult a host cache or fetch a browser.
+    """
+    estate = LAB.parent / ".estate/runtime"
+    env_cache = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    env_browse = os.environ.get("LAB_BROWSE")
+    if env_cache:
+        cache = Path(env_cache)
+    elif (estate / "ms-playwright").is_dir():
+        cache = estate / "ms-playwright"
+    else:
+        cache = None
+    if env_browse:
+        browse = Path(env_browse).expanduser()
+    elif (estate / "browse").is_file():
+        browse = estate / "browse"
+    else:
+        browse = None
+    missing = []
+    if cache is not None:
+        missing.extend(rev for rev in PLAYWRIGHT_REVISIONS if not playwright_revision_ok(cache, rev))
+    if browse is not None and (not browse.is_file() or not os.access(browse, os.X_OK)):
+        missing.append("browse")
+    return missing
+
+
+def main():
+    request = json.load(sys.stdin)
+    if set(request) - {"task", "setup", "expected_head", "require_ready"}:
+        raise ValueError("unexpected setup-preflight request field")
+    task = resolve(request.get("task", ""))
+    if not (task / "goal.md").is_file():
+        raise ValueError("task missing goal.md")
+    check = task / "check"
+    if not check.is_file() or not os.access(check, os.X_OK):
+        raise ValueError("task check is missing or not executable (refusing at $0)")
+    consumer = task / "setup"
+    if not consumer.is_symlink():
+        raise ValueError("scheduled task setup link is missing")
+    declared = str(request.get("setup") or metadata(task).get("setup") or "").strip()
+    from _estate_io import lab_path, link_target  # setups under <lab>/ledger live in the state root
+    linked = link_target(LAB, consumer).resolve(strict=False)
+    prepared = (lab_path(LAB, declared) if declared else linked).resolve(strict=False)
+    if linked != prepared:
+        raise ValueError("scheduled task setup link does not target its prepared setup")
+    if not request.get("require_ready", True):
+        print(json.dumps({"ok": True, "task": str(task), "setup": str(prepared),
+                          "ready": False}, sort_keys=True))
+        return
+    if not (prepared / ".git").exists():
+        raise ValueError("prepared setup is not a git worktree")
+    expected = str(request.get("expected_head") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", expected):
+        raise ValueError("expected_head must be one Git object id")
+    actual = git(prepared, "rev-parse", "refs/lab/base")
+    if actual != expected:
+        raise ValueError("prepared setup base does not match destination HEAD")
+    if git(prepared, "rev-parse", "HEAD") != expected:
+        raise ValueError("prepared setup checkout does not match destination HEAD")
+    missing = lane_runtime_missing()
+    if missing:
+        raise ValueError("lane runtime missing (refusing at $0): " + ", ".join(missing))
+    print(json.dumps({"ok": True, "task": str(task), "setup": str(prepared),
+                      "ready": True, "head": actual}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        print("setup-preflight: " + str(error), file=sys.stderr)
+        sys.exit(1)

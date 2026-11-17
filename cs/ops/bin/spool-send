@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""spool-send — deliver finalize-run's envelopes to the configured receiver (Plan.CS.v2.1 §9, S2).
+
+ Operator- and tick-called, never palette. Input {} (JSON). Reads
+<config>/policy/spool.json {version: 1, receiver: null | {kind: "dir", path}, min_free_bytes}.
+
+receiver null, or the file absent (the state this ships in, until phase 6): sends nothing and
+reports the outbox {pending, oldest_age_s, bytes} with the line `no receiver configured`.
+
+kind "dir" (tests; a local mount if the owner wants one): for each <state>/outbox/<run_id>.json, in
+name order, the envelope and every file it lists are copied to <path>/events/<event_id>/; the
+receiver side re-hashes every copied file and the envelope_sha256 and writes
+<path>/acks/<event_id>.json {event_id, envelope_sha256, ts} only when all match. The sender then
+moves the outbox entry to outbox/acked/. An entry stays in the outbox until acked, so a killed
+send is re-sent next time (at-least-once); an event_id already acked with the same
+envelope_sha256 is not copied again and returns the same ack (idempotent). A hash mismatch
+writes no ack and leaves the entry pending. An ack authorises nothing yet (no pruning).
+
+kind "director" (phase 6; {url, node, token_env}, _director_client): for each outbox entry,
+POST api/v1/nodes/me/envelopes {envelope, row_line} (row_line: the entry's own, for job_terminal:<job>
+events tick writes, else the state ledger's line for the envelope's transcript, which must hash to
+row_sha256); PUT objects/<sha256> for every file the director lists missing, from the run dir; POST
+again. Only an `acked` answer naming the same envelope_sha256 writes outbox/acked/<entry>.ack.json and
+moves the entry to outbox/acked/. Unreachable, `missing` after upload, or `rejected` leave the entry.
+Under protocol 2 a run's live events (<run>/events.jsonl, _node_events) are flushed before its envelope.
+A run_finalized envelope of a Director job carries `job_id` (additive; the run's stimulus names its job).
+policy `retention`: "keep" (default) or "prune_acked": after an ack with restored true, the run's
+workspace (<workspaces>/<run>/workspace; a git worktree through `git worktree remove --force`) is
+deleted and outbox/acked/<run>.pruned.json written. Nothing else deletes a node's workspace.
+
+Exit 0 {"ok": true, receiver, sent, acked_before, failed: [{event_id, error}], pending,
+oldest_age_s, bytes, pruned}; exit 2 a malformed policy. SPOOL_SEND_CRASH_AFTER=copy is TEST-ONLY
+fault injection: os._exit(137) after the first envelope's files are copied, before any ack.
+"""
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+from _estate_io import write_atomic
+
+from _director_client import Client, DirectorUnreachable, receiver_config
+from _roots import RootsError, ledger_path, outbox_dir, roots, workspace_dir
+
+CRASH_AFTER = os.environ.get("SPOOL_SEND_CRASH_AFTER", "")
+
+
+def emit(value, code):
+    print(json.dumps(value, sort_keys=True))
+    raise SystemExit(code)
+
+
+def load_policy(config):
+    """None when absent or receiver null; else {"kind": "dir", "path": Path}. ValueError when malformed."""
+    path = Path(config) / "policy/spool.json"
+    if not path.is_file():
+        return None
+    policy = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(policy, dict) or policy.get("version") != 1:
+        raise ValueError("policy/spool.json: want {version: 1, receiver, min_free_bytes}")
+    receiver = policy.get("receiver")
+    if receiver is None:
+        return None
+    if policy.get("retention", "keep") not in ("keep", "prune_acked"):
+        raise ValueError('policy/spool.json: retention must be "keep" or "prune_acked"')
+    if isinstance(receiver, dict) and receiver.get("kind") == "director":
+        return dict(receiver_config(receiver), retention=policy.get("retention", "keep"))
+    if not isinstance(receiver, dict) or receiver.get("kind") != "dir" or not os.path.isabs(str(receiver.get("path") or "")):
+        raise ValueError('policy/spool.json: receiver must be null or {"kind": "dir", "path": <absolute>}')
+    return {"kind": "dir", "path": Path(receiver["path"])}
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def outbox_stats(outbox):
+    entries = sorted(outbox.glob("*.json")) if outbox.is_dir() else []
+    now, ages, total = time.time(), [], 0
+    for entry in entries:
+        try:
+            ages.append(now - entry.stat().st_mtime)
+            envelope = json.loads(entry.read_text(encoding="utf-8"))
+            total += sum(int(f.get("bytes") or 0) for f in envelope.get("files") or [])
+        except (OSError, ValueError):
+            continue
+    return {"pending": len(entries), "oldest_age_s": round(max(ages), 1) if ages else None, "bytes": total}
+
+
+def receive(receiver, envelope):
+    """The receiver side: verify what arrived under events/<event_id>/, then (only then) ack."""
+    event = envelope["event_id"]
+    acks = receiver / "acks" / (event + ".json")
+    if acks.is_file():
+        ack = json.loads(acks.read_text(encoding="utf-8"))
+        if ack.get("envelope_sha256") == envelope["envelope_sha256"]:
+            return ack, "existing"
+    landed = receiver / "events" / event
+    files = envelope.get("files") or []
+    for f in files:
+        got = landed / f["path"]
+        if not got.is_file() or sha256_file(got) != f["sha256"]:
+            raise ValueError("%s: %s does not match its sha256" % (event, f["path"]))
+    lines = "".join("%s:%s\n" % (f["path"], f["sha256"]) for f in sorted(files, key=lambda f: f["path"]))
+    if hashlib.sha256(lines.encode("utf-8")).hexdigest() != envelope["envelope_sha256"]:
+        raise ValueError("%s: envelope_sha256 does not match its files" % event)
+    ack = {"event_id": event, "envelope_sha256": envelope["envelope_sha256"],
+           "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    write_atomic(acks, (json.dumps(ack, sort_keys=True) + "\n").encode("utf-8"))
+    return ack, "written"
+
+
+def send_one(entry, runs, receiver):
+    envelope = json.loads(entry.read_text(encoding="utf-8"))
+    event, run = envelope["event_id"], runs / envelope["run_id"]
+    acks = receiver / "acks" / (event + ".json")
+    already = acks.is_file() and json.loads(acks.read_text(encoding="utf-8")).get(
+        "envelope_sha256") == envelope["envelope_sha256"]
+    if not already:
+        landed = receiver / "events" / event
+        for f in envelope.get("files") or []:
+            dest = landed / f["path"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(run / f["path"], dest)
+        write_atomic(landed / "envelope.json", entry.read_bytes())
+        if CRASH_AFTER == "copy":
+            sys.stderr.write("spool-send: SPOOL_SEND_CRASH_AFTER=copy (test-only)\n")
+            sys.stderr.flush()
+            os._exit(137)
+    ack, _ = receive(receiver, envelope)
+    if ack.get("envelope_sha256") != envelope["envelope_sha256"]:
+        raise ValueError("%s: ack names another envelope" % event)
+    (entry.parent / "acked").mkdir(exist_ok=True)
+    os.replace(entry, entry.parent / "acked" / entry.name)
+    return already
+
+
+def row_line_for(envelope, entry_line):
+    """The row bytes the envelope names: a job_terminal entry carries its own; a run's is in the state ledger."""
+    want = envelope.get("row_sha256")
+    if entry_line is not None:
+        line = entry_line.encode("utf-8")
+    elif not want:
+        return None
+    else:
+        line, needle = None, ('"transcript":%s' % json.dumps(envelope.get("transcript"))).encode("utf-8")
+        ledger = ledger_path()
+        with open(ledger, "rb") as rows:
+            for raw in rows:
+                if needle in raw.replace(b'": ', b'":') and hashlib.sha256(raw.rstrip(b"\n")).hexdigest() == want:
+                    line = raw.rstrip(b"\n")
+        if line is None:
+            raise ValueError("%s: no row in %s hashes to row_sha256" % (envelope["event_id"], ledger))
+    if want and hashlib.sha256(line).hexdigest() != want:
+        raise ValueError("%s: row_line does not hash to row_sha256" % envelope["event_id"])
+    return line.decode("utf-8")
+
+
+def director_job(state, run):
+    """The Director job a run belongs to: its frozen stimulus's dispatch job id (else terminal.json's job_id), when
+    that id is a job this node accepted (<state>/jobs/<id>/job.json); None for local work."""
+    from _node_events import job_of
+    job = job_of(run)
+    if not job:
+        try:
+            job = str(json.loads((run / "terminal.json").read_text(encoding="utf-8")).get("job_id") or "") or None
+        except (OSError, ValueError, AttributeError):
+            job = None
+    return job if job and "/" not in job and (Path(state) / "jobs" / job / "job.json").is_file() else None
+
+
+def send_director(entry, runs, client):
+    """One entry to the director; returns the ack, or raises (the entry then stays for the next pass)."""
+    envelope = json.loads(entry.read_text(encoding="utf-8"))
+    line = row_line_for(envelope, envelope.pop("row_line", None))
+    run = runs / str(envelope.get("run_id") or "")
+    if str(envelope.get("event_id", "")).startswith("run_finalized:") and not envelope.get("job_id"):
+        job = director_job(runs.parent, run)
+        if job:  # additive (§9): the Director links every trial's run to its job, so each charge settles
+            envelope["job_id"] = job
+    body = {"envelope": envelope, "row_line": line}
+    if client.protocol >= 2 and envelope.get("run_id") and (run / "events.jsonl").is_file():
+        from _node_events import send as send_events  # protocol 2: the run's live events first, then its result
+        send_events(client, runs.parent, run)
+    answer = client.call("POST", "envelopes", body)
+    if answer.get("status") == "missing":
+        by_sha = {f["sha256"]: f["path"] for f in envelope.get("files") or []}
+        for sha in answer.get("missing") or []:
+            if sha not in by_sha:
+                raise ValueError("%s: director asks for %s, which the envelope does not list" % (envelope["event_id"], sha))
+            client.call("PUT", "objects/" + sha, raw=(runs / envelope["run_id"] / by_sha[sha]).read_bytes())
+        answer = client.call("POST", "envelopes", body)
+    ack = answer.get("ack") or {}
+    if answer.get("status") != "acked" or ack.get("envelope_sha256") != envelope["envelope_sha256"] \
+            or ack.get("event_id") != envelope["event_id"]:
+        raise ValueError("%s: director answered %s %s" % (envelope["event_id"], answer.get("status"),
+                                                           answer.get("error") or answer.get("missing") or ""))
+    acked = entry.parent / "acked"
+    acked.mkdir(exist_ok=True)
+    write_atomic(acked / (entry.stem + ".ack.json"), (json.dumps(ack, sort_keys=True) + "\n").encode("utf-8"))
+    os.replace(entry, acked / entry.name)
+    return envelope, ack
+
+
+def prune_acked(envelope, ack, outbox):
+    """Delete the run's workspace only on an ack naming this envelope and a restored run (Plan §9)."""
+    run = envelope.get("run_id")
+    if not run or not str(envelope.get("event_id", "")).startswith("run_finalized:") or not ack.get("restored") \
+            or ack.get("envelope_sha256") != envelope.get("envelope_sha256"):
+        return None
+    ws = workspace_dir(run)
+    record = {"run_id": run, "event_id": envelope["event_id"], "envelope_sha256": ack["envelope_sha256"],
+              "workspace": str(ws), "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if ws.is_dir():
+        if (ws / ".git").is_file():  # a git worktree: let its repository forget it as well
+            import subprocess
+            common = subprocess.run(["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                    capture_output=True, text=True)
+            gone = common.returncode == 0 and subprocess.run(
+                ["git", "--git-dir", common.stdout.strip(), "worktree", "remove", "--force", str(ws)],
+                capture_output=True).returncode == 0
+            if not gone:
+                return None
+            record["mode"] = "worktree"
+        else:
+            shutil.rmtree(ws)
+            record["mode"] = "tree"
+    else:
+        record["mode"] = "absent"
+    write_atomic(outbox / "acked" / (run + ".pruned.json"), (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+    return record
+
+
+def main_director(state, receiver, outbox):
+    try:
+        client = Client(receiver)
+    except ValueError as error:
+        emit({"ok": False, "error": str(error)}, 2)
+    sent, failed, pruned = 0, [], 0
+    for entry in sorted(outbox.glob("*.json")) if outbox.is_dir() else ():
+        try:
+            envelope, ack = send_director(entry, state["state"] / "runs", client)
+            sent += 1
+            if receiver["retention"] == "prune_acked" and prune_acked(envelope, ack, outbox):
+                pruned += 1
+        except DirectorUnreachable as error:
+            failed.append({"event_id": entry.stem, "error": str(error)})
+            break  # the director is not answering: the rest wait for the next pass, in order
+        except (OSError, ValueError, KeyError) as error:
+            failed.append({"event_id": entry.stem, "error": "%s: %s" % (type(error).__name__, error)})
+    emit({"ok": True, "receiver": receiver["url"], "node": receiver["node"], "sent": sent, "failed": failed,
+          "pruned": pruned, **outbox_stats(outbox)}, 0)
+
+
+def main():
+    try:
+        json.loads(sys.stdin.read() or "{}")
+        state = roots()
+        receiver = load_policy(state["config"])
+    except (ValueError, RootsError) as error:
+        emit({"ok": False, "error": str(error)}, 2)
+    outbox = outbox_dir()
+    if receiver is None:
+        emit({"ok": True, "receiver": None, "sent": 0,
+              "note": "no receiver configured (policy/spool.json receiver null or absent): nothing sent",
+              **outbox_stats(outbox)}, 0)
+    if receiver["kind"] == "director":
+        main_director(state, receiver, outbox)
+    sent, before, failed = 0, 0, []
+    for entry in sorted(outbox.glob("*.json")) if outbox.is_dir() else ():
+        try:
+            if send_one(entry, state["state"] / "runs", receiver["path"]):
+                before += 1
+            else:
+                sent += 1
+        except (OSError, ValueError, KeyError) as error:
+            failed.append({"event_id": entry.stem, "error": "%s: %s" % (type(error).__name__, error)})
+    emit({"ok": True, "receiver": str(receiver["path"]), "sent": sent, "acked_before": before,
+          "failed": failed, **outbox_stats(outbox)}, 0)
+
+
+if __name__ == "__main__":
+    main()

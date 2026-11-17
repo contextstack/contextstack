@@ -1,0 +1,12 @@
+{
+  "exit_code": 2,
+  "ops": [],
+  "requests": [],
+  "rows": [],
+  "run_dirs_distinct": true,
+  "runs": [],
+  "stderr": [
+    "run-spec: env \"FX_SECRET_NO\": not allowed by policy/env.json"
+  ],
+  "stdout": []
+}

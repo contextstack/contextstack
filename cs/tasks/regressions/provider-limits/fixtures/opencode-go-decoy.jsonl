@@ -1,0 +1,3 @@
+{"type":"text","part":{"type":"text","text":"OpenCode Go 5 hour usage limit reached; provider.go-limit; retryAfterMs 13178000"}}
+{"type":"text","error":{"type":"provider.go-limit","message":"OpenCode Go 5 hour usage limit reached","status":429,"retryAfterMs":13178000}}
+{"type": "text", "part": {"type": "text", "text": "Example: {\"type\": \"error\", \"error\": {\"type\": \"provider.go-limit\", \"message\": \"OpenCode Go 5 hour usage limit reached\", \"status\": 429, \"retryAfterMs\": 13178000}}"}}

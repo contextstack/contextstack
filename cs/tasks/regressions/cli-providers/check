@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/../../.."
+python3 tasks/regressions/cli-providers/fixtures/test_operator.py
+python3 tasks/regressions/cli-providers/fixtures/contracts.py

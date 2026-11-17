@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Issue #57: private login refresh and guarded host write-back; decoy JSON only."""
+import ast
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+OPS = Path(__file__).resolve().parents[3] / 'ops/bin'
+sys.path.insert(0, str(OPS))
+from _cli_native import finish_copies, stage
+
+if '--darwin-probe' in sys.argv:
+    subprocess.run([sys.executable, str(Path(__file__).with_name('login-rename-probe')), '--darwin-probe'], check=True)
+
+TEMPLATE = json.loads((OPS / 'executor-templates.json').read_text())['codex']
+
+
+def auth(account='owner', token='original'):
+    return json.dumps({'tokens': {'account_id': account, 'refresh_token': token}}).encode()
+
+
+def case(root, name, mutate, expected, owner_bytes=None):
+    home, private = root / name / 'home', root / name / 'tmp'
+    source = home / '.codex/auth.json'
+    source.parent.mkdir(parents=True)
+    source.write_bytes(auth())
+    private.mkdir()
+    records = []
+    _, links = stage(TEMPLATE, private, home, copy_records=records)
+    copied = private / 'codex-home/auth.json'
+    assert not links and not copied.is_symlink()
+    assert copied.read_bytes() == auth()
+    assert copied.stat().st_nlink == 1 and copied.stat().st_uid == os.getuid()
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+    mutate(copied, source)
+    result = finish_copies(records)
+    assert len(result) == 1 and result[0]['status'] == expected, (name, result)
+    assert source.read_bytes() == (owner_bytes if owner_bytes is not None else auth())
+    if expected == 'written_back':
+        assert stat.S_IMODE(source.stat().st_mode) == 0o600
+        assert source.stat().st_nlink == 1
+    assert not copied.is_file() and not copied.is_symlink(), (name, 'credential copy retained')
+
+
+def replaced(copied, source, value):
+    sibling = copied.with_name('.auth-aB012Z')
+    sibling.write_bytes(value)
+    sibling.replace(copied)
+
+
+def owner_replaced(copied, source):
+    replaced(copied, source, auth(token='rotated'))
+    sibling = source.with_name('owner-refresh')
+    sibling.write_bytes(auth())
+    sibling.replace(source)
+
+
+def owner_changed(copied, source):
+    replaced(copied, source, auth(token='rotated'))
+    source.write_bytes(auth(token='owner-newer'))
+
+
+def symlinked(copied, source):
+    copied.unlink()
+    copied.symlink_to(source)
+
+
+def hardlinked(copied, source):
+    copied.unlink()
+    os.link(source, copied)
+
+
+with tempfile.TemporaryDirectory(prefix='login-copy-regression-') as raw:
+    root = Path(raw)
+    case(root, 'unchanged', lambda *_: None, 'unchanged')
+    # 8th pass #64: a job's copy is never written back, even with a matching account id.
+    case(root, 'rotated', lambda c, s: replaced(c, s, auth(token='rotated')), 'task_copy')
+    case(root, 'swapped', lambda c, s: replaced(c, s, auth('attacker')), 'task_copy')
+    case(root, 'owner-replaced-same-bytes', owner_replaced, 'owner_changed')
+    case(root, 'owner-refreshed', owner_changed, 'owner_changed', auth(token='owner-newer'))
+    case(root, 'symlinked', symlinked, 'invalid_copy')
+    case(root, 'hardlinked', hardlinked, 'invalid_copy')
+    case(root, 'malformed', lambda c, _: c.write_text('{'), 'task_copy')  # discarded before parsing: never written back
+    case(root, 'missing-identity', lambda c, _: c.write_text('{}'), 'task_copy')
+    case(root, 'directory', lambda c, _: (c.unlink(), c.mkdir()), 'invalid_copy')
+    home, private = root / 'parent-symlink/home', root / 'parent-symlink/tmp'
+    source = home / '.codex/auth.json'
+    source.parent.mkdir(parents=True)
+    source.write_bytes(auth())
+    private.mkdir()
+    records = []
+    stage(TEMPLATE, private, home, copy_records=records)
+    runtime = private / 'codex-home'
+    moved = private / 'moved'
+    runtime.rename(moved)
+    runtime.symlink_to(source.parent, target_is_directory=True)
+    assert finish_copies(records) == [{'source': '~/.codex/auth.json', 'status': 'invalid_copy'}]
+    assert source.read_bytes() == auth()
+    runtime.unlink(missing_ok=True)
+    pi = json.loads((OPS / 'executor-templates.json').read_text())['pi']
+    for name, account, expected in (('same', 'owner', 'task_copy'), ('different', 'attacker', 'task_copy'),
+                                    ('unknown', None, 'task_copy')):
+        home, private = root / ('pi-' + name) / 'home', root / ('pi-' + name) / 'tmp'
+        source = home / '.pi/agent/auth.json'
+        source.parent.mkdir(parents=True)
+        original = {'openai-codex': {'type': 'oauth', 'accountId': 'owner', 'refresh': 'original'}}
+        source.write_text(json.dumps(original))
+        private.mkdir()
+        records = []
+        stage(pi, private, home, copy_records=records)
+        copy = private / 'pi-agent/auth.json'
+        lock = copy.with_name('auth.json.lock')
+        lock.mkdir()
+        os.utime(lock, None)
+        lock.rmdir()
+        refreshed = {'openai-codex': {'type': 'oauth', 'refresh': 'rotated'}}
+        if account is not None:
+            refreshed['openai-codex']['accountId'] = account
+        replacement = copy.with_name('refresh')
+        replacement.write_text(json.dumps(refreshed))
+        replacement.replace(copy)
+        result = finish_copies(records)
+        assert result == [{'source': '~/.pi/agent/auth.json', 'status': expected}], result
+        assert json.loads(source.read_text()) == (refreshed if expected == 'written_back' else original)
+        assert not copy.exists()
+    # Every Claude file-backed template has the same private-copy contract.
+    templates = json.loads((OPS / 'executor-templates.json').read_text())
+    claude_templates = {name: template for name, template in templates.items()
+                        if '~/.claude/.credentials.json' in template.get('copies', {}).values()}
+    expected_names = {name for name in templates if name.startswith('claude-code') or name == 'claude-auth-context-probe'}
+    assert expected_names <= claude_templates.keys(), expected_names - claude_templates.keys()
+    for template_name, template in claude_templates.items():
+        assert '~/.claude/.credentials.json' not in template.get('links', {}).values()
+        assert not any(entry.get('literal') == '~/.claude/.credentials.json'
+                       for entry in template.get('login_writes', []))
+        for name, account, organization, expected in (
+                ('same', 'owner-account', 'owner-org', 'task_copy'),
+                ('different-account', 'other-account', 'owner-org', 'task_copy'),
+                ('different-organization', 'owner-account', 'other-org', 'task_copy'),
+                ('missing-account', None, 'owner-org', 'task_copy'),
+                ('missing-organization', 'owner-account', None, 'task_copy'),
+                ('missing-identity', None, None, 'task_copy'),
+                ('owner-changed', 'owner-account', 'owner-org', 'owner_changed'),
+                ('unchanged', 'owner-account', 'owner-org', 'unchanged'),
+                ('malformed', 'owner-account', 'owner-org', 'task_copy'),
+                ('hardlink', 'owner-account', 'owner-org', 'invalid_copy'),
+                ('symlink', 'owner-account', 'owner-org', 'invalid_copy')):
+            home, private = root / (template_name + '-' + name) / 'home', root / (template_name + '-' + name) / 'tmp'
+            source = home / '.claude/.credentials.json'
+            source.parent.mkdir(parents=True)
+            original = {'claudeAiOauth': {'accountUuid': 'owner-account', 'organizationUuid': 'owner-org',
+                                          'refreshToken': 'original-decoy'}}
+            source.write_text(json.dumps(original))
+            private.mkdir()
+            records = []
+            _, links = stage(template, private, home, copy_records=records)
+            copied = records[0]['copy']
+            assert not copied.is_symlink() and stat.S_IMODE(copied.stat().st_mode) == 0o600
+            assert copied.stat().st_nlink == 1
+            refreshed = {'claudeAiOauth': {'refreshToken': 'rotated-decoy'}}
+            if account is not None:
+                refreshed['claudeAiOauth']['accountUuid'] = account
+            if organization is not None:
+                refreshed['claudeAiOauth']['organizationUuid'] = organization
+            copied.write_text(json.dumps(refreshed))
+            owner_value = original
+            if name == 'owner-changed':
+                owner_value = {'claudeAiOauth': dict(original['claudeAiOauth'], refreshToken='owner-newer-decoy')}
+                source.write_text(json.dumps(owner_value))
+            elif name == 'unchanged':
+                copied.write_text(json.dumps(original))
+            elif name == 'malformed':
+                copied.write_text('{')
+            elif name in ('hardlink', 'symlink'):
+                copied.unlink()
+                os.link(source, copied) if name == 'hardlink' else copied.symlink_to(source)
+            result = finish_copies(records)
+            assert result == [{'source': '~/.claude/.credentials.json', 'status': expected}], (template_name, name, result)
+            assert json.loads(source.read_text()) == (refreshed if expected == 'written_back' else owner_value)
+            assert not copied.exists() and not copied.is_symlink()
+            assert 'decoy' not in json.dumps(result), 'credential contents in evidence'
+            for link in links:
+                link.unlink(missing_ok=True)
+        # A Keychain-only owner has no file to copy and gains no file write-back.
+        home, private = root / (template_name + '-missing') / 'home', root / (template_name + '-missing') / 'tmp'
+        home.mkdir(parents=True)
+        private.mkdir()
+        records = []
+        _, links = stage(template, private, home, copy_records=records)
+        assert not records and finish_copies(records) == []
+        assert not (home / '.claude/.credentials.json').exists()
+        for link in links:
+            link.unlink(missing_ok=True)
+    # Exercise the host finalizer used on success and emit() failure/timeout paths.
+    tree = ast.parse((OPS / '_executor.py').read_text())
+    main_fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+    finalizer = next(node for node in main_fn.body if isinstance(node, ast.FunctionDef)
+                     and node.name == 'finalize_login_copies')
+    home, private = root / 'evidence/home', root / 'evidence/tmp'
+    source = home / '.codex/auth.json'
+    source.parent.mkdir(parents=True)
+    source.write_bytes(auth())
+    private.mkdir()
+    for planted_link in (False, True):
+        records = []
+        stage(TEMPLATE, private, home, copy_records=records)
+        (private / 'codex-home/auth.json').write_bytes(auth('attacker'))
+        evidence = home.parent / 'login-copy-refresh.json'
+        if planted_link:
+            evidence.unlink()
+            evidence.symlink_to(source)
+        # binary names a CLI with no trusted refresh, so this exercises only task-copy discard.
+        ns = dict(native_copies=records, row={}, run_dir=home.parent, os=os, json=json, Path=Path,
+                  finish_copies=finish_copies, binary='fixture-cli')
+        # The finalizer is a closure over main's login_refresh_status: give it an enclosing scope.
+        outer = ast.FunctionDef(name='_outer', args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+                                body=[ast.parse('login_refresh_status = None').body[0], finalizer,
+                                      ast.parse('return finalize_login_copies').body[0]], decorator_list=[], type_params=[])
+        module = ast.fix_missing_locations(ast.Module(body=[outer], type_ignores=[]))
+        exec(compile(module, str(OPS / '_executor.py'), 'exec'), ns)
+        ns['finalize_login_copies'] = ns['_outer']()
+        ns['finalize_login_copies']()
+        expected = [{'source': '~/.codex/auth.json', 'status': 'task_copy'}]
+        assert ns['row']['login_copy_refresh'] == expected
+        if not planted_link:
+            assert json.loads(evidence.read_text()) == expected
+            assert 'attacker' not in evidence.read_text() and 'refresh_token' not in evidence.read_text()
+        assert source.read_bytes() == auth()
+        ns['finalize_login_copies']()  # Finalization is idempotent after credentials were discarded.
+print('PASS: private auth copies and guarded refresh write-back (issue #57)')
+
+# 2026-11-12: a persistent HOME (the hosted lead's) still held the old symlink to the real login,
+# and staging refused it ("copied login leaves private tmp"), failing every hosted turn. It is
+# replaced by a private copy; the real file is never followed or changed.
+with tempfile.TemporaryDirectory(prefix='login-copy-stale-link-') as raw:
+    root = Path(raw).resolve()
+    home, runtime = root / 'home', root / 'state/lead-sessions/con_x/home'
+    (home / '.claude').mkdir(parents=True)
+    real = home / '.claude/.credentials.json'
+    real.write_text(json.dumps({'claudeAiOauth': {'refreshToken': 'fixture'}}))
+    real.chmod(0o600)
+    (runtime / '.claude').mkdir(parents=True)
+    (runtime / '.claude/.credentials.json').symlink_to(real)
+    from _cli_native import stage_claude_login
+    stale = stage_claude_login(runtime, home)
+    staged = runtime / '.claude/.credentials.json'
+    assert staged.is_file() and not staged.is_symlink(), 'stale login link was followed, not replaced'
+    assert finish_copies(stale) == [{'source': '~/.claude/.credentials.json', 'status': 'unchanged'}]
+    assert json.loads(real.read_text()) == {'claudeAiOauth': {'refreshToken': 'fixture'}}
+print('login-copies: a stale login link in a persistent HOME is replaced, never followed')

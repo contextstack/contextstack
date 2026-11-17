@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Offline hostile orders, with temporary roots and no credential contents."""
+import ast
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+KIT = Path(__file__).resolve().parents[3]
+OPS = KIT / 'ops/bin'
+sys.path.insert(0, str(OPS))
+import _lead_host as lead
+from _muse import sandbox_command
+from _cli_native import HOSTED_PATHS
+
+# Linux never silently falls through to the executor's unsandboxed development path.
+for flags in ({}, {'LEAD_HOST_NO_SANDBOX': '1'}, {'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}):
+    with patch.dict(os.environ, flags, clear=True), patch.object(sys, 'platform', 'linux'):
+        try:
+            lead.require_host_sandbox(True)
+            raise AssertionError('Linux ran without confinement')
+        except SystemExit as error:
+            assert 'sandbox' in str(error).lower()
+with patch.dict(os.environ, {'LEAD_HOST_NO_SANDBOX': '1', 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}, clear=True):
+    import contextlib, io
+    warning = io.StringIO()
+    with contextlib.redirect_stderr(warning):
+        assert lead.require_host_sandbox(True) is False
+    assert 'WARNING' in warning.getvalue() and 'SANDBOX DISABLED' in warning.getvalue()
+assert lead.parse_cli_extra('["--turn-delay", "1.5"]') == ['--turn-delay', '1.5']
+for raw_extra in ('["--tools", "Bash"]', '["--mcp-config", "evil"]', '["--turn-delay", "NaN"]',
+                  '["--turn-delay", "1", "--dangerously-skip-permissions"]', '["--turn-delay", "11"]', 'invalid'):
+    try:
+        lead.parse_cli_extra(raw_extra)
+        raise AssertionError('unsafe CLI flags accepted')
+    except SystemExit as error:
+        assert 'LEAD_HOST_CLI_EXTRA' in str(error)
+
+with scratch_dir(prefix='hosted-authority-') as raw:
+    root = Path(raw).resolve()
+    for name in ('home', 'config', 'state', 'workspaces', 'tasks/turn'):
+        (root / name).mkdir(parents=True)
+    env = {**hermetic_env(), 'HOME': str(root / 'home'), 'LAB_CONFIG_ROOT': str(root / 'config'), 'LAB_STATE_ROOT': str(root / 'state'), 'LAB_WORKSPACES_ROOT': str(root / 'workspaces'), 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}
+    (root / 'config/hosted-lead.json').write_text(json.dumps({'conversation_id': 'con_real'}))
+    task = root / 'tasks/turn'
+    (task / 'goal.md').write_text('fixture')
+    (task / 'check').write_text('#!/bin/sh\nexit 0\n')
+    spec = {'id': 'hosted-lead', 'model': 'claude-code-sonnet'}
+    spec_path = root / 'spec.yaml'
+    spec_path.write_text('id: hosted-lead\nmodel: claude-code-sonnet\ntrials: 1\n')
+    # Many leads: a turn for any conversation passes this gate; the machine mints a lead credential only for
+    # a conversation the Director marks lead: true (many-leads-host covers that refusal).
+    for identity in ({}, {'conversation_id': 'con_real'}, {'turn_id': 'turn_1'}):
+        order = dict(executor='claude-code-sonnet', task=str(task), spec=str(spec_path), **identity)
+        done = subprocess.run([sys.executable, str(OPS / '_executor.py')], input=json.dumps(order),
+                              text=True, capture_output=True, env=env)
+        assert done.returncode != 0 and "hosted_turn_refused" in done.stdout + done.stderr, (identity, done)
+        assert not list((root / 'workspaces').iterdir()), 'refuse before setup'
+        assert not (root / 'state/lead-sessions').exists(), 'no host session started'
+    # 6th pass R1: an ordinary conversation turn (tasks/turn under any other spec) is a normal executor job.
+    # PATH holds no agent CLI, so the run stops later; it must not be refused or reach the session host.
+    spec_path.write_text('id: ordinary\nmodel: claude-code-sonnet\ntrials: 1\n')
+    for identity in ({}, {'conversation_id': 'con_real', 'turn_id': 'turn_1'},
+                     {'conversation_id': 'con_other', 'turn_id': 'turn_2'}):
+        done = subprocess.run([sys.executable, str(OPS / '_executor.py')],
+                              input=json.dumps(dict(executor='claude-code-sonnet', task=str(task),
+                                                    spec=str(spec_path), **identity)),
+                              text=True, capture_output=True, timeout=120,
+                              env=dict(env, PATH='/usr/bin:/bin'))
+        assert 'hosted_turn_refused' not in done.stdout + done.stderr, done
+        assert not (root / 'state/lead-sessions').exists(), 'an ordinary turn never starts a host session'
+    with patch.dict(os.environ, env, clear=True):
+        assert lead.authorize_hosted_turn({'conversation_id': 'con_real', 'turn_id': 'turn_1'}, task, spec, KIT) == ''
+        assert lead.authorize_hosted_turn({}, task, {'id': 'ordinary'}, KIT)
+    # An untrusted bundle cannot choose a host MCP command, environment, or credential.
+    (root / 'session').mkdir()
+    (root / 'session/mcp.json').write_text(json.dumps({'mcpServers': {
+        'contextstack': {'command': '/evil', 'args': ['--credential-file', '/evil'],
+                        'env': {'EVIL': '1'}}, 'evil': {'command': '/evil'}}}))
+    fixed = lead.build_mcp_config(root, root / 'config/lead-credential', {'node': 'fixture'})
+    assert set(fixed['mcpServers']) == {'contextstack'}
+    server = fixed['mcpServers']['contextstack']
+    assert server['command'] == sys.executable and 'env' not in server
+    assert server['args'][0] == str(KIT / 'scripts/cs') and '--no-land' in server['args']
+    assert '/evil' not in server['args']
+    # The retained check invokes the exact normal-executor sandbox helper.
+    source = (OPS / '_lead_host.py').read_text()
+    hook = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == 'run_hosted_lead_turn')
+    text = ast.unparse(hook)
+    assert "globals_dict['run_check_sandboxed']()" in text
+    assert 'run_process(' not in text
+    (root / 'config/lead-credential').write_text('fixture-not-a-credential')
+    # Credential selection stays on the host; never staged or reopened for the CLI.
+    with patch.dict(os.environ, env, clear=True):
+        # The legacy single-lead credential migrates to its conversation's session folder on first use.
+        found = lead.credential_path(root / 'config', 'con_real', root / 'state')
+        assert found == root / 'state/lead-sessions/con_real/lead-credential', found
+        assert found.read_text() == 'fixture-not-a-credential' and found.stat().st_mode & 0o777 == 0o600
+        lead._SANDBOX_CMD_CACHE = None
+        with patch.object(sys, 'platform', 'darwin'):
+            ws, tmp, runtime = root / 'ws', root / 'tmp', root / 'home/.contextstack/state/lead-sessions/con_real/home'
+            ws.mkdir(); tmp.mkdir(); runtime.mkdir(parents=True)
+            profile = tmp / 'sandbox.sb'
+            lead.sandbox_builder(ws, tmp, profile, write_roots=(runtime,))('/usr/bin/true', [])
+            rules = profile.read_text()
+            for rel in HOSTED_PATHS:
+                assert '(deny file-read* (subpath %s))' % json.dumps(str(root / 'home' / rel)) in rules
+            assert '(allow file-read* file-write* (subpath %s))' % json.dumps(str(runtime.parent)) in rules
+            # The estate deny comes later and wins; the lead's runtime HOME must be one of its exceptions.
+            estate = [l for l in rules.splitlines() if l.startswith('(deny file-read* file-write* file-link (require-all (subpath %s)' % json.dumps(str(root / 'home/.contextstack')))]
+            assert estate and all('(require-not (subpath %s))' % json.dumps(str(runtime)) in l for l in estate), estate
+            sessions = runtime.parent.parent
+            assert '(deny file-read* file-write* file-link (subpath %s))' % json.dumps(str(sessions)) in rules
+            assert '(allow file-read* file-write* (subpath %s))' % json.dumps(str(sessions / 'con_other')) not in rules
+            assert str(root / 'state/lead-sessions') in rules
+            assert not any('allow file-read' in line and 'lead-credential' in line for line in rules.splitlines())
+            session = lead.make_session(ws, tmp, model='sonnet', resume=None, binary='/usr/bin/true',
+                                        mcp_config=fixed, transcript=None, sandbox=True, runtime_home=runtime)
+            try:
+                argv = session.argv()
+                assert 'lead-credential' not in ' '.join(argv)
+                assert session.mcp_bridge.secret_path.parent == runtime
+                assert session.mcp_bridge.token not in ' '.join(argv)
+            finally:
+                session.stop()
+            muse = sandbox_command(['/usr/bin/true'], ws, root / 'home')
+            for rel in HOSTED_PATHS:
+                assert str(root / 'home' / rel) in muse[2]
+print('hosted-turn-authority: pass')

@@ -1,0 +1,19 @@
+{
+  "description": "Operator/launchd: admit each due schedule once, collapse missed slots to one catch-up, then scan corpus stale_after fields. An operator may explicitly retry named hard-failed current slots after a fix; prior attempts remain append-only. Silent when nothing is due or stale.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "now": {"type": "string"},
+      "schedules": {"type": "string"},
+      "fires": {"type": "string"},
+      "lock": {"type": "string"},
+      "dry_run": {"type": "boolean"},
+      "scan_stale": {"type": "boolean"},
+      "retry_failed": {
+        "type": "array",
+        "items": {"type": "string"},
+        "uniqueItems": true
+      }
+    }
+  }
+}

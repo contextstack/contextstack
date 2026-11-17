@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""node-release: the persistent ContextStack layout under ~/.contextstack. Stdlib only.
+
+Run by scripts/node-install under a release's own interpreter; a person types `node-install <command>`.
+
+  ROOT = $HOME/.contextstack
+    releases/<id>/        one release: cs/ (code root; releases before Director.Plan step 0b have a real lab/
+                          instead, which this script still activates; a release built since carries no lab link, so
+                          an earlier release's node-install or node-release cannot switch to it), bin/ (cs-harness, cs-sandbox, cs-tools, cs-gateway;
+                          cs-go and the Go csgateway only in releases built before 2026-11-10), gateway/models.json, python/,
+                          <kit>/.venv; never changed once .complete. Every path into a release is derived from the
+                          release being activated (kit()), so a switch or rollback across the rename writes valid plists
+    current -> releases/<id>   switched atomically (a temp symlink renamed over it); previous releases kept
+    config/               LAB_CONFIG_ROOT: ESTATE, policy/spool.json and policy/env.json (the two policy files ops
+                          read from the config root; seeded from the release when absent, never overwritten),
+                          gateway/providers.d (CSGATEWAY_PROVIDERS_DIR; seeded once from gateway/providers.d when
+                          that exists), node.env (optional, 0600, sourced by the node tick: where the director
+                          token goes), install.json (this installer's record), replaced-agents/ (adopted plists)
+    state/  workspaces/   LAB_STATE_ROOT, LAB_WORKSPACES_ROOT; may already hold data (a director host's ledger):
+                          the installer creates what is missing and never writes, moves or re-modes what exists
+    logs/                 the agents' stdout and stderr
+    gateway/              the gateway's own runtime dir (csgateway.sock, discovery-health.json: its defaults) and
+                          models.json, derived from current's at each activation with lab_executor pointed into
+                          current (the shipped catalog names the dev checkout's absolute path), minus the deployments
+                          of overlay-only providers (OVERLAY_PROVIDERS) this host's providers.d does not define
+  macOS: ~/Library/LaunchAgents/com.contextstack.{csgateway-socket,node,node-listen,director-rs,client-web}.plist
+  Linux: ~/.config/systemd/user/com.contextstack.<service>.service for the same five (command, env, cwd from
+                          _node_services; Restart=on-failure, WantedBy=default.target). systemctl --user daemon-reload
+                          and enable --now; uninstall disable --now. Refuse if systemctl --user is unavailable.
+                          Linger is not enabled; the JSON notes loginctl enable-linger. NODE_INSTALL_PLATFORM
+                          overrides the host (tests). Never embed secrets in a unit or plist.
+  The Laravel director's agents (--serve-director) are retired (2026-11-11): a record that still names
+                          serve_director refuses every activation; uninstall still removes those plists when they are ours.
+  Plists/units name absolute paths into ROOT/current and set an explicit PATH; they never use the PATH links. An
+  agent at one of these paths that is not ours (it does not run from ROOT/current) refuses the command before anything is
+  written, unless --adopt LABEL: then it is copied to config/replaced-agents/ and replaced.
+  PATH links: csgateway, node-install, cs, each a symlink to ROOT/current/...; a `lab` link an earlier release
+  made is removed (it is ours, and the name is retired); in ~/.local/bin when that is on the user's login-shell PATH, else
+  /opt/homebrew/bin. A path that is not already our symlink refuses the whole command before anything is
+  written (--skip-link NAME).
+
+  activate ID [--estate NAME] [--node NAME] [--director URL] [--token-env VAR] [--runner go|rust]
+              [--serve-director-rs [--director-rs-listen ADDR]...] [--installation ID] [--director-token-from FILE|-]
+              [--serve-client-web HOST:PORT [--php PATH]]
+              [--gateway go|rust] [--link-dir DIR] [--skip-link NAME]... [--adopt LABEL]...
+              [--wait SECONDS] [--no-wait|--force] [--keep N] [--no-load]
+      --estate writes config/ESTATE once (a director host: no receiver, no node plist); --node NAME is a fleet
+      node of --director URL, its ESTATE NAME by convention. A Director host may be a node of its own Director.
+      --installation ID goes into the receiver (recorded). --director-token-from FILE (or - for stdin) takes the
+      token `director-rs node register NAME` printed: that JSON line as is (its installation and node are used and
+      checked), or the bare token; it is written to config/node.env (0600) as `export <token-env>=...`, never
+      recorded, printed or put on a command line.
+      --credentials off|file|keychain: the gateway's provider credential store, always written explicitly to
+      CSGATEWAY_CREDENTIALS. Default off on a node, file on a director host; recorded.
+      Lay out ROOT, point current at releases/ID, write links and agents, prune releases beyond the newest N
+      (default 3) in activation order, never the current one. The same keep applies to bundle directories under
+      bundles.noindex: never the one --from-bundle names, never one a release still on disk came from, and never
+      a symlink or a directory without a regular bundle.json. bundles and state/runs are relative symlinks to
+      bundles.noindex and runs.noindex (Spotlight skips a directory whose name ends in .noindex); a real directory
+      already there is renamed, its files kept. Options are recorded in config/install.json and
+      reused by later commands. --no-load writes everything but never calls launchctl or systemctl (tests). Idempotent.
+  switch ID | rollback      activate another complete release (rollback: the one activated before current)
+  select [--gateway go|rust] [--runner go|rust]   change the selection on the current release
+  status                    the record, current, releases, links and agents, as JSON
+  uninstall [--purge [--purge-secrets]]   boot out and remove our agents and links, current and releases/; config/, state/,
+                            workspaces/ and logs/ stay unless --purge. --purge refuses (nothing removed) while
+                            config/director/director.env exists unless --purge-secrets; ROOT/director/, state/director/,
+                            state/client-web/ and ROOT/credentials are never removed
+Before a restart, active jobs from state/dispatch.jsonl drain first: wait up to 30 min by default or
+--wait SECONDS; --no-wait refuses with exit 2 and a JSON reason; --force restarts anyway.
+Env NODE_INSTALL_USER_PATH replaces the login-shell PATH probe (tests).
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_SCRIPTS = str(Path(__file__).resolve().parent)
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+
+from _node_layout import (  # noqa: E402
+    DEFAULTS, DIRECTOR_ENV, DrainRefused, INSTALLATION, KEPT_STATE, LARAVEL_KEYS, LINKS, RECORD, RELEASES, RETIRED_LINKS,
+    check_config, client_web_php, complete, current_id, derive_models, director_rs_listen, director_url,
+    setup_path, remove_path, drain_before_restart, kit, load_record, migrate_churn_dirs, ours, pick_link_dir, plan_links, private_listen,
+    DIRECTOR_DB, prune_bundles, read_node_token, restore_director_db, seed_client_web, seed_config, snapshot_director_db,
+    switch_current, write_atomic, write_node_token,
+)
+from _node_services import (  # noqa: E402
+    ALL_LABELS, CLIENT_WEB, CLIENT_WEB_ENV, CLIENT_WEB_LABEL, CLIENT_WEB_STATE, CONFIG, CREDENTIALS, CURRENT,
+    DIRECTOR_RS_DATA, DIRECTOR_RS_LABEL, DIRECTOR_RS_LISTEN, GATEWAY_BIN, GATEWAY_LABEL, HOME, LARAVEL_LABELS,
+    LINGER_NOTE, LISTEN_LABEL, NODE_LABEL, ROOT, RUNNER_BIN, SYSTEM_PATH, Refused, agent_path, agent_specs, agent_suffix,
+    host_platform, launchctl, load_agent, need_systemctl, our_agent, plan_agents, reload_units, render_agent,
+    release_bin, unload_agent,
+)
+
+# Re-exports cs and cs_init load from this module (SourceFileLoader).
+AGENTS = HOME / "Library/LaunchAgents"  # retired Laravel plists; live agents use agent_path()
+
+
+def is_node():
+    try:
+        receiver = json.loads((CONFIG / "policy/spool.json").read_text(encoding="utf-8")).get("receiver")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(receiver, dict) and receiver.get("kind") == "director"
+
+
+
+def rollback_failed_activation(before, failed_rid, rec, opts, load, reason):
+    """Undo a partial activation: director database, current symlink, and services."""
+    if not before or before == failed_rid:
+        raise Refused(reason)
+    serve_rs = bool(rec.get("serve_director_rs"))
+    restored = False
+    if load and serve_rs:
+        unload_agent(DIRECTOR_RS_LABEL)
+        restored = restore_director_db(failed_rid)
+    activate(before, {"force": True, "retain": True, "smoke": False, "rolling_back": True,
+                      "wait": opts.get("wait"), "no_wait": opts.get("no_wait")}, load)
+    raise Refused("%s; old release %s is back (failed release %s retained%s)"
+                  % (reason, before, failed_rid, "; director database restored" if restored else ""))
+
+
+
+def activate(rid, opts, load=True):
+    if not complete(rid):
+        raise Refused("release %s is not installed (no %s)" % (rid, RELEASES / rid / ".complete"))
+    from _node_rename import migrate_config
+    migrate_config(CONFIG)
+    rec = {**DEFAULTS, **load_record()}
+    rec.update({k: v for k, v in opts.items() if v not in (None, [])
+                and k not in ("adopt", "director_token_from", "from_bundle", "wait", "no_wait", "force", "yes", "smoke", "retain")})
+    if rec["gateway"] not in GATEWAY_BIN or rec["runner"] not in ("go", "rust"):
+        raise Refused("unknown selection: gateway %r, runner %r" % (rec["gateway"], rec["runner"]))
+    for what, bins, rust in (("runner", RUNNER_BIN, "cs-harness"), ("gateway", GATEWAY_BIN, "cs-gateway")):
+        if rec[what] == "go" and not (RELEASES / rid / "bin" / bins["go"]).is_file():
+            raise Refused("release %s has no bin/%s: the Go %s is archived and new releases ship only %s (select --%s "
+                          "rust, or switch to an earlier release that has it)" % (rid, bins["go"], what, rust, what))
+    link_dir = pick_link_dir(opts.get("link_dir"), rec.get("link_dir"))
+    code = kit(rid)
+    links = plan_links(link_dir, rec["skip_links"], rec["gateway"], rec["runner"], code, RELEASES / rid)
+    check_config(rec)
+    node = bool(rec.get("director")) or is_node()
+    rec["credentials"] = rec.get("credentials") or ("off" if node else "file")
+    if rec["credentials"] not in CREDENTIALS:
+        raise Refused("unknown --credentials %r" % rec["credentials"])
+    if rec.get("serve_director"):
+        raise Refused("config/install.json records serve_director (the Laravel director, retired 2026-11-11; this release "
+                      "cannot serve it). Fix, then rerun: boot out and delete %s/{%s}.plist (launchctl bootout gui/%d/LABEL) "
+                      "and remove %s from %s. config/director/ and %s may stay. The Rust Director is --serve-director-rs."
+                      % (AGENTS, ",".join(LARAVEL_LABELS), os.getuid(), ", ".join(LARAVEL_KEYS), RECORD, ROOT / "director"))
+    serve_rs = bool(rec.get("serve_director_rs"))
+    if serve_rs:
+        if not release_bin(RELEASES / rid, "cs-director").is_file():
+            raise Refused("release %s has no bin/cs-director (build the bundle with node-bundle build --director-rs)" % rid)
+        rec["director_rs_listen"] = director_rs_listen(rec.get("director_rs_listen") or [DIRECTOR_RS_LISTEN])
+        if DIRECTOR_RS_DATA.exists() and (not DIRECTOR_RS_DATA.is_dir() or DIRECTOR_RS_DATA.stat().st_mode & 0o077):
+            raise Refused("%s is not a directory only its owner can use (the Director refuses it): chmod 700 it"
+                          % DIRECTOR_RS_DATA)
+    serve_cw = bool(rec.get("serve_client_web"))
+    if serve_cw:
+        if not (RELEASES / rid / CLIENT_WEB / "public/index.php").is_file():
+            raise Refused("release %s has no client-web/ (build the bundle with node-bundle build --client-web)" % rid)
+        private_listen([rec["serve_client_web"]], "--serve-client-web", "127.0.0.1:8781",
+                       "client-web has no login, so whoever reaches it acts with its Director credential")
+        rec["client_web_php"] = client_web_php(rec.get("client_web_php"))
+        for path, want in ((CLIENT_WEB_STATE, "chmod 700"), (CLIENT_WEB_ENV.parent, "chmod 700"), (CLIENT_WEB_ENV, "chmod 600")):
+            if path.exists() and path.stat().st_mode & 0o077:
+                raise Refused("%s is open to other users (it holds client-web's sessions, APP_KEY or device token): %s it"
+                              % (path, want))
+    if rec.get("installation") and not INSTALLATION.fullmatch(str(rec["installation"])):
+        raise Refused("--installation %r is not an installation ID (director-rs installation prints it)" % rec["installation"])
+    token = None
+    if opts.get("director_token_from"):
+        if not node:
+            raise Refused("--director-token-from is for a node of a Director (--node NAME --director URL)")
+        token, inst, named = read_node_token(opts["director_token_from"])
+        if inst and opts.get("installation") and inst != opts["installation"]:
+            raise Refused("--installation %r differs from the installation the token was issued by (%r)" % (opts["installation"], inst))
+        here = rec.get("node") or ((CONFIG / "ESTATE").read_text(encoding="utf-8").strip() if (CONFIG / "ESTATE").is_file() else None)
+        if named and named != here:
+            raise Refused("the token was registered for node %r; this install is node %r" % (named, here))
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", rec["token_env"]):
+            raise Refused("--token-env %r is not a variable name" % rec["token_env"])
+        rec["installation"] = inst or rec.get("installation")
+    specs = agent_specs(rec, code, node=node, serve_rs=serve_rs, serve_cw=serve_cw)
+    adopted = plan_agents([s.label for s in specs], opts.get("adopt") or [])
+    if load and host_platform() == "linux":
+        need_systemctl()
+    drain = drain_before_restart(load, opts)
+    rec["link_dir"] = str(link_dir)
+    seed_config(rid, rec)
+    if serve_rs and not DIRECTOR_RS_DATA.exists():
+        DIRECTOR_RS_DATA.mkdir(mode=0o700)
+        DIRECTOR_RS_DATA.chmod(0o700)
+    env_seeded = seed_client_web(rid, rec) if serve_cw else None
+    token_changed = write_node_token(rec["token_env"], token) if token else None
+    before = current_id()
+    switch_current(rid)
+    models_changed = derive_models(rid)
+    history = [h for h in rec.get("history", []) if h != rid] + [rid]
+    retired = [link_dir / n for n in RETIRED_LINKS if ours(link_dir / n)]
+    for path in retired:
+        path.unlink()
+    for name, (path, target) in links.items():
+        if not (path.is_symlink() and os.readlink(path) == target):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(".%s.tmp.%d" % (name, os.getpid()))
+            os.symlink(target, tmp)
+            os.replace(tmp, path)
+    wanted = {s.label: s for s in agent_specs(rec, code, node=is_node(), serve_rs=serve_rs, serve_cw=serve_cw)}
+    for label in (NODE_LABEL, LISTEN_LABEL):
+        path = agent_path(label)
+        if label not in wanted and our_agent(path):
+            if load:
+                unload_agent(label)
+            path.unlink()
+    report = {}
+    for label in adopted:
+        keep_dir = CONFIG / "replaced-agents"
+        keep_dir.mkdir(mode=0o700, exist_ok=True)
+        src = agent_path(label)
+        shutil.copy2(src, keep_dir / ("%s%s.%s" % (label, agent_suffix(), time.strftime("%Y%m%d-%H%M%S"))))
+    linux = host_platform() == "linux"
+    switched = before is not None and before != rid
+    if load and serve_rs and switched and DIRECTOR_DB.is_file():
+        path = agent_path(DIRECTOR_RS_LABEL)
+        if our_agent(path):
+            unload_agent(DIRECTOR_RS_LABEL)
+        snapshot_director_db(rid)
+    for label, svc in wanted.items():
+        path = agent_path(label)
+        changed = write_atomic(path, render_agent(svc))
+        restart = (switched or models_changed) if label == GATEWAY_LABEL else \
+            switched and label in (DIRECTOR_RS_LABEL, LISTEN_LABEL, CLIENT_WEB_LABEL)
+        report[label] = {"path": str(path), "changed": changed, "restart": restart}
+    if not load:
+        for label in report:
+            report[label]["launchd"] = "not loaded (--no-load)"
+    else:
+        try:
+            if linux:
+                reload_units()
+            for label, info in report.items():
+                info["launchd"] = load_agent(label, Path(info["path"]), info["changed"], info["restart"])
+        except Refused as error:
+            if opts.get("rolling_back"):
+                raise
+            rollback_failed_activation(before, rid, rec, opts, load, str(error))
+    for info in report.values():
+        info.pop("restart", None)
+    # Trial only what can be trialled: services not loaded (--no-load) cannot be, nor a release without cs smoke.
+    if opts.get("smoke") and load and (RELEASES / rid / code / "scripts/cs_smoke.py").is_file():
+        # Publish configuration for the trial, but retain every release until it passes.
+        rec["history"] = history
+        rec["previous"] = before if before != rid else rec.get("previous")
+        write_atomic(RECORD, (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+        try:
+            smoke = subprocess.run([sys.executable, "-I", str(RELEASES / rid / code / "scripts/cs"),
+                                    "smoke", "--json"], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            smoke = subprocess.CompletedProcess([], 1, "", str(error))
+        try:
+            result = json.loads(smoke.stdout)
+            if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
+                raise ValueError("invalid smoke report")
+        except ValueError:
+            result = {"ok": False, "checks": [{"name": "smoke", "ok": False,
+                       "reason": (smoke.stderr or smoke.stdout)[-500:]}]}
+        if smoke.returncode or not result.get("ok"):
+            failed = "; ".join("%s: %s" % (c["name"], c.get("reason", "failed"))
+                               for c in result.get("checks", []) if not c.get("ok")) or "smoke exited %s" % smoke.returncode
+            if before and before != rid:
+                rollback_failed_activation(before, rid, rec, opts, load,
+                                            "smoke failed: %s (failed release %s retained)" % (failed, rid))
+            raise Refused("smoke failed: %s; no previous release to restore" % failed)
+    keep = max(1, int(rec["keep"]))
+    pruned = [] if opts.get("retain") else [h for h in history[:-keep] if h not in (rid, before)]
+    for h in pruned:
+        shutil.rmtree(RELEASES / h, ignore_errors=True)
+    rec["history"] = [h for h in history if h not in pruned]
+    rec["previous"] = before if before != rid else rec.get("previous")
+    write_atomic(RECORD, (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+    bundle_dir = migrate_churn_dirs()
+    pruned_bundles = prune_bundles(opts.get("from_bundle"), bundle_dir)
+    verify = RELEASES / rid / "verify.json"
+    v = json.loads(verify.read_text(encoding="utf-8")) if verify.is_file() else {}
+    setup_path(link_dir, opts.get("yes", False))
+    out = {"ok": True, "release": rid, "previous": before, "root": str(ROOT), "node": is_node(), "kit": code,
+           "runner": rec["runner"], "gateway": rec["gateway"], "credentials": rec["credentials"],
+           "drain": drain,
+           "links": {n: str(p) for n, (p, _) in links.items()}, "retired_links_removed": [str(p) for p in retired],
+           "plists": report, "pruned": pruned, "pruned_bundles": pruned_bundles,
+           "director_rs": {"data_dir": str(DIRECTOR_RS_DATA), "listen": rec["director_rs_listen"],
+                           "url": "http://" + rec["director_rs_listen"][0]} if serve_rs else None,
+           "client_web": {"url": "http://" + rec["serve_client_web"], "php": rec["client_web_php"],
+                          "env_file": "%s %s" % (CLIENT_WEB_ENV, "seeded" if env_seeded else "kept"),
+                          "storage": str(CLIENT_WEB_STATE), "director": director_url(rec)} if serve_cw else None,
+           "node_token": None if token is None else ("written to %s" % (CONFIG / "node.env") if token_changed else "unchanged"),
+           "verify": {"errors": v.get("errors"), "missing_host_runtimes": sorted(v.get("missing_host_runtimes", {}))}}
+    if opts.get("smoke") and load and (RELEASES / rid / code / "scripts/cs_smoke.py").is_file():
+        out["smoke"] = result
+    if linux:
+        out["linger"] = LINGER_NOTE
+        print("node-install: %s" % LINGER_NOTE, file=sys.stderr)
+    return out
+
+
+def status():
+    rec = load_record()
+    link_dir = Path(rec["link_dir"]) if rec.get("link_dir") else None
+    return {"root": str(ROOT), "current": current_id(), "record": rec,
+            "releases": sorted(p.name for p in RELEASES.iterdir() if p.is_dir()) if RELEASES.is_dir() else [],
+            "links": {n: (os.readlink(link_dir / n) if link_dir and (link_dir / n).is_symlink() else None) for n in LINKS},
+            "plists": {l: agent_path(l).is_file() for l in ALL_LABELS}}
+
+
+def uninstall(purge, load=True, purge_secrets=False):
+    rec, removed = load_record(), []
+    if purge and DIRECTOR_ENV.exists() and not purge_secrets:
+        raise Refused("--purge would delete %s, which holds the retired Laravel director's APP_KEY: its database's encrypted "
+                      "columns cannot be read without it. Back it up, then pass --purge-secrets to delete it too."
+                      % DIRECTOR_ENV)
+    linux = host_platform() == "linux"
+    if load and linux:
+        need_systemctl()
+    for label in (LISTEN_LABEL, NODE_LABEL, GATEWAY_LABEL) + LARAVEL_LABELS + (DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL):
+        path = agent_path(label)
+        if our_agent(path):
+            if load:
+                unload_agent(label)
+            path.unlink()
+            removed.append(str(path))
+    if load and linux and removed:
+        reload_units()
+    remove_path()
+    if rec.get("link_dir"):
+        for name in list(LINKS) + list(RETIRED_LINKS):
+            path = Path(rec["link_dir"]) / name
+            if ours(path):
+                path.unlink()
+                removed.append(str(path))
+    if CURRENT.is_symlink():
+        CURRENT.unlink()
+        removed.append(str(CURRENT))
+    if RELEASES.is_dir():
+        shutil.rmtree(RELEASES)
+        removed.append(str(RELEASES))
+    if purge:
+        for d in ("config", "state", "workspaces", "logs", "gateway"):
+            if d == "state" and any((ROOT / d / k).exists() for k in KEPT_STATE):
+                for child in (ROOT / d).iterdir():
+                    if child.name not in KEPT_STATE:
+                        shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+                        removed.append(str(child))
+            elif (ROOT / d).exists():
+                shutil.rmtree(ROOT / d)
+                removed.append(str(ROOT / d))
+    return {"ok": True, "removed": removed, "kept": sorted(p.name for p in ROOT.iterdir()) if ROOT.is_dir() else []}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("activate")
+    a.add_argument("release")
+    a.add_argument("--json", action="store_true", help="emit the full activation record")
+    a.add_argument("--verbose", action="store_true", help="emit the full activation record")
+    a.add_argument("--estate")
+    a.add_argument("--node")
+    a.add_argument("--director")
+    a.add_argument("--token-env")
+    a.add_argument("--runner", choices=("go", "rust"))
+    a.add_argument("--gateway", choices=("go", "rust"))
+    a.add_argument("--credentials", choices=sorted(CREDENTIALS))
+    a.add_argument("--link-dir")
+    a.add_argument("--yes", action="store_true")
+    a.add_argument("--skip-link", action="append", default=[], choices=sorted(LINKS))
+    a.add_argument("--adopt", action="append", default=[], choices=[GATEWAY_LABEL, NODE_LABEL, LISTEN_LABEL, DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL])
+    a.add_argument("--serve-director", nargs="?", const="", default=None, help=argparse.SUPPRESS)
+    a.add_argument("--serve-director-rs", action="store_const", const=True, default=None,
+                   help="serve the Rust Director (bin/director-rs) as a launchd or systemd user agent; recorded")
+    a.add_argument("--director-rs-listen", metavar="ADDR", action="append", default=[],
+                   help="its listen address (repeatable; default 127.0.0.1:8780): loopback or Tailscale")
+    a.add_argument("--serve-client-web", metavar="HOST:PORT",
+                   help="serve client-web (php -S) as a launchd or systemd user agent: loopback or Tailscale only; recorded")
+    a.add_argument("--php", metavar="PATH", help="the php client-web runs on (default: the login-shell PATH's); recorded")
+    a.add_argument("--installation", metavar="ID", help="the Director's installation ID, for the node's receiver")
+    a.add_argument("--director-token-from", metavar="FILE", help="the node token (node register's JSON line, or bare; - for stdin)")
+    a.add_argument("--wait", type=int, metavar="SECONDS", help="drain active jobs for at most SECONDS before restart (default 1800)")
+    a.add_argument("--no-wait", action="store_true", help="refuse with exit 2 when active jobs are present")
+    a.add_argument("--force", action="store_true", help="restart even when active jobs are present")
+    a.add_argument("--keep", type=int)
+    a.add_argument("--from-bundle", help="bundle directory this install unpacked; retention never removes it")
+    a.add_argument("--no-smoke", action="store_true", help="skip the real-job release trial")
+    a.add_argument("--no-load", action="store_true")
+    s = sub.add_parser("switch")
+    s.add_argument("release")
+    s.add_argument("--wait", type=int, metavar="SECONDS")
+    s.add_argument("--no-wait", action="store_true")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--no-load", action="store_true")
+    c = sub.add_parser("select")
+    c.add_argument("--gateway", choices=("go", "rust"))
+    c.add_argument("--runner", choices=("go", "rust"))
+    c.add_argument("--credentials", choices=sorted(CREDENTIALS))
+    c.add_argument("--wait", type=int, metavar="SECONDS")
+    c.add_argument("--no-wait", action="store_true")
+    c.add_argument("--force", action="store_true")
+    c.add_argument("--no-load", action="store_true")
+    r = sub.add_parser("rollback")
+    r.add_argument("--wait", type=int, metavar="SECONDS")
+    r.add_argument("--no-wait", action="store_true")
+    r.add_argument("--force", action="store_true")
+    r.add_argument("--no-load", action="store_true")
+    sub.add_parser("status")
+    u = sub.add_parser("uninstall")
+    u.add_argument("--purge", action="store_true")
+    u.add_argument("--purge-secrets", action="store_true", help="with --purge: also delete config/director/director.env")
+    u.add_argument("--no-load", action="store_true")
+    args = ap.parse_args()
+    try:
+        if args.cmd == "activate":
+            if args.serve_director is not None:
+                raise Refused("--serve-director (the Laravel director) was retired on 2026-11-11; "
+                              "the Rust Director is --serve-director-rs")
+            opts = {"estate": args.estate, "adopt": args.adopt, "node": args.node, "director": args.director,
+                    "token_env": args.token_env, "installation": args.installation, "runner": args.runner, "credentials": args.credentials,
+                    "gateway": args.gateway, "link_dir": args.link_dir, "skip_links": args.skip_link, "keep": args.keep,
+                    "from_bundle": args.from_bundle, "yes": args.yes,
+                    "serve_director_rs": args.serve_director_rs, "director_rs_listen": args.director_rs_listen,
+                    "director_token_from": args.director_token_from,
+                    "serve_client_web": args.serve_client_web, "client_web_php": args.php,
+                    "wait": args.wait, "no_wait": args.no_wait, "force": args.force, "smoke": not args.no_smoke}
+            out = activate(args.release, opts, not args.no_load)
+        elif args.cmd == "switch":
+            out = activate(args.release, {"wait": args.wait, "no_wait": args.no_wait, "force": args.force}, not args.no_load)
+        elif args.cmd == "select":
+            if not complete(current_id() or ""):
+                raise Refused("no current release to select on")
+            out = activate(current_id(), {"gateway": args.gateway, "runner": args.runner,
+                                          "credentials": args.credentials, "wait": args.wait,
+                                          "no_wait": args.no_wait, "force": args.force}, not args.no_load)
+        elif args.cmd == "rollback":
+            rec, cur = load_record(), current_id()
+            back = next((h for h in reversed(rec.get("history", [])) if h != cur and complete(h)), None)
+            if not back:
+                raise Refused("no earlier complete release to roll back to")
+            out = activate(back, {"wait": args.wait, "no_wait": args.no_wait, "force": args.force}, not args.no_load)
+        elif args.cmd == "status":
+            out = status()
+        else:
+            out = uninstall(args.purge, not args.no_load, args.purge_secrets)
+    except DrainRefused as error:
+        print(json.dumps({"ok": False, "reason": error.reason}))
+        return 2
+    except Refused as error:
+        print(json.dumps({"ok": False, "refused": str(error)}))
+        return 1
+    # Pipes retain the historical JSON contract, including the plists map.
+    if args.cmd == "activate" and sys.stdout.isatty() and not (args.json or args.verbose):
+        services = (["Director"] if out.get("director_rs") else []) + ["gateway"]
+        if out.get("node"):
+            services.append("node")
+        if out.get("client_web"):
+            services.append("web client")
+        print("Services %s: %s ✓" % ("configured" if args.no_load else "started", ", ".join(services)))
+    else:
+        print(json.dumps(out, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

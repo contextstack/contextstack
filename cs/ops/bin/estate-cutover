@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""estate-cutover — name an install's state root as its new estate (dev -> m4, 2026-11-11).
+
+Operator-called, never palette, never run by tick. Runs against an install's roots: LAB_STATE_ROOT (the state root in
+place, ~/.contextstack/state; nothing is copied) and LAB_CONFIG_ROOT (whose ESTATE the operator has already set to the
+new name) must both be set. Input {estate, aliases (default: the state root's estate-cutover-v1 record's estate, e.g.
+["dev"]), mode: "dry-run" (default) | "write" | "verify"}.
+
+dry-run: the record it would write (shelves and prefixes); changes nothing.
+write: refuses unless config/ESTATE is `estate`, the state root holds no .cutover-incomplete marker, and every shelf
+ends on a row boundary. Writes <state>/estate-cutover-v2.json (_estate_cutover's docstring is the record) and its
+anchor <config>/estate-cutover-v2.sha256 (0600), both fsync'd, then appends one {"event": "estate_cutover", "from",
+"to"} row after the prefix of every shelf, stamped with the new estate. Rerun: an identical record is kept and only
+missing rows are appended; a different one is refused (the record is immutable). From then on history keeps its
+estate, new rows say the new one, and grants, cohort templates and copied-forward rows that say an alias are accepted
+as this estate (_estate_io.estate_matches, estate_row).
+verify: _estate_cutover.verify against the anchor, the v1 record, every prefix, and every later row's estate.
+
+Exit 0 {ok, ...}; 2 a refused input or a failed verify.
+"""
+import json
+import os
+import sys
+import time
+
+from _estate_cutover import ANCHOR, prefixes, sha256_bytes, verify
+from _estate_io import CUTOVER_V2, append_jsonl, estate_id, write_atomic
+
+
+def emit(value, code=0):
+    print(json.dumps(value, sort_keys=True))
+    raise SystemExit(code)
+
+
+def has_cutover_row(path, size, estate):
+    raw = path.read_bytes()[size:]
+    return any(b'"estate_cutover"' in line and json.loads(line).get("to") == estate for line in raw.splitlines() if line.strip())
+
+
+def main():
+    try:
+        args = json.loads(sys.stdin.read() or "{}")
+        mode = args.get("mode", "dry-run")
+        if mode not in ("dry-run", "write", "verify"):
+            raise ValueError('mode must be "dry-run", "write" or "verify"')
+        if not os.environ.get("LAB_STATE_ROOT") or not os.environ.get("LAB_CONFIG_ROOT"):
+            raise ValueError("LAB_STATE_ROOT and LAB_CONFIG_ROOT must name the install's roots")
+        from _roots import roots
+        found = roots()
+        state, config = found["state"], found["config"]
+        ident = estate_id(config)
+        if mode == "verify":
+            problems = verify(state, config, ident)
+            emit({"ok": not problems, "mode": mode, "estate": ident, "state_root": str(state),
+                  "problems": problems[:20]}, 0 if not problems else 2)
+        estate = str(args.get("estate") or "")
+        if estate != ident:
+            raise ValueError("config/ESTATE is %r, the request says %r" % (ident, estate))
+        if (state / ".cutover-incomplete").exists():
+            raise ValueError("the state root holds .cutover-incomplete: an unfinished state-cutover copy")
+        copied = json.loads((state / "cutover.json").read_text()) if (state / "cutover.json").is_file() else None
+        v1_path = state / "estate-cutover.json"
+        v1 = json.loads(v1_path.read_text()) if v1_path.is_file() else None
+        aliases = args.get("aliases", [v1["estate"]] if v1 and v1.get("estate") else [])
+        if not isinstance(aliases, list) or not all(isinstance(a, str) and a and a != estate for a in aliases):
+            raise ValueError("aliases must be a list of earlier estate names, not this one")
+        existing = (state / CUTOVER_V2).read_bytes() if (state / CUTOVER_V2).is_file() else None
+        if existing:
+            record = json.loads(existing)
+            if record.get("estate") != estate or record.get("aliases") != aliases:
+                raise ValueError("%s already names %r with aliases %r: the record is immutable"
+                                 % (CUTOVER_V2, record.get("estate"), record.get("aliases")))
+        else:
+            record = {"schema": "estate-cutover-v2", "estate": estate, "aliases": aliases, "state_root": str(state),
+                      "previous": {"schema": v1.get("schema"), "estate": v1.get("estate"),
+                                   "sha256": sha256_bytes(v1_path.read_bytes())} if v1 else None,
+                      "copy": {k: copied.get(k) for k in ("inventory_sha256", "ts", "files", "bytes")} if copied else None,
+                      "historical_prefixes": prefixes(state),
+                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        emit({"ok": False, "error": str(error)}, 2)
+    if mode == "dry-run":
+        emit({"ok": True, "mode": mode, "record": record, "exists": bool(existing)})
+    raw = existing or (json.dumps(record, indent=1, sort_keys=True) + "\n").encode()
+    if not existing:
+        write_atomic(state / CUTOVER_V2, raw)
+        write_atomic(config / ANCHOR, (sha256_bytes(raw) + "\n").encode(), mode=0o600)
+    appended = []
+    origin = (record.get("previous") or {}).get("estate") or (aliases[0] if aliases else None)
+    for name, prefix in sorted(record["historical_prefixes"].items()):
+        path = state / name
+        if has_cutover_row(path, prefix["bytes"], estate):
+            continue
+        append_jsonl(path, {"event": "estate_cutover", "from": origin, "to": estate, "aliases": aliases,
+                            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "actor_id": "ops:estate-cutover",
+                            "actor_kind": "human"}, sort_keys=True, compact=True, sync=True, encoding="utf-8")
+        appended.append(name)
+    problems = verify(state, config, estate)
+    emit({"ok": not problems, "mode": mode, "estate": estate, "aliases": aliases, "record_sha256": sha256_bytes(raw),
+          "state_root": str(state), "shelves": len(record["historical_prefixes"]), "rows_appended": appended,
+          "problems": problems[:20]}, 0 if not problems else 2)
+
+
+if __name__ == "__main__":
+    main()

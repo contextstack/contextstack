@@ -1,0 +1,5 @@
+{
+  "estate": "dev",
+  "models": [{"name": "fake-paid", "provider": "vllm", "tier": 1, "cost_class": "api", "cost_per_1k": 0.01}],
+  "deployments": [{"id": "dispatch-timeout-fixture", "provider": "vllm", "endpoint": "http://127.0.0.1:0/v1", "models": ["fake-paid"], "max_concurrent": 1, "max_queued": 0, "max_wait_ms": 0, "capacity": {"dev": 1}}]
+}

@@ -1,0 +1,6 @@
+{
+  "exit": 1,
+  "stdout": "{\"ok\":false,\"action\":\"lint\",\"version\":\"0.2\",\"files\":4,\"concepts\":3,\"errors\":[\"three.md: type is required\",\"three.md: status must be draft, stable, or deprecated\"],\"warnings\":[],\"duplicate_groups\":[]}\n",
+  "files": {},
+  "untouched": true
+}

@@ -1,0 +1,20 @@
+{
+  "description": "Operator, one-shot: backfill Director land records for lanes that landed on main before cs land reported them. Walks main's history for Land lane/<name>, legacy lane <name>: …, and Merge branch 'lane/<name>' commits; matches the newest finished job for that repo and lane finished before each commit; posts state: landed with a stable Idempotency-Key per run and commit. --dry-run prints without posting. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repo name from config/repos.json (or CS_REPOS_FILE)."
+      },
+      "dry_run": {
+        "type": "boolean",
+        "description": "Print what would be posted without calling the Director."
+      }
+    },
+    "required": [
+      "repo"
+    ],
+    "additionalProperties": false
+  }
+}

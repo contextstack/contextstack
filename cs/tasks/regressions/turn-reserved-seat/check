@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Real listener -> intake -> tick admission, with fake Director, clock and executors."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+from contextlib import ExitStack
+from functools import partial
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parents[3] / 'ops/bin'
+sys.path.insert(0, str(HERE))
+
+
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace('-', '_'), str(HERE / name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class StillRunning(BaseException):
+    """Suspend the stub executor after real tick has published its running row."""
+
+
+with scratch_dir(prefix='turn-reserved-seat-', dir='/tmp') as tmp:
+    state = Path(tmp)
+    os.environ['LAB_STATE_ROOT'] = tmp
+    (state / 'config').mkdir()
+    os.environ['LAB_CONFIG_ROOT'] = str(state / 'config')
+    import _node_intake as intake
+    import _vitals
+    from _estate_io import append_jsonl, read_jsonl
+
+    tick, listen = load('tick'), load('node-listen')
+    clock, pressure = [1800000000.0], ['normal']
+    live, started, spawned, emitted, objects = set(), [], [], [], {}
+    real_gmtime = time.gmtime
+
+    def append(row):
+        append_jsonl(state / 'dispatch.jsonl', row, sort_keys=False, compact=False,
+                     sync=False, encoding='utf-8')
+
+    def shelf():
+        return read_jsonl(state / 'dispatch.jsonl', strict=True)
+
+    def job(jid, conversation=None, forged=False):
+        files = []
+        for path, raw in [('spec.yaml', b'id: fixture\nmodel: stub\n'),
+                          ('tasks/work/goal.md', b'fixture')]:
+            sha = hashlib.sha256(raw).hexdigest()
+            objects[sha] = raw
+            files.append(dict(path=path, sha256=sha, bytes=len(raw), mode=0o644))
+        row = dict(job_id=jid, task='tasks/work', spec='spec.yaml', files=files,
+                   bundle_sha256=intake.bundle_sha(files))
+        identity = dict(conversation_id=conversation, turn_id='turn-' + jid)
+        if forged:
+            row['meta'] = identity
+        elif conversation:
+            row.update(identity)
+        return row
+
+    class Director:
+        protocol = 2
+        offered = []
+
+        def call(self, method, path, *args):
+            if path.startswith('objects/'):
+                return objects[path.split('/')[1]]
+            if path == 'work':
+                listener.stop.set()
+                return {'jobs': self.offered, 'cursor': 'next'}
+            return {}
+
+    director = Director()
+    listener = listen.Listener(director, state, HERE.parent.parent, state / 'config')
+
+    def executor(spec, schedule, jid, *args):
+        # The actual admission lock must already be released while the executor runs.
+        held = tick.lockf(False)
+        assert held is not None, 'dispatch lock held for executor lifetime'
+        held.close()
+        started.append((jid, clock[0]))
+        raise StillRunning()
+
+    class Process:
+        def __init__(self, *args, **kwargs):
+            spawned.append(args)
+            self.pid = 10000 + len(started)
+            live.add(self.pid)
+            self.running = False
+            turn_only = bool(args and '--turn-seat' in args[0])
+            with ExitStack() as process_patches:
+                process_patches.enter_context(patch.object(tick.os, 'getpid', return_value=self.pid))
+                if turn_only:
+                    for name in ('sweep_stale_locks', 'finalize_sweep', 'job_pull_pass', 'spool_pass'):
+                        process_patches.enter_context(patch.object(tick, name, side_effect=AssertionError(
+                            'reserved admission blocked behind maintenance: ' + name)))
+                try:
+                    tick.main(turn_only=turn_only)
+                except StillRunning:
+                    self.running = True
+
+        def poll(self):
+            return None if self.running else 0
+
+        def wait(self):
+            return 0
+
+    listener.kick = partial(listener.kick, now=lambda: clock[0], popen=Process)
+    listener.retry_pending = partial(listener.retry_pending, now=lambda: clock[0])
+
+    def offer(*jobs):
+        director.offered = list(jobs)
+        listener.stop.clear()
+        listener.work_loop()
+
+    def reset(lanes):
+        (state / 'dispatch.jsonl').write_text('')
+        started.clear()
+        spawned.clear()
+        live.clear()
+        listener.kicked, listener.turn_kicked, listener.kicked_at = None, None, 0
+        for index in range(lanes):
+            pid = 20000 + index
+            live.add(pid)
+            append(dict(id='lane-' + str(index), director_job='lane-' + str(index),
+                        state='running', pid=pid, lane='production',
+                        spec='fixture.yaml', ts='2027-01-15T08:00:00Z'))
+
+    noop = lambda *args, **kwargs: None
+    overrides = {name: noop for name in (
+        'sweep_stale_locks', 'finalize_sweep', 'job_pull_pass', 'spool_pass', 'write_heartbeat')}
+    overrides.update(NODE=True, lab_count=lambda: 0, run_spec=executor,
+                     local_model=lambda job: '', state_root_disk_free=lambda: 10**15,
+                     spool_low=lambda free: None, emit=lambda row, swept: emitted.append(row))
+    with ExitStack() as stack:
+        stack.enter_context(patch.dict(tick.main.__globals__, overrides))
+        stack.enter_context(patch.object(tick, 'pid_live', side_effect=lambda pid: pid in live))
+        stack.enter_context(patch.object(listen, 'pid_live', side_effect=lambda pid: pid in live))
+        stack.enter_context(patch.object(listen.time, 'time', side_effect=lambda: clock[0]))
+        stack.enter_context(patch.object(listen.time, 'gmtime', side_effect=lambda: real_gmtime(clock[0])))
+        stack.enter_context(patch.object(_vitals, 'read_vitals', side_effect=lambda *a, **k:
+                                        {'memory_pressure': pressure[0]}))
+        stack.enter_context(patch.object(_vitals, 'load_resources_policy', return_value={
+            'hold_at_memory_pressure': 'critical'}))
+        stack.enter_context(patch.object(intake, 'read_vitals', side_effect=lambda *a, **k:
+                                        {'memory_pressure': pressure[0]}))
+        stack.enter_context(patch.object(intake, 'load_resources_policy', return_value={
+            'hold_at_memory_pressure': 'critical'}))
+
+        reset(2)
+        # An outstanding listener-owned tick must not suppress the turn either.
+        listener.kicked = type('LiveTick', (), {'poll': lambda self: None})()
+        offer(job('two-lanes-turn', 'conversation-a'))
+        assert started == [('two-lanes-turn', clock[0])], ('no immediate admission', started)
+        running = [row for row in shelf() if row.get('state') == 'running']
+        assert len(running) == 3 and {row['id'] for row in running[:2]} == {'lane-0', 'lane-1'}
+        assert running[-1]['conversation_id'] == 'conversation-a'
+        assert running[-1]['turn_id'] == 'turn-two-lanes-turn'
+
+        reset(2)
+        offer(job('full-pool-turn', 'conversation-b'))
+        assert started == [('full-pool-turn', clock[0])], started
+        assert shelf()[-1].get('dispatch_seat') == 'reserved', shelf()[-1]
+        before = len(started)
+        offer(job('waiting-lane'), job('forged-lane', 'forged-conversation', forged=True))
+        clock[0] += 1
+        # A reserved invocation cannot execute lanes, including forged bundle metadata.
+        Process(['tick', '--turn-seat'])
+        assert len(started) == before, ('lane took reserved capacity', started)
+        # Another conversation cannot use an occupied reserved seat either.
+        before_spawn = len(spawned)
+        offer(job('second-conversation', 'conversation-other'))
+        assert len(spawned) == before_spawn, 'listener launched into an occupied reserved seat'
+        Process(['tick', '--turn-seat'])
+        assert len(started) == before, ('reserved seat overcommitted', started)
+        # Ordinary dispatch remains available alongside the reserved turn.
+        append(dict(id='second-conversation', state='done', pid=0))
+        Process()
+        assert len(started) == before + 1 and started[-1][0] == 'waiting-lane', started
+
+        reset(2)
+        offer(job('finished-turn', 'conversation-finished'))
+        old_child = listener.turn_kicked
+        assert old_child.poll() is None
+        append(dict(shelf()[-1], state='done', pid=0))
+        clock[0] += 1
+        offer(job('next-after-terminal', 'conversation-next'))
+        assert old_child.poll() is None, 'fixture must retain the flushing child'
+        assert [jid for jid, _ in started] == ['finished-turn', 'next-after-terminal'], (
+            'terminal turn child suppressed next turn while flushing', started)
+        assert len([a for a in listener.active() if a['state'] == 'running']) == 3
+
+        reset(2)
+        append(dict(id='forged-local', state='pending', pid=0, lane='production',
+                    spec='fixture.yaml', conversation_id='forged-local-conversation',
+                    turn_id='forged-local-turn'))
+        Process(['tick', '--turn-seat'])
+        assert not started, ('local turn identity claimed reserved seat', started)
+
+        reset(2)
+        offer(job('serial-first', 'conversation-c'))
+        clock[0] += 1
+        offer(job('serial-second', 'conversation-c'))
+        Process(['tick', '--turn-seat'])
+        Process()
+        assert [jid for jid, _ in started] == ['serial-first'], ('conversation overlap', started)
+
+        reset(2)
+        # Already queued when pressure rises: the real tick resource guard holds it.
+        assert intake.take(director, [job('pressure-turn', 'conversation-d')], state)[1] == ['pressure-turn']
+        pressure[0] = 'critical'
+        listener.kick('pressure rose')
+        assert not started and emitted[-1]['skip'] == 'resource_held', emitted[-1]
+        pressure[0] = 'normal'
+        clock[0] += 1
+        listener.retry_pending(listener.active())
+        assert started == [('pressure-turn', clock[0])], ('no one-second retry', started)
+
+print('PASS: immediate concurrent turns, reserved capacity, conversation serialization, critical hold and retry')

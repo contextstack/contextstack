@@ -1,0 +1,13 @@
+{
+  "body_path": "_evidence/bodies/4ad3a44e6d902a4ed27e71db6675c6e04d6569e1056973ccbd92d2deb7a16bf5.html",
+  "bytes": 133,
+  "content_type": "text/html; charset=utf-8",
+  "final_url": "https://93.184.216.34/fixture",
+  "kind": "fetch",
+  "redirects": [],
+  "requested_url": "https://93.184.216.34/fixture",
+  "retrieved_at": "2026-01-16T00:00:00Z",
+  "schema_version": "0.1",
+  "sha256": "4ad3a44e6d902a4ed27e71db6675c6e04d6569e1056973ccbd92d2deb7a16bf5",
+  "status": 200
+}

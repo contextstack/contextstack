@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import json
+import subprocess
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+import os
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must use the same isolated roots as fixture subprocesses.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+if str(LAB / "ops/bin") not in sys.path:
+    sys.path.insert(0, str(LAB / "ops/bin"))
+from _void import hold_schedule, is_config_void
+
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def tick(root, now, **extra):
+    ops = root / "ops/bin"
+    ops.mkdir(parents=True, exist_ok=True)
+    for name in ("schedule-tick", "_grant.py", "_estate_io.py", "_void.py"):
+        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+    (root / "ESTATE").write_text("dev\n")
+    (root / "grants").mkdir(exist_ok=True)
+    (root / "grants/fixture.yaml").write_text(
+        "id: fixture\nestate: dev\nrepo: /tmp/fixture\n"
+        "paths: [tasks, specs]\ngates: [\"true\"]\ncommit: true\n"
+        "status: active\nexpiry: 2999-01-01T00:00:00Z\n")
+    payload = {
+        "now": now,
+        "schedules": str(root / "schedules.jsonl"),
+        "fires": str(root / "fires.jsonl"),
+        "dispatch": str(root / "dispatch.jsonl"),
+        "lock": str(root / "schedule.lock"),
+        "scan_stale": False,
+        "dry_run": True,
+        "local_model_ready": True,
+    }
+    payload.update(extra)
+    result = subprocess.run([str(ops / "schedule-tick")], input=json.dumps(payload),
+                            text=True, capture_output=True, cwd=LAB, env={**hermetic_env()})
+    assert result.returncode == 0, result.stderr
+    if not result.stdout.strip():
+        return {"admitted": [], "deferred": []}
+    return json.loads(result.stdout)
+
+
+def probe(schedule_id, spec):
+    return {
+        "id": schedule_id,
+        "enabled": True,
+        "grant": "fixture",
+        "cron": "0 6 * * *",
+        "timezone": "America/New_York",
+        "catch_up_window_minutes": 30,
+        "lane": "probe",
+        "spec": spec,
+        "task": "tasks/create-file",
+    }
+
+
+CONFIG_STOP = ("error: gateway fatal_session [gateway.no_provider_credential]: "
+               "provider credential not configured on the gateway")
+UNSUPPORTED = ("error: gateway fatal_session [gateway.provider_unsupported]: "
+               "cs model.call has no cli executor path; inventory entry is cli")
+
+with scratch_dir(prefix="config-void-hold-") as raw:
+    root = Path(raw)
+    write_jsonl(root / "schedules.jsonl", [
+        probe("probe-exp-003-h", "specs/exp-003-h.yaml"),
+        probe("probe-hello-smoke", "specs/hello-smoke.yaml"),
+        probe("probe-exp-538-claude-code", "specs/exp-538-claude-code.yaml"),
+    ])
+    write_jsonl(root / "fires.jsonl", [
+        {"ts": "2026-09-04T10:00:00Z", "id": "probe-exp-003-h",
+         "slot": "2026-09-04T10:00:00Z", "job": "h-1", "lane": "probe"},
+        {"ts": "2026-09-04T10:00:00Z", "id": "probe-hello-smoke",
+         "slot": "2026-09-04T10:00:00Z", "job": "hello-1", "lane": "probe"},
+        {"ts": "2026-09-04T10:00:00Z", "id": "probe-exp-538-claude-code",
+         "slot": "2026-09-04T10:00:00Z", "job": "e-1", "lane": "probe"},
+    ])
+    write_jsonl(root / "dispatch.jsonl", [
+        {"ts": "2026-09-04T10:00:49Z", "id": "h-1", "state": "error",
+         "verdict": "void", "stop": CONFIG_STOP, "schedule_id": "probe-exp-003-h",
+         "slot": "2026-09-04T10:00:00Z"},
+        {"ts": "2026-09-04T10:00:20Z", "id": "hello-1", "state": "done",
+         "verdict": "pass", "schedule_id": "probe-hello-smoke",
+         "slot": "2026-09-04T10:00:00Z"},
+        {"ts": "2026-09-04T10:00:50Z", "id": "e-1", "state": "error",
+         "verdict": "void", "stop": UNSUPPORTED, "schedule_id": "probe-exp-538-claude-code",
+         "slot": "2026-09-04T10:00:00Z"},
+    ])
+    replay = tick(root, "2026-09-04T10:06:00+00:00")
+    admitted = [row["id"] for row in replay.get("admitted") or []]
+    assert admitted == [], admitted
+    deferred_ids = {row["id"]: row["reason"] for row in replay.get("deferred") or []}
+    assert deferred_ids["probe-exp-003-h"] == "prior_attempt_failed"
+    assert deferred_ids["probe-exp-538-claude-code"] == "prior_attempt_failed"
+    assert "probe-hello-smoke" not in deferred_ids
+
+    before_hold = (root / "schedules.jsonl").read_bytes()
+    hold_schedule("probe-exp-003-h", "no_provider_credential",
+                  schedules=root / "schedules.jsonl", lock=root / "schedule.lock")
+    assert (root / "schedules.jsonl").read_bytes().startswith(before_hold)
+    held = json.loads((root / "schedules.jsonl").read_text().splitlines()[-1])
+    assert held["enabled"] is False and held["hold"] == "no_provider_credential"
+    after_hold = tick(root, "2026-09-04T10:12:00+00:00")
+    after_ids = [row["id"] for row in after_hold.get("admitted") or []]
+    after_deferred = {row["id"] for row in after_hold.get("deferred") or []}
+    assert "probe-exp-003-h" not in after_ids
+    assert "probe-exp-003-h" not in after_deferred
+
+with scratch_dir(prefix="config-void-run-spec-") as raw:
+    root = Path(raw)
+    ledger = root / "ledger.jsonl"
+    spec = root / "fixture.yaml"
+    spec.write_text(
+        "id: exp-003-h\nmodel: claude-haiku-4-5-20251001\n"
+        "tasks: [tasks/pipeline-verify, tasks/extract-dup, tasks/impl-from-test]\n"
+        "trials: 6\nhypothesis: \"fixture-003 pin arm\"\n",
+        encoding="utf-8",
+    )
+    loader = importlib.machinery.SourceFileLoader("lab_tick", str(LAB / "ops/bin/tick"))
+    module_spec = importlib.util.spec_from_loader("lab_tick", loader)
+    lab_tick = importlib.util.module_from_spec(module_spec)
+    loader.exec_module(lab_tick)
+    lab_tick.LAB = root
+    lab_tick.LEDGER = ledger
+    lab_tick.TEMPLATES = {}
+    calls = []
+    held = []
+
+    def fake_one_trial(text, n, task=None, job_id=""):
+        # The dispatch job id must reach the trial, or capture-stimulus has no
+        # work order to bind its authority to.
+        calls.append((n, task, job_id))
+        row = {
+            "ts": "2026-09-04T10:00:49Z", "spec": "exp-003-h", "trial": n,
+            "task": task, "verdict": "void", "stop": CONFIG_STOP,
+        }
+        with ledger.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(row) + "\n")
+        return 1
+
+    lab_tick.one_trial = fake_one_trial
+    lab_tick.hold_schedule = lambda sid, reason, **kw: held.append((sid, reason)) or True
+    rc, row = lab_tick.run_spec("fixture.yaml", schedule_id="probe-exp-003-h",
+                                job_id="job-void-1")
+    assert rc == 1 and row["verdict"] == "void"
+    assert calls == [(1, "tasks/pipeline-verify", "job-void-1")], calls
+    assert ledger.read_text(encoding="utf-8").count("\n") == 1
+    assert held == [("probe-exp-003-h", "no_provider_credential")]
+
+assert is_config_void({"verdict": "void", "stop": CONFIG_STOP})
+assert is_config_void({"verdict": "void", "stop": UNSUPPORTED})
+assert not is_config_void({"verdict": "void", "stop": "error: gateway transport_failed"})
+assert not is_config_void({"verdict": "pass", "stop": CONFIG_STOP})
+
+tick_src = (LAB / "ops/bin/tick").read_text(encoding="utf-8")
+assert "hold_schedule" in tick_src and "is_config_void" in tick_src
+sched_src = (LAB / "ops/bin/schedule-tick").read_text(encoding="utf-8")
+assert "is_config_void" in sched_src
+print("check: config/credential voids hold the schedule and never retry")

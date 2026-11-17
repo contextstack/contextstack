@@ -1,0 +1,104 @@
+{
+  "opencode": {
+    "binary": "/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe",
+    "model": "lab/local-coder",
+    "cost_class": "free_local",
+    "auth": "none",
+    "network_port": "*",
+    "args": [
+      "run",
+      "--standalone",
+      "--auto",
+      "--archived",
+      "--format",
+      "json",
+      "--model",
+      "lab/local-coder",
+      "{{prompt}}"
+    ],
+    "environment": {
+      "OPENCODE_DISABLE_AUTOUPDATE": "true",
+      "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+      "OPENCODE_DISABLE_CLAUDE_CODE": "true",
+      "OPENCODE_DISABLE_MODELS_FETCH": "true",
+      "OPENCODE_DISABLE_FILEWATCHER": "true",
+      "OPENCODE_CONFIG": "{{home}}/opencode.json"
+    },
+    "files": {
+      "opencode.json": {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "lab/local-coder",
+        "small_model": "lab/local-coder",
+        "enabled_providers": [
+          "lab"
+        ],
+        "provider": {
+          "lab": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {
+              "baseURL": "http://127.0.0.1:8000/v1",
+              "apiKey": "local"
+            },
+            "models": {
+              "local-coder": {
+                "name": "Local Coder",
+                "limit": {
+                  "context": 131072,
+                  "output": 4096
+                },
+                "cost": {
+                  "input": 0,
+                  "output": 0
+                }
+              }
+            }
+          }
+        },
+        "autoupdate": false,
+        "share": "disabled",
+        "plugin": [],
+        "mcp": {},
+        "lsp": false,
+        "formatter": false,
+        "permission": {
+          "*": "deny",
+          "read": "allow",
+          "edit": "allow",
+          "glob": "allow",
+          "grep": "allow",
+          "bash": "allow"
+        }
+      }
+    },
+    "cost_usd": 0,
+    "opt_in": true
+  },
+  "opencode-go": {
+    "binary": "/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe",
+    "model": "opencode-go/kimi-k3",
+    "cost_class": "subscription",
+    "auth": "opencode_db",
+    "refuse_environment": [
+      "OPENCODE_API_KEY"
+    ],
+    "args": [
+      "run",
+      "--standalone",
+      "--auto",
+      "--archived",
+      "--format",
+      "json",
+      "--model",
+      "opencode-go/kimi-k3",
+      "{{prompt}}"
+    ],
+    "environment": {
+      "OPENCODE_DISABLE_AUTOUPDATE": "true",
+      "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+      "OPENCODE_DISABLE_CLAUDE_CODE": "true",
+      "OPENCODE_DISABLE_FILEWATCHER": "true"
+    },
+    "cost_usd": 0,
+    "opt_in": true
+  }
+}

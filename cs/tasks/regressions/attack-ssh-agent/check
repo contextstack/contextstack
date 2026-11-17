@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""ssh-agent connect under each production executor profile.
+
+Host-only: --darwin-probe on macOS. Reports booleans and route names, never
+socket paths. A route fails when connect() succeeds.
+"""
+import ast
+import json
+import os
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+OPS = Path(__file__).resolve().parents[3] / "ops/bin"
+sys.path.insert(0, str(OPS))
+sys.path.insert(0, str(next(p / 'tasks/regressions/_lib' for p in Path(__file__).resolve().parents if (p / 'tasks/regressions/_lib').is_dir())))
+import _executor
+
+PROBE = r"""
+import json
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    spec = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    sys.stdout.write('{"error": true}')
+    raise SystemExit(0)
+out = {}
+for name, path in spec["connect"].items():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect(path)
+        out[name] = True
+    except OSError:
+        out[name] = False
+    finally:
+        sock.close()
+try:
+    done = subprocess.run(["/bin/launchctl", "getenv", "SSH_AUTH_SOCK"],
+                          capture_output=True, timeout=5)
+    out["launchctl-getenv"] = bool(done.stdout.strip())
+except (OSError, subprocess.TimeoutExpired):
+    out["launchctl-getenv"] = False
+sys.stdout.write(json.dumps(out))
+"""
+
+
+def skip_or_run():
+    if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+        print("SKIP: requires --darwin-probe on macOS")
+        return False
+    done = subprocess.run(
+        ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if done.returncode != 0:
+        if "sandbox_apply: Operation not permitted" in done.stderr:
+            print("SKIP: actual Seatbelt probe (environment refuses sandbox_apply: Operation not permitted)")
+            return False
+        print("sandbox_exec_failed=true")
+        raise SystemExit(1)
+    return True
+
+
+def load_sandbox():
+    return _executor
+
+
+class DecoySocket:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.path.is_symlink() or self.path.exists():
+            self.path.unlink()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(str(self.path))
+        os.chmod(self.path, 0o666)
+        self.sock.listen(64)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _addr = self.sock.accept()
+            except OSError:
+                return
+            conn.close()
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def allocate_dirs():
+    """Short dirs: AF_UNIX paths must stay under 104 bytes, including ~/.ssh/ssh-agent.sock."""
+    for base in (Path("/private/tmp"), Path("/tmp")):
+        token = secrets.token_hex(4)
+        root = base / ("cs-ssh-" + token)
+        launchd = Path("/private/tmp") / ("com.apple.launchd." + token)
+        try:
+            root.mkdir(mode=0o700)
+        except OSError:
+            continue
+        os.chmod(root, 0o700)
+        try:
+            launchd.mkdir(mode=0o700)
+        except OSError:
+            launchd = root / ("com.apple.launchd." + token)
+            try:
+                launchd.mkdir(mode=0o700)
+            except OSError:
+                shutil.rmtree(root, ignore_errors=True)
+                continue
+        os.chmod(launchd, 0o700)
+        return root, launchd, token
+    print("socket_setup_failed=true")
+    raise SystemExit(1)
+
+
+def remove_owned(path, token):
+    if token not in path.name or path.name in ("tmp", "private"):
+        raise AssertionError("refusing cleanup")
+    resolved = path.resolve()
+    if resolved in (Path("/"), Path("/tmp"), Path("/private"), Path("/private/tmp")):
+        raise AssertionError("refusing cleanup")
+    shutil.rmtree(resolved, ignore_errors=True)
+
+
+def main():
+    if not skip_or_run():
+        return 0
+    from _cli_native import stage, unstage
+
+    templates = json.loads((OPS / "executor-templates.json").read_text())
+    sandbox = load_sandbox()
+    failures = []
+    root, launchd_dir, token = allocate_dirs()
+    listeners = []
+    saved_sock = os.environ.get("SSH_AUTH_SOCK")
+    try:
+        home, run = root / "home", root / "run"
+        ws, private = run / "workspace", run / "tmp"
+        for path in (home, ws, private):
+            path.mkdir(parents=True)
+        ssh_dir = home / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        socket_paths = (
+            launchd_dir / "Listeners",
+            ssh_dir / "agent.sock",
+            ssh_dir / "ssh-agent.sock",
+        )
+        if any(len(str(path)) > 100 for path in socket_paths):
+            print("socket_setup_failed=true")
+            return 1
+        try:
+            launchd = DecoySocket(socket_paths[0])
+            agent = DecoySocket(socket_paths[1])
+            alt = DecoySocket(socket_paths[2])
+        except OSError:
+            print("socket_setup_failed=true")
+            return 1
+        listeners.extend((launchd, agent, alt))
+        os.environ["SSH_AUTH_SOCK"] = str(launchd.path)
+        spec = {
+            "connect": {
+                "launchd-listeners": str(launchd.path),
+                "ssh-agent-sock": str(agent.path),
+                "ssh-ssh-agent-sock": str(alt.path),
+            }
+        }
+        spec_path = ws / "routes.json"
+        spec_path.write_text(json.dumps(spec))
+        probe = private / "probe.py"
+        probe.write_text(PROBE)
+        _executor.HOME = home
+        child_env = {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "TMPDIR": str(private)}
+        for name, template in templates.items():
+            stage_root = private / name
+            stage_root.mkdir()
+            try:
+                _env, links = stage(template, stage_root, home)
+            except (ValueError, OSError):
+                print("%s stage_failed=true" % name)
+                failures.append("%s stage" % name)
+                continue
+            profile = root / (name + ".sb")
+            from _estate_io import native_caller
+            caller, _ = native_caller(template, home, run, ws, private)
+            try:
+                sandbox.sandbox_cmd(
+                    sys.executable, [str(probe), str(spec_path)], ws, private, profile,
+                    caller=caller, read_links=links, login_writes=template,
+                )
+            except (AssertionError, ValueError, OSError):
+                print("%s profile_failed=true" % name)
+                failures.append("%s profile" % name)
+                unstage(links)
+                continue
+            done = subprocess.run(
+                ["sandbox-exec", "-f", str(profile), sys.executable, str(probe), str(spec_path)],
+                cwd=ws, env=child_env, capture_output=True, text=True, timeout=20,
+            )
+            unstage(links)
+            if "sandbox_apply: Operation not permitted" in (done.stderr or ""):
+                print("SKIP: actual Seatbelt probe (environment refuses sandbox_apply: Operation not permitted)")
+                return 0
+            try:
+                result = json.loads(done.stdout)
+            except ValueError:
+                result = {"error": True}
+            if done.returncode != 0 or result.get("error") or set(result) != {
+                "launchd-listeners", "ssh-agent-sock", "ssh-ssh-agent-sock", "launchctl-getenv",
+            }:
+                print("%s probe_failed=true" % name)
+                failures.append("%s probe" % name)
+                continue
+            for route, connected in result.items():
+                if route == "launchctl-getenv":
+                    print("%s launchctl-getenv path_returned=%s" % (name, str(bool(connected)).lower()))
+                    continue
+                print("%s %s connected=%s" % (name, route, str(bool(connected)).lower()))
+                if connected:
+                    failures.append("%s %s" % (name, route))
+    finally:
+        for listener in listeners:
+            listener.close()
+        remove_owned(root, token)
+        if launchd_dir.parent != root:
+            remove_owned(launchd_dir, token)
+        if saved_sock is None:
+            os.environ.pop("SSH_AUTH_SOCK", None)
+        else:
+            os.environ["SSH_AUTH_SOCK"] = saved_sock
+    if failures:
+        for item in failures:
+            print("FAIL " + item)
+        return 1
+    print("PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

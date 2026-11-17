@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""#24: portable ownership contracts; --darwin-probe runs host-only live attacks."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import argparse
+from contextlib import nullcontext
+import json
+import os
+import platform
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve()
+sys.path.insert(0, str(HERE.parents[3] / 'ops/bin'))
+import _job_memory as jobs
+
+
+def ownership_contract():
+    # A real test-owned process stands in for an already orphaned grandchild.
+    # Neither its parent, process group nor cwd identifies it as this job.
+    with subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], cwd='/') as decoy:
+        tracker = jobs.JobProcesses.__new__(jobs.JobProcesses)
+        tracker.pid, tracker.workspace = 987654, HERE.parent
+        tracker.marker = 'regression-owned-marker'
+        tracker.known = {}
+        tracker.root_identity = None
+        tracker._lock = threading.RLock()
+        tracker.identities = {}
+        me = os.getpid()
+        rows = f'{me} 1 {me} S\n{decoy.pid} 1 {decoy.pid} S\n'
+        try:
+            with patch.object(jobs.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, rows, '')), \
+                 patch.object(jobs, '_marked_pids', return_value={decoy.pid: jobs._pid_identity(decoy.pid)}, create=True):
+                assert decoy.pid in tracker.pids(), 'double-fork orphan in / is not tracked'
+        finally:
+            decoy.kill()
+            decoy.wait()
+    print('check: orphan ownership does not require parent, group, cwd or an earlier sample')
+
+
+def pid_reuse_contract():
+    import _job_identity as identity
+    with subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']) as decoy:
+        try:
+            birth = identity._pid_identity(decoy.pid)
+            assert birth is not None
+            stale = ('old-start-time',)
+            # Simulates a remembered PID surviving ten failed samples, then
+            # being reused by this unrelated, test-owned decoy.
+            for sig in (signal.SIGSTOP, signal.SIGKILL):
+                assert not identity._signal_pid(decoy.pid, stale, sig)
+                assert decoy.poll() is None, 'stale PID authority killed decoy'
+            tracker = jobs.JobProcesses.__new__(jobs.JobProcesses)
+            tracker.pid, tracker.root_identity = decoy.pid, stale
+            tracker.known = {decoy.pid: stale}
+            tracker._lock = threading.RLock()
+            with patch.object(jobs.platform, 'system', return_value='Darwin'), \
+                 patch.object(tracker, 'pids', side_effect=RuntimeError('persistent sample failures')):
+                try:
+                    tracker.kill()
+                except RuntimeError:
+                    pass
+            assert decoy.poll() is None, 'failed-sample fallback killed reused PID'
+            # A changed identity between STOP and KILL must be checked again.
+            with patch.object(identity, '_pid_identity', side_effect=[birth, stale]), \
+                 patch.object(identity.os, 'kill') as kill:
+                assert identity._signal_pid(decoy.pid, birth, signal.SIGSTOP)
+                assert not identity._signal_pid(decoy.pid, birth, signal.SIGKILL)
+                kill.assert_called_once_with(decoy.pid, signal.SIGSTOP)
+        finally:
+            decoy.kill()
+            decoy.wait()
+    print('check: reused PID decoy survives stale STOP and KILL; each signal revalidates identity')
+
+
+def independent_signals_contract():
+    import _job_identity as identity
+    import _job_darwin as darwin
+    root, orphan, birth = 987654, 987655, (100, 1)
+    tracker = jobs.JobProcesses.__new__(jobs.JobProcesses)
+    tracker.pid, tracker.root_identity, tracker.marker = root, birth, 'union-fixture'
+    tracker._lock, tracker.evidence = threading.RLock(), []
+    for marked, kernel in (({orphan: birth}, {}), ({}, {orphan: birth})):
+        tracker.known = {}
+        with patch.object(jobs.platform, 'system', return_value='Darwin'), \
+             patch.object(jobs, '_marked_pids', return_value=marked), \
+             patch.object(darwin, 'owned_pids', return_value=kernel), \
+             patch.object(identity, 'suspect_pids', return_value=[]):
+            assert tracker.pids() == {orphan}, 'signals must be combined with OR'
+    # Metadata failure records evidence but confers no membership authority.
+    with patch.object(identity, '_darwin_pids', return_value=[orphan]), \
+         patch.object(identity, '_pid_identity', return_value=birth), \
+         patch.object(identity, '_darwin_environment', return_value=None), \
+         patch.object(darwin, 'responsible_pid', return_value=None), \
+         patch.object(identity, '_darwin_lib') as lib:
+        lib.return_value.proc_pidpath.return_value = 0
+        rows = identity.suspect_pids((99, 0), {}, time.monotonic() + 2)
+        assert len(rows) == 1 and rows[0]['pid'] == orphan
+        assert 'proc_pidpath' in rows[0]
+        # A reused pid between metadata queries is not recorded under old birth.
+        with patch.object(identity, '_pid_identity', side_effect=[birth, (101, 0)]):
+            assert not identity.suspect_pids((99, 0), {}, time.monotonic() + 2)
+    tracker.known = {}
+    with patch.object(jobs.platform, 'system', return_value='Darwin'), \
+         patch.object(jobs, '_marked_pids', return_value={}), \
+         patch.object(darwin, 'owned_pids', return_value={}), \
+         patch.object(identity, 'suspect_pids', return_value=rows), \
+         patch.object(jobs, '_signal_pid') as kill:
+        assert tracker.pids() == set()
+        assert tracker.evidence == rows
+        tracker.kill()
+        kill.assert_not_called()
+    print('check: ownership signals combine with OR; unreadable metadata is evidence only')
+
+
+ATTACK = r'''
+import json, os, sys, time
+from pathlib import Path
+pidfile, ready, mode, ops = map(str, sys.argv[1:])
+sys.path.insert(0, ops)
+from _job_identity import _pid_identity
+readfd, writefd = os.pipe()
+if os.fork() == 0:
+    os.close(readfd)
+    os.setsid()
+    if os.fork(): os._exit(0)
+    os.chdir('/')
+    null = os.open('/dev/null', os.O_RDWR)
+    for fd in (0, 1, 2): os.dup2(null, fd)
+    if null > 2: os.close(null)
+    Path(pidfile).write_text(json.dumps([os.getpid(), _pid_identity(os.getpid())]))
+    if mode == 'memory':
+        allocation = bytearray(96 * 1024 * 1024)
+        for i in range(0, len(allocation), 4096): allocation[i] = 1
+    if mode.startswith(('python-', 'platform-')):
+        env = {} if mode.endswith('-clear') else dict(os.environ.items())
+        # An inherited pipe signals that exec completed (CLOEXEC), rather than
+        # letting cleanup race ahead of the actual bypass.
+        if mode.startswith('platform-'):
+            os.execve('/bin/sleep', ['sleep', '30'], env)
+        os.execve(sys.executable, [sys.executable, '-c', 'import time; time.sleep(30)'], env)
+    Path(ready).touch()
+    time.sleep(30)
+    os._exit(0)
+os.close(writefd)
+os.wait()
+if mode.startswith(('python-', 'platform-')):
+    os.read(readfd, 1)
+else:
+    while not Path(ready).exists(): time.sleep(.005)
+os.close(readfd)
+if mode == 'memory': time.sleep(15)
+'''
+
+
+def live_attacks():
+    from _muse import run_process
+    from _agent_stream import run_streaming
+    for streaming in (False, True):
+        for mode in (('normal', 'memory', 'python-env', 'python-clear', 'platform-env', 'platform-clear') if args.case == 'all' else (args.case,)):
+            with scratch_dir(prefix='job-double-fork-', dir=HERE.parents[4]) as raw:
+                ws = Path(raw)
+                pidfile, ready = ws / 'grandchild.pid', ws / 'ready'
+                command = [sys.executable, '-c', ATTACK, str(pidfile), str(ready), mode, str(HERE.parents[3] / 'ops/bin')]
+                launch_args = (command, str(ws), {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(ws)}, 20)
+                kwargs = {'memory_cap_mb': 64} if mode == 'memory' else {}
+                child = identity = None
+                try:
+                    # Optional fault injection reproduces host KERN_PROCARGS2
+                    # denial on machines where platform metadata is readable.
+                    denial = patch('_job_identity._darwin_environment', return_value=None) if args.unreadable_env else nullcontext()
+                    with denial:
+                        done = run_streaming(*launch_args, lambda line: None, **kwargs) if streaming else run_process(*launch_args, **kwargs)
+                    child, identity = json.loads(pidfile.read_text())
+                    identity = tuple(identity) if isinstance(identity, list) else identity
+                    if mode == 'memory':
+                        assert getattr(done, 'forced_stop', None) == 'memory_cap', 'orphan memory was outside cap'
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline and jobs._pid_identity(child) == identity:
+                        time.sleep(.02)
+                    assert jobs._pid_identity(child) != identity, f'{streaming=} {mode=}: double-fork grandchild outlived job'
+                    print(f'check: {streaming=} {mode=}: descendant removed', flush=True)
+                finally:
+                    # Only this freshly-created fixture writes pidfile. Validate the
+                    # process identity before fallback cleanup; never sweep by name.
+                    if pidfile.exists():
+                        child, identity = json.loads(pidfile.read_text())
+                        identity = tuple(identity) if isinstance(identity, list) else identity
+                        if identity is not None:
+                            jobs._signal_pid(child, identity, signal.SIGKILL)
+    print('check: both adapters clean double forks and cap detached RSS')
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--darwin-probe', action='store_true', help='run host-only live libproc/adapter attack probes')
+parser.add_argument('--unreadable-env', action='store_true', help='also simulate KERN_PROCARGS2 refusal (Darwin only)')
+parser.add_argument('--case', choices=('all', 'normal', 'memory', 'python-env', 'python-clear', 'platform-env', 'platform-clear'), default='all')
+parser.add_argument('--baseline', action='store_true', help='run live attacks against the committed tracker and adapters')
+args = parser.parse_args()
+if args.unreadable_env and platform.system() != 'Darwin':
+    parser.error('--unreadable-env requires Darwin')
+if args.baseline:
+    if platform.system() == 'Darwin' and not args.darwin_probe:
+        parser.error('--baseline on macOS requires --darwin-probe')
+    import _muse, _agent_stream, _job_identity
+    for module in (_job_identity, jobs, _muse, _agent_stream):
+        relative = Path(module.__file__).resolve().relative_to(HERE.parents[4])
+        source = subprocess.check_output(['git', 'show', 'HEAD:' + str(relative)], text=True)
+        exec(compile(source, str(relative), 'exec'), module.__dict__)
+    # Lanes cannot exec ps. Preserve the committed tracker algorithm and
+    # substitute only its four-column OS snapshot with the same libproc data.
+    if platform.system() == 'Darwin':
+        import ctypes
+        import struct
+        from _job_identity import _darwin_lib, _darwin_pids
+        original_run = subprocess.run
+        def native_ps(argv, *a, **kw):
+            if argv == ['ps', '-axo', 'pid=,ppid=,pgid=,stat=']:
+                rows = []
+                for pid in _darwin_pids():
+                    buf = ctypes.create_string_buffer(136)
+                    if _darwin_lib().proc_pidinfo(pid, 3, 0, buf, 136) == 136:
+                        status = struct.unpack_from('=I', buf.raw, 4)[0]
+                        parent = struct.unpack_from('=I', buf.raw, 16)[0]
+                        group = struct.unpack_from('=I', buf.raw, 100)[0]
+                        rows.append(f'{pid} {parent} {group} {"Z" if status == 5 else "S"}')
+                return subprocess.CompletedProcess(argv, 0, '\n'.join(rows), '')
+            return original_run(argv, *a, **kw)
+        with patch.object(subprocess, 'run', side_effect=native_ps):
+            live_attacks()
+    else:
+        live_attacks()
+    raise SystemExit(0)
+ownership_contract()
+pid_reuse_contract()
+independent_signals_contract()
+if platform.system() != 'Darwin' or args.darwin_probe:
+    if platform.system() == 'Darwin':
+        from kernel_probe import kernel_identity_probe
+        kernel_identity_probe()
+    live_attacks()
+else:
+    print('check: live macOS attacks require host invocation with --darwin-probe')

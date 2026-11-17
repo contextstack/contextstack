@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Publish what a run actually produced, before harvest can touch it.
+
+Operator/adapter-called, never palette. Writes an immutable
+`ledger/runs/<run>/evidence/` holding the full candidate diff against its
+recorded base, new-file content, the original check result, and a transcript
+reference — then publishes a versioned `ready_for_inspection` marker.
+
+An ordinary `git diff` against current HEAD is not enough: the 2026-09-05 audit
+found harvest had already committed the workspace, so the diff read empty while
+`git diff refs/lab/base HEAD` showed five files. Missing output never becomes a
+usable empty tree; incomplete capture is recorded as incomplete.
+"""
+from _estate_io import digest, hardened_git_env, sha256_bytes
+import gzip
+import io
+import tarfile
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parent.parent.parent
+CONTRACT = "lifecycle-v1"
+MAX_BLOB = 4 << 20
+MAX_ARCHIVE_BLOB = 64 << 20
+MAX_ARCHIVE_SOURCE = 256 << 20
+
+
+
+# Host git hardened against the workspace's own config; a repo lane pins its git dir through _lanes
+# (imported only then, so plain workspaces and fixture labs don't need it).
+_HARDEN = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
+
+
+def _workspace_git(ws, *args, lane_ctx=None, env=None):
+    if lane_ctx:
+        import _lanes
+        return _lanes.workspace_git(ws, *args, lane_ctx=lane_ctx, env=env)
+    return subprocess.run(["git", "-C", str(Path(ws).resolve()), *_HARDEN, *args],
+                          capture_output=True, text=True, env=env or hardened_git_env(), stdin=subprocess.DEVNULL)
+
+
+def refuse(message):
+    print("publish-evidence: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def gzip_bytes(raw):
+    """Deterministic gzip: fixed mtime, max compression, no embedded name."""
+    return gzip.compress(raw, compresslevel=9, mtime=0)
+
+
+def manifest_diff(ws, base):
+    """Candidate change against an explicit non-Git baseline manifest.
+
+    Many lab tasks copy plain files into a workspace with no repository. The
+    baseline recorded at capture is the comparison; an absent baseline is
+    unsupported evidence, never an empty successful diff.
+    """
+    before = {}
+    for entry in base.get("files") or []:
+        path = str(entry.get("path") or "")
+        if path:
+            before[path] = str(entry.get("sha256") or "")
+    now = {}
+    for f in sorted(ws.rglob("*")):
+        if f.is_symlink() or not f.is_file():
+            continue
+        rel = f.relative_to(ws).as_posix()
+        if rel.startswith(".lab-") or "/.lab-" in rel:
+            continue
+        now[rel] = sha256_bytes(f.read_bytes())
+    files, lines = [], []
+    for rel in sorted(set(before) | set(now)):
+        old, new = before.get(rel), now.get(rel)
+        if old == new:
+            continue
+        status = "A" if old is None else ("D" if new is None else "M")
+        files.append({"status": status, "path": rel})
+        lines.append("%s %s %s -> %s" % (status, rel, (old or "-")[:12], (new or "-")[:12]))
+    return "\n".join(lines) + ("\n" if lines else ""), files, True, ""
+
+
+def candidate_diff(ws, base, lane_git=None):
+    """Every candidate change: committed, staged, unstaged, deleted, untracked.
+
+    Returns (text, files, complete, note). `complete` is False whenever the
+    diff cannot be taken; the caller must not present it as an empty success.
+
+    Uses pinned lane git (`_lanes.workspace_git`) and pointer verification when `lane_git` names a repo lane.
+    """
+    lane_ctx = None
+    if isinstance(lane_git, dict) and lane_git.get("main") and lane_git.get("lane"):
+        lane_ctx = {"main": lane_git["main"], "lane": lane_git["lane"]}
+    git_env = hardened_git_env()
+
+    kind = base.get("kind")
+    if not (ws / ".git").exists():
+        if kind == "manifest":
+            text, files, ok, note = manifest_diff(ws, base)
+            # A non-Git candidate is identified by the content it produced.
+            content = hashlib.sha256()
+            for entry in files:
+                content.update((entry["status"] + " " + entry["path"] + "\n").encode())
+                blob = ws / entry["path"]
+                content.update(blob.read_bytes() if blob.is_file() else b"")
+            return text, files, ok, note, content.hexdigest()
+        if kind == "absent":
+            return "", [], False, "no workspace existed at capture", ""
+        return "", [], False, "workspace is not a git repository and has no baseline manifest", ""
+    try:
+        if kind == "git" and base.get("commit"):
+            ref = base["commit"]
+            if _workspace_git(ws, "cat-file", "-e", ref + "^{commit}",
+                                    lane_ctx=lane_ctx, env=git_env).returncode != 0:
+                return "", [], False, "recorded base commit %s is unreachable" % ref[:12], ""
+        elif kind == "git":
+            ref = (_workspace_git(ws, "hash-object", "-t", "tree", "/dev/null",
+                                        lane_ctx=lane_ctx, env=git_env).stdout.strip()
+                   or "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+        else:
+            return "", [], False, "no git baseline recorded at capture", ""
+
+        # Stage everything so untracked and deleted files are represented too,
+        # without creating a commit in the operator's workspace.
+        index = tempfile.NamedTemporaryFile(prefix="evidence-index-", delete=False)
+        index.close()
+        # Preserve our private index so evidence staging never changes the workspace index.
+        index_env = hardened_git_env(extra={"GIT_INDEX_FILE": index.name})
+
+        def indexed(*args):
+            result = _workspace_git(ws, *args, lane_ctx=lane_ctx, env=index_env)
+            if result.returncode:
+                raise ValueError(args[0] + " failed: " + (result.stderr or "").strip())
+            return result.stdout
+
+        try:
+            indexed("read-tree", ref)
+            indexed("add", "-A", "--", ".", ":(exclude).lab-*", ":(exclude).lab-*/**")
+            diff = indexed("diff", "--cached", "--binary", "-M", ref)
+            names = indexed("diff", "--cached", "--name-status", "-z", "-M", ref)
+            files = []
+            parts = iter(names.split("\0"))
+            for status in parts:
+                if not status:
+                    break
+                name = next(parts)
+                if status.startswith(("R", "C")):
+                    name = next(parts)
+                files.append({"status": status, "path": name})
+            return diff, files, True, "", indexed("write-tree").strip()
+        except ValueError as error:
+            return "", [], False, str(error), ""
+        finally:
+            os.unlink(index.name)
+    except ValueError as error:  # _lanes.LaneError is a ValueError
+        return "", [], False, str(error), ""
+
+
+def file_modes(ws, files):
+    """Binary, symlink, and executable facts the diff text alone loses."""
+    out = []
+    for entry in files:
+        p = ws / entry["path"]
+        record = dict(entry)
+        if p.is_symlink():
+            record["kind"] = "symlink"
+            record["target"] = os.readlink(p)
+        elif p.is_file():
+            raw = p.read_bytes()
+            record["kind"] = "binary" if b"\0" in raw[:8192] else "text"
+            record["bytes"] = len(raw)
+            record["sha256"] = sha256_bytes(raw)
+            record["executable"] = bool(p.stat().st_mode & 0o111)
+        else:
+            record["kind"] = "absent"
+        out.append(record)
+    return out
+
+
+def archive_candidate(ws, tree, base, staging, files, changed_only=False):
+    """Store inspection bytes of the live walk (or, for a repo lane, of the changed files); never follow links."""
+    from _lifecycle_evidence import pack_workspace, pack_workspace_paths
+    raw = b"" if changed_only else pack_workspace(ws)
+    scope = "workspace_walk"
+    if changed_only or len(raw) > MAX_ARCHIVE_SOURCE:
+        changed = [entry["path"] for entry in files
+                   if not str(entry.get("status") or "").startswith("D")]
+        raw = pack_workspace_paths(ws, changed)
+        scope = "changed_files"
+    packed = gzip_bytes(raw)
+    if len(raw) > MAX_ARCHIVE_SOURCE or len(packed) > MAX_ARCHIVE_BLOB:
+        raise ValueError("candidate archive exceeds inspection envelope")
+    (staging / "candidate.tar.gz").write_bytes(packed)
+    return {"path": "candidate.tar.gz", "sha256": sha256_bytes(packed),
+            "bytes": len(packed), "source_bytes": len(raw), "scope": scope}
+
+
+def publish_ready(run_dir, evidence):
+    if evidence.get("capture_state") != "complete":
+        return
+    fd, temporary = tempfile.mkstemp(prefix=".ready-", dir=run_dir)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps({"contract_version": CONTRACT, "run_id": evidence["run_id"],
+                                  "evidence_sha": evidence["evidence_sha"]}, sort_keys=True) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, run_dir / "ready_for_inspection")
+        fd = os.open(run_dir, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def main():
+    try:
+        args = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as exc:
+        refuse("invalid JSON: " + str(exc))
+    run_dir = Path(str(args.get("run_dir") or "")).resolve()
+    if not run_dir.is_dir():
+        refuse("run_dir must exist")
+    stim = run_dir / "stimulus"
+    manifest_path = stim / "manifest.json"
+    if not manifest_path.is_file():
+        refuse("no stimulus manifest — capture-stimulus must run before the first call")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    evidence_dir = run_dir / "evidence"
+    if (evidence_dir / "manifest.json").is_file():
+        existing = json.loads((evidence_dir / "manifest.json").read_text(encoding="utf-8"))
+        from _lifecycle_evidence import verify
+        _, why = verify(run_dir, require_ready=False)
+        if why and existing.get("capture_state") == "complete":
+            refuse("existing snapshot is invalid: " + why)
+        publish_ready(run_dir, existing)
+        print(json.dumps({"ok": True, "existing": True,
+                          "evidence_sha": existing.get("evidence_sha", ""),
+                          "ready": existing.get("capture_state") == "complete"},
+                         sort_keys=True))
+        return
+
+    # finalize-run names the workspace under LAB_WORKSPACES_ROOT (_roots.workspace_dir); other callers keep it in the run dir.
+    ws = Path(str(args.get("workspace") or run_dir / "workspace"))
+    lane_git = args.get("lane_git")
+    if not (isinstance(lane_git, dict) and lane_git.get("main") and lane_git.get("lane")):
+        lane_git = None
+    diff_text, files, complete, note, candidate_tree = candidate_diff(
+        ws, manifest.get("base") or {}, lane_git=lane_git)
+
+    # The frozen snapshot is what the run consumed, so integrity is checked
+    # against the snapshot, never against the live task: editing a task after
+    # a run is ordinary estate work and must not retro-spoil its evidence.
+    drift = []
+    for item in manifest.get("inputs") or []:
+        frozen = stim / str(item.get("path") or "")
+        if not frozen.is_file():
+            drift.append({"path": item.get("path"), "reason": "frozen input missing"})
+            continue
+        if sha256_bytes(frozen.read_bytes()) != item.get("sha256"):
+            drift.append({"path": item.get("path"), "reason": "frozen input altered"})
+
+    transcript = run_dir / "transcript.md"
+    transcript_ref = {"path": "transcript.md", "present": transcript.is_file()}
+    if transcript.is_file():
+        raw = transcript.read_bytes()
+        transcript_ref.update({"sha256": sha256_bytes(raw), "bytes": len(raw)})
+
+    check_result = {
+        "verdict": str(args.get("verdict") or ""),
+        "stop": str(args.get("stop") or ""),
+        "exit_code": args.get("check_exit"),
+        "skipped": bool(args.get("check_skipped")),
+        "output": str(args.get("check_output") or ""),
+    }
+    check_result["output_sha256"] = sha256_bytes(check_result["output"].encode())
+
+    diff_bytes = diff_text.encode()
+    source_bytes = len(diff_bytes)
+    diff_filename = "candidate.diff"
+    compression = "none"
+    truncated = False
+    stored_bytes = diff_bytes
+    if source_bytes > MAX_BLOB:
+        archive = gzip_bytes(diff_bytes)
+        if source_bytes <= MAX_ARCHIVE_SOURCE and len(archive) <= MAX_ARCHIVE_BLOB:
+            # The whole candidate still fits, just compressed: capture stays
+            # complete rather than being downgraded to a partial view.
+            diff_filename = "candidate.diff.gz"
+            compression = "gzip"
+            stored_bytes = archive
+        else:
+            # Even compressed the candidate is too large to hold in full.
+            # An honest incomplete truncation beats a silent, partial "success".
+            truncated = True
+            stored_bytes = diff_bytes[:MAX_BLOB]
+
+    capture_state = "complete" if complete and not drift and not truncated else "incomplete"
+    reasons = []
+    if not complete:
+        reasons.append(note or "candidate diff unavailable")
+    if drift:
+        reasons.append("frozen input drift")
+    if truncated:
+        # The archive must hold the full candidate. A clipped blob is a view.
+        reasons.append("candidate diff exceeds the compressed evidence envelope and was truncated")
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".evidence-", dir=str(run_dir)))
+    try:
+        (staging / diff_filename).write_bytes(stored_bytes)
+        evidence = {
+            "contract_version": CONTRACT,
+            "run_id": manifest.get("run_id", run_dir.name),
+            "adapter": str(args.get("adapter") or manifest.get("adapter") or "unknown"),
+            "stimulus_sha": manifest.get("stimulus_sha", ""),
+            "task_sha": manifest.get("task_sha", ""),
+            "base": manifest.get("base") or {},
+            "grant": manifest.get("grant") or {},
+            "capture_state": capture_state,
+            "incomplete_reasons": reasons,
+            "input_drift": drift,
+            "diff": {
+                "path": diff_filename,
+                "sha256": sha256_bytes(stored_bytes),
+                "bytes": len(stored_bytes),
+                "compression": compression,
+                "truncated": truncated,
+                "source_bytes": source_bytes,
+                "available": complete,
+            },
+            # Binds the evidence to the exact candidate content.
+            # refuses to land a branch whose tree is not this one.
+            "candidate_tree": candidate_tree,
+            "files": [],
+            "check": check_result,
+            "transcript": transcript_ref,
+        }
+        try:
+            evidence["candidate_archive"] = archive_candidate(
+                ws, candidate_tree, manifest.get("base") or {}, staging, files,
+                changed_only=args.get("archive") == "changed_files")
+            from _lifecycle_evidence import inspection_workspace
+            with inspection_workspace(run_dir, evidence, evidence_dir=staging) as frozen_ws:
+                if (manifest.get("base") or {}).get("kind") == "manifest":
+                    _, frozen_files, frozen_ok, _, frozen_tree = candidate_diff(frozen_ws, manifest["base"])
+                    if not frozen_ok or frozen_tree != candidate_tree or frozen_files != files:
+                        raise ValueError("plain candidate changed during publication")
+                evidence["files"] = file_modes(frozen_ws, files)
+        except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
+            evidence["capture_state"] = "incomplete"
+            evidence["incomplete_reasons"].append(str(error))
+        # evidence_sha binds stimulus and output manifests together.
+        evidence["evidence_sha"] = digest({k: v for k, v in evidence.items()
+                                           if k != "evidence_sha"})
+        (staging / "manifest.json").write_text(
+            json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        for path in sorted(staging.rglob("*")):
+            if path.is_file():
+                with path.open("rb") as fh:
+                    os.fsync(fh.fileno())
+        os.replace(staging, evidence_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    publish_ready(run_dir, evidence)
+
+    print(json.dumps({"ok": True, "existing": False,
+                      "evidence_sha": evidence["evidence_sha"],
+                      "capture_state": evidence["capture_state"],
+                      "incomplete_reasons": evidence["incomplete_reasons"],
+                      "files": len(evidence["files"]),
+                      "ready": evidence["capture_state"] == "complete"}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

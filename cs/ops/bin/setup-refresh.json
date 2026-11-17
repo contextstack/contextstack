@@ -1,0 +1,23 @@
+{
+  "description": "Operator: refresh task setup from destination, excluding private runtime files. notes.md repair_run + repair_evidence_sha reapply a verified frozen candidate against the exact destination base on every refresh, including dispatch. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "Task dir, absolute or lab-relative."
+      },
+      "dest": {
+        "type": "string",
+        "description": "Dest repo; default notes.md repo:"
+      },
+      "setup": {
+        "type": "string",
+        "description": "Setup cache; default notes.md setup: or task setup/."
+      }
+    },
+    "required": [
+      "task"
+    ]
+  }
+}

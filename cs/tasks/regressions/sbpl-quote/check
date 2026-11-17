@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Rust Seatbelt path quoting and optional real --darwin-probe."""
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path[:0] = [str(HERE.parent / '_lib'), str(HERE.parents[2] / 'ops/bin')]
+from scratch import scratch_dir
+from sandbox_profile import render_profile
+
+with scratch_dir(prefix='sbpl-quote-') as raw:
+    root = Path(raw).resolve()
+    home, ws, tmp = (root / name for name in ('home', 'workspace', 'tmp'))
+    for path in (home, ws, tmp):
+        path.mkdir()
+    for name in ('a b', 'café-测试', 'say"hello', 'a\\b'):
+        target = ws / name
+        target.mkdir()
+        profile = render_profile(home, ws, tmp, caller={'deny_write_roots': [str(target)]})
+        escaped = str(target).replace('\\', '\\\\').replace('"', '\\"')
+        assert f'(deny file-write* (subpath "{escaped}"))' in profile
+        if '--darwin-probe' in sys.argv and sys.platform == 'darwin':
+            done = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile,
+                                   '/usr/bin/touch', str(target / 'probe.txt')],
+                                  capture_output=True, text=True, timeout=15)
+            if 'sandbox_apply: Operation not permitted' in done.stderr:
+                print('SKIP: actual Seatbelt probe (environment refuses sandbox_apply)')
+            else:
+                assert done.returncode != 0, (name, done.stderr)
+                assert not (target / 'probe.txt').exists()
+    # Login regexes exercise quoted literals in the regex path prefix as well.
+    quoted_home = home / 'say"hello'
+    quoted_home.mkdir()
+    profile = render_profile(quoted_home, ws, tmp, login={'login_writes': [{'regex': '~/.grok/auth[0-9]+'}]})
+    assert r'say\"hello/\.grok/auth[0-9]+$' in profile
+    for control in ('\x00', '\n', '\x7f'):
+        try:
+            render_profile(home, ws, tmp, caller={'deny_write_roots': [str(ws / ('x' + control))]})
+        except (RuntimeError, ValueError):
+            pass
+        else:
+            raise AssertionError('control character accepted')
+print('sbpl-quote: PASS (Rust profiles)')

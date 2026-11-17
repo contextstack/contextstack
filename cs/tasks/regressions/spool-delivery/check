@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""spool-delivery (Plan.CS.v2.1 §9; phase 4b S2-S3). goal.md has the contract.
+
+  null       receiver null (and policy absent): spool-send sends nothing, says so, counts the outbox
+  deliver    kind dir: envelope and files land, every sha256 verified, ack written, entry -> acked/
+  killed     SPOOL_SEND_CRASH_AFTER=copy: no ack, entry still pending; the next send acks (at-least-once)
+  again      the same envelope re-queued: not copied again, the same ack returned (idempotent)
+  verify     a file changed after its envelope: no ack, entry pending, the failure named
+  malformed  a receiver that is not null or {kind: dir, path}: exit 2
+  floor      tick below min_free_bytes admits nothing (a yield row, class spool_full, no running row),
+             space back = tick admits again
+Isolated estates only; lab/ledger is never written.
+"""
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import _tick_estate as te  # noqa: E402
+
+FAILED = []
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:600]) if detail else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def finalized_run(root, name):
+    """One void run finalized by the real finalize-run: its envelope is in <state>/outbox."""
+    run = root / "ledger/runs" / ("20261109-000000.000000000-%s-fx-t1" % name)
+    run.mkdir(parents=True)
+    term = {"run_id": run.name, "run_dir": str(run), "transcript": "ledger/runs/" + run.name, "spec": name,
+            "exp": "fixture", "task": "tasks/fx", "trial": 1, "model": "fake", "verdict": "void",
+            "stop": "error: gateway unreachable: fixture", "turns": 1, "tool_calls": 0, "cost_usd": 0,
+            "est_usd": 0, "est_basis": "rate", "cost_class": "", "seconds": 0.1, "check_window": 60,
+            "ended": "2026-11-09T00:00:00Z", "stimulus_sha": ""}
+    (run / "terminal.json").write_text(json.dumps(term), encoding="utf-8")
+    (run / "messages.jsonl").write_text(json.dumps({"event": "error", "turn": 1, "error": "gateway unreachable: fixture"}) + "\n",
+                                        encoding="utf-8")
+    rc, out, err = te.op(root, "finalize-run", {"run_dir": str(run)})
+    assert rc == 0, (rc, out, err)
+    return run
+
+
+def outbox(root):
+    return sorted(p.name for p in (root / "ledger/outbox").glob("*.json"))
+
+
+def main():
+    scratch = Path(tempfile.mkdtemp(prefix="spool-delivery-", suffix=".noindex"))
+    try:
+        root = te.build(scratch / "lab")
+        run = finalized_run(root, "fx-a")
+        entry = run.name + ".json"
+        envelope = json.loads((root / "ledger/outbox" / entry).read_text())
+        rc, out, _ = te.op(root, "spool-send")
+        expect(rc == 0 and out.get("receiver") is None and out.get("sent") == 0 and out.get("pending") == 1
+               and "no receiver configured" in out.get("note", "") and outbox(root) == [entry],
+               "null: policy absent -> nothing sent, the line says so, the outbox counted and untouched", out)
+        te.set_spool(root, {"version": 1, "receiver": None, "min_free_bytes": 0})
+        rc, out, _ = te.op(root, "spool-send")
+        expect(rc == 0 and out.get("receiver") is None and out.get("sent") == 0 and outbox(root) == [entry],
+               "null: receiver null -> the same no-op", out)
+
+        recv = scratch / "receiver"
+        te.set_spool(root, {"version": 1, "receiver": {"kind": "dir", "path": str(recv)}, "min_free_bytes": 0})
+        rc, out, err = te.op(root, "spool-send", SPOOL_SEND_CRASH_AFTER="copy")
+        ack = recv / "acks" / (envelope["event_id"] + ".json")
+        expect(rc == 137 and not ack.exists() and outbox(root) == [entry],
+               "killed: a send killed after the copy leaves no ack and the entry pending", (rc, err[-200:]))
+        rc, out, _ = te.op(root, "spool-send")
+        acked = root / "ledger/outbox/acked" / entry
+        expect(rc == 0 and out.get("sent") == 1 and out.get("pending") == 0 and ack.is_file() and acked.is_file()
+               and outbox(root) == [], "killed: the next send delivers it and the entry moves to outbox/acked", out)
+        landed = recv / "events" / envelope["event_id"]
+        expect(json.loads(ack.read_text())["envelope_sha256"] == envelope["envelope_sha256"]
+               and all((landed / f["path"]).read_bytes() == (run / f["path"]).read_bytes() for f in envelope["files"])
+               and json.loads((landed / "envelope.json").read_text()) == envelope,
+               "deliver: the ack names the envelope; every listed file and the envelope landed byte for byte",
+               sorted(p.name for p in landed.iterdir()))
+
+        first_ack = ack.read_bytes()
+        stamp = (landed / "terminal.json").stat().st_mtime_ns
+        shutil.copy2(acked, root / "ledger/outbox" / entry)  # the sender lost its acked/ move: it re-sends
+        time.sleep(0.01)
+        rc, out, _ = te.op(root, "spool-send")
+        expect(rc == 0 and out.get("sent") == 0 and out.get("acked_before") == 1 and ack.read_bytes() == first_ack
+               and (landed / "terminal.json").stat().st_mtime_ns == stamp and outbox(root) == [],
+               "again: a second receipt is a no-op returning the same ack, nothing copied", out)
+
+        run_b = finalized_run(root, "fx-b")
+        (run_b / "check.json").write_text('{"tampered": true}\n', encoding="utf-8")
+        rc, out, _ = te.op(root, "spool-send")
+        env_b = json.loads((root / "ledger/outbox" / (run_b.name + ".json")).read_text())
+        expect(rc == 0 and out.get("sent") == 0 and len(out.get("failed") or []) == 1
+               and "check.json does not match" in out["failed"][0]["error"]
+               and not (recv / "acks" / (env_b["event_id"] + ".json")).exists() and outbox(root) == [run_b.name + ".json"],
+               "verify: a file that no longer matches its envelope gets no ack and stays pending", out)
+
+        te.set_spool(root, {"version": 1, "receiver": {"kind": "ftp", "path": "x"}})
+        rc, out, _ = te.op(root, "spool-send")
+        expect(rc == 2 and "receiver must be null" in out.get("error", ""), "malformed: refused, exit 2", (rc, out))
+
+        floor_estate = te.build(scratch / "floor", spool={"version": 1, "receiver": None, "min_free_bytes": 10 ** 18},
+                                local_ready=False)
+        rel = te.spec(floor_estate, "fx-floor", model="local-coder")
+        rc, out, _ = te.op(floor_estate, "enqueue", {"spec": rel, "lane": "probe", "task": "tasks/fx", "note": "floor"})
+        expect(rc == 0, "floor: job enqueued", out)
+        rc, out1, err = te.op(floor_estate, "tick")
+        rows = te.dispatch(floor_estate)
+        yields = [r for r in rows if r.get("event") == "yield"]
+        expect(rc == 0 and out1.get("skip") == "spool_full" and len(yields) == 1
+               and yields[0]["error"]["class"] == "spool_full" and yields[0]["min_free_bytes"] == 10 ** 18
+               and not any(r.get("state") == "running" for r in rows),
+               "floor: tick admits nothing, one yield row with class spool_full, no running row", (out1, err[-300:]))
+        te.set_spool(floor_estate, {"version": 1, "receiver": None, "min_free_bytes": 0})
+        rc, out2, _ = te.op(floor_estate, "tick")
+        expect(out2.get("skip") == "local_coder_unavailable",
+               "floor: with space back tick reaches admission again (here: the local model's own skip)",
+               out2)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("\ncheck: spool-delivery %d assertion(s) failed%s" % (len(FAILED), (": " + "; ".join(FAILED)) if FAILED else ""))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

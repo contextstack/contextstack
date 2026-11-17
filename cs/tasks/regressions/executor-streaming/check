@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""A coding-agent run streams and leaves the runner's artifacts (goal.md). Fake agents only: each
+replays canned output and blocks on a gate file, so lines are seen while the agent is still running."""
+import atexit
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+import hashlib
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "scripts"))
+from check_timeout import timeout
+subprocess.run([sys.executable, str(HERE / "verify_processes.py")], check=True)
+LAB_SRC = HERE.parents[2]
+OPS = LAB_SRC / "ops/bin"
+USAGE = LAB_SRC / "tasks/regressions/agent-usage/fixtures"
+TOKENS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "reasoning_tokens")
+COPY = ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py", "_yaml.py",
+        "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_provider_limits.py", "_stuck.py",
+        "_run_record.py", "_env_policy.py", "_errors.py", "capture-stimulus", "publish-evidence", "harvest",
+        "finalize-run")
+FAKE = """#!/usr/bin/env python3
+import os, sys, time
+open("agent.pid", "w").write(str(os.getpid()))
+lines = open(%(fixture)r, encoding="utf-8").read().splitlines()
+for i, line in enumerate(lines):
+    print(line, flush=True)
+    if i == %(gate_at)d:
+        while not os.path.exists(%(gate)r):
+            time.sleep(0.05)
+sys.exit(%(code)d)
+"""
+
+
+def wait(cond, what, limit=30):
+    end = time.monotonic() + timeout(limit)
+    while time.monotonic() < end:
+        if cond():
+            return
+        time.sleep(0.05)
+    raise AssertionError("timed out waiting for " + what)
+
+
+def jsonl(path):
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()] if path.is_file() else []
+
+
+def ev(seq, delta=None, discard=False, turn=1):
+    payload = '"delta":%s,%s"partial":%s,"turn":%d' % (
+        json.dumps(delta or "", ensure_ascii=False).replace(" ", "\\u2028"),
+        '"discard":true,' if discard else "", "true" if delta is not None else "false", turn)
+    return '{"kind":"model.output","payload":{%s},"seq":%d}' % (payload, seq)
+
+
+class Lab:
+    def __init__(self, root, name, binary, args, fixture_lines, gate_at=0, code=0, state=False):
+        self.root, self.lab = root, root / name
+        self.state = root / (name + "-state") if state else self.lab / "ledger"
+        self.state.mkdir(parents=True, exist_ok=True)
+        ops, task, fake, home = self.lab / "ops/bin", self.lab / "tasks/fixture", root / (name + "-bin"), root / "home"
+        for path in (ops, task, self.lab / "ledger", fake, home / "Library/Keychains"):
+            path.mkdir(parents=True, exist_ok=True)
+        for f in COPY:
+            shutil.copy2(OPS / f, ops / f)
+            from native_runtime import stage_native_runtime
+            stage_native_runtime(ops)
+        self.gate = root / (name + ".gate")
+        fixture = root / (name + ".fixture")
+        fixture.write_text("\n".join(fixture_lines) + "\n", encoding="utf-8")
+        exe = fake / binary
+        exe.write_text(FAKE % {"fixture": str(fixture), "gate": str(self.gate), "gate_at": gate_at, "code": code})
+        exe.chmod(0o755)
+        (ops / "executor-templates.json").write_text(json.dumps({"fake": {
+            "binary": str(exe), "args": args, "cost_class": "subscription", "cost_usd": 0, "cost_per_1k": 0.01,
+            "auth": "subscription"}}))
+        (self.lab / "ESTATE").write_text("dev\n", encoding="utf-8")  # finalize-run's node identity
+        (task / "goal.md").write_text("Do nothing.\n", encoding="utf-8")
+        (task / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (task / "check").chmod(0o755)
+        env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_", "CSGATEWAY_"))}
+        self.env = {**env, "HOME": str(home), "CODEX_HOME": str(root / "codex-home"),
+                    "CS_TOOLS_BIN": str(LAB_SRC.parent / "target/release/cs-tools")}  # the copied lab has no target/
+        if state:  # the prod layout: the state root outside the code root
+            self.env["LAB_STATE_ROOT"] = str(self.state)
+        self.order = json.dumps({"executor": "fake", "task": "tasks/fixture", "exp": "task-fixture", "trial": 1,
+                                 "timeout_s": int(timeout(60))})
+
+    def run_dir(self):
+        runs = list((self.state / "runs").glob("*")) if (self.state / "runs").is_dir() else []
+        return runs[0] if runs else None
+
+    def events(self):
+        d = self.run_dir()
+        return (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if d and (d / "events.jsonl").is_file() \
+            else []
+
+    def owned(self):
+        """As the gateway runs it: --gateway-owned, the order on stdin which stays open, its own process group."""
+        proc = subprocess.Popen([sys.executable, str(self.lab / "ops/bin/_executor.py"), "--gateway-owned"],
+                                cwd=self.lab, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, process_group=0)
+        def cleanup():
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout(10))
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+        atexit.register(cleanup)
+        proc.stdin.write((self.order + "\n").encode())
+        proc.stdin.flush()
+        self.lines = []
+        reader = threading.Thread(target=lambda: self.lines.extend(iter(proc.stdout.readline, b"")), daemon=True)
+        reader.start()
+        return proc, reader
+
+    def row(self):
+        rows = jsonl(self.state / "ledger.jsonl")
+        assert len(rows) == 1, rows
+        return rows[0]
+
+    def envelope(self, state, reply):
+        """The run closed as a runner run closes: terminal.json, check.json, finalized.json, the outbox envelope
+        naming messages.jsonl and events.jsonl, the executor's one row reused (no second row, even on a retry)."""
+        run = self.run_dir()
+        term = json.loads((run / "terminal.json").read_text(encoding="utf-8"))
+        row = self.row()
+        assert term["terminal_state"] == state and term["transcript"] == row["transcript"] == "ledger/runs/" + run.name
+        assert term["cancel_reason"] == ("SIGTERM" if state == "cancelled" else None), term
+        assert term["stop"] == row["stop"] and term["stimulus_sha"] == row["stimulus_sha"] != "", (term, row)
+        check = json.loads((run / "check.json").read_text(encoding="utf-8"))
+        assert set(check) == {"verdict", "exit_code", "output", "skipped", "window", "stimulus_sha"}, check
+        assert check["stimulus_sha"] == term["stimulus_sha"], check
+        assert (run / "finalized.json").is_file()
+        env = json.loads((self.state / "outbox" / (run.name + ".json")).read_text(encoding="utf-8"))
+        files = {f["path"]: f["sha256"] for f in env["files"]}
+        for name in ("terminal.json", "check.json", "messages.jsonl", "events.jsonl", "transcript.md",
+                     "evidence/manifest.json", "stimulus/manifest.json"):
+            assert files.get(name) == hashlib.sha256((run / name).read_bytes()).hexdigest(), (name, sorted(files))
+        line = (self.state / "ledger.jsonl").read_bytes().rstrip(b"\n")
+        assert env["row_sha256"] == hashlib.sha256(line).hexdigest() and env["transcript"] == row["transcript"]
+        assert env["usage"]["source"] == {"class": "subscription", "model": "fake",
+                                          **({"reported_model": row["reported_model"]}
+                                             if "reported_model" in row else {})}, env["usage"]
+        assert jsonl(run / "messages.jsonl")[-1] == reply, jsonl(run / "messages.jsonl")
+        # The transcript publish-evidence hashed is the transcript finalize-run left: the evidence still verifies.
+        sys.path.insert(0, str(OPS))
+        from _lifecycle_evidence import verify
+        data, why = verify(run)
+        assert why is None and data["adapter"] == "executor", why
+        again = subprocess.run([str(self.lab / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(run)}),
+                               cwd=self.lab, env=self.env, text=True, capture_output=True, timeout=timeout(60))
+        assert json.loads(again.stdout)["row_appended"] is False and len(jsonl(self.state / "ledger.jsonl")) == 1
+
+
+with scratch_dir(prefix="executor-streaming-") as raw:
+    root = Path(raw)
+    usage = (USAGE / "claude-stream.jsonl").read_text(encoding="utf-8").splitlines()
+    result = json.loads(usage[-1])
+    assert result["type"] == "result"
+    result["result"] = "world. "
+    claude = [usage[0], json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello "}]}}),
+              *usage[1:-1],
+              json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}}),
+              json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "world. "}]}}),
+              json.dumps(result)]
+
+    # 1. Under the gateway: each agent line reaches stdout and events.jsonl while the agent is blocked mid-run.
+    #    A dispatched job on a host west of UTC: node-listen finds the run by its UTC name prefix against the job's
+    #    UTC start and posts the first delta while the agent still runs (a local stamp hid it until the end).
+    lab = Lab(root, "claude", "claude", ["--print", "--output-format", "stream-json", "--verbose", "{{prompt}}"],
+              claude, gate_at=1)
+    lab.env.update(TZ="Etc/GMT+5", LAB_JOB_ID="job-live")  # Etc/GMT+5 is UTC-5
+    (lab.state / "dispatch.jsonl").write_text(json.dumps({"id": "job-live", "director_job": "job-live",
+                                                          "state": "running"}) + "\n", encoding="utf-8")
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    proc, reader = lab.owned()
+    def first_line():
+        if proc.poll() is not None:
+            raise AssertionError((proc.returncode, proc.stderr.read().decode(), lab.lines))
+        return len(lab.lines) >= 2 and lab.events()
+    wait(first_line, "the first live line")
+    assert proc.poll() is None and not lab.gate.exists(), "lines must arrive before the agent exits"
+    assert lab.events() == [ev(1, "Hello ")], lab.events()
+    sys.path.insert(0, str(OPS))
+    from _node_events import live_runs, send as send_events
+
+    class Director:
+        protocol, calls = 2, []
+
+        def call(self, method, path, body):
+            self.calls.append((method, path, body))
+            return {"confirmed": max(e["seq"] for e in body["events"])}
+    found = live_runs(lab.state, [{"job_id": "job-live", "state": "running", "started_at": started}])
+    assert found == {lab.run_dir().name: (lab.run_dir(), "job-live")}, (started, sorted(found), lab.run_dir())
+    assert send_events(Director(), lab.state, lab.run_dir(), "job-live") is False  # still running: not done
+    assert Director.calls == [("POST", "runs/%s/events" % lab.run_dir().name, {"job_id": "job-live", "events": [
+        {"seq": 1, "kind": "delta", "partial": True, "payload": {"text": "Hello ", "turn": 1}}]})], Director.calls
+    assert [json.loads(x) for x in lab.lines] == [json.loads(x) for x in claude[:2]], lab.lines
+    lab.gate.touch()
+    proc.wait(timeout(60))  # stdin stays open until the child exits, as the gateway holds it; EOF would mean cancel
+    proc.stdin.close()
+    reader.join(timeout(10))
+    err = proc.stderr.read().decode()
+    assert proc.returncode == 0 and "Traceback" not in err, (proc.returncode, err, lab.lines[-1:])
+    out = [x.decode().rstrip("\n") for x in lab.lines]
+    assert [json.loads(x) for x in out[:-1]] == [json.loads(x) for x in claude], out
+    report = json.loads(out[-1])
+    assert report["verdict"] == "pass" and report["ok"] is True, report
+    run = lab.run_dir()
+    # The runner's exact bytes: keys sorted, compact, raw UTF-8, U+2028 escaped.
+    assert lab.events() == [ev(1, "Hello "), ev(2, "world. "), ev(3)], lab.events()
+    assert " " not in (run / "events.jsonl").read_text(encoding="utf-8")
+    assert (run / "messages.jsonl").read_text(encoding="utf-8") == \
+        '{"event":"turn","text":"world.\\u2028","turn":1}\n', (run / "messages.jsonl").read_text()
+    row = lab.row()
+    assert tuple(row.get(k) for k in TOKENS) == (4, 175, 28719, 12504, 40), row
+    assert row["reported_model"] == "claude-sonnet-5-5" and row["est_basis"] == "api_list", row
+    assert report["finalize"] == "finalized", report
+    lab.envelope("completed", {"event": "turn", "text": "world.\u2028", "turn": 1})
+
+    # 2. Called directly (no gateway): stdout stays the one-line report; artifacts are the same shape.
+    codex = (USAGE / "codex-exec.jsonl").read_text(encoding="utf-8").splitlines()
+    codex.insert(2, json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Looking."}}))
+    lab = Lab(root, "codex", "codex", ["exec", "--json", "{{prompt}}"], codex, gate_at=-1, state=True)
+    done = subprocess.run([sys.executable, str(lab.lab / "ops/bin/_executor.py")], cwd=lab.lab, env=lab.env,
+                          input=lab.order, text=True, capture_output=True, timeout=timeout(60))
+    assert done.returncode == 0 and len(done.stdout.splitlines()) == 1, (done.stdout, done.stderr)
+    assert json.loads(done.stdout)["verdict"] == "pass"
+    assert lab.events() == [ev(1, "Looking."), ev(2, "<redacted>"), ev(3)], lab.events()
+    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "turn", "text": "<redacted>", "turn": 1}]
+    row = lab.row()
+    assert tuple(row.get(k) for k in TOKENS) == (350, 513, 225408, None, 236), row
+    lab.envelope("completed", {"event": "turn", "text": "<redacted>", "turn": 1})
+
+    # 3. Gemini stream-json: assistant chunks are deltas, the reply is their text, usage from result.stats.
+    gemini = [json.dumps(x) for x in (
+        {"type": "init", "session_id": "s", "model": "gemini-3-flash-preview"},
+        {"type": "message", "role": "user", "content": "Do nothing."},
+        {"type": "message", "role": "assistant", "content": "Hel", "delta": True},
+        {"type": "tool_use", "tool_name": "ls", "tool_id": "t1", "parameters": {}},
+        {"type": "message", "role": "assistant", "content": "lo", "delta": True},
+        {"type": "result", "status": "success", "stats": {"total_tokens": 13206, "input_tokens": 12993,
+                                                         "output_tokens": 213, "cached": 40, "input": 12953,
+                                                         "duration_ms": 900, "tool_calls": 1}})]
+    lab = Lab(root, "gemini", "gemini", ["--output-format", "stream-json", "--prompt", "{{prompt}}"], gemini, -1)
+    done = subprocess.run([sys.executable, str(lab.lab / "ops/bin/_executor.py")], cwd=lab.lab, env=lab.env,
+                          input=lab.order, text=True, capture_output=True, timeout=timeout(60))
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert lab.events() == [ev(1, "Hel"), ev(2, "lo"), ev(3)], lab.events()
+    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "turn", "text": "Hello", "turn": 1}]
+    row = lab.row()
+    assert tuple(row.get(k) for k in TOKENS) == (12953, 213, 40, None, None), row
+    assert row["reported_model"] == "gemini-3-flash-preview" and row["est_basis"] == "rate", row
+
+    # 4. A failed attempt voids its partial text: discard, then an error event, never a turn.
+    lab = Lab(root, "codex-fail", "codex", ["exec", "--json", "{{prompt}}"], codex[:3], gate_at=-1, code=1)
+    done = subprocess.run([sys.executable, str(lab.lab / "ops/bin/_executor.py")], cwd=lab.lab, env=lab.env,
+                          input=lab.order, text=True, capture_output=True, timeout=timeout(60))
+    assert done.returncode == 1 and json.loads(done.stdout)["stop"] == "executor_exit_1", done.stdout
+    assert lab.events() == [ev(1, "Looking."), ev(2, discard=True)], lab.events()
+    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "error", "error": "task exited 1", "turn": 1}]
+    lab.envelope("completed", {"event": "error", "error": "task exited 1", "turn": 1})
+
+    # 5. Cancel mid-run, as the gateway does (TERM the executor's group): the agent dies, the turn closes with
+    #    discard, messages.jsonl says why, and the row's terminal stop is cancelled.
+    lab = Lab(root, "cancel", "claude", ["--print", "--output-format", "stream-json", "--verbose", "{{prompt}}"],
+              claude, gate_at=1)
+    proc, reader = lab.owned()
+    wait(lambda: lab.events(), "the first live line before cancel")
+    pid = int((lab.run_dir() / "workspace/agent.pid").read_text())
+    os.killpg(proc.pid, signal.SIGTERM)
+    proc.wait(timeout(30))
+    reader.join(timeout(10))
+    assert proc.returncode == 1, (proc.returncode, proc.stderr.read())
+    try:
+        os.kill(pid, 0)
+        raise AssertionError("the agent outlived the cancel")
+    except ProcessLookupError:
+        pass
+    assert lab.events() == [ev(1, "Hello "), ev(2, discard=True)], lab.events()
+    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "error", "error": "task cancelled", "turn": 1}]
+    row = lab.row()
+    assert row["stop"] == "cancelled" and row["verdict"] == "fail", row
+    assert json.loads(lab.lines[-1])["stop"] == "cancelled", lab.lines
+    lab.envelope("cancelled", {"event": "error", "error": "task cancelled", "turn": 1})
+    # Independent verification 2026-11-11: setsid escapes killpg and can rewrite a lane after evidence.
+    # Reuse its fork/setsid attack, closing inherited pipes so the root exits normally.
+    from _muse import run_process
+    from _agent_stream import run_streaming
+    for streaming in (False, True):
+        for mode in ("normal", "timeout", "memory"):
+            ws = root / ("escaped-%s-%s" % (streaming, mode))
+            ws.mkdir()
+            attack = r"""
+import os, sys, time
+mode = sys.argv[1]
+if os.fork() == 0:
+    os.setsid()
+    os.close(1); os.close(2)
+    open("escaped.pid", "w").write(str(os.getpid()))
+    if mode == "memory":
+        b = bytearray(150 * 1024 * 1024)
+        for i in range(0, len(b), 4096): b[i] = 1
+    open("escaped.ready", "w").write("ready")
+    while not os.path.exists("allow-write"): time.sleep(.02)
+    open("late-write", "w").write("escaped")
+    os._exit(0)
+while not os.path.exists("escaped.ready"): time.sleep(.02)
+print("root ended", flush=True)
+if mode != "normal":
+    while True: time.sleep(1)
+"""
+            args = ([sys.executable, "-c", attack, mode], str(ws), {**hermetic_env()},
+                    timeout(5) if mode == "timeout" else timeout(30))
+            kwargs = {"memory_cap_mb": 100} if mode == "memory" else {}
+            try:
+                try:
+                    done = run_streaming(*args, lambda line: None, **kwargs) if streaming else run_process(*args, **kwargs)
+                except subprocess.TimeoutExpired:
+                    assert mode == "timeout"
+                else:
+                    assert mode != "timeout"
+                    if mode == "memory":
+                        assert done.forced_meta["stop"] == "memory_cap", done
+                    else:
+                        assert done.returncode == 0, done
+                (ws / "allow-write").touch()
+                escaped = int((ws / "escaped.pid").read_text())
+                status = subprocess.run(["ps", "-o", "stat=", "-p", str(escaped)],
+                                        capture_output=True, text=True, timeout=timeout(10))
+                assert status.returncode in (0, 1), status.stderr
+                assert not status.stdout.strip() or status.stdout.strip().startswith("Z"), \
+                    "setsid child survived cleanup: " + status.stdout
+                assert not (ws / "late-write").exists(), "setsid child outlived evidence capture boundary"
+            finally:
+                # Clean up even when the boundary under test fails to own the escape.
+                if (ws / "escaped.pid").exists():
+                    try:
+                        os.kill(int((ws / "escaped.pid").read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+print("check: executor streaming — live lines before exit, the run found live by node-listen west of UTC, runner-shaped events.jsonl, messages.jsonl reply, "
+      "discard on failure and cancel, usage unchanged; each run closes as a runner run: terminal.json, check.json, "
+      "one ledger row, a run_finalized envelope with messages.jsonl and events.jsonl, under a separate state root too")

@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Home-read attack: every coding-agent profile must hide planted HOME secrets.
+
+Darwin probe only. Markers stay in a temporary HOME. The probe prints booleans,
+never file contents. Expected to fail until unlisted home paths are unreadable.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import ast
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+OPS = Path(__file__).resolve().parents[3] / "ops" / "bin"
+sys.path.insert(0, str(OPS))
+
+import _executor  # noqa: E402
+
+DECOYS = (
+    ".zsh_history",
+    ".bash_history",
+    ".git-credentials",
+    ".gitconfig",
+    ".npmrc",
+    ".pypirc",
+    ".docker/config.json",
+    ".kube/config",
+    ".aws/credentials",
+    ".ssh/id_ed25519",
+    ".config/gh/hosts.yml",
+    "Library/Application Support/Google/Chrome/Default/Cookies",
+    "Library/Application Support/Firefox/Profiles/x/cookies.sqlite",
+    ".contextstack/director-db-backup/x.sqlite",
+    ".acme-cli/session.json",
+)
+ROUTES = ("direct", "symlink", "listdir", "cp", "devfd")
+PYTHON = "/usr/bin/python3" if os.access("/usr/bin/python3", os.X_OK) else sys.executable
+
+# The literal /dev/fd/<dirfd>/<name> lookup returns ENOENT on current macOS.
+# Opening the child relative to the parent fd and reading /dev/fd/<filefd> is
+# the same route: bytes come through /dev/fd after the parent was opened.
+PROBE = r"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+READ = 65536
+
+
+def has_marker(data, marker):
+    return bool(data) and marker in data
+
+
+def read_flags(path, flags):
+    fd = os.open(str(path), flags)
+    try:
+        return os.read(fd, READ)
+    finally:
+        os.close(fd)
+
+
+def devfd_has_marker(parent, name, marker):
+    try:
+        dfd = os.open(str(parent), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        literal = "/dev/fd/%d/%s" % (dfd, name)
+        try:
+            if has_marker(read_flags(literal, os.O_RDONLY), marker):
+                return True
+        except OSError:
+            pass
+        try:
+            cfd = os.open(name, os.O_RDONLY, dir_fd=dfd)
+        except OSError:
+            return False
+        try:
+            via = os.open("/dev/fd/%d" % cfd, os.O_RDONLY)
+            try:
+                return has_marker(os.read(via, READ), marker)
+            finally:
+                os.close(via)
+        except OSError:
+            return False
+        finally:
+            os.close(cfd)
+    finally:
+        os.close(dfd)
+
+
+def workspace_controls(workspace):
+    benign = workspace / "benign.txt"
+    benign.write_bytes(b"benign-workspace")
+    link = workspace / "control-link"
+    link.unlink(missing_ok=True)
+    link.symlink_to(benign)
+    if read_flags(link, os.O_RDONLY) != b"benign-workspace":
+        raise RuntimeError("symlink")
+    dest = workspace / "control-copy"
+    dest.unlink(missing_ok=True)
+    copied = subprocess.run(["/bin/cp", str(benign), str(dest)], capture_output=True)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if copied.returncode != 0 or read_flags(dest, flags) != b"benign-workspace":
+        raise RuntimeError("cp")
+
+
+def one(workspace, index, decoy):
+    path = Path(decoy["path"])
+    marker = decoy["marker"].encode("utf-8")
+    name = path.name
+    row = {"rel": decoy["rel"]}
+    try:
+        row["direct"] = has_marker(read_flags(path, os.O_RDONLY), marker)
+    except OSError:
+        row["direct"] = False
+    link = workspace / ("link-%d" % index)
+    try:
+        link.unlink(missing_ok=True)
+        link.symlink_to(path)
+        row["symlink"] = has_marker(read_flags(link, os.O_RDONLY), marker)
+    except OSError:
+        row["symlink"] = False
+    finally:
+        try:
+            link.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        row["listdir"] = name in os.listdir(path.parent)
+    except OSError:
+        row["listdir"] = False
+    dest = workspace / ("copy-%d" % index)
+    try:
+        dest.unlink(missing_ok=True)
+        subprocess.run(["/bin/cp", str(path), str(dest)], capture_output=True)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        if dest.is_file() and not dest.is_symlink():
+            row["cp"] = has_marker(read_flags(dest, flags), marker)
+        else:
+            row["cp"] = False
+    except OSError:
+        row["cp"] = False
+    finally:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+    row["devfd"] = devfd_has_marker(path.parent, name, marker)
+    return row
+
+
+def main():
+    manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    workspace = Path(manifest["workspace"])
+    workspace_controls(workspace)
+    routes = [one(workspace, index, decoy) for index, decoy in enumerate(manifest["decoys"])]
+    json.dump({"ok": True, "routes": routes}, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        json.dump({"ok": False, "error": "probe"}, sys.stdout)
+        sys.stdout.write("\n")
+"""
+
+
+def skip(reason):
+    print("SKIP: " + reason)
+    return 0
+
+
+def redact(text, markers):
+    redacted = text or ""
+    for marker in markers:
+        if marker:
+            redacted = redacted.replace(marker, "[marker]")
+    return redacted
+
+
+def load_templates():
+    data = json.loads((OPS / "executor-templates.json").read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not data:
+        raise ValueError("executor-templates.json has no templates")
+    return data
+
+
+def load_sandbox_cmd():
+    import _executor
+    return {"sandbox_cmd": _executor.sandbox_cmd}
+
+
+def profiled(name, template):
+    # _executor.py returns before sandbox_cmd for these. Their profile is _muse.sandbox_command.
+    return name == "muse-code" or template.get("profile") == "cli-profiles.json"
+
+
+def write_profile(ns, name, template, home, ws, private, profile_path):
+    if profiled(name, template):
+        from _muse import sandbox_command
+        command = sandbox_command([PYTHON], ws, home)
+        if command[1] != "-p":
+            raise RuntimeError("muse sandbox command has no inline profile")
+        profile_path.write_text(command[2] + "\n", encoding="utf-8")
+        return
+    from _cli_native import stage, unstage
+    private.mkdir(parents=True, exist_ok=True)
+    _, links = stage(template, private, home)
+    try:
+        _executor.HOME = home
+        built = ns["sandbox_cmd"](
+            "/usr/bin/true", [], ws, private, profile_path,
+            caller=dict(deny_write_roots=[str(home / p[2:] if p.startswith("~/") else Path(p)) for p in template.get("deny_write", [])]),
+            env={"PATH": os.environ.get("PATH", ""), "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK")},
+            read_links=links,
+            login_writes=template,
+        )
+    finally:
+        unstage(links)
+    if built[:2] != ["sandbox-exec", "-f"]:
+        raise RuntimeError("sandbox_cmd did not emit sandbox-exec -f")
+
+
+def plant(home):
+    """Return [{rel, path, marker}, ...] and create Keychains so login links resolve."""
+    home.mkdir(mode=0o700)
+    (home / "Library" / "Keychains").mkdir(parents=True)
+    planted = []
+    for rel in DECOYS:
+        if ".." in Path(rel).parts:
+            raise ValueError("decoy escapes HOME: " + rel)
+        path = home / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        marker = "cs-home-marker:" + secrets.token_hex(16)
+        body = "[credential]\n helper = " + marker if rel == ".gitconfig" else marker
+        path.write_text(body + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+        if marker not in path.read_text(encoding="utf-8"):
+            raise RuntimeError("planted decoy was not readable outside the sandbox: " + rel)
+        planted.append({"rel": rel, "path": str(path), "marker": marker})
+    return planted
+
+
+def seatbelt_refused(stderr, stdout=""):
+    return "sandbox_apply: Operation not permitted" in ((stderr or "") + (stdout or ""))
+
+
+def capability():
+    try:
+        done = subprocess.run(
+            ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        print("FAIL: sandbox-exec is not available", file=sys.stderr)
+        return 1
+    except subprocess.TimeoutExpired:
+        print("FAIL: sandbox-exec capability probe timed out", file=sys.stderr)
+        return 1
+    if done.returncode == 0:
+        return None
+    if seatbelt_refused(done.stderr, done.stdout):
+        return skip("nested sandbox-exec refused (sandbox_apply: Operation not permitted)")
+    print("FAIL: sandbox-exec capability probe failed", file=sys.stderr)
+    sys.stderr.write(redact((done.stderr or done.stdout or "").strip(), ()) + "\n")
+    return 1
+
+
+def run_probe(profile_path, probe_path, manifest_path, scratch, home, markers):
+    env = {
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "TMPDIR": str(scratch),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    try:
+        done = subprocess.run(
+            ["sandbox-exec", "-f", str(profile_path), PYTHON, str(probe_path), str(manifest_path)],
+            cwd=str(scratch),
+            env=env,
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout", None
+    if seatbelt_refused(done.stderr, done.stdout):
+        return "refused", None
+    output = done.stdout or ""
+    if any(marker and marker in output for marker in markers):
+        return "leaked-stdout", None
+    if any(marker and marker in (done.stderr or "") for marker in markers):
+        return "leaked-stderr", None
+    try:
+        report = json.loads(output)
+    except ValueError:
+        return "bad-report", redact(output + (done.stderr or ""), markers)
+    if not isinstance(report, dict):
+        return "bad-report", ""
+    return "ok", report
+
+
+def evaluate(name, report, expected):
+    """Failure lines for one template. A missing or non-boolean route is a failure."""
+    if not report or report.get("ok") is not True:
+        return ["FAIL: %s: probe did not report routes" % name]
+    rows = report.get("routes")
+    if not isinstance(rows, list):
+        return ["FAIL: %s: probe did not report routes" % name]
+    by_rel = {}
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("rel"), str):
+            by_rel[row["rel"]] = row
+    failures = []
+    for decoy in expected:
+        row = by_rel.get(decoy["rel"])
+        if row is None:
+            failures.append("FAIL: %s: %s (no report)" % (name, decoy["rel"]))
+            continue
+        open_routes = []
+        for route in ROUTES:
+            seen = row.get(route)
+            if seen is True:
+                open_routes.append(route)
+            elif seen is not False:
+                failures.append("FAIL: %s: %s (route %s missing)" % (name, decoy["rel"], route))
+        if open_routes:
+            failures.append("FAIL: %s: %s (%s)" % (name, decoy["rel"], ", ".join(open_routes)))
+    return failures
+
+
+def main():
+    if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+        return skip("home-read attack runs only with --darwin-probe on macOS")
+    try:
+        templates = load_templates()
+        ns = load_sandbox_cmd()
+    except (OSError, ValueError, SyntaxError) as error:
+        print("FAIL: could not load the production profile builder: %s" % type(error).__name__, file=sys.stderr)
+        return 1
+    with scratch_dir(prefix="home-read-attack-") as raw:
+        root = Path(raw).resolve()
+        home = root / "home"
+        ws = root / "workspace"
+        tmp = root / "tmp"
+        ws.mkdir(mode=0o700)
+        tmp.mkdir(mode=0o700)
+        try:
+            planted = plant(home)
+        except OSError as error:
+            print("FAIL: could not plant decoys: %s" % type(error).__name__, file=sys.stderr)
+            return 1
+        markers = [item["marker"] for item in planted]
+        probe_path = root / "probe.py"
+        probe_path.write_text(PROBE, encoding="utf-8")
+        profiles = []
+        for name, template in templates.items():
+            private = tmp / name
+            private.mkdir(mode=0o700)
+            profile_path = root / (name + ".sb")
+            try:
+                write_profile(ns, name, template, home, ws, private, profile_path)
+            except Exception as error:
+                print("FAIL: %s: profile build %s: %s" % (
+                    name, type(error).__name__, redact(str(error), markers),
+                ))
+                return 1
+            if not profile_path.is_file() or "(version 1)" not in profile_path.read_text(encoding="utf-8"):
+                print("FAIL: %s: profile was not written" % name)
+                return 1
+            profiles.append((name, profile_path, private))
+        refused = capability()
+        if refused is not None:
+            return refused
+        failures = []
+        for name, profile_path, private in profiles:
+            scratch = ws / name
+            scratch.mkdir(mode=0o700)
+            manifest_path = private / "manifest.json"
+            manifest_path.write_text(json.dumps({
+                "home": str(home),
+                "workspace": str(scratch),
+                "decoys": planted,
+            }), encoding="utf-8")
+            status, payload = run_probe(profile_path, probe_path, manifest_path, scratch, home, markers)
+            if status == "refused":
+                return skip("nested sandbox-exec refused (sandbox_apply: Operation not permitted)")
+            if status == "timeout":
+                failures.append("FAIL: %s: probe timed out" % name)
+                continue
+            if status == "leaked-stdout" or status == "leaked-stderr":
+                failures.append("FAIL: %s: probe printed a marker" % name)
+                continue
+            if status != "ok":
+                detail = payload if isinstance(payload, str) else ""
+                failures.append("FAIL: %s: probe report unreadable" % name)
+                if detail.strip():
+                    print(redact(detail.strip(), markers)[-2000:], file=sys.stderr)
+                continue
+            failures.extend(evaluate(name, payload, planted))
+    if failures:
+        print("FAIL: home-read attack: %d open result(s)" % len(failures))
+        for line in failures:
+            print(line)
+        return 1
+    print("PASS: every template blocked every home-read route")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

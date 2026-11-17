@@ -1,0 +1,242 @@
+{
+  "exit_code": 0,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "capture-stimulus",
+      "stdin": {
+        "adapter": "runner",
+        "hooks": [],
+        "prompts": [
+          "prompts/coder-min.md"
+        ],
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-env-direct-run-ignores-request-fx-t1",
+        "run_id": "<RUNSTAMP>-fx-env-direct-run-ignores-request-fx-t1",
+        "runner_implementation": "<RUNNER>",
+        "runner_path": "<RUNNER_PATH>",
+        "spec": "specs/fx.yaml",
+        "spec_sha": "7dac8f70f971146bf6bef2d8b0bb11bf013c28f7320c6ff31e461c5fc70a60f8",
+        "task": "tasks/fx",
+        "tools": [
+          "fx_tool"
+        ],
+        "trial": 1,
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-env-direct-run-ignores-request-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-env-direct-run-ignores-request-fx-t1"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "publish-evidence",
+      "stdin": {
+        "adapter": "runner",
+        "check_exit": 0,
+        "check_output": "",
+        "check_skipped": false,
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-env-direct-run-ignores-request-fx-t1",
+        "stop": "done",
+        "verdict": "pass"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "1.000000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-env-direct-run-ignores-request",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.990000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          },
+          {
+            "content": "one call",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "mode": "echo"
+                },
+                "id": "c1",
+                "name": "fx_tool"
+              }
+            ]
+          },
+          {
+            "content": "[fx_tool {\"mode\":\"echo\"}]\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
+            "role": "tool",
+            "tool_call_id": "c1"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-env-direct-run-ignores-request",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    }
+  ],
+  "rows": [
+    {
+      "cost_class": "api",
+      "cost_usd": 0.02,
+      "env_sha": "<ENV_SHA>",
+      "est_basis": "rate",
+      "est_usd": 0.02,
+      "estate": "dev",
+      "model": "fake-model",
+      "seconds": "<SECONDS>",
+      "spec": "fx-env-direct-run-ignores-request",
+      "spec_sha": "7dac8f70f971146bf6bef2d8b0bb11bf013c28f7320c6ff31e461c5fc70a60f8",
+      "stimulus_sha": "<STIMULUS_SHA>",
+      "stop": "done",
+      "task": "tasks/fx",
+      "task_sha": "2fa288b80c39a119855af1a658911af6838eaae6085b7e4c96dc7a3af8f7ea79",
+      "tool_calls": 1,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-env-direct-run-ignores-request-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 2,
+      "verdict": "pass"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-env-direct-run-ignores-request-fx-t1",
+      "entries": [
+        "check.json",
+        "evidence",
+        "finalize.lock",
+        "finalized.json",
+        "messages.jsonl",
+        "ready_for_inspection",
+        "stimulus",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "frozen": {
+        "check": "#!/bin/sh\nexit 0\n",
+        "goal.md": "Create hello.txt containing exactly: hello\n"
+      },
+      "transcript": "# fx-env-direct-run-ignores-request · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\none call\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n### turn 2\n\ndone\n\n---\nstop done · verdict **pass** · turns 2 · tools 1 · cost $0.0200\n",
+      "workspace": {}
+    }
+  ],
+  "stderr": [],
+  "stdout": [
+    "  tasks/fx                       t1  pass stop=done turns=2 tools=1 $0.0200"
+  ]
+}

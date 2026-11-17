@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Every coding-agent run records the usage its agent reports. Recorded, redacted fixtures only:
+no claude, codex or gemini runs against a model."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+
+HERE = Path(__file__).resolve().parent
+FIX = HERE / "fixtures"
+LAB = HERE.parents[2]
+OPS = LAB / "ops/bin"
+sys.path.insert(0, str(OPS))
+from _est import parse_usage  # noqa: E402
+from _cli_budget import Admission, native_result  # noqa: E402
+
+TOKENS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "reasoning_tokens")
+
+
+def parse(name, **kw):
+    return parse_usage((FIX / name).read_text(encoding="utf-8"), "x" * 1000, 0.01, **kw)
+
+
+def tokens(row):
+    return tuple(row.get(k, "absent") for k in TOKENS)
+
+
+# Claude stream-json: every token kind, the real model, the API list price as an estimate, allowance per window.
+row = parse("claude-stream.jsonl")
+assert tokens(row) == (4, 175, 28719, 12504, 40), row
+assert row["reported_model"] == "claude-sonnet-5-5" and row["est_usd"] == 0.054646, row
+assert row["est_basis"] == "api_list", "an agent's list price is an estimate, never a charge"
+allow = row["allowance"]
+assert allow["via"] == "rate_limit_event" and allow["rejected"] is False, allow
+windows = {w["window"]: w for w in allow["windows"]}
+assert windows["five_hour"] == {"window": "five_hour", "used_pct": 42.0, "resets_at": "2026-11-15T11:03:20Z",
+                                "status": "allowed"}, "public fields win over unifiedWindows: %s" % windows
+assert windows["seven_day"]["used_pct"] == 81.0 and windows["seven_day"]["status"] == "allowed_warning", windows
+assert windows["seven_day_opus"]["used_pct"] == 10.0, "unifiedWindows (internal) only fills gaps"
+
+# Claude --output-format json: modelUsage without token counts falls back to usage; no allowance reported.
+row = parse("claude-json.json")
+assert tokens(row) == (4, 175, 28719, 12504, None), row
+assert row["reported_model"] == "claude-sonnet-5-5" and "allowance" not in row, row
+
+# A rejected window with no result (a run cut short): allowance reached, no invented tokens.
+row = parse("claude-rejected.jsonl")
+assert row["allowance"]["rejected"] is True and row["reported_model"] == "claude-opus-5-5", row
+assert row["est_basis"] == "chars" and tokens(row) == ("absent",) * 5, row
+
+# Codex exec --json: input excludes cache reads; the rollout gives the real model and allowance.
+since = time.mktime((2026, 11, 9, 12, 0, 0, 0, 0, -1))
+row = parse("codex-exec.jsonl", codex_sessions=FIX / "codex-home/sessions", since=since)
+assert tokens(row) == (350, 513, 225408, None, 236), row
+assert row["reported_model"] == "gpt-6.1-sol" and row["codex_thread"] == "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+assert row["est_basis"] == "rate" and abs(row["est_usd"] - (350 + 513 + 0.1 * 225408) * 0.01 / 1000) < 1e-6, row
+assert row["allowance"] == {"via": "rollout", "rejected": False, "windows": [
+    {"window": "seven_day", "used_pct": 68.0, "resets_at": "2026-11-15T11:03:20Z", "status": None}],
+    "credits": {"has_credits": True, "unlimited": False, "balance": "<n>"}}, row["allowance"]
+row = parse("codex-exec.jsonl")
+assert "reported_model" not in row and "allowance" not in row and row["input_tokens"] == 350, row
+row = parse("codex-limit.jsonl")
+assert row["allowance"] == {"via": "error", "rejected": True, "windows": []} and row["est_basis"] == "chars", row
+
+# Gemini --output-format json: per-model tokens after non-JSON noise; a missing field is null, never 0.
+row = parse("gemini.json")
+assert tokens(row) == (12993, 213, 0, None, 0) and row["reported_model"] == "gemini-3-flash-preview", row
+row = parse("gemini-partial.json")
+assert tokens(row) == (60, 10, 40, None, None), row
+row = parse("gemini-quota.json")
+assert row["allowance"]["rejected"] is True and row["est_basis"] == "chars" and "input_tokens" not in row, row
+
+# The templates ask each agent for its machine-readable output.
+templates = json.loads((OPS / "executor-templates.json").read_text())
+for name, t in templates.items():
+    args = t.get("args") or []
+    if t.get("binary") == "claude" and "--output-format" in args:
+        assert args[args.index("--output-format") + 1] == "stream-json" and "--verbose" in args, name
+assert templates["codex"]["args"][:2] == ["exec", "--json"], templates["codex"]
+gem = templates["gemini-cli"]["args"]
+assert gem[gem.index("--output-format") + 1] == "stream-json", gem
+
+# The budget path reads Claude's terminal from a stream as from one object.
+stream = (FIX / "claude-stream.jsonl").read_text()
+budget = {"turns": 5, "tool_calls": 3, "usd": 0, "seconds": 60}
+assert native_result(stream, budget, Admission(3)) == {"stop": "done", "turns": 2, "tool_calls": 0}
+try:
+    native_result(stream.rsplit("\n{\"type\":\"result\"", 1)[0], budget, Admission(3))
+    raise AssertionError("a stream without its result must not pass")
+except ValueError:
+    pass
+
+# The envelope keeps protocol 1's six keys and adds the reported fields only when the row has them.
+with scratch_dir(prefix="agent-usage-") as raw:
+    os.environ["LAB_STATE_ROOT"] = raw
+    loader = importlib.machinery.SourceFileLoader("finalize_run", str(OPS / "finalize-run"))
+    spec = importlib.util.spec_from_loader("finalize_run", loader)
+    fin = importlib.util.module_from_spec(spec)
+    loader.exec_module(fin)
+    del os.environ["LAB_STATE_ROOT"]
+    base = {"est_usd": 0.05, "est_basis": "api_list", "cost_usd": 0, "cost_class": "subscription",
+            "model": "claude-code-sonnet"}
+    plain = fin.envelope_usage(base, Path(raw))
+    assert set(plain) == {"input_tokens", "output_tokens", "est_usd", "est_basis", "charged_usd", "source"}
+    assert set(plain["source"]) == {"class", "model"}, plain
+    full = fin.envelope_usage({**base, **parse("claude-stream.jsonl")}, Path(raw))
+    assert (full["input_tokens"], full["cache_read_tokens"], full["cache_creation_tokens"]) == (4, 28719, 12504)
+    assert full["source"] == {"class": "subscription", "model": "claude-code-sonnet",
+                              "reported_model": "claude-sonnet-5-5"}, full
+    assert full["allowance"]["windows"] and full["charged_usd"] == 0, full
+
+# End to end through the executor: a fake codex prints the recorded stream; the row carries what it reported.
+with scratch_dir(prefix="agent-usage-exec-") as raw:
+    lab = Path(raw) / "lab"
+    ops, task, fake = lab / "ops/bin", lab / "tasks/fixture", lab / "fake"
+    for path in (ops, task, lab / "ledger", fake):
+        path.mkdir(parents=True, exist_ok=True)
+    for name in ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py",
+                 "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_provider_limits.py", "_est.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py",
+                 "capture-stimulus", "publish-evidence", "harvest", "_run_record.py", "_env_policy.py", "_errors.py", "finalize-run"):
+        shutil.copy2(OPS / name, ops / name)
+    from native_runtime import stage_native_runtime
+    stage_native_runtime(ops)
+    for module in sorted(OPS.glob("_*.py")):  # direct imports between ops/bin modules: ship every sibling module
+        if not (ops / module.name).exists():
+            shutil.copy2(module, ops / module.name)
+    (lab / "ESTATE").write_text("dev\n")  # finalize-run's node identity
+    day = lab.parent / "codex-home/sessions" / time.strftime("%Y/%m/%d")
+    day.mkdir(parents=True)
+    roll = next((FIX / "codex-home/sessions/2026/11/09").glob("rollout-*.jsonl"))
+    shutil.copy2(roll, day / roll.name.replace("2026-11-09", time.strftime("%Y-%m-%d")))
+    codex = fake / "codex"
+    # The fixture lives in the checkout under HOME, which agent profiles deny; stage it beside the fake.
+    shutil.copy2(FIX / "codex-exec.jsonl", fake / "codex-exec.jsonl")
+    codex.write_text("#!/bin/sh\ncat %s\n" % json.dumps(str(fake / "codex-exec.jsonl")), encoding="utf-8")
+    codex.chmod(0o755)
+    (ops / "executor-templates.json").write_text(json.dumps({"fake-codex": {
+        "binary": str(codex), "args": ["exec", "--json", "{{prompt}}"], "env_drop": ["OPENAI_API_KEY"],
+        "cost_class": "subscription", "cost_usd": 0, "cost_per_1k": 0.015, "auth": "subscription"}}))
+    (task / "goal.md").write_text("Do nothing.\n", encoding="utf-8")
+    (task / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (task / "check").chmod(0o755)
+    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_"))}
+    result = subprocess.run([sys.executable, str(ops / "_executor.py")], cwd=lab, text=True, capture_output=True,
+                            timeout=60, input=json.dumps({"executor": "fake-codex", "task": "tasks/fixture",
+                                                          "exp": "task-fixture", "trial": 1, "timeout_s": 20}),
+                            env={**env, "CODEX_HOME": str(lab.parent / "codex-home"),
+                                 "CS_TOOLS_BIN": str(LAB.parent / "target/release/cs-tools")})
+    assert "Traceback" not in result.stderr, result.stderr
+    rows = [json.loads(line) for line in (lab / "ledger/ledger.jsonl").read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["cli_exit"] == 0, (rows, result.stdout, result.stderr)
+    row = rows[0]
+    assert tokens(row) == (350, 513, 225408, None, 236) and row["reported_model"] == "gpt-6.1-sol", row
+    assert row["model"] == "fake-codex" and row["est_basis"] == "rate" and row["cost_usd"] == 0, row
+    assert row["allowance"]["via"] == "rollout" and row["allowance"]["windows"][0]["used_pct"] == 68.0, row
+print("check: agent usage — Claude/Codex/Gemini tokens incl. cache, real model, list-price estimate, allowance")

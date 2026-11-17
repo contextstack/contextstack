@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""finalize-crash-loses-row: observed reproduction (Plan.CS.v2.1 §4).
+
+Kills the Go runner with SIGKILL at a KNOWN boundary inside finalization:
+after the frozen check has run and transcript.md (rendered by finalize-run
+from the runner's messages.jsonl, then footered) is on disk, inside the
+`publish-evidence` op, before the ledger row. The boundary is
+deterministic: the temp estate's ops/bin/publish-evidence records its
+stdin, SIGKILLs the runner (pid from fixture/runner.pid) and then its own
+parent while both are blocked on it. No sleep, no SIGINT (the runner
+handles SIGINT on purpose: stop=interrupted, verdict=void, row still
+written).
+
+Before extraction 1 of phase 1b the runner called publish-evidence itself,
+so the kill left stimulus/, transcript.md and workspace/ and nothing else
+(notes.md, "Observed"). Now the runner writes messages.jsonl as it
+goes and terminal.json at the end, then calls finalize-run, whose publish
+step is the same boundary: the kill leaves messages.jsonl, terminal.json,
+check.json and the rendered transcript.md, and the row is recoverable.
+
+Three parts, each printed:
+  observation  what was on disk, what was in the ledger, the exit status
+  detection    tick's execution_row/ledger_size logic (ops/bin/tick) against
+               the temp ledger; and what a manual `lab run` tells its caller
+               (nothing but -9)
+  recovery     ops/bin/finalize-run on the run dir yields the row with the
+               original verdict and the evidence record, exactly once; the
+               kill op forwards to the real publish-evidence on later calls.
+
+Builds its own temp estate; never touches lab/ledger. The binary under
+test is $CS_RUNNER_BIN; absent, the default Rust runner.
+Wired into scripts/check as finalize-run's acceptance.
+"""
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+CHAR = LAB / "tasks/regressions/runner-characterisation-v2"  # the fake gateway that speaks the current wire
+sys.path.insert(0, str(CHAR))
+from _fake_gateway import FakeGateway  # noqa: E402
+sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation"))
+from _harness import install_exe  # noqa: E402 runtime exe tools
+
+REAL_TOOLS = ("fs_read", "fs_write", "exec", "_calllog.py")
+REAL_OPS = ("setup-workspace", "capture-stimulus", "finalize-run")
+OP_HELPERS = ("_estate_io.py", "_roots.py", "_lifecycle_evidence.py", "_harvest_git.py", "_setup_workspace.py",
+              "_corpus_contract.py", "_workspace_setup.py", "_env_policy.py", "_errors.py")
+SPEC_REL = "specs/fx.yaml"
+SPEC_ID = "fx-finalize-crash"
+TASK_REL = "tasks/create-file"
+FOOTER = re.compile(r"^stop (\S+) · verdict \*\*(\w+)\*\* · turns (\d+) · tools (\d+) · cost \$([0-9.]+)$", re.M)
+
+SPEC = """id: %s
+model: fake
+system: prompts/coder-min.md
+context: []
+tools: [fs_read, fs_write, exec]
+post_turn: []
+mcp: []
+budget: {turns: 5, tool_calls: 10, usd: 1, seconds: 30}
+tasks: [%s]
+trials: 1
+hypothesis: "fixture-1971: SIGKILL inside publish-evidence loses the row"
+""" % (SPEC_ID, TASK_REL)
+
+GATEWAY = [
+    {"ok": {"text": "writing the file",
+            "tool_calls": [{"id": "1", "name": "fs_write",
+                            "args": {"path": "hello.txt", "content": "hello"}}]}},
+    {"ok": {"text": "done", "tool_calls": []}},
+]
+
+# The known boundary. Installed as <estate>/ops/bin/publish-evidence; one shot.
+KILL_OP = """#!/usr/bin/env python3
+# Fixture boundary: record the invocation, SIGKILL the runner (fixture/runner.pid)
+# and then our parent (finalize-run; the pre-1b runner itself) while both are
+# blocked on this op: check done, transcript rendered and footered, ledger row not.
+# Once fired, later calls forward to the real op so recovery can publish.
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+estate = Path(__file__).resolve().parent.parent.parent
+data = sys.stdin.buffer.read()
+marker = estate / "fixture/killed"
+if marker.exists():
+    sys.exit(subprocess.run([str(estate / "ops/real-bin/publish-evidence")], input=data).returncode)
+try:
+    payload = json.loads(data)
+except ValueError:
+    payload = data.decode("utf-8", "replace")
+pidfile = estate / "fixture/runner.pid"
+for _ in range(200):
+    if pidfile.is_file() and pidfile.read_text().strip():
+        break
+    time.sleep(0.05)
+runner, ppid = int(pidfile.read_text().strip()), os.getppid()
+rec = {"op": "publish-evidence", "ppid": ppid, "runner": runner, "cwd": os.getcwd(),
+       "stdin": payload, "signal": "SIGKILL"}
+(estate / "fixture/publish-evidence-call.json").write_text(json.dumps(rec, sort_keys=True) + "\\n")
+marker.write_text("1")
+os.kill(runner, signal.SIGKILL)
+if ppid != runner:
+    os.kill(ppid, signal.SIGKILL)
+sys.exit(0)
+"""
+
+# A prior row for the same spec: tick's cursor (`after=before`) must not
+# mistake it for this trial's row.
+PRIOR_ROWS = [
+    {"ts": "2026-11-07T00:00:00Z", "exp": "other-task", "spec": "fx-other", "model": "fake",
+     "task": "tasks/other", "trial": 1, "verdict": "pass", "stop": "done",
+     "transcript": "ledger/runs/20261107-000000.000000000-fx-other-other-t1", "estate": "dev"},
+    {"ts": "2026-11-07T00:01:00Z", "exp": "fixture-1971", "spec": SPEC_ID, "model": "fake",
+     "task": TASK_REL, "trial": 1, "verdict": "pass", "stop": "done",
+     "transcript": "ledger/runs/20261107-000100.000000000-%s-create-file-t1" % SPEC_ID,
+     "estate": "dev"},
+]
+
+
+def copy_exec(src, dst):
+    shutil.copy2(src, dst)
+    if not dst.name.endswith(".json") and not dst.name.endswith(".py"):
+        dst.chmod(0o755)
+
+
+def runner_binary(scratch):
+    """$CS_RUNNER_BIN if set, else the default Rust runner (_runner.built_runner)."""
+    sys.path.insert(0, str(LAB / "ops/bin"))
+    from _runner import built_runner
+    return built_runner(LAB).resolve()
+
+
+def build_estate(root):
+    estate = root / "estate"
+    for d in ("ledger", "prompts", "tools/bin", "hooks/bin", "ops/bin", "ops/real-bin", "specs", "tasks",
+              "fixture", "home", "tmp"):
+        (estate / d).mkdir(parents=True)
+    (estate / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
+    (estate / "ESTATE").write_text("dev\n", encoding="utf-8")
+    shutil.copy2(LAB / "prompts/coder-min.md", estate / "prompts/coder-min.md")
+    for name in REAL_TOOLS:
+        if not (LAB / "tools/bin" / name).is_file() and (LAB / "tools/bin" / (name + ".json")).is_file():
+            install_exe(LAB / "tools/bin" / (name + ".json"), LAB, estate)
+            continue
+        copy_exec(LAB / "tools/bin" / name, estate / "tools/bin" / name)
+        if (LAB / "tools/bin" / (name + ".json")).is_file():
+            shutil.copy2(LAB / "tools/bin" / (name + ".json"), estate / "tools/bin" / (name + ".json"))
+    for name in REAL_OPS:
+        copy_exec(LAB / "ops/bin" / name, estate / "ops/bin" / name)
+    for name in OP_HELPERS:
+        shutil.copy2(LAB / "ops/bin" / name, estate / "ops/bin" / name)
+        shutil.copy2(LAB / "ops/bin" / name, estate / "ops/real-bin" / name)
+    # The real publisher, reached by the kill op only after it has fired.
+    copy_exec(LAB / "ops/bin/publish-evidence", estate / "ops/real-bin/publish-evidence")
+    kill = estate / "ops/bin/publish-evidence"
+    kill.write_text(KILL_OP, encoding="utf-8")
+    kill.chmod(0o755)
+    shutil.copytree(LAB / TASK_REL, estate / TASK_REL)
+    (estate / TASK_REL / "check").chmod(0o755)
+    (estate / SPEC_REL).write_text(SPEC, encoding="utf-8")
+    with open(estate / "ledger/ledger.jsonl", "w", encoding="utf-8") as f:
+        for row in PRIOR_ROWS:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    return estate
+
+
+def child_env(estate, endpoint):
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(estate / "home"),
+            "TMPDIR": str(estate / "tmp"), "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+            "CSGATEWAY_ENDPOINT": endpoint}
+
+
+# --- tick's detection, replicated faithfully from lab/ops/bin/tick -------------
+# ledger_size: tick:39-43. execution_row: tick:46-57 (spec_key: tick:35-36).
+# tick:290 takes `before = ledger_size()`, runs the trial, then tick:303-305:
+#     row = execution_row(rel, sid, before)
+#     if not row:
+#         raise RuntimeError("trial produced no fresh matching execution row")
+
+def spec_key(value):
+    return str(value or "").replace("specs/", "").removesuffix(".yaml")
+
+
+def ledger_size(ledger):
+    if not ledger.is_file():
+        return 0
+    return len([line for line in ledger.read_text(encoding="utf-8").splitlines()
+                if line.strip()])
+
+
+def execution_row(ledger, rel, sid, after=0):
+    if not ledger.is_file():
+        return {}
+    wanted = {spec_key(rel), spec_key(sid)}
+    lines = [line for line in ledger.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    for line in reversed(lines[max(0, int(after)):]):
+        row = json.loads(line)
+        if (row.get("trial") is not None
+                and row.get("verdict") in {"pass", "fail", "void"}
+                and spec_key(row.get("spec")) in wanted):
+            return row
+    return {}
+
+
+def rows_of(ledger):
+    if not ledger.is_file():
+        return []
+    return [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+class Report:
+    def __init__(self):
+        self.failed = []
+
+    def expect(self, cond, label, detail=""):
+        status = "ok  " if cond else "FAIL"
+        print("%s %s%s" % (status, label, (" : " + detail) if detail else ""))
+        if not cond:
+            self.failed.append(label)
+        return cond
+
+
+def main():
+    keep = "--keep" in sys.argv[1:]
+    scratch = Path(tempfile.mkdtemp(prefix="finalize-crash-loses-row-", suffix=".noindex"))
+    rep = Report()
+    gateway = None
+    try:
+        binary = runner_binary(scratch)
+        estate = build_estate(scratch)
+        if estate.resolve() == LAB or LAB in estate.resolve().parents:
+            raise SystemExit("check: refusing live lab root")
+        ledger = estate / "ledger/ledger.jsonl"
+        gateway = FakeGateway(GATEWAY, estate)
+        env = child_env(estate, gateway.endpoint)
+
+        # --- 1. run and observe -------------------------------------------------
+        before = ledger_size(ledger)
+        child = subprocess.Popen([str(binary), "run", SPEC_REL], cwd=str(estate), env=env,
+                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (estate / "fixture/runner.pid").write_text("%d\n" % child.pid, encoding="utf-8")
+        out, err = child.communicate(timeout=120)
+        proc = subprocess.CompletedProcess(child.args, child.returncode, out, err)
+        proc.pid = child.pid
+        gateway.stop.set()
+        after = ledger_size(ledger)
+        runs = sorted((estate / "ledger/runs").iterdir()) if (estate / "ledger/runs").is_dir() else []
+        run_dir = runs[0] if len(runs) == 1 else None
+        transcript = (run_dir / "transcript.md") if run_dir else None
+        footer = None
+        if transcript and transcript.is_file():
+            m = FOOTER.search(transcript.read_text(encoding="utf-8"))
+            footer = m.group(0) if m else None
+        verdict_in_transcript = FOOTER.search(footer).group(2) if footer else None
+        call_file = estate / "fixture/publish-evidence-call.json"
+        call = json.loads(call_file.read_text(encoding="utf-8")) if call_file.is_file() else None
+        entries = sorted(e.name for e in run_dir.iterdir()) if run_dir else []
+        hello = (run_dir / "workspace/hello.txt") if run_dir else None
+        observation = {
+            "runner": str(binary),
+            "exit_code": proc.returncode,
+            "signal": signal.Signals(-proc.returncode).name if proc.returncode < 0 else None,
+            "stdout": proc.stdout.splitlines(),
+            "stderr": proc.stderr.splitlines(),
+            "gateway_requests": len(gateway.requests),
+            "ledger_rows_before": before,
+            "ledger_rows_after": after,
+            "run_dirs": [d.name for d in runs],
+            "run_dir_entries": entries,
+            "workspace_hello_txt": hello.read_text(encoding="utf-8") if hello and hello.is_file() else None,
+            "transcript_exists": bool(transcript and transcript.is_file()),
+            "transcript_footer": footer,
+            "publish_evidence_invoked": call is not None,
+            "publish_evidence_stdin_verdict": (call or {}).get("stdin", {}).get("verdict") if call else None,
+            "publish_evidence_stdin_check_exit": (call or {}).get("stdin", {}).get("check_exit") if call else None,
+            "publish_evidence_killed_pid": (call or {}).get("runner") if call else None,
+            "terminal_json": "terminal.json" in entries,
+            "messages_jsonl": "messages.jsonl" in entries,
+            "check_json": "check.json" in entries,
+            "finalized_json": "finalized.json" in entries,
+            "evidence_record": "evidence" in entries or "ready_for_inspection" in entries,
+        }
+        print("observation " + json.dumps(observation, sort_keys=True, ensure_ascii=False))
+        print()
+        print("--- observation")
+        rep.expect(proc.returncode == -signal.SIGKILL, "runner terminated by SIGKILL",
+                   "returncode=%s" % proc.returncode)
+        rep.expect(run_dir is not None, "exactly one run dir", str(entries))
+        rep.expect(observation["publish_evidence_invoked"], "publish-evidence was invoked (boundary reached)")
+        rep.expect(observation["publish_evidence_killed_pid"] == proc.pid if hasattr(proc, "pid") else True,
+                   "kill sent to the runner", "pid=%s" % observation["publish_evidence_killed_pid"])
+        rep.expect(observation["messages_jsonl"], "messages.jsonl survives the kill (the runner's structured transcript)")
+        rep.expect(observation["transcript_exists"],
+                   "transcript.md exists in run dir (finalize-run's render step ran before the footer)")
+        rep.expect(footer is not None, "transcript footer records the verdict", footer or "no footer")
+        rep.expect(verdict_in_transcript == "pass", "verdict computed was pass (check ran)",
+                   "transcript=%s publish_evidence_stdin=%s" % (verdict_in_transcript, observation["publish_evidence_stdin_verdict"]))
+        rep.expect(observation["publish_evidence_stdin_verdict"] == verdict_in_transcript,
+                   "verdict handed to publish-evidence matches transcript (in memory, then gone)")
+        rep.expect(after == before, "ledger has NO row for the run", "%d -> %d rows" % (before, after))
+        rep.expect(observation["terminal_json"], "terminal.json survives the kill (the durable record)")
+        rep.expect(observation["check_json"], "check.json survives the kill (the verdict is persisted, not re-derived)")
+        rep.expect(not observation["evidence_record"], "no evidence record")
+        rep.expect(not observation["finalized_json"], "no finalized.json: unfinished finalization, by definition")
+        if after != before:
+            print("STOP: a row was appended despite SIGKILL inside publish-evidence; the task's premise is wrong")
+            return 2
+
+        # --- 2. detection -----------------------------------------------------
+        print("--- detection (tick:290, tick:303-305)")
+        fresh = execution_row(ledger, SPEC_REL, SPEC_ID, before)
+        rep.expect(fresh == {}, "execution_row(rel, sid, before) finds no fresh row -> tick raises "
+                   "'trial produced no fresh matching execution row'")
+        stale = execution_row(ledger, SPEC_REL, SPEC_ID, 0)
+        rep.expect(bool(stale) and stale["transcript"] == PRIOR_ROWS[1]["transcript"],
+                   "control: without the cursor the prior same-spec row would be mistaken for this trial",
+                   "matched=%s" % stale.get("transcript"))
+        # The per-cell line is printed after Run returns, which never happens; the
+        # banner and TOTAL lines left the runner for ops/bin/run-spec.
+        rep.expect(proc.stdout == "" and proc.stderr.strip() == "",
+                   "manual `lab run` reports nothing: no cell line, no stderr, "
+                   "only exit status %d" % proc.returncode,
+                   "stdout=%r stderr=%r" % (proc.stdout, proc.stderr))
+        run_name = run_dir.name if run_dir else ""
+        rep.expect(run_name not in proc.stderr, "no stderr line names the run dir or the loss")
+
+        # --- 3. recovery (Plan.CS.v2.1 §4 'Recovery contract for finalize-run') --
+        print("--- recovery (Plan.CS.v2.1 §4 'Recovery contract for finalize-run')")
+        finalize = estate / "ops/bin/finalize-run"
+        if not finalize.is_file():
+            rep.expect(False, "recovery: no finalize-run op; transcript, check result and row are unrecoverable")
+        else:
+            payload = json.dumps({"run_dir": str(run_dir)})
+            first = subprocess.run([str(finalize)], cwd=str(estate), env=env, input=payload,
+                                   text=True, capture_output=True, timeout=120)
+            rows1 = rows_of(ledger)
+            new1 = [r for r in rows1[before:] if r.get("transcript", "").endswith(run_name)]
+            rep.expect(first.returncode == 0, "finalize-run exits 0 on the crashed run dir",
+                       "rc=%d stderr=%r" % (first.returncode, first.stderr))
+            rep.expect(len(new1) == 1, "finalize-run appended exactly one row for the run",
+                       "rows %d -> %d, matching=%d" % (before, len(rows1), len(new1)))
+            rep.expect(bool(new1) and new1[0].get("verdict") == verdict_in_transcript,
+                       "recovered row carries the original verdict", "row=%s transcript=%s"
+                       % ((new1[0].get("verdict") if new1 else None), verdict_in_transcript))
+            ents = sorted(e.name for e in run_dir.iterdir())
+            rep.expect("evidence" in ents or "ready_for_inspection" in ents, "evidence record exists", str(ents))
+            rep.expect("finalized.json" in ents, "finalized.json written last", str(ents))
+            steps = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8")).get("steps", {}) \
+                if "finalized.json" in ents else {}
+            rep.expect(steps.get("check") == "existing" and steps.get("render") == "existing"
+                       and steps.get("transcript") == "existing",
+                       "recovery found the check, the rendered body and the footer from before the kill", str(steps))
+            rep.expect((run_dir / "transcript.md").read_text(encoding="utf-8").count("\n---\nstop ") == 1,
+                       "recovery appended no second footer")
+            second = subprocess.run([str(finalize)], cwd=str(estate), env=env, input=payload,
+                                    text=True, capture_output=True, timeout=120)
+            rows2 = rows_of(ledger)
+            rep.expect(second.returncode == 0 and len(rows2) == len(rows1),
+                       "second finalize-run is idempotent: no second row",
+                       "rc=%d rows %d -> %d" % (second.returncode, len(rows1), len(rows2)))
+        if keep:
+            print("estate kept at %s" % estate)
+    finally:
+        if gateway:
+            gateway.close()
+        if not keep:
+            shutil.rmtree(scratch, ignore_errors=True)
+    print()
+    print("check: finalize-crash-loses-row %d assertion(s) failed%s"
+          % (len(rep.failed), (": " + "; ".join(rep.failed)) if rep.failed else ""))
+    return 1 if rep.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

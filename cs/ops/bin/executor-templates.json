@@ -1,0 +1,689 @@
+{
+  "claude-code": {
+    "binary": "claude",
+    "args": [
+      "--print",
+      "--dangerously-skip-permissions",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.01,
+    "auth": "subscription",
+    "keychain": "login",
+    "copies": {
+      "{{tmp}}/claude-home/.claude/.credentials.json": "~/.claude/.credentials.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "claude-code-sonnet": {
+    "binary": "claude",
+    "args": [
+      "--print",
+      "--dangerously-skip-permissions",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.01,
+    "auth": "subscription",
+    "keychain": "login",
+    "copies": {
+      "{{tmp}}/claude-home/.claude/.credentials.json": "~/.claude/.credentials.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "claude-code-sonnet-planner": {
+    "binary": "claude",
+    "args": [
+      "--print",
+      "--permission-mode",
+      "acceptEdits",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet",
+      "--setting-sources",
+      "",
+      "--settings",
+      "{\"disableAllHooks\":true}",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Write",
+      "--disable-slash-commands",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.01,
+    "auth": "subscription",
+    "keychain": "login",
+    "copies": {
+      "{{tmp}}/claude-home/.claude/.credentials.json": "~/.claude/.credentials.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "claude-code-opus": {
+    "binary": "claude",
+    "args": [
+      "--print",
+      "--dangerously-skip-permissions",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "opus",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.025,
+    "auth": "subscription",
+    "keychain": "login",
+    "copies": {
+      "{{tmp}}/claude-home/.claude/.credentials.json": "~/.claude/.credentials.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "claude-code-opus-judge": {
+    "binary": "claude",
+    "args": [
+      "--print",
+      "--permission-mode",
+      "acceptEdits",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "opus",
+      "--setting-sources",
+      "",
+      "--settings",
+      "{\"disableAllHooks\":true}",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Write",
+      "--disable-slash-commands",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.025,
+    "auth": "subscription",
+    "keychain": "login",
+    "copies": {
+      "{{tmp}}/claude-home/.claude/.credentials.json": "~/.claude/.credentials.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "codex": {
+    "binary": "codex",
+    "args": [
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--ignore-user-config",
+      "{{prompt}}"
+    ],
+    "env": {
+      "CODEX_HOME": "{{tmp}}/codex-home",
+      "TMPDIR": "{{tmp}}/os-tmp",
+      "TMP": "{{tmp}}/os-tmp",
+      "TEMP": "{{tmp}}/os-tmp"
+    },
+    "env_drop": [
+      "OPENAI_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.015,
+    "auth": "subscription",
+    "copies": {
+      "{{tmp}}/codex-home/auth.json": "~/.codex/auth.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "gemini-cli": {
+    "binary": "gemini",
+    "args": [
+      "--yolo",
+      "--skip-trust",
+      "--output-format",
+      "stream-json",
+      "--prompt",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.003,
+    "auth": "subscription",
+    "env": {
+      "GEMINI_CLI_HOME": "{{tmp}}/gemini-home"
+    },
+    "links": {
+      "{{tmp}}/gemini-home/.gemini/settings.json": "~/.gemini/settings.json",
+      "{{tmp}}/gemini-home/.gemini/oauth_creds.json": "~/.gemini/oauth_creds.json",
+      "{{tmp}}/gemini-home/.gemini/google_accounts.json": "~/.gemini/google_accounts.json",
+      "{{tmp}}/gemini-home/.gemini/gemini-credentials.json": "~/.gemini/gemini-credentials.json",
+      "{{tmp}}/gemini-home/.gemini/installation_id": "~/.gemini/installation_id"
+    },
+    "terminal": "gemini_result",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "cursor-agent": {
+    "binary": "cursor-agent",
+    "args": [
+      "--print",
+      "--force",
+      "--trust",
+      "--sandbox",
+      "disabled",
+      "--output-format",
+      "stream-json",
+      "{{prompt}}"
+    ],
+    "env": {
+      "CURSOR_CONFIG_DIR": "{{tmp}}/cursor/config",
+      "CURSOR_DATA_DIR": "{{tmp}}/cursor/data"
+    },
+    "env_drop": [
+      "CURSOR_API_KEY"
+    ],
+    "terminal": "cursor_result",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.015,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "cursor-sol": {
+    "binary": "cursor-agent",
+    "args": [
+      "--print",
+      "--force",
+      "--trust",
+      "--sandbox",
+      "disabled",
+      "--output-format",
+      "stream-json",
+      "--model",
+      "gpt-5.6-sol-high",
+      "{{prompt}}"
+    ],
+    "env": {
+      "CURSOR_CONFIG_DIR": "{{tmp}}/cursor/config",
+      "CURSOR_DATA_DIR": "{{tmp}}/cursor/data"
+    },
+    "env_drop": [
+      "CURSOR_API_KEY"
+    ],
+    "terminal": "cursor_result",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.015,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "cursor-codex": {
+    "binary": "cursor-agent",
+    "args": [
+      "--print",
+      "--force",
+      "--trust",
+      "--sandbox",
+      "disabled",
+      "--output-format",
+      "stream-json",
+      "--model",
+      "gpt-5.3-codex-high",
+      "{{prompt}}"
+    ],
+    "env": {
+      "CURSOR_CONFIG_DIR": "{{tmp}}/cursor/config",
+      "CURSOR_DATA_DIR": "{{tmp}}/cursor/data"
+    },
+    "env_drop": [
+      "CURSOR_API_KEY"
+    ],
+    "terminal": "cursor_result",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.015,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "cursor-composer": {
+    "binary": "cursor-agent",
+    "args": [
+      "--print",
+      "--force",
+      "--trust",
+      "--sandbox",
+      "disabled",
+      "--output-format",
+      "stream-json",
+      "--model",
+      "composer-2.5",
+      "{{prompt}}"
+    ],
+    "env": {
+      "CURSOR_CONFIG_DIR": "{{tmp}}/cursor/config",
+      "CURSOR_DATA_DIR": "{{tmp}}/cursor/data"
+    },
+    "env_drop": [
+      "CURSOR_API_KEY"
+    ],
+    "terminal": "cursor_result",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.015,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "cursor-grok": {
+    "binary": "cursor-agent",
+    "args": [
+      "--print",
+      "--force",
+      "--trust",
+      "--sandbox",
+      "disabled",
+      "--output-format",
+      "stream-json",
+      "--model",
+      "grok-4.7-high",
+      "{{prompt}}"
+    ],
+    "env": {
+      "CURSOR_CONFIG_DIR": "{{tmp}}/cursor/config",
+      "CURSOR_DATA_DIR": "{{tmp}}/cursor/data"
+    },
+    "env_drop": [
+      "CURSOR_API_KEY"
+    ],
+    "terminal": "cursor_result",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.015,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "cursor-sonnet": {
+    "binary": "cursor-agent",
+    "args": [
+      "--print",
+      "--force",
+      "--trust",
+      "--sandbox",
+      "disabled",
+      "--output-format",
+      "stream-json",
+      "--model",
+      "claude-sonnet-5-thinking-high",
+      "{{prompt}}"
+    ],
+    "env": {
+      "CURSOR_CONFIG_DIR": "{{tmp}}/cursor/config",
+      "CURSOR_DATA_DIR": "{{tmp}}/cursor/data"
+    },
+    "env_drop": [
+      "CURSOR_API_KEY"
+    ],
+    "terminal": "cursor_result",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.015,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "antigravity": {
+    "binary": "agy",
+    "args": [
+      "--output-format",
+      "stream-json",
+      "--dangerously-skip-permissions",
+      "--disable-slash-commands",
+      "--print",
+      "{{prompt}}"
+    ],
+    "home": "private",
+    "env_drop": [
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY"
+    ],
+    "terminal": "antigravity",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.003,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "antigravity-hydrogen": {
+    "binary": "agy",
+    "args": [
+      "--output-format",
+      "stream-json",
+      "--dangerously-skip-permissions",
+      "--disable-slash-commands",
+      "--model",
+      "gemini-4-hydrogen-high",
+      "--print",
+      "{{prompt}}"
+    ],
+    "home": "private",
+    "env_drop": [
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY"
+    ],
+    "terminal": "antigravity",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.003,
+    "auth": "subscription",
+    "keychain": "login",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "test-echo": {
+    "binary": "python3",
+    "args": [
+      "-c",
+      "open('hello.txt','w').write('hello\\n')"
+    ],
+    "cost_class": "free_local",
+    "cost_usd": 0,
+    "cost_per_1k": 0.002,
+    "auth": "none",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "muse-code": {
+    "binary": "muse-bin-1.0.3-R2198.1",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "auth": "oauth_keychain",
+    "profile": "muse-profile.json",
+    "est_rate_known": false,
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "opencode": {
+    "binary": "/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe",
+    "profile": "cli-profiles.json",
+    "auth": "none",
+    "cost_class": "free_local",
+    "cost_usd": 0,
+    "est_rate_known": true,
+    "env": {
+      "XDG_CONFIG_HOME": "{{tmp}}/opencode/config",
+      "XDG_DATA_HOME": "{{tmp}}/opencode/data",
+      "XDG_STATE_HOME": "{{tmp}}/opencode/state",
+      "XDG_CACHE_HOME": "{{tmp}}/opencode/cache"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "opencode-go": {
+    "binary": "/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe",
+    "profile": "cli-profiles.json",
+    "auth": "opencode_db",
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "est_rate_known": false,
+    "env": {
+      "XDG_CONFIG_HOME": "{{tmp}}/opencode/config",
+      "XDG_DATA_HOME": "{{tmp}}/opencode/data",
+      "XDG_STATE_HOME": "{{tmp}}/opencode/state",
+      "XDG_CACHE_HOME": "{{tmp}}/opencode/cache"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "pi": {
+    "binary": "pi",
+    "args": [
+      "--print",
+      "--mode",
+      "json",
+      "--no-session",
+      "--model",
+      "openai-codex/gpt-6.1-sol",
+      "--approve",
+      "--tools",
+      "read,bash,edit,write",
+      "{{prompt}}"
+    ],
+    "home": "private",
+    "env": {
+      "PI_CODING_AGENT_DIR": "{{tmp}}/pi-agent",
+      "PI_CODING_AGENT_SESSION_DIR": "{{tmp}}/pi-sessions",
+      "PI_TELEMETRY": "0"
+    },
+    "links": {
+      "{{tmp}}/pi-agent/settings.json": "~/.pi/agent/settings.json",
+      "{{tmp}}/pi-agent/models.json": "~/.pi/agent/models.json"
+    },
+    "deny_write": [
+      "~/.pi/agent"
+    ],
+    "terminal": "pi_json",
+    "unmetered": true,
+    "cost_class": "api",
+    "auth": "stored",
+    "copies": {
+      "{{tmp}}/pi-agent/auth.json": "~/.pi/agent/auth.json"
+    },
+    "interpreters": [
+      "node"
+    ],
+    "sockets_allow": [],
+    "home_reads": [
+      "~/.pi/agent/install"
+    ]
+  },
+  "goose": {
+    "binary": "goose",
+    "args": [
+      "run",
+      "--text",
+      "{{prompt}}",
+      "--output-format",
+      "json",
+      "--with-builtin",
+      "developer",
+      "--max-turns",
+      "{{turns}}"
+    ],
+    "home": "private",
+    "env": {
+      "GOOSE_MODE": "auto",
+      "XDG_CONFIG_HOME": "{{tmp}}/home/.config",
+      "XDG_DATA_HOME": "{{tmp}}/home/.local/share",
+      "XDG_STATE_HOME": "{{tmp}}/home/.local/state",
+      "XDG_CACHE_HOME": "{{tmp}}/home/.cache"
+    },
+    "links": {
+      "{{tmp}}/home/.config/goose/config.yaml": "~/.config/goose/config.yaml",
+      "{{tmp}}/home/.config/goose/chatgpt_codex": "~/.config/goose/chatgpt_codex",
+      "{{tmp}}/home/.config/goose/gemini_oauth": "~/.config/goose/gemini_oauth",
+      "{{tmp}}/home/.config/goose/xai_oauth": "~/.config/goose/xai_oauth"
+    },
+    "deny_write": [
+      "~/.config/goose",
+      "~/.local/share/goose",
+      "~/.local/state/goose"
+    ],
+    "terminal": "goose_json",
+    "unmetered": true,
+    "cost_class": "api",
+    "auth": "stored",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "grok": {
+    "binary": "~/.grok/bin/grok",
+    "args": [
+      "-p",
+      "{{prompt}}",
+      "--output-format",
+      "json",
+      "--always-approve",
+      "--permission-mode",
+      "bypassPermissions",
+      "--no-plan",
+      "--no-subagents",
+      "--max-turns",
+      "{{turns}}",
+      "--cwd",
+      "{{workspace}}"
+    ],
+    "home": "private",
+    "env": {
+      "GROK_HOME": "{{tmp}}/grok-home",
+      "GROK_DISABLE_AUTOUPDATER": "1"
+    },
+    "env_drop": [
+      "XAI_API_KEY",
+      "GROK_API_KEY"
+    ],
+    "copies": {
+      "{{tmp}}/grok-home/auth.json": "~/.grok/auth.json"
+    },
+    "deny_write": [
+      "~/.grok"
+    ],
+    "terminal": "grok_json",
+    "unmetered": true,
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "auth": "subscription",
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "claude-auth-context-probe": {
+    "binary": "tasks/regressions/claude-auth-context/claude",
+    "args": [
+      "--print",
+      "--permission-mode",
+      "acceptEdits",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet",
+      "--setting-sources",
+      "",
+      "--settings",
+      "{\"disableAllHooks\":true}",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Write",
+      "--disable-slash-commands",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.01,
+    "auth": "subscription",
+    "keychain": "login",
+    "copies": {
+      "{{tmp}}/claude-home/.claude/.credentials.json": "~/.claude/.credentials.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  },
+  "claude-code-sonnet-patch": {
+    "binary": "claude",
+    "args": [
+      "--print",
+      "--permission-mode",
+      "acceptEdits",
+      "--allowedTools",
+      "Bash",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "sonnet",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Bash",
+      "--disable-slash-commands",
+      "{{prompt}}"
+    ],
+    "env_drop": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "cost_class": "subscription",
+    "cost_usd": 0,
+    "cost_per_1k": 0.01,
+    "auth": "subscription",
+    "keychain": "login",
+    "copies": {
+      "{{tmp}}/claude-home/.claude/.credentials.json": "~/.claude/.credentials.json"
+    },
+    "sockets_allow": [],
+    "home_reads": []
+  }
+}

@@ -1,0 +1,1032 @@
+{
+  "binary": {
+    "path": "<scratch build>",
+    "sha256": "07082521e77dc6364f68769b87fd1520b3d106744e445d49d23594d5d439877c"
+  },
+  "concurrency": "cases run sequentially; shared gateways per configuration (base, auth, admit, cloud) reused across cases with mocks reset between them; within a case, concurrency is explicit (admission and cancellation cases hold upstream requests).",
+  "effective_config": {
+    "dropped_disables": [],
+    "sha256": "70b915807313e18484aeb40c6ae99626b0b0ac73d2b4f8226c69db6272695135",
+    "value": {
+      "env": {
+        "CSGATEWAY_AUTH_REQUIRED": "false",
+        "CSGATEWAY_CREDENTIALS": "off",
+        "CSGATEWAY_DISCOVERY_HEALTH": "off",
+        "HOME": "<TMP>/manifest/home",
+        "HTTPS_PROXY": "<PROXY>",
+        "HTTP_PROXY": "<PROXY>",
+        "LANG": "C",
+        "LOGNAME": "spec",
+        "NO_PROXY": "",
+        "OLLAMA_ENDPOINT": "<OLLAMA>",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "SSL_CERT_FILE": "<TMP>/tls/ca.pem",
+        "TMPDIR": "<TMP>/manifest/tmp",
+        "USER": "spec",
+        "VLLM_ENDPOINT": "<VLLM>",
+        "http_proxy": "<PROXY>",
+        "https_proxy": "<PROXY>",
+        "no_proxy": ""
+      },
+      "models": {
+        "deployments": [],
+        "executables": {
+          "claude": "<TMP>/bin/claude",
+          "codex": "<TMP>/absent/codex",
+          "gemini": "<TMP>/absent/gemini",
+          "python3": "<PYTHON>"
+        },
+        "models": [
+          {
+            "capability": "coding",
+            "name": "local-coder",
+            "preferred": true,
+            "provider": "vllm",
+            "tier": 1
+          },
+          {
+            "capability": "coding",
+            "name": "vllm-big",
+            "provider": "vllm",
+            "tier": 2
+          },
+          {
+            "capability": "general",
+            "cost_class": "api",
+            "cost_per_1k": 0.01,
+            "name": "fake-paid",
+            "provider": "vllm",
+            "tier": 3
+          },
+          {
+            "capability": "general",
+            "cost_class": "subscription",
+            "cost_per_1k": 0.02,
+            "name": "fake-sub",
+            "provider": "vllm",
+            "tier": 3
+          },
+          {
+            "capability": "coding",
+            "name": "vllm-absent",
+            "provider": "vllm",
+            "tier": 2
+          },
+          {
+            "capability": "general",
+            "name": "ollama-small",
+            "provider": "ollama",
+            "tier": 2
+          },
+          {
+            "capability": "coding",
+            "cost_per_1k": 0.015,
+            "name": "gpt-spec",
+            "provider": "openai",
+            "tier": 1
+          },
+          {
+            "capability": "coding",
+            "cost_per_1k": 0.015,
+            "name": "claude-spec",
+            "provider": "anthropic",
+            "tier": 1
+          },
+          {
+            "capability": "coding",
+            "cli_binary": "claude",
+            "executor": "cli",
+            "name": "claude-code",
+            "provider": "anthropic",
+            "tier": 1
+          },
+          {
+            "capability": "general",
+            "name": "mock-echo",
+            "provider": "mock",
+            "tier": 3
+          }
+        ]
+      },
+      "profile": {
+        "_notes": [
+          "build: run from gateway/, builds the workspace's release binary and copies it to the runner's {out}. CSGATEWAY_BIN=<repo>/target/release/cs-gateway skips it.",
+          "upstream_env: the same variables as Go (the Rust gateway reads Go's environment contract unchanged).",
+          "ca_env: rustls with native roots honours SSL_CERT_FILE on every platform (no GODEBUG equivalent is needed).",
+          "disable_endpoints: none. vllm-spark2 is not compiled in (G5 moved it to a host overlay file), so nothing local needs guarding."
+        ],
+        "build": [
+          "sh",
+          "-c",
+          "cargo build --release -q -p cs-gateway && cp ../target/release/cs-gateway \"$0\"",
+          "{out}"
+        ],
+        "ca_env": [
+          "SSL_CERT_FILE"
+        ],
+        "capabilities": {
+          "tls_intercept": true
+        },
+        "disable_endpoints": [],
+        "env": {},
+        "impl": "rust",
+        "source": "gateway/",
+        "upstream_env": {
+          "ollama": "OLLAMA_ENDPOINT",
+          "vllm": "VLLM_ENDPOINT"
+        }
+      }
+    }
+  },
+  "fixtures": {
+    "files": 25,
+    "sha256": "78f5578c383f5afa2ef93fe26ddfa3dee9cbf7469938b62df44fb595440e78fc"
+  },
+  "impl": "rust",
+  "method": "Black box at the process boundary: each case starts or reuses a gateway process with a fresh HOME and cwd, a minimal environment (no inherited variables, no *_API_KEY), credentials off unless the case supplies a temp file store with fake keys, and every outbound connection through the suite's egress proxy (provider hosts TLS-terminated locally to mocks, all others refused). Assertions are on HTTP status, headers, bodies, SSE frames, bytes sent upstream, child argv/stdin/environment, exit codes, files and log rows. Normalised: latency_ms, timestamps (RFC3339 fields compared by shape or relation), uptime, ephemeral ports and temp paths. Never normalised: resolved model, cost amount/class/est_usd/charged_usd, error class and code, missing terminal events, upstream request counts.",
+  "os": {
+    "machine": "arm64",
+    "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+    "release": "27.2.0",
+    "system": "Darwin"
+  },
+  "results": {
+    "cases": [
+      {
+        "area": "routes",
+        "id": "health-shape",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "health-ollama-unreachable",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "capabilities-shape",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "models-listing",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "models-cli",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "retired-routes-404",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "unknown-route-and-method",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "auth-bearer",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "auth-retired-route-order",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "schema-v2-and-v1-echo",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "alias-route",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "schema-mismatch",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "malformed-json",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "empty-messages",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "unknown-fields-ignored",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "wire-cutover-counts",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "admission-report-unconfigured",
+        "result": "pass"
+      },
+      {
+        "area": "routes",
+        "id": "inventory-refresh-route",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "unknown-model-refuses",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "empty-hint-local-coder",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "empty-hint-other-free-local",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "empty-hint-no-free-local",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "resolved-model-echoed",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "named-unavailable-dispatches",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "no-fallback-on-failure",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "cli-entry-refused",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "api-without-credential",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "mock-provider",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "system-messages-hoisted",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "only-system-messages",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "upstream-reply-model-ignored",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "rate-limits-parked-on-agent-route",
+        "result": "pass"
+      },
+      {
+        "area": "routing",
+        "id": "duplicate-discovered-name",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "request-bytes",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "default-max-tokens",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "native-tool-calls",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "tool-args-empty-or-unparseable",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "hermes-xml-tool-calls",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "native-tool-calls-win-over-xml",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "tool-history-forwarded",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "legacy-tool-observation",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "malformed-tool-history-refused",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "images-refused-openai-compat",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "invalid-neutral-image-block",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "finish-reason-passthrough",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "reasoning-fields-not-content",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "no-choices",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "upstream-status-classes",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "upstream-garbage",
+        "result": "pass"
+      },
+      {
+        "area": "translation",
+        "id": "upstream-unreachable",
+        "result": "pass"
+      },
+      {
+        "area": "streaming",
+        "id": "stream-unknown-model",
+        "result": "pass"
+      },
+      {
+        "area": "streaming",
+        "id": "stream-empty-messages",
+        "result": "pass"
+      },
+      {
+        "area": "streaming",
+        "id": "stream-invalid-image-block",
+        "result": "pass"
+      },
+      {
+        "area": "streaming",
+        "id": "stream-schema-mismatch-is-envelope",
+        "result": "pass"
+      },
+      {
+        "area": "streaming",
+        "id": "stream-openai-compat-unsupported",
+        "result": "pass"
+      },
+      {
+        "area": "streaming",
+        "id": "stream-mock-unsupported",
+        "result": "pass"
+      },
+      {
+        "area": "streaming",
+        "id": "stream-empty-hint-refused",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-request-bytes",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-unary-response",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-tool-name-refusals",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-images",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-tool-history",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-status-classes",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-normal",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-v1-family",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-stop-reason",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-eof-without-stop",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-error-event",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-upstream-status",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-cut",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-deadline",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-client-disconnect",
+        "result": "pass"
+      },
+      {
+        "area": "anthropic",
+        "id": "anthropic-stream-tool-use-dropped",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "api-class",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "subscription-class",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "free-local-class",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "ollama-shadow-price",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "rounding",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "provider-reported-charge",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "negative-charge-refused",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "errors-cost-nothing",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "budget-fields-not-enforced",
+        "result": "pass"
+      },
+      {
+        "area": "accounting",
+        "id": "budget-max-usd-must-be-string",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "admission-report",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "queue-then-full",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "cancel-while-queued",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "cancel-in-flight",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "deadline-in-flight",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "unbound-model-refused",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "release-on-every-path",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "queue-timeout",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "no-queue-configured",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "shared-host-capacity",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "estate-capacity-share",
+        "result": "pass"
+      },
+      {
+        "area": "admission",
+        "id": "stream-holds-permit",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-runs-child",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-env-filtered",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-exit-code",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-invalid",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-oversize",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-unbound-executor",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-queue-full",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-cancel-kills-tree",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-surviving-descendant",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-parent-death",
+        "result": "pass"
+      },
+      {
+        "area": "workorders",
+        "id": "workorder-not-configured",
+        "result": "pass"
+      },
+      {
+        "area": "transport",
+        "id": "socket-same-routes",
+        "result": "pass"
+      },
+      {
+        "area": "transport",
+        "id": "socket-auth",
+        "result": "pass"
+      },
+      {
+        "area": "transport",
+        "id": "socket-lab-execute-refused",
+        "result": "pass"
+      },
+      {
+        "area": "transport",
+        "id": "socket-stale-replaced-and-removed",
+        "result": "pass"
+      },
+      {
+        "area": "transport",
+        "id": "socket-refusals",
+        "result": "pass"
+      },
+      {
+        "area": "transport",
+        "id": "socket-default-under-state-root",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-health-modes",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-failure-isolated",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-error-classes",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-stale-and-recovery",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-stopped-loop-goes-stale",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-health-persisted",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-disabled",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-stale-after-bound",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-sighup-refresh",
+        "result": "pass"
+      },
+      {
+        "area": "discovery",
+        "id": "discovery-ollama-auto-add",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "store-keys-used",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "discovery-list-decides-availability",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "store-refused-fails-closed",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "store-file-too-open",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "keychain-providers-narrow",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "env-keys-ignored",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "env-keys-not-inherited-by-children",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "credentials-invalid-spec",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "credentials-cli",
+        "result": "pass"
+      },
+      {
+        "area": "credentials",
+        "id": "credentials-resolved-once",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "auth-token-required",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "auth-disabled-warns",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "invalid-deployments",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "invalid-executables",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "lab-executor-validated",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "missing-models-json",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "sigterm-clean-exit",
+        "result": "pass"
+      },
+      {
+        "area": "process",
+        "id": "port-in-use",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "catalog-status-shape",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "overlay-adds-endpoint",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "overlay-patches-endpoint",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "overlay-env-override-wins",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "overlay-removes-endpoint",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "overlay-removed-endpoint-leaves-discovery",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "overlay-rejects-fail-startup",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "overlay-dir-default-off-and-missing",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "revision-deterministic",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "reload-sighup-publishes",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "reload-by-poll",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "reload-bad-file-keeps-snapshot",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "reload-error-clears-when-restored",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "revision-bound-per-call",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "reload-keeps-admission-permits",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "model-cache-fresh-stale-empty",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "model-cache-expires",
+        "result": "pass"
+      },
+      {
+        "area": "catalog",
+        "id": "dgx-overlay-ids-resolve",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "capability-denied-before-permit",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "endpoint-declaration-narrows",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "intersection-denial-wins",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "stream-denied-before-connection",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "discovery-skips-denied-host",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "cross-host-redirect-refused",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "offline-missing-policy-loopback-only",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "offline-invalid-policy-loopback-only",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "offline-expiry-during-run",
+        "result": "pass"
+      },
+      {
+        "area": "policy",
+        "id": "tenant-reload-rejects",
+        "result": "pass"
+      }
+    ],
+    "counts": {
+      "pass": 168
+    },
+    "seconds": 38.8
+  },
+  "schema": "modelgateway-spec.baseline.v1",
+  "selection": {
+    "by_area": {
+      "accounting": 10,
+      "admission": 12,
+      "anthropic": 16,
+      "catalog": 18,
+      "credentials": 10,
+      "discovery": 10,
+      "policy": 10,
+      "process": 8,
+      "routes": 18,
+      "routing": 15,
+      "streaming": 7,
+      "translation": 17,
+      "transport": 6,
+      "workorders": 11
+    },
+    "cases": 168,
+    "fast_only": false
+  },
+  "source": {
+    "commit": "d838d4f60 + credentials resolved once (uncommitted working tree)",
+    "suite_commit": "0cfa2921487954c1d0f71d0b9d5e05b3fa01ea3e",
+    "suite_dirty": true
+  },
+  "toolchain": {
+    "harness": "python 3.15.2",
+    "implementation": "",
+    "openssl": "OpenSSL 4.1.0 23 Oct 2026 (Library: OpenSSL 4.1.0 23 Oct 2026)"
+  }
+}

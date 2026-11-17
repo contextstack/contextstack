@@ -1,0 +1,1279 @@
+#!/bin/sh
+''':'
+# cs: the CLI for this machine's ContextStack install. Uses the install's pinned interpreter when present; otherwise python3.
+KIT=cs
+PY="$HOME/.contextstack/current/$KIT/.venv/bin/python3"
+[ -x "$PY" ] || PY=$(command -v python3) || { echo "cs: no ContextStack install on this machine (no ~/.contextstack/current); install with the ContextStack install script (curl | sh), or run cs update if releases are already present" >&2; exit 1; }
+exec "$PY" -I "$0" "$@"
+'''
+# Implementation detail (not in --help): start/stop use launchctl bootstrap/bootout/kickstart; releases delegate to
+# scripts/node-install under the hood; cs init activates through node-release.
+DOC = """cs: see and control this machine's ContextStack install.
+
+  cs status [--json]                         release, services, gateway, machine, Director, spend, tunnels, disk
+  cs logs SERVICE [-n N] [-f]                service stdout and stderr
+  cs start|stop|restart SERVICE              gateway, node, director, client-web, or tunnels
+  cs models [--json]                         models the gateway routes to now
+  cs jobs [--json]                           jobs this machine is running or queueing
+  cs release list|switch ID|rollback         list, activate, or roll back a release
+  cs doctor [--json] [--repin [TEMPLATE|all]]  problems and how to fix them; --repin re-records CLI binary pins
+  cs repo add PATH [--name NAME] [--branch BRANCH] [--gate CMD]
+  cs repo list | remove NAME                 register, list or remove this machine's repos
+  cs land REPO LANE [-m MSG] [--job JOB] [--json]
+                                             land: accept a task lane's result into a repo's main line after its check
+                                             passes; refuses a dirty main; never pushes
+  cs update [--channel stable|pre] [--pre] [--allow-downgrade] [--bundle DIR] [--check]
+                                             check or install a release (user-run)
+  cs init [--yes] [--name NAME] [--director-listen ADDR] [--agent NAME] [--api-key PROVIDER]...
+          [--first-job | --no-first-job] [--timeout S]
+                                             set up this machine with its own Director, gateway, and an optional first
+                                             job through a signed-in agent; rerun after a failed first job
+  cs lead create [--node NAME] [--model TEMPLATE] [--title TITLE]
+                 [--director URL] [--credential-file PATH]
+                                             conversation and hosted lead credential for the owner
+  cs mcp [--director URL] [--credential-file PATH] [--node NAME]
+                                             the Director Client API as MCP tools for a lead agent
+  cs review weekly [--since DAYS] [--json] [--plist] [--director URL] [--credential-file PATH] [--node NAME]
+                                             weekly task-lane review from the Director
+  cs review schedule [--state PATH]          install the weekly review schedule on this machine
+  cs ui [--print]                            open or print a one-time Director UI pairing URL (five minutes, once)
+
+Most commands read ~/.contextstack and change nothing. Exceptions: `cs land` commits locally; `cs init` and `cs update`
+write install configuration and activate releases. Secrets are never printed. Env CS_PLATFORM overrides the platform
+probe (tests).
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import plistlib
+import re
+import shutil
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME") or os.path.expanduser("~"))
+ROOT = HOME / ".contextstack"
+CURRENT, CONFIG, LOGS = ROOT / "current", ROOT / "config", ROOT / "logs"
+# The current release code root.
+def _kit_root(current):
+    return current / "cs"
+
+
+KIT = _kit_root(CURRENT)
+AGENTS = HOME / "Library/LaunchAgents"
+PLATFORM = os.environ.get("CS_PLATFORM") or {"darwin": "macos"}.get(sys.platform, sys.platform)
+GATEWAY, NODE = "com.contextstack.csgateway-socket", "com.contextstack.node"
+TUNNELS = ("com.contextstack.spark-tunnel", "com.contextstack.spark2-tunnel")
+DIRECTOR = "com.contextstack.director-rs"  # the Rust Director (node-release --serve-director-rs)
+CLIENT_WEB = "com.contextstack.client-web"  # client-web (node-release --serve-client-web)
+SERVICES = {"gateway": (GATEWAY,), "node": (NODE,), "director": (DIRECTOR,), "client-web": (CLIENT_WEB,), "tunnels": TUNNELS}
+DEFAULT_LOGS = {GATEWAY: "csgateway", NODE: "node", DIRECTOR: "director-rs", CLIENT_WEB: "client-web"}
+DIRECTOR_MODES = (("", 0o700), ("objects", 0o700), ("director.sqlite", 0o600), ("local-credential", 0o600))
+TUNNEL_PORTS = {TUNNELS[0]: 8000, TUNNELS[1]: 8001}
+TUNNEL_SOCK = HOME / ".local/share/dgx-spark/ssh/api-tunnel.sock"
+ROOT_DIRS = ("config", "state", "workspaces", "logs", "gateway", "config/gateway/providers.d")
+SYSTEM_BIN = ("/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/")
+BREW = "/opt/homebrew/bin"
+NO_INSTALL = ("cs: no ContextStack install on this machine (%s is missing); install with the ContextStack install "
+              "script (curl | sh), or run `cs update` if releases are already under ~/.contextstack")
+
+
+# ---- never print a secret -------------------------------------------------------------------------------------
+SECRET_NAME = r"[A-Z][A-Z0-9_]*(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD)"
+SECRET_SHAPES = [re.compile(r"\b(%s)([\"']?\s*(?:=>|=|:)\s*[\"']?)([^\s\"',}]+)" % SECRET_NAME),
+                 re.compile(r"(?i)\b(bearer)(\s+)([A-Za-z0-9._~+/=-]{6,})"),
+                 re.compile(r"()()\b(sk-[A-Za-z0-9_-]{8,})")]
+SECRETS = set()
+
+
+def redact(text):
+    for value in sorted(SECRETS, key=len, reverse=True):
+        text = text.replace(value, "<redacted>")
+    for shape in SECRET_SHAPES:
+        text = shape.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text)
+    return text
+
+
+class Redacting(io.TextIOBase):
+    """Line-buffered: a secret is redacted even when it arrives in pieces."""
+
+    def __init__(self, inner):
+        self.inner, self.pending = inner, ""
+
+    def write(self, s):
+        self.pending += s
+        if "\n" in self.pending:
+            done, self.pending = self.pending.rsplit("\n", 1)
+            self.inner.write(redact(done + "\n"))
+            self.inner.flush()
+        return len(s)
+
+    def flush(self):
+        if self.pending:
+            self.inner.write(redact(self.pending))
+            self.pending = ""
+        self.inner.flush()
+
+
+def parse_node_env(path):
+    """Standalone copy of _node_env's grammar; proc-env-isolation checks parity.
+
+    cs also ships in bootstrap/staged layouts without ops/bin.
+    """
+    assignment = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    values = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = assignment.fullmatch(line)
+        if not match:
+            raise ValueError("node.env: invalid assignment on line %d" % number)
+        try:
+            words = shlex.split(match[2], comments=True, posix=True)
+        except ValueError:
+            raise ValueError("node.env: invalid quoting on line %d" % number) from None
+        if len(words) > 1:
+            raise ValueError("node.env: unquoted whitespace on line %d" % number)
+        values[match[1]] = words[0] if words else ""
+    return values
+
+
+def node_env():
+    """{name: set?} from config/node.env; its values only ever reach the redactor."""
+    values = parse_node_env(CONFIG / "node.env")
+    for value in values.values():
+        if len(value) >= 4:
+            SECRETS.add(value)
+    return {name: bool(value) for name, value in values.items()}
+
+
+# ---- reading the install ----------------------------------------------------------------------------------------
+class Stop(Exception):
+    """Print the message and exit with the code."""
+
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+def installed():
+    return CURRENT.is_symlink() and CURRENT.is_dir()
+
+
+def need_install():
+    if not installed():
+        raise Stop(NO_INSTALL % CURRENT)
+
+
+def need_launchd():
+    if PLATFORM != "macos":
+        raise Stop("cs: services are launchd agents; %s is not supported here yet" % PLATFORM, 2)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def load_plist(label):
+    path = AGENTS / (label + ".plist")
+    try:
+        data = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return path, None
+    env = data.get("EnvironmentVariables") or {}
+    for k, v in env.items():
+        if re.fullmatch(SECRET_NAME, str(k)) and len(str(v)) >= 4:
+            SECRETS.add(str(v))
+    return path, data
+
+
+def program(data):
+    args = data.get("ProgramArguments") or []
+    return str(data.get("Program") or (args[0] if args else ""))
+
+
+def receiver():
+    r = (read_json(CONFIG / "policy/spool.json", {}) or {}).get("receiver")
+    return r if isinstance(r, dict) and r.get("kind") == "director" else None
+
+
+def state_root():
+    _, node = load_plist(NODE)
+    return Path(((node or {}).get("EnvironmentVariables") or {}).get("LAB_STATE_ROOT") or ROOT / "state")
+
+
+def load_script(name, path):
+    path = Path(path)
+    parent = str(path.resolve().parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def release_bin(current, new):
+    """The current release binary; no legacy names are resolved."""
+    return load_script("_node_services", Path(__file__).resolve().with_name("_node_services.py")).release_bin(current, new)
+
+
+def node_release():
+    """The install's own node-release (its load_agent/unload_agent wait out launchd; never copied here)."""
+    path = KIT / "scripts/node-release"
+    if not path.is_file():
+        raise Stop("cs: %s is missing: the current release is broken (cs doctor)" % path)
+    return load_script("node_release", path)
+
+
+def run(argv, timeout=10):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(argv, 127, "", str(error))
+
+
+def curl(url, unix=None, timeout=3):
+    """(HTTP status, body); status 0 when nothing answered. Never sends a credential."""
+    argv = ["curl", "-sS", "-m", str(timeout), "-o", "-", "-w", "\n%{http_code}"]
+    r = run(argv + (["--unix-socket", unix] if unix else []) + [url], timeout + 2)
+    body, _, code = (r.stdout or "").rpartition("\n")
+    return (int(code) if code.strip().isdigit() else 0), body
+
+
+def gateway_get(path):
+    sock = ROOT / "gateway/csgateway.sock"
+    if sock.is_socket():
+        code, body = curl("http://localhost" + path, unix=str(sock))
+        if code:
+            return code, body
+    _, gw = load_plist(GATEWAY)
+    port = ((gw or {}).get("EnvironmentVariables") or {}).get("CSGATEWAY_PORT") or "9200"
+    return curl("http://127.0.0.1:%s%s" % (port, path))
+
+
+# ---- launchd ------------------------------------------------------------------------------------------------------
+def agent(label):
+    """What launchd says about one agent, plus the plist's own problems (never the env it prints)."""
+    path, data = load_plist(label)
+    view = {"label": label, "plist": str(path), "installed": data is not None, "loaded": False, "state": None,
+            "pid": None, "last_exit": None, "up": False, "reason": ""}
+    if data is None:
+        view["reason"] = "no plist"
+        return view
+    if PLATFORM != "macos":
+        view["reason"] = "launchd: not supported here yet"
+        return view
+    r = run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), label)])
+    if r.returncode == 0:
+        view["loaded"] = True
+        for line in r.stdout.splitlines():
+            if line.startswith("\t") and not line.startswith("\t\t"):
+                key, sep, value = line.strip().partition(" = ")
+                if sep and key in ("state", "pid", "last exit code"):
+                    view[{"last exit code": "last_exit"}.get(key, key)] = value.strip()
+    view["pid"] = int(view["pid"]) if str(view["pid"] or "").isdigit() else None
+    if label == NODE:  # a 60 s tick: up when loaded and its last tick did not fail
+        view["up"] = view["loaded"] and str(view["last_exit"] or "0").split(":")[0] in ("0", "(never exited)")
+    else:
+        view["up"] = view["state"] == "running"
+    problems = plist_problems(data)
+    if not view["loaded"]:
+        view["reason"] = "not loaded"
+    elif not view["up"]:
+        view["reason"] = "%s, last exit %s" % (view["state"] or "not running", view["last_exit"] or "?")
+    view["reason"] = "; ".join(x for x in [view["reason"]] + problems if x)
+    return view
+
+
+def plist_problems(data):
+    out = []
+    prog = program(data)
+    if not prog or not os.access(prog, os.X_OK):
+        out.append("program %s does not exist" % (prog or "(none)"))
+    wd = data.get("WorkingDirectory")
+    if wd and not os.path.isdir(wd):
+        out.append("WorkingDirectory %s does not exist" % wd)
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        if data.get(key) and not os.path.isdir(os.path.dirname(data[key])):
+            out.append("log dir %s does not exist" % os.path.dirname(data[key]))
+    return sorted(set(out))
+
+
+# ---- status -------------------------------------------------------------------------------------------------------
+def status_data():
+    record = read_json(CONFIG / "install.json", {}) or {}
+    tokens = node_env()
+    data = {"installed": True, "root": str(ROOT), "platform": PLATFORM,
+            "release": os.readlink(CURRENT).rsplit("/", 1)[-1],
+            "releases": sorted(p.name for p in (ROOT / "releases").iterdir() if p.is_dir()),
+            "gateway_impl": record.get("gateway"), "runner": record.get("runner"),
+            "services": {name: [agent(l) for l in labels
+                                  if l not in TUNNELS or (AGENTS / (l + ".plist")).is_file()] for name, labels in SERVICES.items()}}
+    code, body = gateway_get("/v1/health")
+    health = read_body(body) if code == 200 else {}
+    _, gw = load_plist(GATEWAY)
+    data["gateway"] = {"answers": code != 0, "http": code, "status": health.get("status"),
+                       "catalog_revision": health.get("catalog_revision"),
+                       "models_available": health.get("models_available"),
+                       "providers_active": health.get("providers_active"),
+                       "discovery_stale": health.get("discovery_stale") or [],
+                       "credentials": credential_mode(((gw or {}).get("EnvironmentVariables") or {}))}
+    rec = receiver()
+    init_marker = read_json(CONFIG / "cs-init.json", {}) or {}
+    machine = read_text(CONFIG / "ESTATE") or record.get("node") or init_marker.get("node")
+    node = {"role": "node" if rec else "director host", "estate": read_text(CONFIG / "ESTATE"), "machine": machine}
+    if rec:
+        url = str(rec.get("url") or "")
+        code = curl(url.rstrip("/") + "/api/v1/nodes/me")[0] if url else 0
+        token_env = rec.get("token_env") or "CONTEXTSTACK_NODE_TOKEN"
+        node.update({"director": url, "director_answers": code != 0, "director_http": code,
+                     "token": "set in node.env" if tokens.get(token_env) else "not set (%s in config/node.env)" % token_env})
+    node["last_pull"] = last_tick()
+    outbox = state_root() / "outbox"
+    node["outbox_waiting"] = len([p for p in outbox.glob("*.json") if not p.name.startswith(".")]) if outbox.is_dir() else 0
+    data["node"] = node
+    data["director"] = director_data()
+    data["client_web"] = client_web_data()
+    data["limits"] = limits_data()
+    tunnels = []
+    for label in TUNNELS:
+        if not (AGENTS / (label + ".plist")).is_file():
+            continue
+        port = tunnel_port(label)
+        tunnels.append({"label": label, "port": port, "answers": curl("http://127.0.0.1:%d/v1/models" % port, timeout=2)[0] != 0})
+    data["tunnels"] = tunnels
+    disk = shutil.disk_usage(ROOT)
+    data["disk"] = {"free_gb": round(disk.free / 1e9, 1), "total_gb": round(disk.total / 1e9, 1)}
+    return data
+
+
+# ---- the Rust Director ----------------------------------------------------------------------------------------------
+def director_data():
+    """None without its plist; else its URL (the first --listen), whether it answers (no credential is sent: 401 is
+    an answer), its installation ID (read-only from its database), its data dir and that dir's modes."""
+    _, data = load_plist(DIRECTOR)
+    if data is None:
+        return None
+    args = [str(a) for a in data.get("ProgramArguments") or []]
+    opt = lambda flag: [args[i + 1] for i, a in enumerate(args[:-1]) if a == flag]
+    data_dir = Path((opt("--data-dir") or [str(ROOT / "state/director")])[0])
+    listen = opt("--listen") or ["127.0.0.1:8780"]
+    url = "http://" + listen[0]
+    code = curl(url + "/api/v1/client/me")[0]
+    modes = {}
+    for name, _ in DIRECTOR_MODES:
+        p = data_dir / name if name else data_dir
+        if os.path.lexists(p):
+            modes[name or "data_dir"] = "%o" % (p.lstat().st_mode & 0o777)  # stat only: never read
+    return {"url": url, "listen": listen, "answers": code != 0, "http": code, "installation": installation_id(data_dir),
+            "data_dir": str(data_dir), "modes": modes}
+
+
+def installation_id(data_dir):
+    """The installation ID from the Director's database, opened read-only; None before its first start."""
+    db = data_dir / "director.sqlite"
+    if not db.is_file():
+        return None
+    try:
+        import sqlite3
+        import urllib.parse
+        # No -wal: the database is whole on disk (the service is stopped), and immutable reads it without creating
+        # -wal/-shm there. With one, the service (or its last crash) left them, and a read-only connection uses them.
+        live = os.path.exists(str(db) + "-wal")
+        conn = sqlite3.connect("file:%s?%s" % (urllib.parse.quote(str(db)), "mode=ro" if live else "immutable=1"), uri=True, timeout=2)
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'installation'").fetchone()
+        finally:
+            conn.close()
+        return str(row[0]) if row else None
+    except Exception:  # an unreadable database is reported as no ID; doctor names the modes
+        return None
+
+
+# ---- client-web ---------------------------------------------------------------------------------------------------
+def client_web_env(data=None):
+    """(its env file, {name: value}); APP_KEY joins the redactor and is never shown."""
+    if data is None:
+        data = load_plist(CLIENT_WEB)[1] or {}
+    env_file = Path((data.get("EnvironmentVariables") or {}).get("DIRECTOR_ENV_FILE") or CONFIG / "client-web/client-web.env")
+    values = {}
+    try:
+        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"\s*([A-Z][A-Z0-9_]*)=(.*)$", line)
+            if m:
+                values[m.group(1)] = m.group(2).strip().strip("'\"")
+    except OSError:
+        pass
+    if len(values.get("APP_KEY", "")) >= 4:
+        SECRETS.add(values["APP_KEY"])
+        SECRETS.add(values["APP_KEY"].split(":", 1)[-1])
+    return env_file, values
+
+
+def client_web_data():
+    """None without its plist; else its URL (php -S HOST:PORT), whether it answers /up, the Director it uses
+    (DIRECTOR_URL from its env file; APP_KEY only joins the redactor), and its env file's and storage's modes."""
+    _, data = load_plist(CLIENT_WEB)
+    if data is None:
+        return None
+    args = [str(a) for a in data.get("ProgramArguments") or []]
+    listen = args[args.index("-S") + 1] if "-S" in args[:-1] else "127.0.0.1:8781"
+    url = "http://" + listen
+    env_file, values = client_web_env(data)
+    storage = Path(values.get("LARAVEL_STORAGE_PATH") or ROOT / "state/client-web")
+    modes = {}
+    for name, p in (("env_file", env_file), ("storage", storage)):
+        if os.path.lexists(p):
+            modes[name] = "%o" % (p.lstat().st_mode & 0o777)
+    code = curl(url + "/up")[0]
+    return {"url": url, "answers": code != 0, "http": code, "director": values.get("DIRECTOR_URL"),
+            "env_file": str(env_file), "storage": str(storage), "modes": modes}
+
+
+# ---- spend limits and CLI usage --------------------------------------------------------------------
+API_DEFAULT = 0  # a missing file means $0, never unlimited
+
+
+def api_limit():
+    """(api_usd_per_day, problem) as the gateway reads config/gateway/limits.json; unreadable refuses (0)."""
+    path = CONFIG / "gateway/limits.json"
+    if not path.exists():
+        return API_DEFAULT, None
+    doc = read_json(path)
+    value = doc.get("api_usd_per_day", 0) if isinstance(doc, dict) and set(doc) <= {"api_usd_per_day"} else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value < 0:
+        return 0, "%s is invalid: the gateway refuses every paid call" % path
+    return value, None
+
+
+def cli_runs_today(ledger):
+    """Executor (subscription CLI) runs the ledger records today: rows with cli_invoked true on today's local
+    date. A count, never a limit (the 50-calls-a-day cap was removed, ADR 0018)."""
+    today, n = time.strftime("%Y-%m-%d"), 0
+    try:
+        f = open(ledger, encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    with f:
+        for line in f:
+            if '"cli_invoked"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+                day = datetime.fromisoformat(str(row.get("ts")).replace("Z", "+00:00")).astimezone()
+            except (ValueError, AttributeError):
+                continue
+            n += row.get("cli_invoked") is True and day.strftime("%Y-%m-%d") == today
+    return n
+
+
+def limits_data():
+    api, api_problem = api_limit()
+    spend = read_json(ROOT / "gateway/spend.json", {}) or {}
+    spent = spend.get("api_usd", 0) if isinstance(spend, dict) and spend.get("day") == time.strftime("%Y-%m-%d") else 0
+    return {"api_usd_today": round(float(spent), 6) if isinstance(spent, (int, float)) else None,
+            "api_usd_per_day": api, "api_problem": api_problem,
+            "cli_runs_today": cli_runs_today(state_root() / "ledger.jsonl")}
+
+
+def limits_line(m):
+    api = "API today $%.2f of $%.2f%s" % (m["api_usd_today"] or 0, m["api_usd_per_day"],
+                                          " (paid calls off unless a grant allows)" if not m["api_usd_per_day"] else "")
+    return "limits    %s; CLI runs today %d%s" % (api, m["cli_runs_today"],
+                                                   " (%s)" % m["api_problem"] if m["api_problem"] else "")
+
+
+def read_body(body):
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def credential_mode(env):
+    spec = env.get("CSGATEWAY_CREDENTIALS", "")
+    if spec == "off":
+        return "off"
+    if spec == "keychain":
+        return "keychain, then ~/.contextstack/credentials (explicit opt-in)"
+    if spec:
+        return "file store " + spec
+    return "keychain, then ~/.contextstack/credentials (default)" if PLATFORM == "macos" else "~/.contextstack/credentials"
+
+
+def last_tick():
+    """The node's last tick line (logs/node.out.log): its job_pull result and when it was written."""
+    _, node = load_plist(NODE)
+    path = Path((node or {}).get("StandardOutPath") or LOGS / "node.out.log")
+    for line in reversed(tail_lines(path, 50)):
+        row = read_body(line)
+        if row:
+            pull = row.get("job_pull") or {}
+            if pull.get("error"):
+                result = "error: %s" % pull["error"]
+            elif pull.get("skip"):
+                result = "skip: %s" % pull["skip"]
+            else:
+                result = "accepted %d, failed %d" % (len(pull.get("accepted") or []), len(pull.get("failed") or []))
+            return {"result": result, "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))}
+    return None
+
+
+def tunnel_port(label):
+    _, data = load_plist(label)
+    args = [str(a) for a in (data or {}).get("ProgramArguments") or []]
+    for i, a in enumerate(args[:-1]):
+        if a == "-L":
+            parts = args[i + 1].split(":")
+            if len(parts) in (3, 4) and parts[-3].isdigit():
+                return int(parts[-3])
+    return TUNNEL_PORTS[label]
+
+
+def tunnel_socket(data):
+    args = [str(a) for a in (data or {}).get("ProgramArguments") or []]
+    return Path(args[args.index("-S") + 1]) if "-S" in args[:-1] else TUNNEL_SOCK
+
+
+def print_status(d):
+    machine = d["node"].get("machine") or d["node"].get("estate")
+    head = ("ContextStack %s (%s)" % (machine, d["node"]["role"])) if machine else ("ContextStack (%s)" % d["node"]["role"])
+    print("%s, release %s; %d release(s) kept; gateway %s, runner %s"
+          % (head, d["release"], len(d["releases"]), d["gateway_impl"] or "?", d["runner"] or "?"))
+    print("services")
+    for name, views in d["services"].items():
+        for v in views:
+            word = "up" if v["up"] else ("-" if not v["installed"] else "down")
+            extra = "pid %d" % v["pid"] if v["pid"] else ("last exit %s" % v["last_exit"] if v["up"] and v["last_exit"] else "")
+            short = v["label"].replace("com.contextstack.", "")
+            print("  %-8s %-5s %-24s %-22s %s" % (name, word, short, extra, v["reason"]))
+    g = d["gateway"]
+    if g["http"] == 200:
+        print("gateway   %s, %s model(s) available, catalog %s, %d stale discovery, credentials %s"
+              % (g["status"], g["models_available"], g["catalog_revision"], len(g["discovery_stale"]), g["credentials"]))
+    else:
+        print("gateway   /v1/health %s; credentials %s" % ("HTTP %d" % g["http"] if g["http"] else "no answer", g["credentials"]))
+    n = d["node"]
+    if "director" in n:
+        print("node      director %s (%s), token %s"
+              % (n["director"], "answers HTTP %d" % n["director_http"] if n["director_answers"] else "no answer", n["token"]))
+    pull = n["last_pull"]
+    print("          last pull %s; outbox %d waiting to send"
+          % ("%s (%s)" % (pull["result"], pull["at"]) if pull else "never (no tick logged)", n["outbox_waiting"]))
+    dr = d.get("director")
+    if dr:
+        modes = ", ".join("%s %s" % (k, v) for k, v in dr["modes"].items()) or "missing"
+        print("director  %s %s, installation %s; data %s (%s)"
+              % (dr["url"], "answers HTTP %d" % dr["http"] if dr["answers"] else "no answer", dr["installation"] or "none yet",
+                 dr["data_dir"], modes))
+    cw = d.get("client_web")
+    if cw:
+        modes = ", ".join("%s %s" % (k, v) for k, v in cw["modes"].items()) or "missing"
+        print("client-web %s %s; director %s; env %s, storage %s (%s)"
+              % (cw["url"], "answers HTTP %d" % cw["http"] if cw["answers"] else "no answer", cw["director"] or "?",
+                 cw["env_file"], cw["storage"], modes))
+    print(limits_line(d["limits"]))
+    print("tunnels   " + ", ".join(":%d %s" % (t["port"], "answers" if t["answers"] else "no answer") for t in d["tunnels"]))
+    print("disk      %.1f GB free of %.1f GB" % (d["disk"]["free_gb"], d["disk"]["total_gb"]))
+
+
+# ---- logs ---------------------------------------------------------------------------------------------------------
+def log_files(service):
+    files = []
+    for label in SERVICES[service]:
+        _, data = load_plist(label)
+        base = DEFAULT_LOGS.get(label)
+        for key, suffix in (("StandardOutPath", "out"), ("StandardErrorPath", "err")):
+            p = (data or {}).get(key) or (str(LOGS / ("%s.%s.log" % (base, suffix))) if base else None)
+            if p and p not in files:
+                files.append(p)
+    return [Path(p) for p in files]
+
+
+def tail_lines(path, n, end=None):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size, chunk = min(f.tell(), end) if end is not None else f.tell(), b""
+            while size > 0 and chunk.count(b"\n") <= n:
+                step = min(65536, size)
+                size -= step
+                f.seek(size)
+                chunk = f.read(step) + chunk
+    except OSError:
+        return []
+    return chunk.decode("utf-8", "replace").splitlines()[-n:] if n > 0 else []
+
+
+def cmd_logs(args):
+    need_install()
+    files = log_files(args.service)
+    offsets = {p: (p.stat().st_size if p.is_file() else 0) for p in files}
+    for p in files:
+        print("==> %s <==%s" % (p, "" if p.is_file() else " (no such file)"))
+        for line in tail_lines(p, args.n, offsets[p]):
+            print(line)
+    if not args.follow:
+        return 0
+    sys.stdout.flush()  # headers announce a follower whose starting offsets are already captured
+    try:
+        while True:
+            for p in files:
+                if not p.is_file():
+                    continue
+                size = p.stat().st_size
+                if size < offsets[p]:
+                    offsets[p] = 0  # truncated or rotated
+                if size > offsets[p]:
+                    with open(p, "rb") as f:
+                        f.seek(offsets[p])
+                        data = f.read()
+                    offsets[p] += len(data)
+                    for line in data.decode("utf-8", "replace").splitlines():
+                        print("%s: %s" % (p.name, line) if len(files) > 1 else line)
+            sys.stdout.flush()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+
+
+# ---- start / stop / restart ---------------------------------------------------------------------------------------
+def cmd_service(args):
+    need_install()
+    need_launchd()
+    nr = node_release()
+    rc = 0
+    for label in SERVICES[args.service]:
+        path, data = load_plist(label)
+        if data is None:
+            print("%s: no plist at %s (nothing to %s)" % (label, path, args.action))
+            rc = 1
+            continue
+        try:
+            if args.action == "stop":
+                nr.unload_agent(label)
+                said = "booted out"
+            else:
+                run(["launchctl", "enable", "gui/%d/%s" % (os.getuid(), label)])
+                said = nr.load_agent(label, path, False, args.action == "restart")
+        except nr.Refused as error:
+            print("%s: %s" % (label, error))
+            rc = 1
+            continue
+        v = agent(label)
+        print("%s: %s; now %s%s" % (label, said, "up" if v["up"] else "down", " (%s)" % v["reason"] if v["reason"] else ""))
+    return rc
+
+
+# ---- models, jobs ---------------------------------------------------------------------------------------------------
+def cmd_models(args):
+    need_install()
+    code, body = gateway_get("/v1/models?available_only=false")
+    if code != 200:
+        raise Stop("cs: the gateway's /v1/models %s (cs status, cs logs gateway)" % ("is HTTP %d" % code if code else "does not answer"))
+    rows = [{k: m.get(k) for k in ("name", "provider", "available")} for m in read_body(body).get("models") or []]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    width = max([len(str(r["name"])) for r in rows] + [5])
+    print("%-*s  %-14s  %s" % (width, "MODEL", "PROVIDER", "AVAILABLE"))
+    for r in rows:
+        print("%-*s  %-14s  %s" % (width, r["name"], r["provider"], "yes" if r["available"] else "no"))
+    return 0
+
+
+def jobs_data():
+    state = state_root()
+    ops = KIT / "ops/bin"
+    sys.path.insert(0, str(ops))
+    try:
+        from _dispatch import job_records
+        from _estate_io import read_jsonl
+    finally:
+        sys.path.remove(str(ops))
+    records = job_records(read_jsonl(state / "dispatch.jsonl", strict=False))
+    outbox = state / "outbox"
+    by_job = {str(r["meta"].get("director_job") or qid): (qid, r) for qid, r in records.items()}
+    accepted = sorted(p.name for p in (state / "jobs").iterdir() if p.is_dir()) if (state / "jobs").is_dir() else []
+    rows = []
+    for job in sorted(set(accepted) | set(by_job)):
+        qid, r = by_job.get(job, (None, None))
+        if r and r["terminal"] is not None:
+            t = r["terminal"]
+            phase = "finished %s%s" % (t.get("state"), "/" + str(t["verdict"]) if t.get("verdict") else "")
+        elif r and r["running"] is not None:
+            phase = "running"
+        elif r and r["pending"] is not None:
+            phase = "queued"
+        else:
+            phase = "accepted"
+        if (outbox / ("job_%s.json" % job)).is_file():
+            send = "waiting to send"
+        elif (outbox / "acked" / ("job_%s.json" % job)).is_file():
+            send = "sent"
+        else:
+            send = "-"
+        meta = (r or {}).get("meta") or read_json(state / "jobs" / job / "job.json", {}) or {}
+        rows.append({"job": job, "dispatch_id": qid, "state": phase, "spec": Path(str(meta.get("spec") or "")).name or None,
+                     "send": send})
+    envelopes = len([p for p in outbox.glob("*.json") if not p.name.startswith((".", "job_"))]) if outbox.is_dir() else 0
+    return {"jobs": rows, "run_envelopes_waiting": envelopes}
+
+
+def cmd_jobs(args):
+    need_install()
+    d = jobs_data()
+    if args.json:
+        print(json.dumps(d, indent=2))
+        return 0
+    if not d["jobs"]:
+        print("no jobs")
+    else:
+        print("%-28s  %-22s  %-16s  %s" % ("JOB", "STATE", "SEND", "SPEC"))
+        for j in d["jobs"]:
+            print("%-28s  %-22s  %-16s  %s" % (j["job"], j["state"], j["send"], j["spec"] or "-"))
+    print("run envelopes waiting to send: %d" % d["run_envelopes_waiting"])
+    return 0
+
+
+# ---- releases -------------------------------------------------------------------------------------------------------
+def node_install(*args):
+    script = KIT / "scripts/node-install"
+    if not script.is_file():
+        raise Stop("cs: %s is missing: the current release is broken (cs doctor)" % script)
+    r = run(["sh", str(script), *args], timeout=300)
+    return r.returncode, read_body(r.stdout), r
+
+
+def cmd_release(args):
+    need_install()
+    if args.action == "list":
+        rc, out, r = node_install("status")
+        if rc != 0:
+            raise Stop("cs: release list failed: %s" % (r.stderr or r.stdout).strip()[-400:])
+        history = (out.get("record") or {}).get("history") or []
+        for rid in out.get("releases") or []:
+            mark = "*" if rid == out.get("current") else " "
+            tag = "current" if mark == "*" else ("previous" if rid == (out.get("record") or {}).get("previous") else "")
+            print("%s %s  %s" % (mark, rid, tag or ("activated" if rid in history else "")))
+        return 0
+    if args.action == "switch":
+        if not args.id:
+            raise Stop("usage: cs release switch ID", 2)
+        rc, out, r = node_install("switch", args.id)
+    else:
+        rc, out, r = node_install("rollback")
+    if out.get("ok"):
+        print("current: %s (was %s)" % (out.get("release"), out.get("previous")))
+        for label, p in (out.get("plists") or {}).items():
+            print("  %s: %s" % (label, p.get("launchd")))
+        return 0
+    print("refused: %s" % (out.get("refused") or (r.stderr or r.stdout).strip()[-400:]))
+    return 1
+
+
+
+
+def cli_pin_findings():
+    """Per-machine CLI pins for profiled executor templates."""
+    pin_mod = KIT / "ops/bin/_cli_pins.py"
+    if not pin_mod.is_file():
+        return []
+    sys.path.insert(0, str(KIT / "ops/bin"))
+    from _cli_pins import profiled_templates, pin_state, resolve_binary
+
+    out = []
+    for name, profile in profiled_templates(KIT / "ops/bin"):
+        check = "cli pin %s" % name
+        try:
+            binary = resolve_binary(profile["binary"], HOME)
+        except ValueError:
+            out.append({"check": check, "ok": True, "info": True, "detail": "not installed"})
+            continue
+        state, entry = pin_state(name, binary, env={"LAB_CONFIG_ROOT": str(CONFIG)})
+        if state == "ok":
+            out.append({"check": check, "ok": True, "detail": (entry or {}).get("version", "")})
+        elif state == "unpinned":
+            out.append({"check": check, "ok": True, "info": True,
+                        "detail": "not pinned yet; pins on first use"})
+        elif state == "missing":
+            out.append({"check": check, "ok": True, "info": True, "detail": "not installed"})
+        else:
+            detail = "installed binary changed since pin"
+            if entry and entry.get("version"):
+                detail += " (pinned at %s)" % entry["version"]
+            out.append({"check": check, "ok": False, "detail": detail, "fix": "cs doctor --repin %s" % name})
+    return out
+
+
+def cmd_repin_cli(target):
+    pin_mod = KIT / "ops/bin/_cli_pins.py"
+    if not pin_mod.is_file():
+        raise Stop("cs doctor: this release has no CLI pin support", 2)
+    sys.path.insert(0, str(KIT / "ops/bin"))
+    from _cli_pins import ensure_pin, package_sha256, profiled_templates, resolve_binary
+
+    folder = KIT / "ops/bin"
+    known = {name: prof for name, prof in profiled_templates(folder)}
+    want = sorted(known) if target in (None, "all") else [target]
+    if target not in (None, "all") and target not in known:
+        raise Stop("cs doctor --repin: unknown template %r (want one of %s or all)"
+                   % (target, ", ".join(sorted(known))), 2)
+    env_probe = {k: v for k, v in os.environ.items()
+                 if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GROK_API_KEY")}
+    repinned = []
+    for name in want:
+        profile = known[name]
+        try:
+            binary = resolve_binary(profile["binary"], HOME)
+        except ValueError as error:
+            print("skip  %s: %s" % (name, error), file=sys.stderr)
+            continue
+        probe = run([str(binary), "--version"], 20, env=env_probe)
+        version = ((probe.stdout or probe.stderr).strip().splitlines() or ["?"])[0]
+        if probe.returncode != 0:
+            print("skip  %s: --version failed (%s)" % (name, version), file=sys.stderr)
+            continue
+        pkg = package_sha256(profile["package"]) if profile.get("package") else None
+        ensure_pin(name, binary, version, env={"LAB_CONFIG_ROOT": str(CONFIG)}, repin=True, package_sha=pkg)
+        repinned.append((name, version))
+    if not repinned:
+        raise Stop("cs doctor --repin: nothing repinned", 1)
+    for name, version in repinned:
+        print("repin %s: %s" % (name, version))
+    return 0
+# ---- doctor -------------------------------------------------------------------------------------------------------
+def model_problems():
+    """Latest run per model in the trailing 24 hours, ordered by timestamp rather than append order."""
+    latest = {}
+    now = time.time()
+    try:
+        ledger = open(state_root() / "ledger.jsonl", encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    with ledger:
+        for line in ledger:
+            try:
+                row = json.loads(line)
+                stamp = datetime.fromisoformat(str(row.get("ts")).replace("Z", "+00:00")).timestamp()
+                model = row.get("template") or row.get("model")
+                if not isinstance(model, str) or not row.get("stop") or not now - 86400 <= stamp <= now:
+                    continue
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                continue
+            if model not in latest or stamp >= latest[model][0]:
+                latest[model] = (stamp, row)
+    init = load_script("cs_init", Path(__file__).resolve().with_name("cs_init.py"))
+    out = []
+    for model, (stamp, row) in sorted(latest.items()):
+        stop = row["stop"]
+        agent = next((name for name, template in init.AGENTS.items()
+                      if template and (model == template or model.startswith(template + ":")
+                                       or model.startswith(template + "-"))), None)
+        label = init.LABELS.get(agent, model)
+        if agent == "cursor-agent" and "grok" in model.lower():
+            label = "Cursor Grok"
+        if stop == "provider_unavailable":
+            detail = "%s couldn't reach its model (last at %s)." % (label, time.strftime("%H:%M", time.localtime(stamp)))
+            fix = "Its quota may be used up: check your %s plan, or use another model." % init.LABELS.get(agent, model)
+        elif stop == "auth_expired":
+            detail = "%s is signed out." % label
+            fix = "Run %s." % init.sign_in_command(agent or model)
+        elif stop in ("provider_limit", "rate_limit"):
+            allowance = row.get("allowance")
+            reset = allowance.get("resets_at") if isinstance(allowance, dict) else None
+            detail = "%s hit its usage limit%s." % (label, " (resets at %s)" % reset if reset else "")
+            fix = "Wait for the limit to reset, or use another model."
+        else:
+            continue
+        out.append({"check": "models: " + model, "ok": False, "detail": detail, "fix": fix})
+    return out
+
+
+def doctor():
+    """[(check, ok, detail, fix)] for every failure seen so far."""
+    out = model_problems()
+    add = lambda check, ok, detail="", fix="": out.append({"check": check, "ok": ok, "detail": detail, "fix": fix})
+    m = limits_data()  # a limit above the default is a warning, never a problem (exit code unchanged)
+    path = CONFIG / "gateway/limits.json"
+    if m["api_usd_per_day"] > API_DEFAULT:
+        out.append({"check": "paid API limit", "ok": False, "warn": True,
+                    "detail": "%s is $%s a day, above the default $%s" % (path, m["api_usd_per_day"], API_DEFAULT),
+                    "fix": "set api_usd_per_day to %s in %s, or delete the file" % (API_DEFAULT, path)})
+    if m["api_problem"]:
+        add("spend limits", False, m["api_problem"], "fix or delete the file; a missing file means $%d" % API_DEFAULT)
+    rid = os.readlink(CURRENT).rsplit("/", 1)[-1]
+    add("current release", (CURRENT / ".complete").is_file(), "current -> releases/%s" % rid,
+        "cs release switch ID (cs release list)")
+    for d in ROOT_DIRS:
+        p = ROOT / d
+        if not p.is_dir():
+            add("root %s" % d, False, "%s is missing" % p, "mkdir -m 700 %s" % p)
+        elif p.stat().st_mode & 0o077:
+            add("root %s" % d, False, "%s is mode %o" % (p, p.stat().st_mode & 0o777), "chmod 700 %s" % p)
+        else:
+            add("root %s" % d, True)
+    for p, want in ((CONFIG / "node.env", 0o600), (ROOT / "credentials", 0o700)):  # stat only: never read
+        if p.exists():
+            mode = p.stat().st_mode & 0o777
+            add("mode %s" % p.name, not mode & 0o077, "%s is mode %o" % (p, mode), "chmod %o %s" % (want, p))
+    if (ROOT / "credentials").is_dir() and os.access(ROOT / "credentials", os.R_OK | os.X_OK):
+        for f in sorted((ROOT / "credentials").iterdir()):  # names and modes only: a credential is never read
+            mode = f.lstat().st_mode & 0o777
+            if f.is_file() and mode & 0o077:
+                add("mode credentials/%s" % f.name, False, "%s is mode %o" % (f, mode), "chmod 600 %s" % f)
+    if PLATFORM == "macos":
+        fv = run(["fdesetup", "status"])  # by PATH: a test shims it
+        on = fv.returncode == 0 and "FileVault is On" in fv.stdout
+        add("filevault", on, (fv.stdout or fv.stderr).strip() or "fdesetup status failed",
+            "System Settings → Privacy & Security → FileVault (the credential store is plain files under ~/.contextstack)")
+    record = read_json(CONFIG / "install.json", {}) or {}
+    names = ["csgateway", "cs", "node-install", "cs"]
+    try:
+        names = list(dict.fromkeys(list(node_release().LINKS) + ["cs"]))
+    except Exception:  # a broken release is reported above; check the usual names
+        pass
+    link_dir = Path(record["link_dir"]) if record.get("link_dir") else None
+    for name in names:
+        if link_dir is None or name in (record.get("skip_links") or []):
+            continue
+        p = link_dir / name
+        if p.is_symlink():
+            target = os.readlink(p)
+            add("link %s" % name, os.path.exists(p), "%s -> %s (missing)" % (p, target),
+                "cs release switch %s (cs release list; rewrites the links)" % rid)
+        elif name != "cs":  # cs gets its link from node-release's LINKS
+            add("link %s" % name, False, "%s is missing" % p, "cs release switch %s (cs release list)" % rid)
+    if PLATFORM != "macos":
+        add("launchd agents", True, "not supported here yet (%s)" % PLATFORM)
+        return out
+    node = receiver() is not None
+    dr = director_data()
+    if dr:
+        add("director %s (installation %s)" % (dr["url"], dr["installation"] or "none yet"), dr["answers"],
+            "%s does not answer" % dr["url"], "cs start director; cs logs director")
+        data_dir = Path(dr["data_dir"])
+        for name, want in DIRECTOR_MODES:
+            p = data_dir / name if name else data_dir
+            if not os.path.lexists(p):
+                if not name:
+                    add("director data dir", False, "%s is missing" % p,
+                        "cs release switch %s (cs release list; creates it 0700)" % rid)
+                continue
+            mode = p.lstat().st_mode & 0o777
+            add("director mode %s" % (name or "data dir"), not mode & 0o077, "%s is mode %o, want %o" % (p, mode, want),
+                "chmod %o %s" % (want, p))
+    cw = client_web_data()
+    if cw:
+        add("client-web %s" % cw["url"], cw["http"] == 200, "%s/up %s" % (cw["url"], "is HTTP %d" % cw["http"] if cw["http"]
+                                                                          else "does not answer"),
+            "cs start client-web; cs logs client-web")
+        for name, path, want in (("env file", cw["env_file"], 0o600), ("storage", cw["storage"], 0o700)):
+            if not os.path.lexists(path):
+                add("client-web %s" % name, False, "%s is missing" % path,
+                    "cs release switch %s (cs release list; seeds it)" % rid)
+                continue
+            mode = Path(path).lstat().st_mode & 0o777
+            add("client-web mode %s" % name, not mode & 0o077, "%s is mode %o, want %o" % (path, mode, want),
+                "chmod %o %s" % (want, path))
+    for label in (GATEWAY, NODE, DIRECTOR, CLIENT_WEB) + TUNNELS:
+        path, data = load_plist(label)
+        if data is None:
+            continue
+        ours = label in (GATEWAY, NODE, DIRECTOR, CLIENT_WEB)
+        refix = "cs release switch %s (cs release list; rewrites our plists)" % rid if ours else \
+            "edit %s (or remove the key), then cs restart tunnels" % path
+        problems = plist_problems(data)
+        add("plist paths %s" % label, not problems, "; ".join(problems), refix)
+        if ours or not program(data).startswith(SYSTEM_BIN):  # the node tick is /bin/sh, but it spawns tools
+            path_env = ((data.get("EnvironmentVariables") or {}).get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin")
+            add("agent PATH %s" % label, BREW in path_env.split(":"), "PATH=%s lacks %s" % (path_env, BREW),
+                refix if ours else "add %s to EnvironmentVariables PATH in %s" % (BREW, path))
+    _, gw = load_plist(GATEWAY)
+    if gw is not None and node:
+        mode = credential_mode(gw.get("EnvironmentVariables") or {})
+        try:
+            selectable = hasattr(node_release(), "CREDENTIALS")
+        except Stop:
+            selectable = False
+        add("gateway credentials", "keychain" not in mode,
+            "a node's gateway uses the login Keychain (CSGATEWAY_CREDENTIALS unset): repeated `security` prompts",
+            "set CSGATEWAY_CREDENTIALS=file in %s, then cs restart gateway (or run cs init on a fresh machine)" % (
+                AGENTS / (GATEWAY + ".plist")) if selectable
+            else "run `cs update` to install a current release, then `cs init`; or set "
+                 "CSGATEWAY_CREDENTIALS=off in %s and cs restart gateway" % (AGENTS / (GATEWAY + ".plist")))
+    for label in TUNNELS:
+        _, data = load_plist(label)
+        if data is None:
+            continue
+        sock = tunnel_socket(data)
+        args = [str(a) for a in data.get("ProgramArguments") or []]
+        if os.path.lexists(sock):
+            live = run(["ssh", "-S", str(sock), "-O", "check", args[-1] if args else "spark"], timeout=8).returncode == 0
+            add("tunnel socket %s" % label, live, "%s exists with no live master" % sock,
+                "rm %s, then cs restart tunnels" % sock)
+    ops = KIT / "ops/bin"
+    if (ops / "_toolchains.py").is_file():
+        try:
+            load = importlib.util.spec_from_file_location("_toolchains", ops / "_toolchains.py")
+            mod = importlib.util.module_from_spec(load)
+            load.loader.exec_module(mod)
+            out.extend(mod.doctor_findings(CONFIG / "toolchains.json"))
+        except Exception:
+            pass
+    return out
+
+
+def cmd_doctor(args):
+    if getattr(args, "repin", None) is not None:
+        return cmd_repin_cli(args.repin)
+    need_install()
+    findings = doctor() + cli_pin_findings()
+    if args.json:
+        print(json.dumps(findings, indent=2))
+    else:
+        for f in findings:
+            if f.get("warn"):
+                print("WARN  %s: %s\n      fix: %s" % (f["check"], f["detail"], f["fix"]))
+            elif f.get("info"):
+                print("info  %s: %s" % (f["check"], f["detail"]))
+            elif f["ok"]:
+                print("ok    %s%s" % (f["check"], " (%s)" % f["detail"] if "not supported" in f["detail"] else ""))
+            else:
+                print("FAIL  %s: %s\n      fix: %s" % (f["check"], f["detail"], f["fix"]))
+    bad = sum(1 for f in findings if not f["ok"] and not f.get("warn"))
+    warned = sum(1 for f in findings if f.get("warn"))
+    if not args.json:
+        print("doctor: %d problem(s)%s" % (bad, ", %d warning(s)" % warned if warned else ""))
+    return 1 if bad else 0
+
+
+def cmd_repo(args):
+    ops = Path(__file__).resolve().parents[1] / "ops/bin"
+    sys.path.insert(0, str(ops))
+    try:
+        return load_script("_repos", ops / "_repos.py").main(args)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        raise Stop("cs repo: " + str(error), 2) from error
+
+
+def cmd_land(args):
+    """The checkout's own lane code beside this script (an install's cs is a link into its kit)."""
+    ops = Path(__file__).resolve().parents[1] / "ops/bin"
+    lanes = load_script("_lanes", ops / "_lanes.py")
+    code, result = lanes.land(args.repo, args.lane, args.message, allow_agent_config=args.allow_agent_config)
+    try:
+        recorded = load_script("_land_record", ops / "_land_record.py").record_landing(
+            result, getattr(args, "job", None), ROOT)
+    except Exception as error:
+        recorded = {"recorded": False, "record_error": str(error).split("\n", 1)[0][:300]}
+    result.update(recorded)
+    if not result.get("recorded"):
+        print("cs land: warning: the landing couldn't be recorded: %s" % result.get("record_error", ""),
+              file=sys.stderr)
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    elif code == 0:
+        print("landed %s on %s as %s (%d files)%s" % (result["branch"], result["main"], result["commit"][:12],
+                                                    len(result["files"]), "; " + result["cleanup"]
+                                                    if result.get("cleanup") else ""))
+    else:
+        print("cs land: %s: %s" % (result["status"], result.get("reason") or "; ".join(result.get("failed") or [])),
+              file=sys.stderr)
+        if result.get("output_tail"):
+            print(result["output_tail"], file=sys.stderr)
+    return code
+
+
+def cmd_update(args):
+    return load_script("cs_update", Path(__file__).resolve().parent / "cs_update.py").main(args)
+
+
+def cmd_smoke(args):
+    need_install()
+    return load_script("cs_smoke", KIT / "scripts/cs_smoke.py").main(argparse.Namespace(**globals()), args)
+
+
+def cmd_init(args):
+    need_install()
+    return load_script("cs_init", KIT / "scripts/cs_init.py").main(argparse.Namespace(**globals()), args)
+
+
+def cmd_lead(args):
+    """Hosted lead bootstrap: does not need a full install when --director and --credential-file are given."""
+    if args.action != "create":
+        raise Stop("usage: cs lead create", 2)
+    mod = load_script("cs_lead", Path(__file__).resolve().parent / "cs_lead.py")
+    try:
+        return mod.create(args, argparse.Namespace(**globals()))
+    except mod.LeadError as error:
+        raise Stop("cs lead: %s" % error, error.code)
+
+
+def cmd_review(args):
+    """Weekly task-lane review, or install its Monday schedule (scripts/cs_review.py)."""
+    mod = load_script("cs_review", Path(__file__).resolve().parent / "cs_review.py")
+    if args.period == "schedule" and not getattr(args, "state", None):
+        # The node's plist, not the shell's LAB_STATE_ROOT (that is the checkout estate).
+        args.state = str(state_root())
+    try:
+        return mod.run_cli(args, root=ROOT)
+    except mod.ClientError as error:
+        raise Stop("cs review: %s" % error, 1)
+
+
+def cmd_ui(args):
+    """One-time Director UI pairing URL (scripts/cs_ui.py; ADR 0022). Never logs the URL."""
+    need_install()
+    return load_script("cs_ui", Path(__file__).resolve().parent / "cs_ui.py").run(
+        args, argparse.Namespace(**globals()))
+
+
+def cmd_status(args):
+    if not installed():
+        if args.json:
+            print(json.dumps({"installed": False, "root": str(ROOT), "message": NO_INSTALL % CURRENT}))
+        raise Stop(NO_INSTALL % CURRENT)
+    d = status_data()
+    if args.json:
+        print(json.dumps(d, indent=2))
+    else:
+        print_status(d)
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["mcp"]:  # stdout is the JSON-RPC channel: no redacting wrapper; the module never prints a secret
+        return load_script("cs_mcp", Path(__file__).resolve().parent / "cs_mcp.py").main(argv[1:], ROOT)
+    sys.stdout, sys.stderr = Redacting(sys.stdout), Redacting(sys.stderr)
+    ap = argparse.ArgumentParser(prog="cs", description=DOC, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("status", "models", "jobs", "doctor"):
+        parser = sub.add_parser(name)
+        parser.add_argument("--json", action="store_true")
+        if name == "doctor":
+            parser.add_argument("--repin", nargs="?", const="all", metavar="TEMPLATE",
+                                help="re-record CLI pins for TEMPLATE or all profiled templates")
+    lg = sub.add_parser("logs")
+    lg.add_argument("service", choices=sorted(SERVICES))
+    lg.add_argument("-n", type=int, default=40)
+    lg.add_argument("-f", dest="follow", action="store_true")
+    for action in ("start", "stop", "restart"):
+        sub.add_parser(action).add_argument("service", choices=sorted(SERVICES))
+    up = sub.add_parser("update", help="check or install a release; no automatic updates")
+    up.add_argument("--channel", choices=("stable", "latest", "pre"), default=None)
+    up.add_argument("--allow-downgrade", action="store_true", help="permit installing an older release")
+    up.add_argument("--pre", action="store_true", help="allow pre-release updates")
+    up.add_argument("--bundle", type=Path, help="install an offline bundle directory")
+    up.add_argument("--check", action="store_true", help="report versions without installing")
+    up.add_argument("--no-smoke", action="store_true")
+    smoke = sub.add_parser("smoke", help="test signed-in agents and the configured lead with real jobs")
+    smoke.add_argument("--json", action="store_true")
+    smoke.add_argument("--agents", help="comma-separated agent names")
+    it = sub.add_parser("init")
+    it.add_argument("--yes", action="store_true", help="never prompt: defaults for everything not given")
+    it.add_argument("--name", help="this machine's node name (default: from the host name)")
+    it.add_argument("--director-listen", metavar="ADDR", help="the Director's loopback address (default 127.0.0.1:8780)")
+    init_py = Path(__file__).resolve().with_name("cs_init.py")  # a minimal release may ship cs without cs_init
+    runnable = (tuple(n for n, t in load_script("cs_init", init_py).AGENTS.items() if t) if init_py.is_file()
+                else ("claude", "codex", "gemini"))
+    it.add_argument("--agent", choices=runnable, metavar="NAME",
+                    help="the CLI the first job runs on: " + ", ".join(runnable))
+    it.add_argument("--api-key", metavar="PROVIDER", action="append", help="store a key (hidden input) in the file store")
+    it.add_argument("--verbose", action="store_true", help="show activation JSON details")
+    it.add_argument("--first-job", action="store_true", help="run a first job again on an initialised machine")
+    it.add_argument("--no-first-job", action="store_true")
+    it.add_argument("--no-open", action="store_true", help="print the UI URL instead of opening a browser")
+    it.add_argument("--timeout", type=int, default=300, help="seconds to wait for the first job")
+    rl = sub.add_parser("release")
+    rl.add_argument("action", choices=("list", "switch", "rollback"))
+    rl.add_argument("id", nargs="?")
+    repo = sub.add_parser("repo", help="register this machine's git repositories")
+    actions = repo.add_subparsers(dest="action", required=True)
+    add = actions.add_parser("add")
+    add.add_argument("path")
+    add.add_argument("--name")
+    add.add_argument("--branch")
+    add.add_argument("--gate")
+    actions.add_parser("list")
+    actions.add_parser("remove").add_argument("name")
+    ld = sub.add_parser("land", help="accept a lane's result into a repo's main after its check passes",
+                        description="Land merges the lane branch into the repo's local main, runs the check, and on "
+                                    "success commits and removes the lane (the isolated branch and working copy for "
+                                    "one task). Never pushes.")
+    ld.add_argument("repo")
+    ld.add_argument("lane")
+    ld.add_argument("-m", "--message")
+    ld.add_argument("--job", help="Director job whose run this landing records (default: newest finished job for this repo and lane)")
+    ld.add_argument("--json", action="store_true")
+    ld.add_argument("--allow-agent-config", action="store_true",
+                    help="owner override: permit protected agent, hook, editor and CI configuration changes")
+    lead = sub.add_parser("lead")
+    lead_sub = lead.add_subparsers(dest="action", required=True)
+    lead_create = lead_sub.add_parser("create")
+    lead_script = Path(__file__).resolve().parent / "cs_lead.py"
+    if lead_script.is_file():  # minimal release fixtures (install-update) ship only what they test
+        load_script("cs_lead", lead_script).add_create_flags(lead_create)
+    lead_create.add_argument("--node", help="node where the lead's jobs run (default: install.json node or the only node)")
+    lead_create.add_argument("--model", help="executor template (default: ready lead-capable model, preferring Claude Sonnet)")
+    lead_create.add_argument("--title", help="conversation title (default: Hosted lead)")
+    lead_create.add_argument("--name", help="lead credential name (default: hosted-lead)")
+    lead_create.add_argument("--director", help="Director URL (default: install.json / cs status)")
+    lead_create.add_argument("--credential-file", help="owner credential file (default: state/director/local-credential)")
+    lead_create.add_argument("--config-root", help="where to write lead config (default: ~/.contextstack)")
+    rev = sub.add_parser("review")
+    rev.add_argument("period", nargs="?", default="weekly", choices=("weekly", "schedule"))
+    rev.add_argument("--state", help="state root for `review schedule` (default: the node's)")
+    rev.add_argument("--since", type=float, default=7.0, metavar="DAYS", help="lookback window in days (default: 7)")
+    rev.add_argument("--json", action="store_true", help="emit JSON instead of markdown")
+    rev.add_argument("--plist", action="store_true", help="print the weekly launchd plist template and exit")
+    rev.add_argument("--director", help="Director URL (default: install.json)")
+    rev.add_argument("--credential-file", help="owner credential file (default: state/director/local-credential)")
+    rev.add_argument("--node", help="default node name")
+    ui = sub.add_parser("ui", help="open a one-time Director UI pairing URL")
+    ui.add_argument("--print", dest="print_url", action="store_true",
+                    help="print the URL instead of opening it (one-time, expires in five minutes)")
+    args = ap.parse_args(argv)
+    if args.cmd in ("start", "stop", "restart"):
+        args.action = args.cmd
+    handler = {"status": cmd_status, "logs": cmd_logs, "models": cmd_models, "jobs": cmd_jobs, "doctor": cmd_doctor,
+               "smoke": cmd_smoke, "update": cmd_update, "release": cmd_release, "land": cmd_land, "init": cmd_init, "lead": cmd_lead,
+               "review": cmd_review, "ui": cmd_ui, "repo": cmd_repo}.get(args.cmd, cmd_service)
+    node_env()  # its values join the redactor before anything prints
+    client_web_env()  # and client-web's APP_KEY
+    try:
+        return handler(args)
+    except Stop as stop:
+        print(str(stop), file=sys.stderr)
+        return stop.code
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

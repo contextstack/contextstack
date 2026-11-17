@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Captured authority belongs to THIS job, or it is not captured at all.
+
+Matching the dispatch shelf by spec or task picks a sibling whenever two jobs
+share them. Two queued jobs on one task are driven here for real: each run must
+record its own work order's grant, a run with no job id must stay `unknown`, and
+a caller may not name a grant its own work order contradicts.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+OPS = ('_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "capture-stimulus", "capture-stimulus.json", "_grant.py")
+FAILURES = []
+
+
+def expect(ok, message):
+    if not ok:
+        FAILURES.append(message)
+
+
+def build():
+    root = Path(tempfile.mkdtemp(prefix="work-order-", suffix=".noindex"))
+    lab = root / "lab"
+    (lab / "ops/bin").mkdir(parents=True)
+    (lab / "ledger/runs").mkdir(parents=True)
+    (lab / "grants").mkdir(parents=True)
+    (lab / "scripts").mkdir(parents=True)
+    for name in OPS:
+        src = LAB / "ops/bin" / name
+        if src.is_file():
+            shutil.copy2(src, lab / "ops/bin" / name)
+            if not name.endswith(".json"):
+                (lab / "ops/bin" / name).chmod(0o755)
+    (lab / "scripts/checklib.sh").write_text("# lib\n", encoding="utf-8")
+    for gid in ("g-alpha", "g-beta"):
+        (lab / "grants" / (gid + ".yaml")).write_text(
+            "id: %s\nstatus: active\n" % gid, encoding="utf-8")
+    task = lab / "tasks/work/shared"
+    task.mkdir(parents=True)
+    (task / "goal.md").write_text("shared goal\n", encoding="utf-8")
+    chk = task / "check"
+    chk.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    chk.chmod(0o755)
+    # Two jobs, one task, one spec. Only JOB-B was granted anything.
+    (lab / "ledger/dispatch.jsonl").write_text("".join(
+        json.dumps(r) + "\n" for r in (
+            {"ts": "2026-09-05T23:59:00Z", "id": "JOB-A", "job": "JOB-A",
+             "spec": "specs/shared.yaml", "task": "tasks/work/shared",
+             "state": "running"},
+            {"ts": "2026-09-05T23:59:01Z", "id": "JOB-B", "job": "JOB-B",
+             "spec": "specs/shared.yaml", "task": "tasks/work/shared",
+             "state": "running", "grant": "g-beta"},
+        )), encoding="utf-8")
+    return root, lab, task
+
+
+def capture(lab, task, run_id, job_id, extra=None):
+    payload = {"run_dir": str(lab / "ledger/runs" / run_id), "run_id": run_id,
+               "task": str(task), "workspace": str(lab / "ledger/runs" / run_id
+                                                   / "workspace"),
+               "spec": "/tmp/lab-tick-generated.yaml", "adapter": "fixture"}
+    payload.update(extra or {})
+    Path(payload["workspace"]).mkdir(parents=True, exist_ok=True)
+    env = {k: v for k, v in hermetic_env().items() if k != "LAB_JOB_ID"}
+    if job_id:
+        env["LAB_JOB_ID"] = job_id
+    r = subprocess.run([str(lab / "ops/bin/capture-stimulus")],
+                       input=json.dumps(payload), text=True, capture_output=True,
+                       cwd=str(lab), env=env)
+    manifest = lab / "ledger/runs" / run_id / "stimulus/manifest.json"
+    grant = json.loads(manifest.read_text(encoding="utf-8")).get("grant") \
+        if manifest.is_file() else None
+    return r.returncode, grant, (r.stderr or "")
+
+
+root, lab, task = build()
+try:
+    # 1. The ungranted job keeps its own emptiness; it does not borrow g-beta.
+    code, grant, err = capture(lab, task, "run-a", "JOB-A")
+    expect(code == 0, "capture refused a legitimate run: " + err[:200])
+    expect((grant or {}).get("state") == "absent",
+           "JOB-A recorded state %r, not absent" % (grant or {}).get("state"))
+    expect((grant or {}).get("id") == "",
+           "JOB-A took another job's authority: %r" % (grant or {}).get("id"))
+
+    manifest = json.loads((lab / "ledger/runs/run-a/stimulus/manifest.json").read_text())
+    dependencies = {item["path"] for item in manifest["inputs"]
+                    if item["role"] == "check_dependency"}
+    expect(dependencies == {"scripts/checklib.sh"},
+           "generic capture unexpectedly froze task-specific helpers: %r" % dependencies)
+    expect((lab / "ledger/runs/run-a/stimulus/scripts/checklib.sh").read_text() == "# lib\n",
+           "generic check library was not frozen")
+
+    # 2. The granted job gets its own grant, not the shelf's newest.
+    code, grant, err = capture(lab, task, "run-b", "JOB-B")
+    expect(code == 0, "capture refused the granted run: " + err[:200])
+    expect((grant or {}).get("state") == "present"
+           and (grant or {}).get("id") == "g-beta",
+           "JOB-B did not record its own grant: %r" % (grant,))
+
+    # 3. No job id is not a guess. A run outside the queue is unknown.
+    code, grant, err = capture(lab, task, "run-none", "")
+    expect(code == 0, "capture refused a queue-less run: " + err[:200])
+    expect((grant or {}).get("state") == "unknown",
+           "a run outside the queue recorded %r, not unknown"
+           % (grant or {}).get("state"))
+
+    # 4. A job id with no matching row is unknown too, never the nearest row.
+    code, grant, err = capture(lab, task, "run-ghost", "JOB-GHOST")
+    expect((grant or {}).get("state") == "unknown",
+           "an unmatched job id resolved to %r" % (grant,))
+
+    # 5. A caller may not name a grant its own work order contradicts.
+    code, grant, err = capture(lab, task, "run-conflict", "JOB-B",
+                               {"grant": "g-alpha"})
+    expect(code != 0, "capture accepted a grant the work order contradicts")
+    expect("g-beta" in err, "the refusal does not name the real authority: "
+                            + err[:200])
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+# 6. The dispatcher must actually export the id, or none of the above fires.
+tick = (LAB / "ops/bin/tick").read_text(encoding="utf-8", errors="replace")
+expect("LAB_JOB_ID" in tick,
+       "ops/bin/tick does not export LAB_JOB_ID; capture cannot bind to a job")
+
+if FAILURES:
+    for line in FAILURES:
+        print("check: " + line)
+    raise SystemExit("check: %d work-order binding failure(s)" % len(FAILURES))
+print("check: captured authority binds to the exact dispatch job")

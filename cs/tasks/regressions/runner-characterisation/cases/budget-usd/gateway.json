@@ -1,0 +1,16 @@
+[
+ {
+  "ok": {
+   "text": "spending",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ]
+  }
+ }
+]

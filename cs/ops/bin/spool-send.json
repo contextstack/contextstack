@@ -1,0 +1,8 @@
+{
+  "description": "Operator/tick: deliver finalize-run's run envelopes (<state>/outbox/<run_id>.json) to policy/spool.json's receiver. receiver null or the file absent (until phase 6): sends nothing, reports {pending, oldest_age_s, bytes}. kind dir: copies the envelope and its files to <path>/events/<event_id>/, the receiver side verifies every sha256 and only then writes <path>/acks/<event_id>.json; the sender moves the acked entry to outbox/acked/. At-least-once (unacked entries are re-sent), idempotent (an acked event_id is not copied again). kind director: POST envelopes to the director's node API, PUT the objects it lists missing, move the entry to outbox/acked/ only on an ack naming the same envelope_sha256; retention prune_acked deletes the run's workspace after an ack with restored true. A dir ack authorises nothing. Env SPOOL_SEND_CRASH_AFTER=copy is TEST-ONLY fault injection. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  }
+}

@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""One-shot backfill of Director land records from git history on main."""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from _land_record import (  # noqa: E402
+    _parse_instant,
+    _run_id,
+    _utc_z,
+    backfill_idempotency_key,
+    landed_body,
+    newest_finished_job,
+    post_land_record,
+    recorder_session,
+)
+from _lanes import LaneError, repo_config  # noqa: E402
+
+LAND_SQUASH = re.compile(r"^Land lane/([^/]+)$")
+LAND_LEGACY = re.compile(r"^lane ([^/:]+):")
+MERGE_LANE = re.compile(r"^Merge branch 'lane/([^/]+)'$")
+
+
+def die(message, code=2):
+    print("land-backfill: %s" % message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def lane_from_subject(subject):
+    subject = (subject or "").strip()
+    for pattern in (LAND_SQUASH, MERGE_LANE, LAND_LEGACY):
+        match = pattern.match(subject)
+        if match:
+            return match.group(1)
+    return None
+
+
+def git_main_log(main):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    done = subprocess.run(
+        ["git", "-C", str(main), "log", "--format=%H%x09%cI%x09%s", "main"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if done.returncode:
+        die((done.stderr or done.stdout or "git log failed").strip())
+    rows = []
+    for line in done.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        commit, when, subject = parts
+        lane = lane_from_subject(subject)
+        if lane:
+            rows.append({"commit": commit, "when": when, "lane": lane, "subject": subject})
+    return rows
+
+
+def landed_at(when):
+    instant = _parse_instant(when)
+    return _utc_z(instant) if instant else when
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Backfill Director land records from main history.")
+    parser.add_argument("repo", help="repo name from config/repos.json")
+    parser.add_argument("--dry-run", action="store_true", help="print without posting")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv or sys.argv[1:])
+    try:
+        cfg = repo_config(args.repo)
+    except LaneError as error:
+        die(str(error))
+    landings = git_main_log(cfg["path"])
+    root = Path(os.environ.get("LAB_STATE_ROOT") or Path.home() / ".contextstack")
+    session, err = recorder_session(root)
+    if err:
+        die(err)
+    client = session["client"]
+    landed_by = session["landed_by"]
+    jobs = session["jobs"]
+    main_branch = str(cfg.get("branch") or "main")
+    summary = {"recorded": [], "already_present": [], "no_matching_run": [], "errors": [], "dry_run": []}
+
+    for row in landings:
+        lane = row["lane"]
+        commit = row["commit"]
+        when = row["when"]
+        job = newest_finished_job(jobs, args.repo, lane, before=when)
+        if job is None:
+            summary["no_matching_run"].append(
+                {"lane": lane, "commit": commit, "when": when, "subject": row["subject"]}
+            )
+            continue
+        run_id = _run_id(job)
+        if not run_id:
+            summary["errors"].append(
+                {"lane": lane, "commit": commit, "error": "job %s has no run" % job.get("job_id")}
+            )
+            continue
+        body = landed_body(args.repo, lane, main_branch, commit, landed_by, landed_at(when))
+        key = backfill_idempotency_key(run_id, commit)
+        item = {"lane": lane, "commit": commit, "run_id": run_id, "job_id": job.get("job_id"), "key": key}
+        if args.dry_run:
+            item["body"] = body
+            summary["dry_run"].append(item)
+            continue
+        status, detail = post_land_record(client, run_id, body, key)
+        item["land_id"] = detail if status in ("recorded", "already") else None
+        if status == "recorded":
+            summary["recorded"].append(item)
+        elif status == "already":
+            summary["already_present"].append(item)
+        else:
+            item["error"] = detail
+            summary["errors"].append(item)
+
+    print(json.dumps(summary, sort_keys=True))
+    return 1 if summary["errors"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

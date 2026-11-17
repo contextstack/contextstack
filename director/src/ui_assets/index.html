@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ContextStack Director</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/markdown.js" defer></script>
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <a class="brand" href="/ui/#status">ContextStack <span>Director</span></a>
+    <nav aria-label="Main navigation">
+      <a href="#status" data-page="status">Status</a>
+      <a href="#conversations" data-page="conversations">Conversations</a>
+      <button id="logout" type="button" disabled>Log out</button>
+    </nav>
+  </header>
+  <main id="main" tabindex="-1">
+    <p id="notice" role="status" aria-live="polite">Connecting…</p>
+    <div id="content"></div>
+  </main>
+  <footer>Local Director · <button id="refresh" type="button">Refresh</button></footer>
+  <noscript>This UI needs JavaScript enabled. All assets are served by your local Director.</noscript>
+</body>
+</html>

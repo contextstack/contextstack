@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""estate-split (CS phase 6; Phase6.EstateSplit design). goal.md has the contract.
+
+A node whose code root holds no ledger/, specs/ or tasks/ (ops, policy, INVARIANTS, ESTATE only;
+state under its own root) runs director jobs through the real tick, the configured runner
+(CS_RUNNER_BIN, else the default Rust runner) and the characterisation fake gateway, against _fake_director.py.
+  offline   director down: tick accepts nothing, queues nothing, changes nothing
+  run       a job's bundle is verified, materialised, accepted, run with the prompt it carried
+  hold      director down at send: envelope and job_terminal stay in the outbox, workspace kept
+  deliver   director back: acked, run restored, the node's row appended byte for byte, workspace pruned
+  again     a re-sent acked envelope gets the same ack and no second row
+  restart   tick killed mid-run: the next tick closes it node_restart, spools it, never re-runs it
+  accepted  a job accepted by job-pull alone survives to the next tick and runs exactly once
+  tamper    an object that does not hash to its name: the job is neither materialised nor accepted
+  grant     a job carrying a grant for this node runs with that copy frozen; an expired one is closed
+            at once (grant: ..., node_config) and the director learns it; schedule meta rides the row
+  schedule  schedule-tick fires a node schedule through LAB_DIRECTOR_DISPATCH, not enqueue, and reads
+            the slot's state from the director estate's dispatch shelf (claimed, then done)
+  shape     after all of it the node's code root still has no ledger/, specs/ or tasks/
+"""
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation-v2"))
+from _fake_director import FakeDirector  # noqa: E402
+from _fake_gateway import FakeGateway  # noqa: E402
+sys.path.append(str(LAB / "ops/bin"))
+from _runner import built_runner  # noqa: E402 the default Rust runner unless $CS_RUNNER_BIN
+
+FAILED = []
+TOKEN = "fixture-node-token-" + "x" * 24
+SPEC = """id: fx-split
+model: fake
+system: prompts/job-only.md
+context: []
+tools: []
+post_turn: []
+mcp: []
+budget: {turns: 2, tool_calls: 0, usd: 0, seconds: 60}
+tasks: [tasks/fx]
+trials: 1
+hypothesis: "fixture-2146: fixture"
+"""
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:700]) if detail else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def build_node(root):
+    """A code root as phase 6 ships it: no ledger/, specs/, tasks/, prompts/."""
+    for d in ("ops/bin", "policy", "tools/bin", "hooks/bin", "scripts", "home", "tmp"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    for p in (LAB / "ops/bin").iterdir():
+        if p.is_file():
+            shutil.copy2(p, root / "ops/bin" / p.name)
+    shutil.copy2(LAB / "INVARIANTS.md", root / "INVARIANTS.md")
+    shutil.copy2(LAB / "policy/env.json", root / "policy/env.json")
+    shutil.copy2(LAB / "scripts/checklib.sh", root / "scripts/checklib.sh")
+    (root / "ESTATE").write_text("node-fx\n", encoding="utf-8")
+
+
+def job_files(word):
+    return {"spec.yaml": ((SPEC + "intent: 01ARZ3NDEKTSV4RRFFQ69G5FAV\n").encode(), 0o644),
+            "prompts/job-only.md": (("You are a fixture. " + word + "\n").encode(), 0o644),
+            "tasks/fx/goal.md": (b"Say done.\n", 0o644),
+            "tasks/fx/check": (b"#!/bin/sh\ntest -f marker\n", 0o755),
+            "tasks/fx/setup/marker": (word.encode() + b"\n", 0o644)}
+
+
+def grant_yaml(gid, estate, expiry):
+    return ('id: %s\nestate: %s\nrepo: /nonexistent/fx\npaths: ["src/"]\ngates: ["true"]\ncommit: false\n'
+            'status: active\nexpiry: "%s"\n' % (gid, estate, expiry)).encode()
+
+
+def schedule_case(scratch):
+    """The director host: schedule-tick with a node schedule, a fake director dispatch command."""
+    host = scratch / "host"
+    for d in ("ops/bin", "grants", "ledger", "home"):
+        (host / d).mkdir(parents=True)
+    for p in (LAB / "ops/bin").iterdir():
+        if p.is_file():
+            shutil.copy2(p, host / "ops/bin" / p.name)
+    shutil.copy2(LAB / "INVARIANTS.md", host / "INVARIANTS.md")
+    (host / "ESTATE").write_text("dev\n")
+    (host / "grants/g-fx-node.yaml").write_bytes(grant_yaml("g-fx-node", "node-fx", "2099-01-01T00:00:00Z"))
+    estate, calls = scratch / "director-estate", scratch / "dispatch-calls.jsonl"
+    estate.mkdir()
+    fake = scratch / "fake-dispatch"
+    fake.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\necho '{\"job_id\": \"jobS\", \"bundle_sha256\": \"x\"}'\n" % calls)
+    fake.chmod(0o755)
+    sched = host / "ledger/schedules.jsonl"
+    sched.write_text(json.dumps({"event": "schedule_updated", "id": "fx-node-hourly", "enabled": True, "cron": "0 * * * *",
+                                 "timezone": "UTC", "spec": "specs/fx.yaml", "task": "tasks/fx", "lane": "production",
+                                 "grant": "g-fx-node", "node": "node-fx", "ts": "2026-11-10T00:00:00Z"}) + "\n")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host / "home"),
+           "LAB_DIRECTOR_DISPATCH": json.dumps([str(fake)]), "LAB_DIRECTOR_ESTATE_ROOT": str(estate)}
+
+    def tick_at(now):
+        args = {"now": now, "schedules": str(sched), "fires": str(host / "ledger/fires.jsonl"),
+                "dispatch": str(host / "ledger/dispatch.jsonl"), "lock": str(host / "ledger/schedule.lock"), "scan_stale": False}
+        r = subprocess.run([sys.executable, str(host / "ops/bin/schedule-tick")], input=json.dumps(args), text=True,
+                           capture_output=True, cwd=str(host), env=env, timeout=60)
+        return r.returncode, (json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}), r.stderr
+
+    rc, out, err = tick_at("2026-11-10T03:05:00+00:00")
+    called = calls.read_text().splitlines() if calls.is_file() else []
+    expect(rc == 0 and [a["job"] for a in out.get("admitted", [])] == ["jobS"] and len(called) == 1
+           and "node-fx specs/fx.yaml --schedule=fx-node-hourly --slot=2026-11-10T03:00:00Z" in called[0]
+           and "--grant=g-fx-node" in called[0] and not (host / "ledger/dispatch.jsonl").exists(),
+           "schedule: a node schedule fires through the director's dispatch, never a local enqueue", (rc, out, err[-300:], called))
+    rc, out, err = tick_at("2026-11-10T03:06:00+00:00")
+    expect(rc == 0 and not out.get("admitted") and len(calls.read_text().splitlines()) == 1,
+           "schedule: while the director has no terminal row the slot stays claimed, not re-fired", (out, err[-200:]))
+    (estate / "dispatch.jsonl").write_text(json.dumps({"id": "jobS", "job": "jobS", "state": "done", "verdict": "pass",
+                                                        "schedule_id": "fx-node-hourly", "slot": "2026-11-10T03:00:00Z",
+                                                        "director_job": "jobS"}) + "\n")
+    rc, out, err = tick_at("2026-11-10T03:07:00+00:00")
+    expect(rc == 0 and not out.get("admitted") and len(calls.read_text().splitlines()) == 1,
+           "schedule: the director estate's done row closes the slot", (out, err[-200:]))
+    (host / "grants/g-fx-node.yaml").write_bytes(grant_yaml("g-fx-node", "dev", "2099-01-01T00:00:00Z"))
+    rc, out, err = tick_at("2026-11-10T04:05:00+00:00")
+    expect(rc == 0 and not out.get("admitted") and any("targets node node-fx" in d.get("reason", "") for d in out.get("deferred", [])),
+           "schedule: a grant not issued for the node defers the schedule", (out, err[-200:]))
+
+
+def shelf(path):
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()] if path.is_file() else []
+
+
+def main():
+    scratch = Path(tempfile.mkdtemp(prefix="estate-split-", suffix=".noindex"))
+    gateway = director = None
+    try:
+        node, state = scratch / "node", scratch / "state"
+        build_node(node)
+        state.mkdir()
+        director = FakeDirector(scratch / "director", TOKEN)
+        gateway = FakeGateway([{"ok": {"text": "done"}}, {"delay_s": 120}, {"ok": {"text": "done"}}], scratch)
+        (node / "policy/spool.json").write_text(json.dumps({"version": 1, "min_free_bytes": 0, "retention": "prune_acked",
+            "receiver": {"kind": "director", "url": director.url, "node": "fx", "token_env": "CS_FX_TOKEN",
+                         "installation": director.installation}}))
+        (node / "node.env").write_text("export CS_FX_TOKEN=%s\n" % TOKEN)
+        (node / "node.env").chmod(0o600)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(node / "home"), "TMPDIR": str(node / "tmp"),
+               "LANG": os.environ.get("LANG", "en_US.UTF-8"), "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(node),
+               "CSGATEWAY_ENDPOINT": gateway.endpoint, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+               "CS_RUNNER_BIN": str(built_runner(LAB))}
+
+        def op(name, payload=None, **kw):
+            r = subprocess.run([sys.executable, str(node / "ops/bin" / name)], input=json.dumps(payload or {}),
+                               text=True, capture_output=True, cwd=str(node), env=env, timeout=180, **kw)
+            try:
+                return r.returncode, json.loads(r.stdout.strip().splitlines()[-1]), r.stderr
+            except (ValueError, IndexError):
+                return r.returncode, {"raw": r.stdout[-400:]}, r.stderr[-800:]
+
+        dispatch, outbox = state / "dispatch.jsonl", state / "outbox"
+        director.offer("jobA", job_files("alpha"))
+        director.down = True
+        rc, out, err = op("tick")
+        expect(bool(out.get("job_pull", {}).get("error")) and not [r for r in shelf(dispatch) if r.get("director_job")],
+               "offline: the director down, nothing is accepted or queued", (out, err[-300:]))
+        expect(director.jobs["jobA"]["state"] == "offered" and not (state / "jobs").exists(), "offline: the job is still offered")
+
+        director.down = False
+        real_receive = director.receive
+        director.receive = lambda env_, row: {"status": "rejected", "error": "held"}  # reachable, but no ack yet
+        rc, out, err = op("tick")
+        rows = [r for r in shelf(dispatch) if r.get("director_job") == "jobA"]
+        term = [r for r in rows if r.get("state") in ("done", "error")]
+        expect(rc == 0 and term and term[-1]["state"] == "done" and term[-1].get("verdict") == "pass",
+               "run: the job was pulled, accepted and run to a pass", (rc, out, err[-600:]))
+        expect(director.jobs["jobA"]["state"] == "accepted", "run: the director saw the accept")
+        run_id = term[-1].get("run_id") if term else ""
+        terminal = state / "runs" / str(run_id) / "terminal.json"
+        expect(terminal.is_file() and json.loads(terminal.read_text()).get("intent") == "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+               "run: the stamped Director task link survives tick and the runner")
+        expect(any(r.get("intent") == "01ARZ3NDEKTSV4RRFFQ69G5FAV" for r in shelf(state / "ledger.jsonl")),
+               "run: the ledger row names the Director task")
+        manifest = state / "runs" / str(run_id) / "stimulus/manifest.json"
+        prompts = [i for i in json.loads(manifest.read_text()).get("inputs", []) if i.get("role") == "prompt"] if manifest.is_file() else []
+        expect(len(prompts) == 1 and os.path.realpath(prompts[0]["source"]).startswith(os.path.realpath(state / "jobs/jobA")),
+               "run: the frozen prompt came from the job dir, not a config root", prompts)
+        pending = sorted(p.name for p in outbox.glob("*.json"))
+        ws = state / "runs" / str(run_id) / "workspace"
+        expect(pending == sorted([run_id + ".json", "job_jobA.json"]) and ws.is_dir(),
+               "hold: no ack, so the run envelope and job_terminal wait in the outbox and the workspace stays", pending)
+
+        director.receive = real_receive
+        director.down = True
+        rc, out, _ = op("spool-send")
+        expect(rc == 0 and out.get("sent") == 0 and out.get("pending") == 2, "hold: director down at send, still pending", out)
+        director.down = False
+        rc, out, _ = op("spool-send")
+        expect(rc == 0 and out.get("sent") == 2 and out.get("pending") == 0 and out.get("pruned") == 1,
+               "deliver: both events acked, one workspace pruned", out)
+        node_row = [l for l in (state / "ledger.jsonl").read_text().splitlines() if run_id in l]
+        dir_rows = (scratch / "director/ledger.jsonl").read_text().splitlines()
+        expect(len(node_row) == 1 and dir_rows == node_row, "deliver: the director's ledger holds the node's row byte for byte")
+        restored = scratch / "director/runs" / run_id
+        expect(all((restored / n).is_file() for n in ("terminal.json", "transcript.md", "check.json", "stimulus/manifest.json")),
+               "deliver: the run restored in the director's estate")
+        expect(not ws.exists() and (outbox / "acked" / (run_id + ".pruned.json")).is_file() and director.jobs["jobA"]["state"] == "done",
+               "deliver: the workspace went only after the ack; the job is done in the director")
+
+        first = (outbox / "acked" / (run_id + ".ack.json")).read_text()
+        shutil.copy2(outbox / "acked" / (run_id + ".json"), outbox / (run_id + ".json"))
+        rc, out, _ = op("spool-send")
+        expect(out.get("sent") == 1 and (outbox / "acked" / (run_id + ".ack.json")).read_text() == first
+               and (scratch / "director/ledger.jsonl").read_text().splitlines() == dir_rows,
+               "again: the same ack, no second row", out)
+
+        director.offer("jobB", job_files("bravo"))
+        proc = subprocess.Popen([sys.executable, str(node / "ops/bin/tick")], cwd=str(node), env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        arrived = gateway.wait_requests(2, 60)
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        expect(arrived, "restart: job B reached the gateway before the kill")
+        rc, out, err = op("tick")
+        b_rows = [r for r in shelf(dispatch) if r.get("director_job") == "jobB"]
+        b_term = [r for r in b_rows if r.get("state") in ("done", "error")]
+        expect(len(b_term) == 1 and (b_term[0].get("error") or {}).get("class") == "node_restart"
+               and len([r for r in b_rows if r.get("state") == "running"]) == 1 and len(gateway.requests) == 2,
+               "restart: closed node_restart once, never run again", (b_rows, err[-300:]))
+        expect(director.jobs["jobB"]["state"] == "error" and (director.jobs["jobB"]["terminal"] or {}).get("error", {}).get("class") == "node_restart",
+               "restart: the director learned it through job_terminal", director.jobs["jobB"]["terminal"])
+
+        director.offer("jobC", job_files("charlie"))
+        rc, out, _ = op("job-pull")
+        rc2, out2, _ = op("job-pull")
+        c_rows = [r for r in shelf(dispatch) if r.get("director_job") == "jobC"]
+        expect(out.get("accepted") == ["jobC"] and out2.get("accepted") == ["jobC"] and len(c_rows) == 1,
+               "accepted: job-pull accepts and queues once, a second pull re-accepts without re-queueing", (out, out2))
+        rc, out, err = op("tick")
+        c_term = [r for r in shelf(dispatch) if r.get("director_job") == "jobC" and r.get("state") in ("done", "error")]
+        expect(len(c_term) == 1 and c_term[0]["state"] == "done" and director.jobs["jobC"]["state"] == "done"
+               and len(gateway.requests) == 3, "accepted: the next tick runs it exactly once and the director has it", (out, err[-300:]))
+
+        job_d = director.offer("jobD", job_files("delta"))
+        director.bad_objects.add(next(f["sha256"] for f in job_d["files"] if f["path"] == "tasks/fx/goal.md"))
+        rc, out, _ = op("job-pull")
+        expect(out.get("accepted") == [] and [f["job_id"] for f in out.get("failed", [])] == ["jobD"]
+               and not (state / "jobs/jobD").exists() and director.jobs["jobD"]["state"] == "offered"
+               and not [r for r in shelf(dispatch) if r.get("director_job") == "jobD"],
+               "tamper: a bad object fails the job before anything is written or accepted", out)
+
+        director.bad_objects.clear()  # every fixture job shares goal.md's object; withdraw the tampered job
+        director.jobs.pop("jobD")
+        good = grant_yaml("g-fx-node", "node-fx", "2099-01-01T00:00:00Z")
+        director.offer("jobG", job_files("golf"), grant=("g-fx-node", good),
+                       meta={"schedule_id": "fx-node-hourly", "slot": "2026-11-10T03:00:00Z"})
+        rc, out, err = op("tick")
+        g_rows = [r for r in shelf(dispatch) if r.get("director_job") == "jobG"]
+        g_term = [r for r in g_rows if r.get("state") in ("done", "error")]
+        run_g = g_term[-1].get("run_id") if g_term else ""
+        frozen = (json.loads((state / "runs" / str(run_g) / "stimulus/manifest.json").read_text()).get("grant")
+                  if run_g and (state / "runs" / str(run_g) / "stimulus/manifest.json").is_file() else {})
+        expect(len(g_term) == 1 and g_term[0]["state"] == "done" and g_term[0].get("grant") == "g-fx-node"
+               and g_term[0].get("schedule_id") == "fx-node-hourly" and (frozen or {}).get("state") == "present"
+               and frozen.get("sha256") == __import__("hashlib").sha256(good).hexdigest()
+               and director.jobs["jobG"]["state"] == "done",
+               "grant: the carried grant is frozen as present with its bytes' hash; schedule meta rides the row",
+               (g_term, frozen, out, err[-300:]))
+        director.offer("jobH", job_files("hotel"), grant=("g-fx-old", grant_yaml("g-fx-old", "node-fx", "2020-01-01T00:00:00Z")))
+        director.offer("jobI", job_files("india"), grant=("g-fx-dev", grant_yaml("g-fx-dev", "dev", "2099-01-01T00:00:00Z")))
+        before = len(gateway.requests)
+        rc, out, err = op("tick")
+        refused = {r["director_job"]: r for r in shelf(dispatch) if r.get("director_job") in ("jobH", "jobI")}
+        expect(set(refused) == {"jobH", "jobI"} and all(r["state"] == "error" and r["stop"].startswith("grant: ")
+               and r["error"]["class"] == "node_config" for r in refused.values()) and "expired" in refused["jobH"]["stop"]
+               and "estate" in refused["jobI"]["stop"] and len(gateway.requests) == before,
+               "grant: an expired grant and one for another estate queue no run; each job closes at once", refused)
+        expect(director.jobs["jobH"]["state"] == "error" and director.jobs["jobI"]["state"] == "error",
+               "grant: the director learns both refusals through job_terminal",
+               {k: director.jobs[k]["state"] for k in ("jobH", "jobI")})
+        schedule_case(scratch)
+
+        expect(not any((node / d).exists() for d in ("ledger", "specs", "tasks", "prompts")),
+               "shape: the node's code root never grew ledger/, specs/, tasks/ or prompts/",
+               sorted(p.name for p in node.iterdir()))
+    finally:
+        for thing in (gateway, director):
+            if thing:
+                thing.close()
+        if not os.environ.get("ESTATE_SPLIT_KEEP"):
+            shutil.rmtree(scratch, ignore_errors=True)
+        else:
+            print("kept", scratch)
+    print("\ncheck: estate-split %d assertion(s) failed%s" % (len(FAILED), (": " + "; ".join(FAILED)) if FAILED else ""))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

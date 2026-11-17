@@ -1,0 +1,11 @@
+id: fx-messages-jsonl-events
+model: fake
+system: prompts/coder-min.md
+context: []
+tools: [fs_write]
+post_turn: [rerun-check]
+mcp: []
+budget: {turns: 4, tool_calls: 10, usd: 1, seconds: 0}
+tasks: [tasks/fx]
+trials: 1
+hypothesis: "fixture-1972: messages.jsonl event sequence (two turns, one tool call, one post_turn)"

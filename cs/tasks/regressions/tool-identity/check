@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""tool-identity: tool and hook builds in the frozen run identity. See notes.md."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+V1, V2 = HERE.parent / 'runner-characterisation', HERE.parent / 'runner-characterisation-v2'
+sys.path.insert(0, str(V1))
+import _harness as harness  # noqa: E402
+
+CASE = V2 / 'cases/happy-fs-write'
+TOOLS = ('fs_read', 'fs_write', 'exec')
+
+
+def flip(path):
+    raw = bytearray(path.read_bytes())
+    assert raw[-1:] == b'\n', path
+    raw[-1] = ord(' ')  # one byte: the trailing newline becomes a space; still valid source
+    path.write_bytes(bytes(raw))
+
+
+def run_once(binary, estate, gateway_cls):
+    gateway = gateway_cls(json.loads((CASE / 'gateway.json').read_text()), estate)
+    try:
+        process = harness.launch(binary, estate, harness.child_env(estate, gateway.endpoint, {}), {})
+        out, err = process.communicate(timeout=60)
+        assert process.returncode == 0, (out, err)
+    finally:
+        gateway.close()
+    rows = [json.loads(l) for l in (estate / 'ledger/ledger.jsonl').read_text().splitlines() if l.strip()]
+    run = estate / rows[-1]['transcript']
+    manifest = json.loads((run / 'stimulus/manifest.json').read_text())
+    terminal = json.loads((run / 'terminal.json').read_text())
+    assert manifest['env_sha'] == terminal['env_sha'] == rows[-1]['env_sha'], (manifest, terminal, rows[-1])
+    assert set(manifest['tool_builds']) == set(TOOLS), manifest['tool_builds']
+    assert all(v and v.startswith('sha256:') for v in manifest['tool_builds'].values()), manifest
+    assert manifest['hook_builds'] == {}, manifest['hook_builds']
+    assert manifest['tool_builds_basis'] == 'executable+descriptor+imports', manifest
+    return manifest
+
+
+def runner(name, binary, scratch, gateway_cls):
+    root = scratch / name
+    root.mkdir()
+    estate = harness.build_estate(root, CASE, {}, LAB, V2)
+    (estate / 'scripts').mkdir()
+    shutil.copy2(LAB / 'scripts/node-bundle', estate / 'scripts/node-bundle')
+    base = run_once(binary, estate, gateway_cls)
+    flip(estate / 'tools/bin/fs_write')
+    tool = run_once(binary, estate, gateway_cls)
+    changed = {t for t in TOOLS if tool['tool_builds'][t] != base['tool_builds'][t]}
+    assert changed == {'fs_write'}, (name, base['tool_builds'], tool['tool_builds'])
+    assert tool['env_sha'] != base['env_sha'], name
+    flip(estate / 'tools/bin/_calllog.py')
+    helper = run_once(binary, estate, gateway_cls)
+    # A runtime exe tool (fs_read, implemented by cs-tools) has no file here and imports nothing.
+    src = {t: (estate / 'tools/bin' / t).read_text() for t in TOOLS if (estate / 'tools/bin' / t).is_file()}
+    importers = {t for t, text in src.items() if 'import _calllog' in text or 'from _calllog' in text}
+    changed = {t for t in TOOLS if helper['tool_builds'][t] != tool['tool_builds'][t]}
+    assert importers and changed == importers, (name, importers, changed)
+    assert len({base['env_sha'], tool['env_sha'], helper['env_sha']}) == 3, name
+    print('check: %s: one tool byte -> that tool only + env_sha; helper byte -> its importers %s'
+          % (name, sorted(importers)))
+    return estate, [base['tool_builds'], tool['tool_builds'], helper['tool_builds']]
+
+
+def unreadable(estate, scratch):
+    """capture-stimulus directly: a name that is not there records null, never a refusal."""
+    out = subprocess.run([str(estate / 'ops/real-bin/capture-stimulus')], cwd=str(estate), text=True,
+                         capture_output=True, env={'PATH': os.environ['PATH'], 'HOME': str(scratch)},
+                         input=json.dumps({'run_dir': str(scratch / 'direct-run'), 'task': str(estate / 'tasks/fx'),
+                                           'adapter': 'runner', 'runner_implementation': 'rust',
+                                           'tools': ['fs_read', 'no_such_tool'], 'hooks': ['rerun-check', 'no_such_hook']}))
+    assert out.returncode == 0, out.stderr
+    reply = json.loads(out.stdout.splitlines()[-1])
+    assert reply['tool_builds']['no_such_tool'] is None and reply['tool_builds']['fs_read'], reply
+    assert reply['hook_builds']['no_such_hook'] is None, reply
+    assert reply['hook_builds']['rerun-check'].startswith('sha256:'), reply
+    print('check: present tool/hook digested, unreadable tool and hook record null; capture still succeeds')
+
+
+def exe_tool(estate, scratch):
+    """a runtime exe tool's digest covers its bin (resolved from the descriptor) and its descriptor."""
+    seen = []
+
+    def digest():
+        out = subprocess.run([str(estate / 'ops/real-bin/capture-stimulus')], cwd=str(estate), text=True,
+                             capture_output=True, env={'PATH': os.environ['PATH'], 'HOME': str(scratch)},
+                             input=json.dumps({'run_dir': str(scratch / ('exe-run-%d' % len(seen))), 'task': str(estate / 'tasks/fx'),
+                                               'adapter': 'runner', 'runner_implementation': 'rust', 'tools': ['fx_exe']}))
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout.splitlines()[-1])['tool_builds']['fx_exe']
+    seen.append(digest())
+    assert seen[0] and seen[0].startswith('sha256:'), seen
+    flip(estate / 'fixture/fx_exe_bin')
+    seen.append(digest())
+    flip(estate / 'tools/bin/fx_exe.json')
+    seen.append(digest())
+    assert len(set(seen)) == 3, seen
+    print('check: runtime exe tool: its bin and its descriptor each move its digest')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--rust-bin', type=Path, default=LAB.parent / 'target/release/cs-harness')
+    args = ap.parse_args()
+    if not args.rust_bin.is_file():
+        ap.error('build the Rust runner first (cargo build --release -p cs-harness), or pass --rust-bin')
+    with scratch_dir(prefix='tool-identity-') as raw:
+        scratch = Path(raw)
+        os.environ.pop('CS_RUNNER_BIN', None)
+        # The default Rust runner only: the archived Go runner is no longer held to parity (ADR 0011).
+        estate, _ = runner('rust', args.rust_bin.resolve(), scratch, harness.load_gateway(V2))
+        unreadable(estate, scratch)
+        exe_tool(estate, scratch)
+    print('check: tool-identity passed')
+
+
+if __name__ == '__main__':
+    main()

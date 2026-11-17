@@ -1,0 +1,27 @@
+name: CS runner tests
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['harness/**', 'sandbox/**', 'tools/**', 'director/**', 'Cargo.*', 'rust-toolchain.toml', 'cs/**', 'gateway/**', 'tests/**', 'scripts/*cs*', '.github/workflows/cs-tests.yml']
+  pull_request:
+    paths: ['harness/**', 'sandbox/**', 'tools/**', 'director/**', 'Cargo.*', 'rust-toolchain.toml', 'cs/**', 'gateway/**', 'tests/**', 'scripts/*cs*', '.github/workflows/cs-tests.yml']
+permissions:
+  contents: read
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, same pin as director CI
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Rust checks
+        run: scripts/check-cs
+      - name: Caller selection and rollback
+        run: python3 cs/tasks/regressions/runner-selection/check

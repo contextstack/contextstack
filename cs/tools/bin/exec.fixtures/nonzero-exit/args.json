@@ -1,0 +1,7 @@
+{
+  "cmd": [
+    "sh",
+    "-c",
+    "echo oops >&2; exit 3"
+  ]
+}

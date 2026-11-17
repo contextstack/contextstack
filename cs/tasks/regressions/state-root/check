@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""state-root regression (goal.md; Plan.CS.v2.1 §9).
+
+  default    with no LAB_*_ROOT set, _roots.roots() is today's layout byte for byte
+  relocated  one cell runs end to end with LAB_STATE_ROOT outside the estate (the v2
+             characterisation case state-root-outside-lab): every artifact and the row
+             land under the state root, the estate's ledger/ gains nothing, the row's
+             transcript is "ledger/runs/<id>" and resolves through _roots.run_dir
+  refusals   a relative, a missing, and an inside-the-code-root state root each refuse
+             before anything is written: run-spec exit 2, tick a config-void row,
+             finalize-run and capture-stimulus exit 2 on their own entry. The runner
+             refuses nothing: a direct `lab run` with a relative root ends in
+             capture-stimulus's refusal and no row. finalize-run still refuses a run
+             dir outside runs_dir().
+
+Isolated estates only; lab/ledger is never written (asserted). $CS_RUNNER_BIN overrides
+the default Rust runner.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+import json
+import os
+import runpy
+import shutil
+import subprocess
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+V2 = LAB / "tasks/regressions/runner-characterisation-v2"
+
+FAILED = []
+SPEC = """id: fx-state-root
+model: fake
+system: prompts/coder-min.md
+context: []
+tools: []
+post_turn: []
+mcp: []
+budget: {turns: 1, tool_calls: 0, usd: 0, seconds: 0}
+tasks: [tasks/fx]
+trials: 1
+hypothesis: "fixture-1973: state-root regression"
+"""
+ROOT_NAMES = ("LAB_CODE_ROOT", "LAB_CONFIG_ROOT", "LAB_STATE_ROOT", "LAB_WORKSPACES_ROOT")
+
+
+def expect(ok, what, detail=None):
+    print(("ok   " if ok else "FAIL ") + what + ("" if ok or detail is None else " : %r" % (detail,)))
+    if not ok:
+        FAILED.append(what)
+
+
+def runner_binary(scratch):
+    """$CS_RUNNER_BIN if set, else the default Rust runner (_runner.built_runner)."""
+    sys.path.insert(0, str(LAB / "ops/bin"))
+    from _runner import built_runner
+    return built_runner(LAB).resolve()
+
+
+def estate(root):
+    """Every op copied (tick imports most of ops/bin), one spec, one task, a stub runner that records a launch."""
+    e = root / "estate"
+    for d in ("ledger", "ledger2", "specs", "tasks/fx", "ops/bin", "prompts"):
+        (e / d).mkdir(parents=True)
+    (e / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
+    (e / "ESTATE").write_text("dev\n", encoding="utf-8")
+    (e / "specs/fx.yaml").write_text(SPEC, encoding="utf-8")
+    (e / "tasks/fx/goal.md").write_text("fixture\n", encoding="utf-8")
+    (e / "tasks/fx/check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (e / "tasks/fx/check").chmod(0o755)
+    shutil.copy2(LAB / "prompts/coder-min.md", e / "prompts/coder-min.md")
+    for p in (LAB / "ops/bin").iterdir():
+        if p.is_file():
+            shutil.copy2(p, e / "ops/bin" / p.name)
+    (e / "lab-stub").write_text('#!/bin/sh\ntouch "$(dirname "$0")/launched"\n', encoding="utf-8")
+    (e / "lab-stub").chmod(0o755)
+    return e
+
+
+def tree(path):
+    return sorted(p.relative_to(path).as_posix() for p in Path(path).rglob("*") if "__pycache__" not in p.parts)
+
+
+def default_layout(_roots):
+    want = {"code": LAB, "config": LAB, "state": LAB / "ledger", "workspaces": LAB / "ledger/runs"}
+    expect(_roots.roots(lab=LAB, env={}) == want, "default: roots() is today's layout", _roots.roots(lab=LAB, env={}))
+    expect(_roots.runs_dir(lab=LAB, env={}) == LAB / "ledger/runs" and _roots.ledger_path(lab=LAB, env={}) == LAB / "ledger/ledger.jsonl",
+           "default: runs_dir() and ledger_path() are ledger/runs and ledger/ledger.jsonl")
+    expect(_roots.run_dir("ledger/runs/x", lab=LAB, env={}) == LAB / "ledger/runs/x" == _roots.run_dir("x", lab=LAB, env={}),
+           "default: run_dir() takes the row's transcript or a bare id")
+    for shape in ("", "a/b", "..", "/abs/x", "ledger/runs/"):
+        try:
+            _roots.run_dir(shape, lab=LAB, env={})
+            expect(False, "run_dir: %r is not a run id" % shape)
+        except ValueError:
+            expect(True, "run_dir: %r is not a run id" % shape)
+    explicit = {"LAB_STATE_ROOT": str(LAB / "ledger"), "LAB_CONFIG_ROOT": str(LAB)}
+    expect(_roots.roots(lab=LAB, env=explicit) == want, "default: a root set to its default is the default, not a refusal")
+
+
+def relocated(scratch, _roots):
+    dump = scratch / "dump"
+    r = subprocess.run([str(V2 / "check"), "--only", "state-root-outside-lab", "--dump", str(dump)],
+                       text=True, capture_output=True, env={**hermetic_env()})
+    expect(r.returncode == 0, "relocated: v2 case state-root-outside-lab passes (artifacts, row and ops paths under <STATE>)",
+           (r.returncode, r.stdout[-1500:], r.stderr[-500:]))
+    out = dump / "state-root-outside-lab.json"
+    if not out.is_file():
+        return
+    d = json.loads(out.read_text(encoding="utf-8"))
+    run, row = d["runs"][0], d["rows"][0]
+    expect(d["estate_ledger"] == [], "relocated: the estate's own ledger/ gained nothing", d["estate_ledger"])
+    expect({"messages.jsonl", "terminal.json", "check.json", "evidence", "finalized.json", "workspace"} <= set(run["entries"]),
+           "relocated: run dir holds messages.jsonl, terminal.json, check.json, evidence/, finalized.json, workspace/", run["entries"])
+    expect(row["transcript"] == "ledger/runs/" + run["dir"], "relocated: the row's transcript is ledger/runs/<id>", row["transcript"])
+    state = scratch / "state"
+    state.mkdir()
+    expect(_roots.run_dir(row["transcript"], env={"LAB_STATE_ROOT": str(state)}) == state.resolve() / "runs" / run["dir"],
+           "relocated: the transcript resolves to <state>/runs/<id> through _roots.run_dir")
+    expect(all(op["stdin"]["run_dir"].startswith("<STATE>/runs/") and "LAB_STATE_ROOT" in op["env_names"] for op in d["ops"]),
+           "relocated: every op got a state-root run_dir and inherited LAB_STATE_ROOT", d["ops"])
+
+
+def op(e, name, env, payload):
+    r = subprocess.run([str(e / "ops/bin" / name)], input=json.dumps(payload), cwd=str(e), env=env, text=True, capture_output=True)
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        out = {}
+    return r.returncode, out, r.stderr
+
+
+def refusals(scratch, e, binary):
+    outside = scratch / "outside"
+    outside.mkdir()
+    base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(scratch), "TMPDIR": str(scratch),
+            "PYTHONDONTWRITEBYTECODE": "1", "CSGATEWAY_ENDPOINT": "http://127.0.0.1:9", "LAB_RUNNER_BIN": str(e / "lab-stub")}
+    before = tree(e)
+    bad = (("relative", "ledger-elsewhere"), ("missing", str(scratch / "nope")), ("inside lab", str(e / "ledger2")))
+    for label, value in bad:
+        env = dict(base, LAB_STATE_ROOT=value)
+        r = subprocess.run([str(e / "ops/bin/run-spec"), "specs/fx.yaml"], cwd=str(e), env=env, text=True, capture_output=True)
+        expect(r.returncode == 2 and "run-spec: LAB_STATE_ROOT=" in r.stderr and not (e / "launched").exists(),
+               "run-spec: %s state root refused, exit 2 naming it, no cell launched" % label, (r.returncode, r.stderr))
+        code, out, err = op(e, "finalize-run", env, {"run_dir": str(e / "ledger/runs/x")})
+        expect(code == 2 and out.get("ok") is False and "LAB_STATE_ROOT=" in str(out.get("error")),
+               "finalize-run: %s state root refused as input, exit 2" % label, (code, out, err))
+        code, out, err = op(e, "capture-stimulus", env, {"run_dir": str(scratch / "capture" / label), "task": "tasks/fx"})
+        expect(code == 2 and "capture-stimulus: LAB_STATE_ROOT=" in err and not (scratch / "capture").exists(),
+               "capture-stimulus: %s state root refused on entry, exit 2, nothing captured" % label, (code, err))
+    expect(tree(e) == before and not list(outside.iterdir()), "refusals: nothing was written", tree(e))
+    # tick, imported from the estate with the roots valid; each bad root is a config-void row at launch time.
+    sys.path.insert(0, str(e / "ops/bin"))
+    tick = runpy.run_path(str(e / "ops/bin/tick"))
+    sys.path.remove(str(e / "ops/bin"))
+    for label, value in bad:
+        os.environ["LAB_STATE_ROOT"] = value
+        try:
+            rc, row = tick["run_spec"]("specs/fx.yaml")
+        finally:
+            del os.environ["LAB_STATE_ROOT"]
+        expect(rc == 1 and row.get("verdict") == "void" and str(row.get("stop")).startswith("roots: LAB_STATE_ROOT=")
+               and tick["is_config_void"](row) and not (e / "launched").exists(),
+               "tick.run_spec: %s state root = config-void row naming it; nothing launched" % label, (rc, row))
+    r = subprocess.run([str(binary), "run", "specs/fx.yaml"], cwd=str(e), env=dict(base, LAB_WORKSPACES_ROOT=str(e / "ledger2")),
+                       text=True, capture_output=True)
+    runs_after = tree(e / "ledger/runs")
+    expect(r.returncode == 3 and "capture-stimulus: exit status 2" in r.stderr and not list(e.rglob("ledger.jsonl"))
+           and not any(name.endswith("finalized.json") for name in runs_after),
+           "runner: a workspaces root inside lab is refused by capture-stimulus on entry; the run dir stays pending, no row",
+           (r.returncode, r.stderr, runs_after))
+    r = subprocess.run([str(binary), "run", "specs/fx.yaml"], cwd=str(e), env=dict(base, LAB_STATE_ROOT="ledger-elsewhere"),
+                       text=True, capture_output=True)
+    expect(r.returncode == 3 and "capture-stimulus: exit status 2" in r.stderr and not list(e.rglob("ledger.jsonl"))
+           and tree(e / "ledger/runs") == runs_after,
+           "runner: a direct run with a relative state root ends in capture-stimulus's refusal, no row, nothing new under ledger/runs",
+           (r.returncode, r.stderr))
+    # Containment: a run dir must be directly under runs_dir(), in both layouts; the identifier resolves there.
+    state = scratch / "state2"
+    (state / "runs/kept").mkdir(parents=True)
+    stray = e / "ledger/runs/stray"
+    stray.mkdir(parents=True)
+    (stray / "terminal.json").write_text("{}\n", encoding="utf-8")
+    env = dict(base, LAB_STATE_ROOT=str(state))
+    code, out, _ = op(e, "finalize-run", env, {"run_dir": str(stray)})
+    expect(code == 2 and "must be a directory under %s" % (state / "runs").resolve() in str(out.get("error")),
+           "finalize-run: the default-layout run dir is outside a relocated runs_dir(), refused", out)
+    code, out, _ = op(e, "finalize-run", env, {"run_dir": "ledger/runs/kept"})
+    expect(code == 2 and out.get("error") == "no terminal.json: execution has not ended",
+           "finalize-run: the identifier ledger/runs/<id> resolves under the state root (refused only for its content)", out)
+    code, out, _ = op(e, "finalize-run", env, {"run_dir": "../../elsewhere"})
+    expect(code == 2 and "must be a directory under" in str(out.get("error")), "finalize-run: a relative path is not an identifier", out)
+    code, out, _ = op(e, "finalize-run", base, {"run_dir": str(stray)})
+    expect("must be a directory under" not in str(out.get("error")), "finalize-run: default layout still accepts ledger/runs/<id>", out)
+    code, out, _ = op(e, "finalize-run", base, {"run_dir": str(outside)})
+    expect(code == 2 and "must be a directory under" in str(out.get("error")),
+           "finalize-run: default layout still refuses a dir outside ledger/runs", out)
+
+
+def main():
+    for name in ROOT_NAMES:
+        os.environ.pop(name, None)
+    live_runs = LAB / "ledger/runs"
+    live_before = (sorted(os.listdir(live_runs)) if live_runs.is_dir() else [],
+                   (LAB / "ledger/ledger.jsonl").stat().st_size if (LAB / "ledger/ledger.jsonl").is_file() else 0)
+    scratch = Path(tempfile.mkdtemp(prefix="state-root-", suffix=".noindex"))
+    try:
+        e = estate(scratch / "refuse")
+        sys.path.insert(0, str(e / "ops/bin"))  # the estate's copy of _roots, so tick (imported below) and the check agree
+        import _roots
+        default_layout(_roots)
+        relocated(scratch, _roots)
+        refusals(scratch, e, runner_binary(scratch))
+    finally:
+        if "--keep" in sys.argv:
+            print("kept", scratch)
+        else:
+            shutil.rmtree(scratch, ignore_errors=True)
+    live_after = (sorted(os.listdir(live_runs)) if live_runs.is_dir() else [],
+                  (LAB / "ledger/ledger.jsonl").stat().st_size if (LAB / "ledger/ledger.jsonl").is_file() else 0)
+    expect(live_before == live_after, "live lab/ledger/runs and ledger.jsonl untouched")
+    print("check: state-root %d failed" % len(FAILED))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

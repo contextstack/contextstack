@@ -1,0 +1,23 @@
+[
+ {
+  "error": {
+   "class": "fatal_session",
+   "code": "gateway.unknown_model",
+   "message": "unknown model_tier_hint fake"
+  }
+ },
+ {
+  "error": {
+   "class": "fatal_session",
+   "code": "gateway.no_provider_credential",
+   "message": "no credential for provider"
+  }
+ },
+ {
+  "error": {
+   "class": "fatal_session",
+   "code": "gateway.provider_unsupported",
+   "message": "provider does not support tools"
+  }
+ }
+]

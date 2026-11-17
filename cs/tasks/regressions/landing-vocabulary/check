@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Landing vocabulary: legal combinations land; illegal ones refuse with the rule."""
+import json, os, shutil, subprocess, sys, tempfile, time
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+# Directly imported estate helpers must see the same isolated roots as children.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _landing import ESCALATE, RULE_FACTORY_GAP, RULE_MODEL_MISS, RULE_UNSEATED, validate_operator_close
+
+
+def write_jsonl(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def estate():
+    root = Path(tempfile.mkdtemp(prefix="landing-vocab-", suffix=".noindex"))
+    lab = root / "lab"
+    for name in ("ops/bin", "ledger", "grants", "scripts"):
+        (lab / name).mkdir(parents=True)
+    for name in ("_landing.py", "_estate_io.py", "_dispatch.py", "_roots.py", "close"):
+        src = LAB / "ops/bin" / name
+        if src.is_file():
+            shutil.copy2(src, lab / "ops/bin" / name)
+    (lab / "ESTATE").write_text("dev\n")
+    (lab / "scripts/check").write_text("#!/bin/sh\nexit 0\n")
+    (lab / "scripts/check").chmod(0o755)
+    write_jsonl(lab / "ledger/ledger.jsonl", [])
+    write_jsonl(lab / "ledger/dispatch.jsonl", [])
+    write_jsonl(lab / "ledger/refusals.jsonl", [])
+    return root, lab
+
+
+def close(lab, payload):
+    env = {**hermetic_env(), "GIT_TERMINAL_PROMPT": "0"}
+    r = subprocess.run([str(lab / "ops/bin/close")], input=json.dumps(payload),
+                       text=True, capture_output=True, cwd=str(lab), env=env)
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def base(exp="task-1950"):
+    return {
+        "id": "job-%s-%s" % (exp, time.time_ns()),
+        "state": "operator_close",
+        "spec": "specs/exp-demo.yaml",
+        "task": "tasks/work/demo",
+        "dest": "/tmp/demo-dest",
+        "dest_sha": "abc1234",
+    }
+
+
+root, lab = estate()
+try:
+    # Seed a non-pass run and a pass run.
+    write_jsonl(lab / "ledger/ledger.jsonl", [
+        {"ts": "2026-09-23T00:00:00Z", "exp": "task-x", "verdict": "miss",
+         "run": "run-miss-1", "stop": "budget:turns", "estate": "dev"},
+        {"ts": "2026-09-23T00:00:01Z", "exp": "task-y", "verdict": "pass",
+         "run": "run-pass-1", "stop": "done", "estate": "dev"},
+    ])
+    write_jsonl(lab / "ledger/dispatch.jsonl", [
+        {"ts": "2026-09-23T00:00:00Z", "id": "enq-seat-1", "state": "done", "estate": "dev"},
+    ])
+    write_jsonl(lab / "ledger/refusals.jsonl", [
+        {"ts": "2026-09-23T00:00:00Z", "id": "ref-1", "event": "enqueue_refused",
+         "code": "grant estate mismatch", "message": "grant g-x is estate: prod-1; this lab is dev; run on prod-1.",
+         "grant": "g-x", "estate": "dev"},
+    ])
+
+    # Legal: unseated (no seat)
+    err = validate_operator_close(lab, {"reason": "unseated"})
+    assert err == "", err
+    code, out, err = close(lab, {**base("task-u1"), "reason": "unseated", "note": "hand work"})
+    assert code == 0, (out, err)
+    written = json.loads((lab / "ledger/ledger.jsonl").read_text().splitlines()[-1])
+    assert "exp" not in written and "intent" not in written
+
+    # Legal: model_miss with non-pass run
+    err = validate_operator_close(lab, {"reason": "model_miss", "run_id": "run-miss-1"})
+    assert err == "", err
+    code, out, err = close(lab, {**base("task-m1"), "reason": "model_miss", "run_id": "run-miss-1"})
+    assert code == 0, (out, err)
+    written = json.loads((lab / "ledger/ledger.jsonl").read_text().splitlines()[-1])
+    assert "exp" not in written and "intent" not in written
+
+    # Legal: factory_gap with run (dispatch id)
+    err = validate_operator_close(lab, {"reason": "factory_gap", "run_id": "enq-seat-1"})
+    assert err == "", err
+    code, out, err = close(lab, {**base("task-f1"), "reason": "factory_gap", "run_id": "enq-seat-1",
+                                 "grant": "g-x", "cause": "rails", "wave": "w1"})
+    assert code == 0, (out, err)
+    written = json.loads((lab / "ledger/ledger.jsonl").read_text().splitlines()[-1])
+    assert "exp" not in written and "intent" not in written
+
+    # Legal: factory_gap with refusal receipt
+    err = validate_operator_close(lab, {"reason": "factory_gap", "refusal_id": "ref-1"})
+    assert err == "", err
+    code, out, err = close(lab, {**base("task-f2"), "reason": "factory_gap", "refusal_id": "ref-1",
+                                 "grant": "g-x", "cause": "estate mismatch", "wave": "w2"})
+    assert code == 0, (out, err)
+    written = json.loads((lab / "ledger/ledger.jsonl").read_text().splitlines()[-1])
+    assert "exp" not in written and "intent" not in written
+
+    # Illegal: model_miss with only a pass run
+    err = validate_operator_close(lab, {"reason": "model_miss", "run_id": "run-pass-1"})
+    assert RULE_MODEL_MISS in err and "refused" in err, err
+
+    # Illegal: model_miss with no run (must be unseated)
+    err = validate_operator_close(lab, {"reason": "model_miss"})
+    assert RULE_UNSEATED in err, err
+
+    # Illegal: factory_gap with neither
+    err = validate_operator_close(lab, {"reason": "factory_gap"})
+    assert RULE_FACTORY_GAP in err or RULE_UNSEATED in err, err
+
+    # Illegal: factory_gap with unknown refusal
+    err = validate_operator_close(lab, {"reason": "factory_gap", "refusal_id": "missing"})
+    assert RULE_FACTORY_GAP in err and "missing" in err, err
+
+    # Illegal: unseated with a seat
+    err = validate_operator_close(lab, {"reason": "unseated", "run_id": "run-miss-1"})
+    assert RULE_UNSEATED in err, err
+
+    # Third same-cause factory_gap in a wave refuses
+    write_jsonl(lab / "ledger/ledger.jsonl", [
+        {"ts": "2026-09-23T01:00:00Z", "verdict": "operator_close", "close_reason": "factory_gap",
+         "grant": "g-x", "cause": "estate mismatch", "wave": "w-gap", "stop": "operator-close reason factory_gap",
+         "estate": "dev"},
+        {"ts": "2026-09-23T01:00:01Z", "verdict": "operator_close", "close_reason": "factory_gap",
+         "grant": "g-x", "cause": "estate mismatch", "wave": "w-gap", "stop": "operator-close reason factory_gap",
+         "estate": "dev"},
+    ])
+    err = validate_operator_close(lab, {
+        "reason": "factory_gap", "refusal_id": "ref-1",
+        "grant": "g-x", "cause": "estate mismatch", "wave": "w-gap"})
+    assert ESCALATE in err, err
+    code, out, err = close(lab, {**base("task-f3"), "reason": "factory_gap", "refusal_id": "ref-1",
+                                 "grant": "g-x", "cause": "estate mismatch", "wave": "w-gap"})
+    assert code != 0 and ESCALATE in (out + err), (code, out, err)
+
+    # First two with same cause still land
+    write_jsonl(lab / "ledger/ledger.jsonl", [])
+    code, out, err = close(lab, {**base("task-f4"), "reason": "factory_gap", "refusal_id": "ref-1",
+                                 "grant": "g-y", "cause": "estate mismatch", "wave": "w-ok"})
+    assert code == 0, (out, err)
+    written = json.loads((lab / "ledger/ledger.jsonl").read_text().splitlines()[-1])
+    assert "exp" not in written and "intent" not in written
+    code, out, err = close(lab, {**base("task-f5"), "reason": "factory_gap", "refusal_id": "ref-1",
+                                 "grant": "g-y", "cause": "estate mismatch", "wave": "w-ok"})
+    assert code == 0, (out, err)
+    written = json.loads((lab / "ledger/ledger.jsonl").read_text().splitlines()[-1])
+    assert "exp" not in written and "intent" not in written
+
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+print("check: landing vocabulary — legal land; illegal refuse with rule; third gap escalates")

@@ -1,0 +1,923 @@
+#!/usr/bin/env python3
+"""Offline lead session host: stub stream-json CLI, no network, no real ~/.contextstack."""
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+OPS = KIT / "ops/bin"
+STUB = HERE / "stub_stream_cli"
+STUB_DELAY = HERE / "stub_delayed_cli"
+STUB_SANDBOX = HERE / "stub_sandbox_cli"
+LEAD = KIT / "lead"
+sys.path.insert(0, str(OPS))
+
+def login_copies_only():
+    """Host lifecycle checks without sockets, sandbox-exec, or personal credentials."""
+    from _lead_session import ClaudeStreamSession, prepare_runtime_home
+
+    with scratch_dir(prefix="lead-login-copies-") as raw:
+        root = Path(raw)
+        owner = root / "owner"
+        source = owner / ".claude/.credentials.json"
+        source.parent.mkdir(parents=True)
+        original = {"claudeAiOauth": {"accountUuid": "owner-account", "organizationUuid": "owner-org",
+                                      "refreshToken": "fixture-original"}}
+        source.write_text(json.dumps(original))
+        with patch.dict(os.environ, {"HOME": str(owner)}):
+            transcript = root / "events.ndjson"
+            session = ClaudeStreamSession(root, root / "runtime", root / "tmp",
+                                          binary="/usr/bin/true", transcript=transcript)
+            session.start()
+            session.stop()
+            assert session.login_copy_refresh[-1]["status"] == "unchanged"
+            copied = session.home / ".claude/.credentials.json"
+            assert not copied.exists()
+
+            def stage_copy():
+                session._login_copies = prepare_runtime_home(session.home)
+                assert copied.is_file() and not copied.is_symlink()
+                assert stat.S_IMODE(copied.stat().st_mode) == 0o600 and copied.stat().st_nlink == 1
+
+            refreshed = {"claudeAiOauth": {**original["claudeAiOauth"], "refreshToken": "fixture-rotated"}}
+            stage_copy()
+            copied.write_text(json.dumps(refreshed))
+            assert json.loads(source.read_text()) == original
+            session.stop()
+            assert session.login_copy_refresh[-1]["status"] == "task_copy"
+            assert json.loads(source.read_text()) == original and not copied.exists()
+
+            stage_copy()
+            copied.write_text(json.dumps({"claudeAiOauth": {**refreshed["claudeAiOauth"], "accountUuid": "other"}}))
+            session.stop()
+            assert session.login_copy_refresh[-1]["status"] == "task_copy"
+            assert json.loads(source.read_text()) == original and not copied.exists()
+
+            stage_copy()
+            copied.write_text(json.dumps(refreshed))
+            owner_refresh = {"claudeAiOauth": {**refreshed["claudeAiOauth"], "refreshToken": "fixture-owner-newer"}}
+            source.write_text(json.dumps(owner_refresh))
+            session.stop()
+            assert session.login_copy_refresh[-1]["status"] == "owner_changed"
+            assert json.loads(source.read_text()) == owner_refresh and not copied.exists()
+            events = [json.loads(line)["msg"] for line in transcript.read_text().splitlines()]
+            assert [event["login_copy_refresh"][0]["status"] for event in events] == [
+                "unchanged", "task_copy", "task_copy", "owner_changed"]
+            assert all(set(event) == {"login_copy_refresh"} and
+                       set(event["login_copy_refresh"][0]) == {"source", "status"} for event in events)
+
+            failed = ClaudeStreamSession(root, root / "failed-runtime", root / "tmp", binary=str(root / "missing-cli"))
+            try:
+                failed.start()
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("missing CLI accepted")
+            assert failed.login_copy_refresh[-1]["status"] == "unchanged"
+            assert not (failed.home / ".claude/.credentials.json").exists()
+
+            source.unlink()
+            keychain_only = ClaudeStreamSession(root, root / "keychain-only", root / "tmp", binary="/usr/bin/true")
+            keychain_only.start()
+            keychain_only.stop()
+            assert keychain_only.login_copy_refresh == []
+            assert not (keychain_only.home / ".claude/.credentials.json").exists()
+    print("PASS: hosted lead private login lifecycle, task refresh discard, owner precedence, failure cleanup and evidence")
+    return 0
+
+
+if "--login-copies-only" in sys.argv:
+    raise SystemExit(login_copies_only())
+
+
+subprocess.run([sys.executable, str(HERE / "cleanup-check")], check=True, env={**hermetic_env()})
+import _lead_host  # noqa: E402
+sys.path.insert(0, str(HERE.parent / "lead-wakeups"))
+from fake_events import FakeDirector
+DIRECTOR = FakeDirector()
+
+SECRET = "cslead_fixture_secret_token_do_not_leak"
+FAKE_TOKEN = "cslead_echo_me_in_reply"
+CONV_MAIN = "con_fixture_main"
+CONV_REDACTION = "con_fixture_redaction"
+CONV_LIFETIME = "con_fixture_lifetime"
+CONV_SERIAL = "con_fixture_serial"
+CONV_EXECUTOR = "con_fixture_executor"
+CONV_LIFECYCLE = "con_fixture_lifecycle"
+problems = []
+
+CHECK_TIMEOUT_SMOKE = 300
+CHECK_TIMEOUT_TURN = 90
+CHECK_TIMEOUT_TURN_SLOW = 120
+CHECK_TIMEOUT_EXECUTOR = 240
+CHECK_TIMEOUT_JOIN_SERIAL = 150
+CHECK_SERVE_READY_S = "60"
+CHECK_SERVE_EXIT_S = 60.0
+CHECK_SOCKET_GONE_S = 60.0
+
+
+def expect(ok, msg, detail=""):
+    if not ok:
+        line = msg + ("" if detail == "" else " (" + repr(detail) + ")")
+        problems.append(line)
+        print("  ASSERT FAIL: %s" % line, flush=True)
+
+
+def step_begin(name: str) -> float:
+    print("  step begin: %s" % name, flush=True)
+    return time.monotonic()
+
+
+def step_done(name: str, t0: float) -> None:
+    print("  step done: %s %.2fs" % (name, time.monotonic() - t0), flush=True)
+
+
+def wait_socket_gone(sock: Path, timeout: float = CHECK_SOCKET_GONE_S) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not sock.is_socket():
+            return True
+        time.sleep(0.05)
+    return not sock.is_socket()
+
+
+def timed_client_turn(step: str, **kwargs) -> str:
+    t0 = step_begin(step)
+    try:
+        return _lead_host.client_turn(**kwargs)
+    finally:
+        step_done(step, t0)
+
+
+def timed_subprocess(step: str, **kwargs) -> subprocess.CompletedProcess:
+    t0 = step_begin(step)
+    try:
+        return subprocess.run(**kwargs)
+    finally:
+        step_done(step, t0)
+
+
+def workspace_turn(root: Path, seq: int, message: str) -> Path:
+    state = Path(os.environ["LAB_STATE_ROOT"])
+    cfg = Path(os.environ["LAB_CONFIG_ROOT"])
+    conversation = json.loads((cfg / "hosted-lead.json").read_text())["conversation_id"]
+    ws = state / "jobs" / ("turn-%d" % seq)
+    ws.mkdir(parents=True)
+    (ws / "job.json").write_text(json.dumps({"job_id": ws.name, "task": "tasks/turn", "spec": "spec.yaml"}))
+    DIRECTOR.add_turn(conversation, ws.name)
+    for rel, src in (
+        ("spec.yaml", LEAD / "spec.yaml"),
+        ("prompts/system.md", LEAD / "prompts/system.md"),
+        ("session/mcp.json", LEAD / "session/mcp.json"),
+        ("session/host.json", LEAD / "session/host.json"),
+    ):
+        dest = ws / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dest)
+    (ws / "conversation").mkdir(exist_ok=True)
+    (ws / "conversation/context.md").write_text(
+        "Thread context for turn %d.\n" % seq if seq > 1 else "First turn: no prior thread.\n", encoding="utf-8"
+    )
+    turn = ws / "tasks/turn"
+    turn.mkdir(parents=True)
+    (turn / "goal.md").write_text(message, encoding="utf-8")
+    (turn / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (turn / "check").chmod(stat.S_IRWXU)
+    return ws
+
+
+def executor_fixture_task(root: Path) -> Path:
+    ws = workspace_turn(root, 99, "Executor hook hosted turn.")
+    task = ws / "tasks/turn"
+    (task / "setup").mkdir()
+    return task
+
+
+def kill_serve(state: Path, conversation: str, sock: Path | None = None) -> None:
+    st = _lead_host.load_state(_lead_host.state_file(state, conversation))
+    pid = st.get("serve_pid")
+    if pid:
+        pid = int(pid)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            except OSError:
+                break
+            time.sleep(0.1)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    if sock is None:
+        sock = _lead_host.socket_file(state, conversation)
+    sock.unlink(missing_ok=True)
+
+
+def wait_serve_exit(
+    pid: int, timeout: float = CHECK_SERVE_EXIT_S, label: str = "serve", *, state: Path | None = None, conversation: str | None = None
+) -> bool:
+    sock = _lead_host.socket_file(state, conversation) if state is not None and conversation else None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        gone = False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            gone = True
+        if sock is not None and not sock.is_socket():
+            return True
+        if gone:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def write_hosted_lead(cfg: Path, conversation_id: str) -> None:
+    (cfg / "hosted-lead.json").write_text(
+        json.dumps(
+            {
+                "conversation_id": conversation_id,
+                "director": DIRECTOR.url,
+                "model": "claude-code-sonnet",
+                "credential_file": "lead-credential",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_credential_escape(cs_root: Path) -> None:
+    try:
+        _lead_host.resolve_credential_under_config(cs_root, "../outside")
+        expect(False, "credential .. escape refused")
+    except SystemExit:
+        pass
+    try:
+        _lead_host.resolve_credential_under_config(cs_root, "/etc/passwd")
+        expect(False, "credential absolute path refused")
+    except SystemExit:
+        pass
+
+
+def raw_request(sock: Path, payload: dict) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect(str(sock))
+        client.sendall((json.dumps(payload) + "\n").encode())
+        return json.loads(client.recv(65536))
+
+
+def test_socket_security(root: Path, state: Path, cfg: Path, sock: Path) -> None:
+    expect(sock.parent.stat().st_uid == os.getuid(), "socket directory belongs to host user")
+    expect(stat.S_IMODE(sock.parent.stat().st_mode) == 0o700, "socket directory mode 0700")
+    token = sock.parent / "token"
+    expect(token.is_file() and stat.S_IMODE(token.stat().st_mode) == 0o600, "per-serve token mode 0600")
+    token.chmod(0o644)
+    try:
+        _lead_host.read_socket_token(sock)
+        expect(False, "publicly readable socket token refused")
+    except (SystemExit, ValueError, OSError):
+        pass
+    finally:
+        token.chmod(0o600)
+    for payload in ({"op": "ping"}, {"op": "turn", "workspace": str(root)},
+                    {"op": "watch_job", "job_id": "attacker"}, {"op": "ping", "token": "wrong"}):
+        answer = raw_request(sock, payload)
+        expect(bool(answer.get("error")), "unauthenticated socket request refused", answer)
+
+    attacker = root / "attacker-workspace"
+    (attacker / "session").mkdir(parents=True)
+    (attacker / "session/mcp.json").write_text(json.dumps({"mcpServers": {"evil": {"command": "attacker"}}}))
+    answer = _lead_host.socket_request(sock, {"op": "turn", "workspace": str(attacker)}, timeout=5)
+    expect(bool(answer.get("error")), "arbitrary workspace and attacker MCP refused", answer)
+    # Host-side clients must reject this before attempting a replacement serve, too.
+    with patch.object(
+            _lead_host, "ensure_serving", side_effect=AssertionError("untrusted workspace started a serve")):
+        try:
+            _lead_host.client_turn(attacker, conversation_id=CONV_MAIN, config_root=cfg,
+                                   state=state, cli_binary=str(STUB), sandbox=False)
+            expect(False, "invalid workspace refused before serve replacement")
+        except (SystemExit, ValueError):
+            pass
+    stranger = state / "jobs" / "other-conversation"
+    (stranger / "tasks/turn").mkdir(parents=True)
+    (stranger / "job.json").write_text(json.dumps({"job_id": stranger.name, "task": "tasks/turn", "spec": "spec.yaml"}))
+    (stranger / "tasks/turn/goal.md").write_text("forged owner turn")
+    DIRECTOR.add_turn("con_other", stranger.name)
+    answer = _lead_host.socket_request(sock, {"op": "turn", "workspace": str(stranger)}, timeout=5)
+    expect(bool(answer.get("error")), "another conversation's job bundle refused", answer)
+
+    stale = sock.parent / "stale-socket"
+    for kind in ("file", "symlink"):
+        if kind == "file":
+            stale.write_text("must survive")
+        else:
+            stale.symlink_to(token)
+        try:
+            _lead_host.remove_stale_socket(stale)
+            expect(False, "stale " + kind + " refused without unlinking")
+        except (SystemExit, ValueError, OSError):
+            expect(stale.exists() or stale.is_symlink(), "unsafe stale path remains intact")
+        finally:
+            stale.unlink(missing_ok=True)
+
+    for label in ("public", "symlink"):
+        conversation = "con_unsafe_" + label
+        candidate = _lead_host.socket_file(state, conversation)
+        candidate.parent.parent.mkdir(parents=True, exist_ok=True)
+        if label == "public":
+            candidate.parent.mkdir(mode=0o755)
+            candidate.parent.chmod(0o755)
+        else:
+            target = root / "symlink-target"
+            target.mkdir(mode=0o700)
+            candidate.parent.symlink_to(target, target_is_directory=True)
+        try:
+            _lead_host.ensure_serving(conversation, state, cfg, model="sonnet", cli_binary=str(STUB), sandbox=False)
+            expect(False, label + " socket directory refused")
+        except (SystemExit, ValueError, OSError):
+            pass
+        finally:
+            if candidate.parent.is_symlink():
+                candidate.parent.unlink()
+            elif candidate.parent.exists():
+                candidate.parent.rmdir()
+
+
+def test_serve_outlives_client(cs_root: Path, state: Path, env: dict) -> None:
+    """The serve a turn client spawns keeps running after that client exits: lane wake-ups need it between turns."""
+    write_hosted_lead(cs_root / "config", CONV_LIFETIME)
+    code = ("import sys; sys.path.insert(0, %r); import _lead_host; from pathlib import Path; "
+            "_lead_host.ensure_serving(%r, Path(%r), Path(%r), model='sonnet', cli_binary=%r, sandbox=False)"
+            % (str(OPS), CONV_LIFETIME, str(state), str(cs_root / "config"), str(STUB)))
+    child_env = {k: v for k, v in env.items() if k != "LEAD_HOST_WATCH_PID"}
+    try:
+        done = subprocess.run([sys.executable, "-I", "-c", code], env=child_env, timeout=CHECK_TIMEOUT_TURN,
+                              capture_output=True, text=True)
+        expect(done.returncode == 0, "lifetime client spawned a serve", done.stderr[-400:])
+        time.sleep(2.5)  # past several serve poll intervals: a serve watching the client would be gone
+        pid = _lead_host.load_state(_lead_host.state_file(state, CONV_LIFETIME)).get("serve_pid")
+        alive = False
+        if pid:
+            try:
+                os.kill(int(pid), 0)
+                alive = True
+            except OSError:
+                alive = False
+        expect(alive, "serve outlives the turn client that spawned it", pid)
+    finally:
+        kill_serve(state, CONV_LIFETIME)
+
+
+def test_redaction(cs_root: Path, state: Path, env: dict) -> None:
+    write_hosted_lead(cs_root / "config", CONV_REDACTION)
+    ws = workspace_turn(state.parent, 50, "ECHO_TOKEN: %s" % FAKE_TOKEN)
+    prev = dict(os.environ.items())
+    os.environ.update(env)
+    try:
+        reply = timed_client_turn(
+            "redaction client_turn",
+            workspace=ws,
+            conversation_id=CONV_REDACTION,
+            config_root=cs_root / "config",
+            state=state,
+            cli_binary=str(STUB),
+            sandbox=False,
+            timeout=CHECK_TIMEOUT_TURN,
+        )
+        expect(FAKE_TOKEN not in reply, "socket reply redacts token", reply)
+    finally:
+        kill_serve(state, CONV_REDACTION)
+        os.environ.clear()
+        os.environ.update(prev)
+
+
+def test_turn_serialization(cs_root: Path, state: Path, env: dict) -> None:
+    write_hosted_lead(cs_root / "config", CONV_SERIAL)
+    ws_a = workspace_turn(state.parent, 60, "Concurrent A")
+    ws_b = workspace_turn(state.parent, 61, "Concurrent B")
+    prev = dict(os.environ.items())
+    delay_env = dict(env, LEAD_HOST_CLI_EXTRA=json.dumps(["--turn-delay", "1.5"]))
+    os.environ.update(delay_env)
+    order = []
+    errors = []
+
+    def run_turn(label, ws):
+        try:
+            _lead_host.client_turn(
+                ws,
+                conversation_id=CONV_SERIAL,
+                config_root=cs_root / "config",
+                state=state,
+                cli_binary=str(STUB),
+                sandbox=False,
+                timeout=CHECK_TIMEOUT_TURN_SLOW,
+            )
+            order.append(label)
+        except BaseException as error:  # fail() raises SystemExit, which a thread would swallow
+            errors.append("%s: %r" % (label, error))
+
+    try:
+        ta = threading.Thread(target=run_turn, args=("A", ws_a))
+        tb = threading.Thread(target=run_turn, args=("B", ws_b))
+        ta.start()
+        time.sleep(0.05)
+        tb.start()
+        ta.join(timeout=CHECK_TIMEOUT_JOIN_SERIAL)
+        tb.join(timeout=CHECK_TIMEOUT_JOIN_SERIAL)
+        if ta.is_alive():
+            expect(False, "concurrent turn A timed out (step=serialization thread join, limit=%ds)" % CHECK_TIMEOUT_JOIN_SERIAL)
+        if tb.is_alive():
+            expect(False, "concurrent turn B timed out (step=serialization thread join, limit=%ds)" % CHECK_TIMEOUT_JOIN_SERIAL)
+        expect(not errors, "concurrent turns complete", errors)
+        expect(len(order) == 2, "both turns finished", order)
+        expect(order[0] != order[1] or order == ["A", "B"] or order == ["B", "A"], "serialized turns", order)
+        expect(abs(order.index("A") - order.index("B")) == 1, "turns did not overlap", order)
+    finally:
+        kill_serve(state, CONV_SERIAL)
+        os.environ.clear()
+        os.environ.update(prev)
+
+
+def test_executor_hook(root: Path, cs_root: Path, state: Path, env: dict) -> None:
+    write_hosted_lead(cs_root / "config", CONV_EXECUTOR)
+    executor_src = (OPS / "_executor.py").read_text(encoding="utf-8")
+    expect("run_hosted_lead_turn" in executor_src and "authorize_hosted_turn" in executor_src, "executor hosted-lead hook wired")
+    task = executor_fixture_task(root)
+    run_env = dict(
+        env,
+        LEAD_CLI_BIN=str(STUB),
+        LEAD_HOST_NO_SANDBOX="1", CS_EXECUTOR_ALLOW_UNSANDBOXED="1",
+        CS_TOOLS_BIN=env.get("CS_TOOLS_BIN", ""),
+    )
+    order = json.dumps(
+        {
+            "executor": "claude-code-sonnet",
+            "task": str(task),
+            "spec": "tasks/regressions/lead-session-host/fixtures/hosted-executor-spec.yaml",
+            "exp": "task-lead-host",
+            "conversation_id": CONV_EXECUTOR, "turn_id": "turn_fixture",
+        }
+    )
+    try:
+        done = timed_subprocess(
+            "executor hosted turn",
+            args=[sys.executable, str(OPS / "_executor.py")],
+            input=order,
+            cwd=str(KIT),
+            env=run_env,
+            text=True,
+            capture_output=True,
+            timeout=CHECK_TIMEOUT_EXECUTOR,
+        )
+    except subprocess.TimeoutExpired:
+        expect(
+            False,
+            "executor hosted turn timed out (step=executor subprocess, limit=%ds)" % CHECK_TIMEOUT_EXECUTOR,
+        )
+        kill_serve(state, CONV_EXECUTOR)
+        return
+    expect(done.returncode in (0, 3), "executor hosted turn exits", (done.returncode, done.stderr))
+    run_id = None
+    for line in reversed((done.stdout or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out = json.loads(line)
+            run_id = out.get("run_id")
+            break
+        except json.JSONDecodeError:
+            continue
+    run_dir = None
+    if run_id:
+        run_dir = state / "runs" / run_id
+    elif (state / "runs").is_dir():
+        runs = sorted((state / "runs").iterdir(), key=lambda p: p.stat().st_mtime)
+        if runs:
+            run_dir = runs[-1]
+    expect(run_dir is not None and run_dir.is_dir(), "executor produced a run dir", done.stdout)
+    if run_dir:
+        reply_path = run_dir / "lead-reply.txt"
+        messages = run_dir / "messages.jsonl"
+        transcript = run_dir / "transcript.md"
+        evidence = run_dir / "evidence.json"
+        expect(reply_path.is_file(), "lead-reply.txt written")
+        blob = ""
+        for path in (reply_path, messages, transcript):
+            if path.is_file():
+                blob += path.read_text(encoding="utf-8")
+        if evidence.is_file():
+            blob += evidence.read_text(encoding="utf-8")
+        expect(FAKE_TOKEN not in blob and SECRET not in blob, "executor artifacts redact secrets")
+    kill_serve(state, CONV_EXECUTOR)
+
+
+def test_serve_lifecycle(root: Path, cs_root: Path, state: Path, env: dict) -> None:
+    write_hosted_lead(cs_root / "config", CONV_LIFECYCLE)
+    ws = workspace_turn(root, 70, "Lifecycle idle.")
+    prev = dict(os.environ.items())
+    idle_env = dict(env, LEAD_HOST_IDLE_EXIT_S="2", LEAD_HOST_WAKE="0")
+    os.environ.update(idle_env)
+    try:
+        timed_client_turn(
+            "lifecycle idle client_turn",
+            workspace=ws,
+            conversation_id=CONV_LIFECYCLE,
+            config_root=cs_root / "config",
+            state=state,
+            cli_binary=str(STUB),
+            sandbox=False,
+            timeout=CHECK_TIMEOUT_TURN,
+        )
+        st = _lead_host.load_state(_lead_host.state_file(state, CONV_LIFECYCLE))
+        pid = st.get("serve_pid")
+        expect(pid, "lifecycle serve recorded pid", st)
+        if pid:
+            idle_s = float(os.environ.get("LEAD_HOST_IDLE_EXIT_S", "2") or "2")
+            idle_deadline = time.monotonic() + max(CHECK_SERVE_EXIT_S, idle_s * 10 + 5)
+            exited = False
+            while time.monotonic() < idle_deadline:
+                if wait_serve_exit(
+                    int(pid), timeout=0.2, label="idle-exit serve", state=state, conversation=CONV_LIFECYCLE
+                ):
+                    exited = True
+                    break
+                time.sleep(0.1)
+            expect(exited, "serve exits after idle timeout (step=LEAD_HOST_IDLE_EXIT_S)", {"pid": pid, "st": st})
+
+        ws2 = workspace_turn(root, 71, "Lifecycle state file.")
+        no_idle = dict(env, LEAD_HOST_IDLE_EXIT_S="3600")
+        os.environ.clear()
+        os.environ.update(no_idle)
+        timed_client_turn(
+            "lifecycle respawn client_turn",
+            workspace=ws2,
+            conversation_id=CONV_LIFECYCLE,
+            config_root=cs_root / "config",
+            state=state,
+            cli_binary=str(STUB),
+            sandbox=False,
+            timeout=CHECK_TIMEOUT_TURN,
+        )
+        st2 = _lead_host.load_state(_lead_host.state_file(state, CONV_LIFECYCLE))
+        pid2 = st2.get("serve_pid")
+        sf = _lead_host.state_file(state, CONV_LIFECYCLE)
+        expect(pid2, "lifecycle serve respawned", st2)
+        if pid2:
+            sf.unlink(missing_ok=True)
+            t0 = step_begin("lifecycle serve exit on state removal")
+            exited = wait_serve_exit(
+                int(pid2), timeout=CHECK_SERVE_EXIT_S, label="state-file removal serve", state=state, conversation=CONV_LIFECYCLE
+            )
+            step_done("lifecycle serve exit on state removal", t0)
+            expect(exited, "serve exits when state file removed (step=conversation state file)", {"pid2": pid2})
+    finally:
+        kill_serve(state, CONV_LIFECYCLE)
+        os.environ.clear()
+        os.environ.update(prev)
+
+
+def main():
+    if not STUB.is_file():
+        expect(False, "stub_stream_cli exists")
+        print("lead-session-host: FAIL")
+        return 1
+    for path in (STUB, STUB_DELAY, STUB_SANDBOX):
+        if path.is_file():
+            path.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+
+    DIRECTOR.start()
+    with scratch_dir(prefix="lead-session-host-") as raw:
+        root = Path(raw)
+        fixture_home = root / "login-home"
+        fixture_home.mkdir()
+        state = root / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        cs_root = root / "cs"
+        cfg = cs_root / "config"
+        cfg.mkdir(parents=True)
+        (cfg / "lead-credential").write_text(SECRET + "\n", encoding="utf-8")
+        os.chmod(cfg / "lead-credential", 0o600)
+        write_hosted_lead(cfg, CONV_MAIN)
+        tools = str(KIT.parent / "target/release/cs-tools")
+        env = dict(
+            hermetic_env(),
+            HOME=str(fixture_home),
+            LAB_STATE_ROOT=str(state),
+            LAB_CONFIG_ROOT=str(cs_root / "config"),
+            LAB_CODE_ROOT=str(KIT),
+            CS_TOOLS_BIN=tools,
+            LEAD_HOST_SERVE_READY_S=CHECK_SERVE_READY_S,
+            LEAD_HOST_WAKE="0",
+            LEAD_HOST_NO_SANDBOX="1", CS_EXECUTOR_ALLOW_UNSANDBOXED="1",
+        )
+        sock = _lead_host.socket_file(state, CONV_MAIN)
+        prev = dict(os.environ.items())
+        os.environ.update(env)
+        try:
+            test_credential_escape(cs_root)
+
+            ws1 = workspace_turn(root, 1, "Hello from turn one.")
+            reply1 = timed_client_turn(
+                "first client_turn",
+                workspace=ws1,
+                conversation_id=CONV_MAIN,
+                config_root=cs_root / "config",
+                state=state,
+                cli_binary=str(STUB),
+                sandbox=False,
+                timeout=CHECK_TIMEOUT_TURN,
+            )
+            expect(reply1 == "STUB-REPLY: Hello from turn one.", "first turn reply", reply1)
+
+            st = _lead_host.load_state(_lead_host.state_file(state, CONV_MAIN))
+            sid = st.get("cli_session_id")
+            expect(sid, "session id persisted", st)
+
+            ws2 = workspace_turn(root, 2, "Second message.")
+            reply2 = timed_client_turn(
+                "second client_turn",
+                workspace=ws2,
+                conversation_id=CONV_MAIN,
+                config_root=cs_root / "config",
+                state=state,
+                cli_binary=str(STUB),
+                sandbox=False,
+                timeout=CHECK_TIMEOUT_TURN,
+            )
+            expect(reply2 == "STUB-REPLY: Second message.", "second turn reply", reply2)
+
+            ndjson_path = _lead_host.state_file(state, CONV_MAIN).with_suffix(".ndjson")
+            ndjson_body = ndjson_path.read_text(encoding="utf-8") if ndjson_path.is_file() else ""
+            expect(ndjson_body.count('"subtype": "init"') == 1, "one CLI process: single init for two turns")
+
+            expect(sock.is_socket(), "serve creates unix socket")
+            mode = sock.stat().st_mode & 0o777
+            expect(mode == 0o600, "socket mode 0600", oct(mode))
+            ndjson = ndjson_path
+            text = ndjson.read_text(encoding="utf-8") if ndjson.is_file() else ""
+            serve_log = _lead_host.sessions_root(state) / ("%s-serve.log" % CONV_MAIN)
+            if serve_log.is_file():
+                text += serve_log.read_text(encoding="utf-8")
+            expect(SECRET not in text, "credential token absent from logs")
+
+            test_socket_security(root, state, cfg, sock)
+            first_token = (sock.parent / "token").read_text()
+            test_redaction(cs_root, state, env)
+            test_serve_outlives_client(cs_root, state, env)
+
+            kill_serve(state, CONV_MAIN, sock)
+            t0 = step_begin("wait socket gone after kill")
+            expect(wait_socket_gone(sock), "socket removed after kill", sock)
+            step_done("wait socket gone after kill", t0)
+
+            write_hosted_lead(cfg, CONV_MAIN)
+            ws3 = workspace_turn(root, 3, "After restart.")
+            reply3 = timed_client_turn(
+                "resume client_turn",
+                workspace=ws3,
+                conversation_id=CONV_MAIN,
+                config_root=cs_root / "config",
+                state=state,
+                cli_binary=str(STUB),
+                sandbox=False,
+                timeout=CHECK_TIMEOUT_TURN,
+            )
+            expect(reply3 == "STUB-REPLY: After restart.", "resume turn reply", reply3)
+            expect((sock.parent / "token").read_text() != first_token, "serve restart rotates authentication token")
+            expect(bool(raw_request(sock, {"op": "ping", "token": first_token.strip()}).get("error")),
+                   "previous serve token cannot authenticate replacement")
+            st2 = _lead_host.load_state(_lead_host.state_file(state, CONV_MAIN))
+            expect(st2.get("cli_session_id") == sid, "session id unchanged across restart", st2)
+
+            test_turn_serialization(cs_root, state, env)
+            test_executor_hook(root, cs_root, state, env)
+            test_serve_lifecycle(root, cs_root, state, env)
+
+        finally:
+            kill_serve(state, CONV_MAIN, sock)
+            for conv in (CONV_REDACTION, CONV_SERIAL, CONV_EXECUTOR, CONV_LIFECYCLE):
+                kill_serve(state, conv)
+            os.environ.clear()
+            os.environ.update(prev)
+            DIRECTOR.stop()
+
+    try:
+        smoke = timed_subprocess(
+            "darwin_sandbox_smoke",
+            args=[sys.executable, str(HERE / "darwin_sandbox_smoke.py")],
+            capture_output=True,
+            text=True,
+            timeout=CHECK_TIMEOUT_SMOKE,
+        )
+    except subprocess.TimeoutExpired as exc:
+        expect(
+            False,
+            "darwin sandbox smoke timed out (step=darwin_sandbox_smoke subprocess, limit=%ds)" % CHECK_TIMEOUT_SMOKE,
+            (exc.stdout or "")[-500:] + (exc.stderr or "")[-500:],
+        )
+        smoke = None
+    if smoke is not None:
+        if sys.platform == "darwin":
+            expect(smoke.returncode == 0, "darwin sandbox smoke", smoke.stderr or smoke.stdout)
+        elif smoke.returncode != 0:
+            expect(False, "darwin sandbox smoke should skip off darwin", smoke.stderr)
+
+    # A hosted turn reads its job bundle, not the executor's run workspace (task = <bundle>/tasks/turn).
+    with scratch_dir(prefix="lead-bundle-") as raw:
+        bundle, run_ws = Path(raw) / "job", Path(raw) / "run-ws"
+        (bundle / "session").mkdir(parents=True); (bundle / "tasks/turn").mkdir(parents=True); run_ws.mkdir()
+        (bundle / "session/mcp.json").write_text("{}")
+        expect(_lead_host.turn_bundle(bundle / "tasks/turn", run_ws) == bundle.resolve(),
+               "a hosted turn reads session/ from its job bundle, not the run workspace")
+        expect(_lead_host.turn_bundle(run_ws / "tasks/turn", run_ws) == run_ws,
+               "task parent remains the bundle candidate; host validates it before use")
+
+    # cs mcp under the private HOME gets its node and Director from hosted-lead.json.
+    with scratch_dir(prefix="lead-mcp-") as raw:
+        b = Path(raw); (b / "session").mkdir(); cred_file = b / "cred"; cred_file.write_text("x")
+        (b / "session/mcp.json").write_text(json.dumps({"mcpServers": {"evil": {"command": "attacker"}}}))
+        trusted_config = _lead_host.build_mcp_config(b, cred_file, {"node": "workstation", "director": "http://127.0.0.1:8780"})
+        expect("evil" not in trusted_config.get("mcpServers", {}), "MCP config ignores attacker workspace contents")
+        args = _lead_host.build_mcp_config(b, cred_file, {"node": "workstation", "director": "http://127.0.0.1:8780"})["mcpServers"]["contextstack"]["args"]
+        expect(args[args.index("--node") + 1] == "workstation" and args[args.index("--director") + 1] == "http://127.0.0.1:8780"
+               and "--no-land" in args and str(cred_file) in args,
+               "the lead's cs mcp names its node and Director and keeps --no-land", args)
+        expect(args[args.index("--max-wait") + 1] == "30", "the lead's wait_tasks is capped below its turn deadline", args)
+        # 2026-11-12: a 300 s wait_tasks outlived the lead's 300 s turn. A capped wait returns early with a note.
+        sys.path.insert(0, str(KIT / "scripts"))
+        import cs_mcp
+
+        class _Capped(cs_mcp.Tools):
+            def open_stream(self, deadline):
+                return None
+
+            def job(self, job_id, timeout=None):
+                return {"id": job_id, "state": "running"}
+
+        t0 = time.time()
+        waited = _Capped(None, "workstation", can_land=False, max_wait=1).wait_tasks(["j1"], timeout_seconds=300)
+        expect(time.time() - t0 < 5 and waited["timed_out"] and "end your turn" in waited.get("note", ""),
+               "a hosted wait_tasks stops at its cap and tells the lead to end its turn", waited)
+
+    # The host approves only the lead's Director tools (2026-11-12: it denied every call, so a lead could do nothing).
+    from _lead_session import allowed_tool
+    expect(allowed_tool("mcp__contextstack__start_task") and allowed_tool("mcp__contextstack__needs_you"),
+           "the lead session host allows the contextstack MCP tools")
+    expect(not any(allowed_tool(t) for t in ("Bash", "Write", "mcp__other__x", "mcp__contextstack__", "mcp__contextstackx__start_task")),
+           "the lead session host denies built-in tools and other MCP servers")
+
+    if sys.platform == "darwin":
+        # The lead's Claude reads its login from the Keychain (2026-11-12: "Not logged in" in every
+        # sandboxed turn). Its profile re-allows only login.keychain-db, as the executor's does.
+        with scratch_dir(prefix="lead-keychain-") as raw:
+            kroot = Path(raw)
+            previous_home = os.environ.get("HOME")
+            os.environ["HOME"] = str(kroot / "login-home")
+            Path.home().mkdir()
+            _lead_host._SANDBOX_CMD_CACHE = None
+            (kroot / "ws").mkdir()
+            session = _lead_host.make_session(kroot / "ws", kroot / "tmp", model="sonnet", resume=None,
+                                              binary="/usr/bin/true", mcp_config={"mcpServers": {}},
+                                              transcript=None, sandbox=True)
+            from _lead_session import prepare_runtime_home
+            prepare_runtime_home(session.home)
+            (kroot / "tmp").mkdir(exist_ok=True)
+            session.argv()
+            profile = (kroot / "tmp/sandbox.sb").read_text()
+            keychains = str((Path.home() / "Library/Keychains").resolve())
+            # A persistent per-conversation HOME (claude --resume across turns) is writable in the sandbox.
+            conv_home = kroot / "state/lead-sessions/con_x/home"
+            s2 = _lead_host.make_session(kroot / "ws", kroot / "tmp2", model="sonnet", resume=None,
+                                         binary="/usr/bin/true", mcp_config={"mcpServers": {}},
+                                         transcript=None, sandbox=True, runtime_home=conv_home)
+            prepare_runtime_home(s2.home)
+            (kroot / "tmp2").mkdir()
+            s2.argv()
+            p2 = (kroot / "tmp2/sandbox.sb").read_text()
+            expect(s2.home == conv_home and '(allow file-read* file-write* (subpath %s))' % json.dumps(str(conv_home.parent.resolve())) in p2,
+                   "the lead session's persistent HOME is writable in its sandbox")
+            expect("login\\.keychain-db" in profile and re.escape(keychains) in profile,
+                   "the lead session profile re-allows the login Keychain database", profile[-400:])
+            expect('(allow file-read* (subpath "%s"))' % keychains not in profile,
+                   "the lead session profile does not open all of ~/Library/Keychains")
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
+            _lead_host._SANDBOX_CMD_CACHE = None
+
+    # File-backed Claude login is a private copy, finalized by the host at process exit.
+    with scratch_dir(prefix="lead-file-login-") as raw:
+        root = Path(raw)
+        login_home = root / "login-home"
+        source = login_home / ".claude/.credentials.json"
+        source.parent.mkdir(parents=True)
+        original = {"claudeAiOauth": {"accountUuid": "owner-account", "organizationUuid": "owner-org", "refreshToken": "dummy"}}
+        source.write_text(json.dumps(original))
+        source.chmod(0o600)
+        old_home = os.environ.get("HOME")
+        old_optins = {k: os.environ.get(k) for k in ("LEAD_HOST_NO_SANDBOX", "CS_EXECUTOR_ALLOW_UNSANDBOXED")}
+        os.environ["HOME"] = str(login_home)
+        _lead_host._SANDBOX_CMD_CACHE = None
+        try:
+            from _lead_session import prepare_runtime_home
+            ws, tmp = root / "ws", root / "tmp"
+            ws.mkdir(); tmp.mkdir()
+            if sys.platform != "darwin":
+                os.environ.update(LEAD_HOST_NO_SANDBOX="1", CS_EXECUTOR_ALLOW_UNSANDBOXED="1")
+            session = _lead_host.make_session(ws, tmp, model="sonnet", resume=None,
+                                              binary="/usr/bin/true", mcp_config={},
+                                              transcript=None, sandbox=sys.platform == "darwin",
+                                              runtime_home=root / "state/lead-sessions/con_file/home")
+            copied = session.home / ".claude/.credentials.json"
+            expect(not copied.exists(), "lead defers login staging until process start")
+            session.start()
+            session.stop()
+            expect(not copied.exists() and json.loads(source.read_text()) == original,
+                   "lead exit discards unchanged copy and preserves owner login")
+            # Stage another run and rotate only the private copy, then exercise host cleanup.
+            session._login_copies = prepare_runtime_home(session.home)
+            expect(copied.is_file() and not copied.is_symlink() and copied.stat().st_mode & 0o777 == 0o600,
+                   "lead stages a private 0600 credential copy")
+            refreshed = {"claudeAiOauth": {**original["claudeAiOauth"], "refreshToken": "rotated"}}
+            copied.write_text(json.dumps(refreshed))
+            expect(json.loads(source.read_text()) == original, "lead copy refresh leaves owner file alone during run")
+            session.stop()
+            expect(json.loads(source.read_text()) == original and not copied.exists(), "lead host discards task refresh")
+            expect(session.login_copy_refresh[-1]["status"] == "task_copy", "lead records refresh status without credentials")
+            if sys.platform == "darwin":
+                session.argv()
+                profile = (tmp / "sandbox.sb").read_text()
+                target = json.dumps(str(source.resolve()))
+                expect('(allow file-read* (literal %s))' % target not in profile,
+                       "lead profile grants no read of real credential")
+                expect('(allow file-write* (literal %s))' % target not in profile and
+                       '(deny file-write* file-link (literal %s))' % target in profile,
+                       "lead profile denies real credential writes and links")
+            source.unlink()
+            source.symlink_to(root / "other")
+            try:
+                prepare_runtime_home(session.home)
+                expect(False, "lead refuses source symlink swap")
+            except ValueError:
+                pass
+            source.unlink(); source.mkdir()
+            try:
+                prepare_runtime_home(session.home)
+                expect(False, "lead refuses non-file credential")
+            except ValueError:
+                pass
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+            _lead_host._SANDBOX_CMD_CACHE = None
+            for key, value in old_optins.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    if problems:
+        print("lead-session-host: FAIL (%d)" % len(problems), flush=True)
+        for p in problems:
+            print("  " + p, flush=True)
+    else:
+        print("lead-session-host: ok", flush=True)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

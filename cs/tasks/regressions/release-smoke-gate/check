@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Installed-release trials against fake subscription agents and a fake Director. No real estate or services."""
+import json
+from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+class Director(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        with self.server.order.open("a") as log:
+            log.write("lead\n")
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(201)
+        self.end_headers()
+        self.wfile.write(b'{"turn":{"turn_id":"smoke"}}')
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({"turn_id": "smoke", "state": "error" if self.server.fail else "done", "reply": "2"}).encode())
+
+with scratch_dir(prefix="release-smoke-gate-", dir="/tmp") as tmp:
+    home = Path(tmp)
+    root = home / ".contextstack"
+    shims = home / "shims"
+    shims.mkdir()
+    def executable(path, text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(0o755)
+    executable(shims / "launchctl", '#!/bin/sh\necho "$*" >> "$HOME/service-calls"\n[ "$1" = print ] && exit 113\nexit 0\n')
+    for name in ("claude", "codex", "gemini", "grok"):
+        executable(shims / name, '#!%s\nimport json, os, sys\nif "--version" in sys.argv: print("fake 1")\nelif sys.argv[1:3] == ["auth", "status"]: print(json.dumps({"loggedIn": os.environ.get("NO_AGENTS") != "1"}))\nelif "status" in sys.argv: print("Logged in" if os.environ.get("NO_AGENTS") != "1" else "not logged in"); sys.exit(0 if os.environ.get("NO_AGENTS") != "1" else 1)\n' % sys.executable)
+    (home / ".grok").mkdir()
+    (home / ".grok/auth.json").write_text("{}")
+    (home / ".gemini").mkdir()
+    (home / ".gemini/settings.json").write_text(json.dumps({"selectedAuthType": "oauth-personal"}))
+    config = root / "config"
+    config.mkdir(parents=True)
+    data = root / "state/director"
+    data.mkdir(parents=True, mode=0o700)
+    (data / "local-credential").write_text("fixture-only")
+    for rid in ("old", "new"):
+        rel = root / "releases" / rid
+        scripts = rel / "cs/scripts"
+        scripts.mkdir(parents=True)
+        # Only source scripts are needed; no host binaries, credentials or runtime files.
+        for src in (KIT / "scripts").iterdir():
+            if src.is_file():
+                shutil.copy2(src, scripts / src.name)
+        shutil.copytree(KIT / "policy", rel / "cs/policy")
+        (rel / "cs/ops/bin").mkdir(parents=True)
+        shutil.copy2(KIT / "ops/bin/executor-templates.json", rel / "cs/ops/bin/executor-templates.json")
+        (rel / "cs/.venv/bin").mkdir(parents=True)
+        (rel / "cs/.venv/bin/python3").symlink_to(sys.executable)
+        (rel / ".complete").touch()
+        (rel / "gateway").mkdir()
+        (rel / "gateway/models.json").write_text('{"models": []}')
+        executable(rel / "bin/cs-director", '''#!%s
+import json, os, pathlib, sqlite3, sys, time, uuid
+args = sys.argv
+bundle = pathlib.Path(args[args.index("--bundle")+1])
+spec = (bundle / "spec.yaml").read_text()
+assert "tools: []" in spec and "mcp: []" in spec
+assert "smoke ok" in (bundle / "tasks/hello/goal.md").read_text()
+model = next(line.split(": ",1)[1] for line in spec.splitlines() if line.startswith("model:"))
+if model.startswith("claude-code"):
+    assert "budget: {turns: 2, tool_calls: 0, usd: 0, seconds: 180}" in spec
+job = uuid.uuid4().hex
+data = pathlib.Path(args[args.index("--data-dir")+1])
+conn = sqlite3.connect(data / "director.sqlite", timeout=10)
+conn.execute("CREATE TABLE IF NOT EXISTS jobs(job_id TEXT, state TEXT, run_id TEXT, terminal_row TEXT)")
+conn.execute("INSERT INTO jobs VALUES (?, ?, ?, ?)", (job, "error" if os.environ.get("FAIL_AGENT") == model or os.environ.get("RUN_STOP") else "done", job, json.dumps({"stop": os.environ.get("RUN_STOP", "done"), "verdict": "fail" if os.environ.get("FAIL_VERDICT") == model else "pass"})))
+conn.commit()
+time.sleep(0.2)
+run = data.parent / "runs" / job
+run.mkdir(parents=True)
+(run / "transcript.md").write_text("wrong" if os.environ.get("BAD_REPLY") == model else "smoke ok")
+with (data.parent.parent.parent / "order").open("a") as log:
+    log.write(model + "\\n")
+print(json.dumps({"job_id": job}))
+''' % sys.executable)
+        (rel / "bin/director-rs").symlink_to("cs-director")
+    bundle = home / "bundle"
+    (bundle / "uv").mkdir(parents=True)
+    executable(bundle / "uv/uv", "#!/bin/sh\nexit 0\n")
+    (bundle / "release/cs").mkdir(parents=True)
+    target = ("macos" if sys.platform == "darwin" else "linux") + "-" + ("aarch64" if os.uname().machine in ("arm64", "aarch64") else "x86_64")
+    (bundle / "bundle.json").write_text(json.dumps({"release": "new", "target": target}, indent=2))
+    env = {**hermetic_env(), "HOME": str(home), "TMPDIR": str(home), "PATH": str(shims) + ":/usr/bin:/bin", "CS_AGENT_PATH": str(shims),
+           "NODE_INSTALL_PLATFORM": "macos", "NODE_INSTALL_USER_PATH": str(home / "bin"), "CS_PLATFORM": "macos"}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Director)
+    server.fail = False
+    server.order = home / "order"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # the gate waits for the gateway the executor posts to; this fake answers every GET, so it stands in for it
+    env["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % server.server_address[1]
+    url = "http://127.0.0.1:%s" % server.server_port
+    def reset():
+        current = root / "current"
+        current.unlink(missing_ok=True)
+        current.symlink_to("releases/old")
+        (config / "install.json").write_text(json.dumps({"history": ["old"], "node": "fixture", "director": url, "keep": 1, "default_agent": "claude", "default_model": "claude-code"}))
+        (config / "hosted-lead.json").unlink(missing_ok=True)
+        server.order.write_text("")
+        now = datetime.now(timezone.utc)
+        rows = [{"ts": (now - timedelta(days=days)).isoformat(), "model": model, "stop": stop, "verdict": verdict}
+                for model, days, stop, verdict in [("codex", 1, "done", "pass"), ("gemini-cli", 15, "done", "pass"),
+                                                  ("gemini-cli", 1, "error", "pass"), ("gemini-cli", 1, "done", "fail")]]
+        (root / "state/ledger.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    def activate(extra=(), overrides=None, ok=True):
+        result = subprocess.run(["sh", str(KIT / "scripts/node-install"), "install", str(bundle), "--force",
+                                 "--link-dir", str(home / "bin"), *extra], env={**env, **(overrides or {})}, capture_output=True, text=True, timeout=30)
+        assert (result.returncode == 0) == ok, result.stdout + result.stderr
+        assert (root / "current").resolve().name == ("new" if ok else "old"), result.stdout
+        assert (root / "releases/new/.complete").exists()
+        assert (root / "releases/old/.complete").exists()
+        return result.stdout
+    try:
+        reset()
+        report = json.loads(activate())
+        assert {c["name"] for c in report["smoke"]["checks"]} == {"claude-code-sonnet", "codex"}
+        templates_path = root / "releases/new/cs/ops/bin/executor-templates.json"
+        templates = json.loads(templates_path.read_text())
+        templates_path.write_text(json.dumps({k: v for k, v in templates.items() if k != "claude-code-sonnet"}))
+        reset()
+        assert {c["name"] for c in json.loads(activate())["smoke"]["checks"]} == {"claude-code", "codex"}
+        templates_path.write_text(json.dumps(templates))
+        for model in ("claude-code", "claude-code-sonnet", "claude-code-opus-judge"):
+            reset()
+            record = json.loads((config / "install.json").read_text())
+            record.update(default_agent="codex", default_model="codex")
+            (config / "install.json").write_text(json.dumps(record))
+            (root / "state/ledger.jsonl").write_text(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                "model": model, "stop": "done", "verdict": "pass"}) + "\n")
+            assert {c["name"] for c in json.loads(activate())["smoke"]["checks"]} == {"claude-code-sonnet", "codex"}
+        smoke = subprocess.run([sys.executable, "-I", str(root / "current/cs/scripts/cs"), "smoke", "--agents", "claude"],
+                               env=env, capture_output=True, text=True, timeout=30)
+        assert smoke.returncode == 0 and "ok claude-code-sonnet " in smoke.stdout, smoke.stdout + smoke.stderr
+        reset()
+        failure = activate(overrides={"FAIL_AGENT": "codex"}, ok=False)
+        assert "codex" in failure and "old release old is back" in failure
+        for stop, reason in (("auth_expired", "not signed in (codex login)"),
+                             ("provider_unavailable", "provider unavailable"),
+                             ("provider_limit", "provider limit reached"), ("rate_limit", "rate limited")):
+            reset()
+            report = json.loads(activate(overrides={"RUN_STOP": stop}))["smoke"]
+            assert report["ok"] and all(c["skipped"] for c in report["checks"]), report
+            assert next(c for c in report["checks"] if c["name"] == "codex")["reason"] == reason
+            smoke = subprocess.run([sys.executable, "-I", str(root / "current/cs/scripts/cs"), "smoke", "--agents", "codex"],
+                                   env={**env, "RUN_STOP": stop}, capture_output=True, text=True, timeout=30)
+            assert smoke.returncode == 0 and "skip codex: " + reason in smoke.stdout, smoke.stdout + smoke.stderr
+        smoke = subprocess.run([sys.executable, "-I", str(root / "current/cs/scripts/cs"), "smoke", "--agents", "grok", "--json"],
+                               env={**env, "RUN_STOP": "auth_expired"}, capture_output=True, text=True, timeout=30)
+        report = json.loads(smoke.stdout)
+        assert smoke.returncode == 0 and report["checks"][0]["skipped"], report
+        assert report["checks"][0]["reason"] == "not signed in (grok login)", report
+        reset()
+        assert "job finished error" in activate(overrides={"RUN_STOP": "executor_exit_1"}, ok=False)
+        reset()
+        report = json.loads(activate(overrides={"BAD_REPLY": "claude-code-sonnet"}))["smoke"]
+        assert next(c for c in report["checks"] if c["name"] == "claude-code-sonnet")["reply"] == "wrong"
+        reset(); assert "run verdict fail" in activate(overrides={"FAIL_VERDICT": "codex"}, ok=False)
+        reset()
+        report = json.loads(activate(overrides={"NO_AGENTS": "1"}))["smoke"]
+        assert report["ok"] and report["no_agents"] and not report["checks"]
+        reset()
+        (root / "state/ledger.jsonl").write_text("")
+        record = json.loads((config / "install.json").read_text())
+        record.pop("default_agent"); record.pop("default_model")
+        (config / "install.json").write_text(json.dumps(record))
+        assert not json.loads(activate())["smoke"]["checks"]
+        reset(); activate(extra=["--no-load"], overrides={"FAIL_AGENT": "codex"})
+        reset(); activate(extra=["--no-smoke"], overrides={"FAIL_AGENT": "codex"})
+        reset()
+        (config / "hosted-lead.json").write_text(json.dumps({"director": url, "conversation_id": "fixture"}))
+        activate()
+        assert server.order.read_text().splitlines()[-1] == "lead", server.order.read_text()
+        assert set(server.order.read_text().splitlines()[:-1]) == {"claude-code-sonnet", "codex"}
+        reset()
+        (config / "hosted-lead.json").write_text(json.dumps({"director": url, "conversation_id": "fixture"}))
+        server.fail = True
+        assert "hosted-lead" in activate(ok=False)
+        # A first install or a node of another machine's Director has no local Director credential: skipped, not rolled back.
+        reset()
+        (data / "local-credential").rename(data / "local-credential.aside")
+        report = json.loads(activate(overrides={"FAIL_AGENT": "codex"}))["smoke"]
+        assert report["ok"] and report.get("skipped") and not report["checks"], report
+        (data / "local-credential.aside").rename(data / "local-credential")
+        smoke = subprocess.run([sys.executable, "-I", str(root / "current/cs/scripts/cs"), "smoke", "--agents", "codex", "--json"], env=env, capture_output=True, text=True, timeout=30)
+        assert [r["name"] for r in json.loads(smoke.stdout)["checks"] if r["name"] != "hosted-lead"] == ["codex"]
+        assert "bootstrap" in (home / "service-calls").read_text()
+        print("PASS release smoke: recent-use selection, default agent, alternate reply, account/provider skips, verdict failure, top-level lead reply, lead ordering/failure, empty selection, no agents, skips, explicit agents, retained releases")
+    finally:
+        server.shutdown()
+        server.server_close()

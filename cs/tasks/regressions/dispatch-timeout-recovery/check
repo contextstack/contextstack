@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Enqueue → tick → timeout → cancel/drain → next job. Fake-provider evidence only."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+TASK = Path(__file__).resolve().parent
+LAB = TASK.parents[2]
+# The Rust gateway scripts/check builds (the Go one is archived); $CSGATEWAY_BIN overrides it.
+GATEWAY = Path(os.environ.get("CSGATEWAY_BIN") or TASK.parents[3] / "target/release/cs-gateway")
+
+
+def wait_for(predicate, processes, seconds=20, log=None):
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        dead = [p for p in processes if p.poll() is not None]
+        if dead:
+            text = ""
+            if log is not None:
+                log.flush()
+                log.seek(0)
+                text = log.read()[-4000:]
+            raise AssertionError("fixture process exited: " + text)
+        try:
+            if predicate():
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.02)
+    raise AssertionError("fixture readiness timed out")
+
+
+def request(url, body=None):
+    req = urllib.request.Request(
+        url, data=None if body is None else json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        return error.code, json.load(error)
+
+
+def assert_released(in_flight, active, retried=False):
+    if in_flight != 0:
+        raise AssertionError("upstream still in flight after timeout: %s" % in_flight)
+    if active != 0:
+        raise AssertionError("gateway permit still held after timeout: %s" % active)
+    if retried:
+        raise AssertionError("timed-out job was retried")
+
+
+def prove_detects_uncancelled_upstream():
+    try:
+        assert_released(in_flight=1, active=0, retried=False)
+    except AssertionError as error:
+        if "upstream still in flight" in str(error):
+            return
+        raise
+    raise AssertionError("fixture no longer detects uncancelled upstream")
+
+
+prove_detects_uncancelled_upstream()
+
+with scratch_dir(prefix="dispatch-timeout-") as raw:
+    root = Path(raw)
+    env = {k: v for k, v in os.environ.items() if k in ("HOME", "USER", "PATH", "TMPDIR", "LANG")}
+    binary = root / "csgateway"
+    shutil.copy2(GATEWAY, binary)
+    ready, log, state = root / "ready", root / "requests.jsonl", root / "provider-state.json"
+    provider = subprocess.Popen(
+        [sys.executable, str(TASK / "server.py"), "--ready", str(ready),
+         "--log", str(log), "--state", str(state)], env=env)
+    processes = [provider]
+    output = None
+    server = None
+    try:
+        wait_for(ready.exists, processes)
+        upstream = ready.read_text().strip()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        cfg = json.loads((TASK / "models.json").read_text())
+        cfg["deployments"][0]["endpoint"] = upstream + "/v1"
+        models_path = root / "models.json"
+        models_path.write_text(json.dumps(cfg))
+        # fake-paid is cost class api; a temp HOME allows paid calls and keeps the real spend counter untouched.
+        home = root / "home"
+        (home / ".contextstack/config/gateway").mkdir(parents=True)
+        (home / ".contextstack/config/gateway/limits.json").write_text('{"api_usd_per_day": 1000}')
+        child_env = {**env, "HOME": str(home), "CSGATEWAY_CREDENTIALS": "off", "CSAGENT_MODELS_CONFIG": str(models_path),
+                     "CSGATEWAY_PORT": str(port), "CSGATEWAY_AUTH_REQUIRED": "false", "CSGATEWAY_DISCOVERY_HEALTH": "off",
+                     "VLLM_ENDPOINT": upstream, "OLLAMA_ENDPOINT": "http://127.0.0.1:1"}
+        output = (root / "gateway.log").open("w+")
+        server = subprocess.Popen([str(binary)], cwd=root, env=child_env,
+                                  stdout=output, stderr=output)
+        processes.append(server)
+        gateway = "http://127.0.0.1:" + str(port)
+        wait_for(lambda: request(gateway + "/v1/admission")[0] == 200, processes, log=output)
+
+        estate = root / "lab"
+        ops = estate / "ops/bin"
+        ops.mkdir(parents=True)
+        (estate / "ledger").mkdir()
+        (estate / "specs").mkdir()
+        (estate / "prompts").mkdir()
+        (estate / "tasks/timeout").mkdir(parents=True)
+        (estate / "tasks/complete").mkdir(parents=True)
+        (estate / "grants").mkdir()
+        for source in (LAB / "ops/bin").iterdir():
+            if source.is_file():
+                shutil.copy2(source, ops / source.name)
+        for name in ("estate-commit", "corpus-audit", "void-watch", "shadow-cycle"):
+            (ops / name).write_text("#!/bin/sh\necho '{\"ok\":true,\"skip\":\"fixture\"}'\n")
+            (ops / name).chmod(0o755)
+        (ops / "local-model-ready").write_text("#!/bin/sh\nexit 0\n")
+        (ops / "local-model-ready").chmod(0o755)
+        # The default runner, found where tick's default looks: <code root>/../target/release/cs-harness.
+        sys.path.append(str(LAB / "ops/bin"))
+        from _runner import built_runner
+        (root / "target/release").mkdir(parents=True)
+        shutil.copy2(built_runner(LAB), root / "target/release/cs-harness")
+        (estate / "ESTATE").write_text("dev\n")
+        (estate / "INVARIANTS.md").write_text("Isolated dispatcher timeout fixture.\n")
+        (estate / "PINNED.md").write_text("pinned: fake-paid\n")
+        (estate / "prompts/test.md").write_text("Reply with the canned completion.\n")
+        (estate / "tasks/timeout/goal.md").write_text("TIMEOUT_HOLD and do nothing else.\n")
+        (estate / "tasks/timeout/check").write_text("#!/bin/sh\nexit 0\n")
+        (estate / "tasks/timeout/check").chmod(0o755)
+        (estate / "tasks/complete/goal.md").write_text("COMPLETE_NOW with the canned completion.\n")
+        (estate / "tasks/complete/check").write_text("#!/bin/sh\nexit 0\n")
+        (estate / "tasks/complete/check").chmod(0o755)
+        (estate / "specs/timeout.yaml").write_text(
+            "id: fixture-timeout\nmodel: fake-paid\nsystem: prompts/test.md\n"
+            "context: []\ntools: []\nmcp: []\n"
+            "budget: {turns: 1, tool_calls: 0, usd: 1, seconds: 3}\n"
+            "tasks: [tasks/timeout]\ntrials: 1\n"
+            "hypothesis: \"fixture-1882: controlled dispatcher timeout.\"\n")
+        (estate / "specs/complete.yaml").write_text(
+            "id: fixture-complete\nmodel: fake-paid\nsystem: prompts/test.md\n"
+            "context: []\ntools: []\nmcp: []\n"
+            "budget: {turns: 1, tool_calls: 0, usd: 1, seconds: 20}\n"
+            "tasks: [tasks/complete]\ntrials: 1\n"
+            "hypothesis: \"fixture-1882: job after a cancelled timeout.\"\n")
+        subprocess.run(["git", "init", "-q", str(estate)], check=True, env=env)
+        subprocess.run(["git", "-C", str(estate), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid",
+                        "commit", "--allow-empty", "-qm", "fixture"], check=True, env=env)
+
+        def run_op(name, payload):
+            return subprocess.run(
+                [sys.executable, str(ops / name)],
+                input=json.dumps(payload), text=True, capture_output=True,
+                cwd=estate, env={**child_env, "CSGATEWAY_ENDPOINT": gateway + "/v1/agent/model.call"})
+
+        first = run_op("enqueue", {"spec": "specs/timeout.yaml", "lane": "probe",
+                                   "task": "tasks/timeout", "note": "timeout-job"})
+        assert first.returncode == 0, (first.stdout, first.stderr)
+        timeout_id = json.loads(first.stdout.splitlines()[-1])["id"]
+        second = run_op("enqueue", {"spec": "specs/complete.yaml", "lane": "probe",
+                                    "task": "tasks/complete", "note": "complete-job"})
+        assert second.returncode == 0, (second.stdout, second.stderr)
+        complete_id = json.loads(second.stdout.splitlines()[-1])["id"]
+        decoy = run_op("enqueue", {"spec": "specs/complete.yaml", "lane": "shadow",
+                                   "task": "tasks/complete", "note": "decoy-unrelated",
+                                   "schedule_id": "dark-factory-landscape-sweep"})
+        assert decoy.returncode == 0, (decoy.stdout, decoy.stderr)
+        decoy_id = json.loads(decoy.stdout.splitlines()[-1])["id"]
+        queued_before = (estate / "ledger/dispatch.jsonl").read_text()
+
+        tick_env = {**child_env, "CSGATEWAY_ENDPOINT": gateway + "/v1/agent/model.call"}
+        tick1 = subprocess.run([sys.executable, str(ops / "tick")], input="{}",
+                               text=True, capture_output=True, cwd=estate,
+                               env=tick_env, timeout=25)
+        assert "Traceback" not in tick1.stderr, tick1.stderr
+        dispatch = [json.loads(line) for line in
+                    (estate / "ledger/dispatch.jsonl").read_text().splitlines() if line.strip()]
+        timeout_rows = [row for row in dispatch if str(row.get("id") or row.get("job")) == timeout_id]
+        terminals = [row for row in timeout_rows if row.get("state") in {"done", "error"}]
+        assert terminals, (tick1.stdout, tick1.stderr, dispatch)
+        terminal = terminals[-1]
+        assert terminal.get("stop") == "budget:seconds", terminal
+        assert terminal.get("state") in {"done", "error"}
+        ledger = [json.loads(line) for line in
+                  (estate / "ledger/ledger.jsonl").read_text().splitlines() if line.strip()]
+        timeout_ledger = [row for row in ledger if row.get("spec") == "fixture-timeout"
+                          or "timeout" in str(row.get("task") or "")]
+        assert len(timeout_ledger) == 1, timeout_ledger
+        assert timeout_ledger[0]["stop"] == "budget:seconds"
+        wait_for(lambda: json.loads(state.read_text())["in_flight"] == 0, processes, seconds=10)
+        provider_state = json.loads(state.read_text())
+        status, admission = request(gateway + "/v1/admission")
+        assert status == 200, admission
+        active = admission["deployments"]["dispatch-timeout-fixture"]["active"]
+        assert_released(provider_state["in_flight"], active,
+                        retried=len(timeout_ledger) != 1)
+        assert provider_state["cancelled"] >= 1, provider_state
+        assert provider_state["completed"] == 0, provider_state
+
+        tick2 = subprocess.run([sys.executable, str(ops / "tick")], input="{}",
+                               text=True, capture_output=True, cwd=estate,
+                               env=tick_env, timeout=25)
+        assert "Traceback" not in tick2.stderr, tick2.stderr
+        dispatch = [json.loads(line) for line in
+                    (estate / "ledger/dispatch.jsonl").read_text().splitlines() if line.strip()]
+        complete_rows = [row for row in dispatch if str(row.get("id") or row.get("job")) == complete_id]
+        complete_term = [row for row in complete_rows if row.get("state") in {"done", "error"}]
+        assert complete_term and complete_term[-1].get("state") == "done", (tick2.stdout, complete_rows)
+        ledger = [json.loads(line) for line in
+                  (estate / "ledger/ledger.jsonl").read_text().splitlines() if line.strip()]
+        complete_ledger = [row for row in ledger if row.get("spec") == "fixture-complete"
+                           or str(row.get("task") or "").endswith("complete")]
+        assert len(complete_ledger) == 1, complete_ledger
+        assert complete_ledger[0]["stop"] == "done"
+        assert complete_ledger[0]["verdict"] == "pass"
+        assert timeout_ledger[0]["transcript"] != complete_ledger[0]["transcript"]
+        assert timeout_id != complete_id
+        decoy_rows = [row for row in dispatch if str(row.get("id") or row.get("job")) == decoy_id]
+        assert decoy_rows, dispatch
+        assert not any(row.get("state") in {"done", "error", "running"} for row in decoy_rows), decoy_rows
+        fires = estate / "ledger/schedule-fires.jsonl"
+        assert not fires.exists() or not fires.read_text().strip()
+        ids = {str(row.get("id") or row.get("job") or "") for row in dispatch
+               if row.get("state") in {"pending", "running", "done", "error"}}
+        assert {timeout_id, complete_id, decoy_id} <= ids
+        assert len(timeout_ledger) == 1 and len(complete_ledger) == 1
+        queued_ids = [json.loads(line)["id"] for line in queued_before.splitlines()
+                      if line.strip() and json.loads(line).get("state") == "pending"]
+        assert queued_ids == [timeout_id, complete_id, decoy_id]
+    finally:
+        for proc in processes:
+            proc.terminate()
+        for proc in processes:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if output is not None:
+            output.close()
+
+print("check: dispatcher timeout cancels upstream, releases capacity, and admits the next job")

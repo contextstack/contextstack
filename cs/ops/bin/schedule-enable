@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Granted single-schedule enablement and disabled manifest registration."""
+import fcntl,hashlib,json,re,sys
+from datetime import datetime,timezone
+from pathlib import Path
+from _estate_io import state_dir, append_jsonl,estate_id,estate_matches,read_jsonl
+from _grant import cover,load,same_repo,schedule_error
+
+LAB=Path(__file__).resolve().parents[2]
+ACTOR=re.compile(r'director:(human|automated):user:[1-9][0-9]*')
+EFFECT=re.compile(r'[a-z][a-z0-9_]{0,63}')
+STAGE_FIELDS={'id','cron','timezone','catch_up_window_minutes','lane','spec','task',
+              'grant','model','external_effects','root','setup_root','requires',
+              'reference_root','reference_globs','profile','stale_after',
+              'stale_after_seconds','enabled','hold','source_enabled',
+              'retry'}
+STAGE_REQUIRED={'id','cron','timezone','lane','spec','task','grant','model',
+                'external_effects','enabled','hold'}
+STAGE_RUNTIME={'enabled','hold','event','ts','actor_id','actor_kind','request_key',
+               'request_digest','estate','source_enabled','manifest_sha256',
+               'manifest_corpus','manifest_schema'}
+STAGE_STRUCTURAL=STAGE_FIELDS-STAGE_RUNTIME
+
+def stage_identity(row):
+    return {key: row.get(key) for key in sorted(STAGE_STRUCTURAL)}
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',', ':')).encode()).hexdigest()
+
+def actor(args,allowed):
+    if set(args)-allowed:
+        raise ValueError('unexpected schedule request field')
+    kind=args.get('actor_kind')
+    match=ACTOR.fullmatch(str(args.get('actor_id') or ''))
+    if kind not in ('human','automated') or not match or match.group(1)!=kind:
+        raise ValueError('Director actor attribution required')
+    if not isinstance(args.get('request_key'),str) or not args['request_key'].strip():
+        raise ValueError('request identity required')
+    return kind
+
+def grant_path(gid):
+    for suffix in ('.yaml','.yml'):
+        path=LAB/'grants'/(gid+suffix)
+        if path.is_file():
+            return path
+    raise ValueError('grant not found')
+
+def authority(value):
+    if not isinstance(value,dict) or set(value)!={'estate','grants'}:
+        raise ValueError('write authority invalid')
+    estate=value.get('estate');grants=value.get('grants')
+    if not isinstance(estate,str) or not re.fullmatch(r'[a-z][a-z0-9-]{0,31}',estate):
+        raise ValueError('write authority estate invalid')
+    if (not isinstance(grants,list) or not grants or len(grants)!=len(set(grants))
+            or any(not isinstance(g,str) or not g for g in grants)):
+        raise ValueError('write authority grants invalid')
+    receipts=[]
+    for gid in grants:
+        grant,error=load(gid)
+        if error:
+            raise ValueError(error)
+        if grant.get('estate')!=estate:
+            raise ValueError('write authority grant estate mismatch')
+        path=grant_path(gid)
+        receipts.append({'id':gid,'sha256':hashlib.sha256(path.read_bytes()).hexdigest()})
+    return {'estate':estate,'grants':receipts}
+
+def rel_file(value,label):
+    if not isinstance(value,str) or not value or Path(value).is_absolute() or '..' in Path(value).parts:
+        raise ValueError(label+' path invalid')
+    path=LAB/value
+    if not path.exists():
+        raise ValueError(label+' missing')
+    return path
+
+def stage_row(value,new_grants):
+    if not isinstance(value,dict) or set(value)-STAGE_FIELDS or not STAGE_REQUIRED<=set(value):
+        raise ValueError('schedule stage fields invalid')
+    row=dict(value)
+    for key in ('id','cron','timezone','lane','grant','model'):
+        if not isinstance(row.get(key),str) or not row[key].strip():
+            raise ValueError('schedule '+key+' invalid')
+    if row['lane'] not in ('production','manager','probe','shadow'):
+        raise ValueError('schedule lane invalid')
+    if row['grant'] not in new_grants:
+        raise ValueError('schedule grant outside new authority')
+    if (('root' in row)==('setup_root' in row)):
+        raise ValueError('schedule needs exactly one root or setup_root')
+    source=row.get('root') or row.get('setup_root')
+    if not isinstance(source,str) or not Path(source).is_absolute():
+        raise ValueError('schedule corpus root invalid')
+    if row.get('enabled') is not False or row.get('hold')!='migration_staged':
+        raise ValueError('manifest registration accepts disabled migration_staged schedules only')
+    effects=row.get('external_effects')
+    if (not isinstance(effects,list) or len(effects)!=len(set(effects))
+            or any(not isinstance(e,str) or not EFFECT.fullmatch(e) for e in effects)):
+        raise ValueError('external_effects invalid')
+    spec=rel_file(row.get('spec'),'spec');rel_file(row.get('task'),'task')
+    text=spec.read_text(encoding='utf-8')
+    if re.search(r'^verdict:',text,re.M):
+        raise ValueError('schedule needs a runnable spec, not an archival verdict')
+    found=re.search(r'^model:\s*([^\s#]+)',text,re.M)
+    if not found or found.group(1)!=row['model']:
+        raise ValueError('schedule model differs from spec')
+    ok,error,grant=cover(row['grant'],repo=source,paths=[],commit=bool(row.get('root')),effects=effects)
+    if not ok:
+        raise ValueError(error)
+    if not same_repo(source,grant.get('repo')):
+        raise ValueError('repo mismatch')
+    error=schedule_error(row)
+    if error:
+        raise ValueError(error)
+    requires=row.get('requires',[])
+    if (not isinstance(requires,list) or len(requires)!=len(set(requires))
+            or any(not isinstance(item,str) or not item for item in requires)):
+        raise ValueError('schedule dependencies invalid')
+    return row
+
+def enable_one(args):
+    kind=actor(args,{'schedule_id','grant','grant_digest','actor_id','actor_kind','request_key','expected_digest'})
+    templates=json.loads(Path(__file__).with_suffix('.json').read_text())['templates']
+    sid=args.get('schedule_id')
+    if sid not in templates:
+        raise ValueError('schedule outside enabled definitions')
+    row={**templates[sid],'id':sid,'grant':args.get('grant'),'enabled':True}
+    error=schedule_error(row)
+    if error:
+        raise ValueError(error)
+    ok,error,_=cover(args['grant'],repo=str(LAB),paths=[row['spec'],row['task']])
+    if not ok:
+        raise ValueError(error)
+    if hashlib.sha256(grant_path(args['grant']).read_bytes()).hexdigest()!=args.get('grant_digest'):
+        raise ValueError('grant digest changed')
+    spec=LAB/row['spec']
+    if not spec.is_file() or re.search(r'^verdict:',spec.read_text(),re.M):
+        raise ValueError('schedule needs a runnable spec, not an archival verdict')
+    shelves=state_dir(LAB);shelves.mkdir(exist_ok=True)
+    with (shelves/'schedule.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        history=read_jsonl(shelves/'schedules.jsonl',strict=True)
+        request_digest=digest(args)
+        for old in history:
+            if old.get('request_key')==args['request_key']:
+                if old.get('request_digest')!=request_digest:
+                    raise ValueError('request identity conflict')
+                print(json.dumps({'ok':True,'replayed':True,'schedule':old,'digest':digest(old)}));return
+        prior=next((old for old in reversed(history) if old.get('id')==sid),None)
+        if digest(prior)!=args.get('expected_digest'):
+            raise ValueError('schedule revision changed')
+        row.update(event='schedule_updated' if prior else 'schedule_created',estate=estate_id(LAB),ts=datetime.now(timezone.utc).isoformat(),actor_id=args['actor_id'],actor_kind=kind,request_key=args['request_key'],request_digest=request_digest)
+        append_jsonl(shelves/'schedules.jsonl',row,sort_keys=True,compact=False,sync=True,encoding='utf-8')
+        print(json.dumps({'ok':True,'replayed':False,'schedule':row,'digest':digest(row)}))
+
+def register(args,corpus):
+    kind=actor(args,{'actor_id','actor_kind','request_key','manifest_digest'})
+    manifest_path=LAB/'schedules/manifest-v1.json'
+    manifest_sha=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if args.get('manifest_digest')!=manifest_sha:
+        raise ValueError('manifest digest changed')
+    manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('schema_version')!='schedules-manifest-v1' or set(manifest)-{'schema_version','corpora'}:
+        raise ValueError('schedule manifest schema invalid')
+    corpora=manifest.get('corpora')
+    if not isinstance(corpora,dict) or corpus not in corpora:
+        raise ValueError('corpus outside deployed schedule manifest')
+    definition=corpora[corpus]
+    if not isinstance(definition,dict) or set(definition)!={'write_authority','stages'}:
+        raise ValueError('corpus schedule definition invalid')
+    auth=definition.get('write_authority')
+    if not isinstance(auth,dict) or set(auth)!={'prior','new'}:
+        raise ValueError('write authority invalid')
+    prior_authority=authority(auth['prior']);new_authority=authority(auth['new'])
+    estate=estate_id(LAB)
+    if not estate_matches(LAB,new_authority['estate']):  # a dev authority continues on workstation
+        raise ValueError('new write authority differs from estate')
+    new_grants={item['id'] for item in new_authority['grants']}
+    stages=definition.get('stages')
+    if not isinstance(stages,list) or not stages:
+        raise ValueError('schedule stages empty')
+    rows=[stage_row(item,new_grants) for item in stages]
+    ids=[row['id'] for row in rows]
+    if len(ids)!=len(set(ids)):
+        raise ValueError('duplicate schedule stage id')
+    known=set(ids)
+    if any(dep not in known for row in rows for dep in row.get('requires',[])):
+        raise ValueError('schedule dependency outside corpus')
+    shelves=state_dir(LAB);shelves.mkdir(exist_ok=True)
+    request_digest=digest({'operation':'register','corpus':corpus,**args})
+    with (shelves/'schedule.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        history=read_jsonl(shelves/'schedules.jsonl',strict=True)
+        matching=False
+        for old in history:
+            if old.get('request_key')==args['request_key']:
+                if old.get('request_digest')!=request_digest:
+                    raise ValueError('request identity conflict')
+                matching=True
+        effective={old['id']:old for old in history}
+        created=[];unchanged=[]
+        for row in rows:
+            old=effective.get(row['id'])
+            if old is None:
+                created.append(row['id'])
+            elif stage_identity(old)!=stage_identity(row):
+                raise ValueError('schedule revision changed: '+row['id'])
+            else:
+                unchanged.append(row['id'])
+        stamp=datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            if row['id'] not in created:
+                continue
+            stored={**row,'event':'schedule_created','estate':estate,'ts':stamp,
+                    'actor_id':args['actor_id'],'actor_kind':kind,
+                    'request_key':args['request_key'],'request_digest':request_digest,
+                    'manifest_schema':'schedules-manifest-v1','manifest_sha256':manifest_sha,
+                    'manifest_corpus':corpus}
+            append_jsonl(shelves/'schedules.jsonl',stored,sort_keys=True,compact=False,sync=True,encoding='utf-8')
+    receipt={'ok':True,'event':'schedule_manifest_registered','replayed':matching,
+             'estate':estate,'corpus':corpus,'manifest_sha256':manifest_sha,
+             'rows_created':created,'rows_unchanged':unchanged,
+             'prior_write_authority':prior_authority,'new_write_authority':new_authority}
+    print(json.dumps(receipt,sort_keys=True))
+
+def transition(args,corpus,operation,schedule_id=None):
+    kind=actor(args,{'actor_id','actor_kind','request_key','manifest_digest'})
+    manifest_path=LAB/'schedules/manifest-v1.json'
+    manifest_sha=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if args.get('manifest_digest')!=manifest_sha:
+        raise ValueError('manifest digest changed')
+    manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('schema_version')!='schedules-manifest-v1' or set(manifest)-{'schema_version','corpora'}:
+        raise ValueError('schedule manifest schema invalid')
+    definition=(manifest.get('corpora') or {}).get(corpus)
+    if not isinstance(definition,dict) or set(definition)!={'write_authority','stages'}:
+        raise ValueError('corpus outside deployed schedule manifest')
+    auth=definition.get('write_authority')
+    if not isinstance(auth,dict) or set(auth)!={'prior','new'}:
+        raise ValueError('write authority invalid')
+    prior_authority=authority(auth['prior']);new_authority=authority(auth['new'])
+    estate=estate_id(LAB)
+    expected_estate=prior_authority['estate'] if operation=='hold' else new_authority['estate']
+    if not estate_matches(LAB,expected_estate):
+        raise ValueError(operation+' estate differs from manifest authority')
+    stages=definition.get('stages')
+    if not isinstance(stages,list) or not stages:
+        raise ValueError('schedule stages empty')
+    if schedule_id:
+        stages=[stage for stage in stages if stage.get('id')==schedule_id]
+        if len(stages)!=1:
+            raise ValueError('schedule outside corpus manifest')
+    ids=[row.get('id') for row in stages]
+    if any(not isinstance(sid,str) or not sid for sid in ids) or len(ids)!=len(set(ids)):
+        raise ValueError('schedule stage ids invalid')
+    allowed={item['id'] for item in (prior_authority if operation=='hold' else new_authority)['grants']}
+    request_digest=digest({'operation':operation,'corpus':corpus,**args,
+                           **({'schedule_id':schedule_id} if schedule_id else {})})
+    shelves=state_dir(LAB);shelves.mkdir(exist_ok=True)
+    target_hold='authority_handoff_'+new_authority['estate'] if operation=='hold' else 'shadow_active'
+    changed=[]
+    with (shelves/'schedule.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        history=read_jsonl(shelves/'schedules.jsonl',strict=True)
+        matching=[]
+        for old in history:
+            if old.get('request_key')==args['request_key']:
+                if old.get('request_digest')!=request_digest:
+                    raise ValueError('request identity conflict')
+                matching.append(old)
+        effective={old['id']:old for old in history}
+        if matching:
+            if [row.get('id') for row in matching]!=ids:
+                raise ValueError('incomplete prior transition receipt')
+            changed=ids
+        else:
+            prepared=[]
+            for stage in stages:
+                sid=stage['id'];old=effective.get(sid)
+                if old is None:
+                    raise ValueError('schedule missing: '+sid)
+                if old.get('grant') not in allowed:
+                    raise ValueError('schedule grant outside '+operation+' authority: '+sid)
+                for key in ('id','cron','timezone','lane','spec','task','model','external_effects','requires','root','setup_root'):
+                    inherited=operation=='hold' and key in ('model','external_effects') and key not in old
+                    if key in stage and not inherited and old.get(key)!=stage.get(key):
+                        raise ValueError('schedule differs from manifest: '+sid+' '+key)
+                if operation=='hold':
+                    if old.get('enabled') is not True:
+                        raise ValueError('dev schedule is not active: '+sid)
+                    source=stage.get('root') or stage.get('setup_root')
+                    spec=rel_file(stage.get('spec'),'spec').read_text(encoding='utf-8')
+                    found=re.search(r'^model:\s*([^\s#]+)',spec,re.M)
+                    if not found or found.group(1)!=stage.get('model'):
+                        raise ValueError('schedule model differs from spec: '+sid)
+                    ok,error,grant=cover(old['grant'],repo=source,paths=[],commit=bool(stage.get('root')),
+                                         effects=stage.get('external_effects',[]))
+                    if not ok or not same_repo(source,grant.get('repo')):
+                        raise ValueError(error or 'repo mismatch')
+                elif (old.get('enabled') is False and old.get('manifest_corpus')==corpus
+                      and (schedule_id or old.get('hold')=='migration_staged')):
+                    pass
+                else:
+                    if stage_identity(old)!=stage_identity({**old,**{k:v for k,v in stage.items() if k not in STAGE_RUNTIME}}):
+                        raise ValueError('schedule differs from manifest: '+sid)
+                    continue
+                prepared.append({**old,'event':'schedule_updated','enabled':operation=='activate',
+                                 'hold':target_hold,'source_enabled':True,'estate':estate,
+                                 'ts':datetime.now(timezone.utc).isoformat(),'actor_id':args['actor_id'],
+                                 'actor_kind':kind,'request_key':args['request_key'],
+                                 'request_digest':request_digest,'manifest_schema':'schedules-manifest-v1',
+                                 'manifest_sha256':manifest_sha,'manifest_corpus':corpus})
+            for row in prepared:
+                append_jsonl(shelves/'schedules.jsonl',row,sort_keys=True,compact=False,sync=True,encoding='utf-8')
+                changed.append(row['id'])
+    print(json.dumps({'ok':True,'event':'schedule_authority_held' if operation=='hold' else 'schedule_manifest_activated',
+                      'replayed':bool(matching),'estate':estate,'corpus':corpus,
+                      'manifest_sha256':manifest_sha,'rows':changed,
+                      'prior_write_authority':prior_authority,'new_write_authority':new_authority},sort_keys=True))
+
+def main():
+    args=json.load(sys.stdin)
+    argv=sys.argv[1:]
+    if not argv:
+        enable_one(args);return
+    if len(argv)==3 and argv[0]=='register' and argv[1]=='--corpus' and argv[2]:
+        register(args,argv[2]);return
+    if len(argv)==3 and argv[0] in ('hold','activate') and argv[1]=='--corpus' and argv[2]:
+        transition(args,argv[2],argv[0]);return
+    if (len(argv)==5 and argv[0]=='activate' and argv[1]=='--corpus' and argv[2]
+            and argv[3]=='--schedule' and argv[4]):
+        transition(args,argv[2],'activate',argv[4]);return
+    raise ValueError('usage: schedule-enable <register|hold|activate> --corpus <one> [--schedule <id>]')
+
+if __name__=='__main__':
+    try:main()
+    except (OSError,ValueError,KeyError,TypeError,json.JSONDecodeError) as error:
+        print(json.dumps({'ok':False,'error':str(error)}));sys.exit(1)

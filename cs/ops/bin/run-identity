@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""run-identity — which executables ran a run. Read-only; operator-called, never palette.
+
+Input JSON on stdin {"run_id"?: id or "ledger/runs/<id>"}, or `run-identity [RUN_ID]` at a terminal; no id:
+the latest row in the state root's ledger.jsonl. Prints one JSON object: run_id, runner {kind, path, sha256},
+gateway {endpoint, implementation, version} (null when the run recorded none), source ("row": the row's
+executed_by; "manifest": an older row, read from the frozen stimulus/manifest.json, which has no runner path
+or gateway before), and runner_sha_now: the sha256 of the file at that path today, so a rebuilt or
+swapped binary shows. Exit 0 found; 1 no such run or nothing recorded; 2 refused input or roots.
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from _estate_io import bookkeeping
+from _roots import RootsError, ledger_path, run_dir
+
+
+def sha_of(path):
+    try:
+        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else None
+    except OSError:
+        return None
+
+
+def latest_row(ledger, run_id=None):
+    """The last row (for run_id: the last whose transcript names it), or None."""
+    found = None
+    if ledger.is_file():
+        for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and not bookkeeping(row) \
+                    and (run_id is None or Path(str(row.get("transcript", ""))).name == run_id):
+                found = row
+    return found
+
+
+def identity(run_id=None):
+    ledger = ledger_path()
+    row = latest_row(ledger, run_id)
+    if run_id is None:
+        if row is None:
+            return None, "no rows in %s" % ledger
+        run_id = Path(str(row.get("transcript", ""))).name
+    out = {"run_id": run_id, "row": row is not None}
+    if row and isinstance(row.get("executed_by"), dict):
+        out.update(source="row", runner=row["executed_by"].get("runner"), gateway=row["executed_by"].get("gateway"))
+    else:
+        try:
+            manifest = json.loads((run_dir(run_id) / "stimulus/manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None, "run %s: no executed_by row and no readable stimulus/manifest.json" % run_id
+        if not manifest.get("runner_implementation"):
+            return None, "run %s: not run by a runner (adapter %s)" % (run_id, manifest.get("adapter"))
+        out.update(source="manifest", gateway=manifest.get("gateway"),
+                   runner={"kind": manifest["runner_implementation"], "path": manifest.get("runner_path"),
+                           "sha256": manifest.get("runner_build")})
+    out["runner_sha_now"] = sha_of((out.get("runner") or {}).get("path"))
+    return out, None
+
+
+def main():
+    if len(sys.argv) > 1:
+        run_id = sys.argv[1]
+    else:
+        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        try:
+            run_id = (json.loads(raw) if raw.strip() else {}).get("run_id")
+        except (ValueError, AttributeError):
+            print(json.dumps({"ok": False, "refused": "input is not a JSON object"}))
+            return 2
+    try:
+        if run_id is not None:
+            run_id = run_dir(run_id).name  # a bare id or a transcript; a path is refused
+        out, error = identity(run_id)
+    except (RootsError, ValueError) as exc:
+        print(json.dumps({"ok": False, "refused": str(exc)}))
+        return 2
+    if error:
+        print(json.dumps({"ok": False, "error": error}))
+        return 1
+    print(json.dumps({"ok": True, **out}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

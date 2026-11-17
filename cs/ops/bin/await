@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# ops/bin/await — operator-called. Block until an enqueue id is
+# terminal. Dead running pid → close(error) so the queue learns.
+# Not a model tool.
+from _estate_io import iter_jsonl, state_dir, pid_live
+from _dispatch import TERMINAL, first_terminal, qid
+import json, subprocess, sys, time
+from pathlib import Path
+
+from _roots import roots
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parent.parent
+STATE = roots()["state"]
+# the dispatch shelf tick drains: under the state root (default <code>/ledger, as before)
+Q = STATE / "dispatch.jsonl"
+
+
+def last_for(jid):
+    last = None
+    for r in iter_jsonl(Q, strict=True, errors="strict", objects_only=False):
+        if qid(r) == jid:
+            last = r
+    return last
+
+
+def close_dead(jid, spec):
+    r = subprocess.run(
+        [str(HERE / "close")],
+        input=json.dumps({
+            "id": jid, "spec": spec or "",
+            "state": "error", "note": "running pid dead",
+        }),
+        capture_output=True, text=True, cwd=str(LAB),
+    )
+    if r.returncode != 0:
+        sys.exit("await: close: " + (r.stderr or r.stdout or "close failed").strip())
+    return first_terminal(Q, jid)
+
+
+def status(jid):
+    row = first_terminal(Q, jid)
+    if row:
+        return row
+    last = last_for(jid)
+    if not last:
+        return None
+    if last.get("state") == "running" and not pid_live(int(last.get("pid") or 0)):
+        return close_dead(jid, last.get("spec", "")) or last
+    return last
+
+
+a = json.loads(sys.stdin.read() or "{}") if not sys.stdin.isatty() else {}
+jid = str(a.get("id") or a.get("job") or "")
+if not jid:
+    sys.exit("await: enqueue id required")
+timeout = int(a.get("timeout") or 3600)
+if timeout < 1:
+    timeout = 1
+deadline = time.time() + timeout
+while True:
+    row = status(jid)
+    st = (row or {}).get("state")
+    if row and st in TERMINAL:
+        print(json.dumps({
+            "ok": True, "id": jid, "state": st,
+            "spec": row.get("spec", ""), "code": row.get("code"),
+            "note": row.get("note", ""),
+        }))
+        break
+    if time.time() >= deadline:
+        sys.exit(json.dumps({
+            "ok": False, "id": jid, "error": "timeout",
+            "state": (row or {}).get("state", ""),
+            "spec": (row or {}).get("spec", ""),
+        }))
+    time.sleep(2)

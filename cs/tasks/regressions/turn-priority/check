@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Fake Director/clock regression for the listener's immediate dispatch path."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+from functools import partial
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parents[3] / "ops/bin"
+sys.path.insert(0, str(HERE))
+
+
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace('-', '_'), str(HERE / name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+with scratch_dir(prefix="turn-priority-") as tmp:
+    state = Path(tmp)
+    os.environ['LAB_STATE_ROOT'] = tmp
+    import _node_intake as intake
+    from _estate_io import read_jsonl, append_jsonl
+    from _turn_priority import select, is_turn
+    from _vitals import resource_held
+
+    listener_mod = load('node-listen')
+    tick = load('tick')
+    clock = [time.time()]
+    real_gmtime = time.gmtime
+    admitted = []
+    objects = {}
+
+    def job(jid, turn=False):
+        task = 'tasks/turn' if turn else 'tasks/lane'
+        files = []
+        for path, raw in [('spec.yaml', b'id: hosted-lead\n' if turn else b'id: lane\n'),
+                          (task + '/goal.md', b'fixture')]:
+            sha = hashlib.sha256(raw).hexdigest()
+            objects[sha] = raw
+            files.append(dict(path=path, sha256=sha, bytes=len(raw), mode=0o644))
+        return dict(job_id=jid, task=task, spec='spec.yaml', files=files,
+                    bundle_sha256=intake.bundle_sha(files),
+                    **({'conversation_id': 'con_fixture', 'turn_id': 'turn_fixture'} if turn else {}))
+
+    forged = job('forged')
+    forged['meta'] = {'conversation_id': 'con_fixture', 'turn_id': 'turn_fixture'}
+    intake.materialise(forged, type('D', (), {'call': lambda self, method, path: objects[path.split('/')[1]]})(), state / 'forged')
+    intake.ensure_queued(state, state / 'forged')
+    forged_row = read_jsonl(state / 'dispatch.jsonl', strict=True)[0]
+    assert not is_turn(forged_row), forged_row
+    (state / 'dispatch.jsonl').unlink()
+
+    lanes, turn = [job('lane1'), job('lane2')], job('turn', True)
+
+    class Director:
+        protocol = 2
+
+        def call(self, method, path, *args):
+            if path.startswith('objects/'):
+                return objects[path.split('/')[1]]
+            if path == 'work':
+                listener.stop.set()
+                return {'jobs': [turn], 'cursor': 'next'}
+            return {}
+
+    director = Director()
+    listener = listener_mod.Listener(director, state, HERE.parent.parent, HERE.parent.parent)
+
+    class Process:
+        pid = 123
+
+        def __init__(self, *args, **kwargs):
+            # Real tick queue filtering and ordering, without launching a model.
+            row = tick.admit(tick.jobs())
+            if row:
+                admitted.append((row['id'], clock[0]))
+                append_jsonl(state / 'dispatch.jsonl', {**row, 'state': 'done'},
+                             sort_keys=True, compact=True, sync=False, encoding='utf-8')
+
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    listener.kick = partial(listener.kick, now=lambda: clock[0], popen=Process)
+    listener.retry_pending = partial(listener.retry_pending, now=lambda: clock[0])
+
+    with patch.object(intake, 'read_vitals', return_value={}), \
+         patch.object(listener_mod.time, 'time', side_effect=lambda: clock[0]), \
+         patch.object(listener_mod.time, 'gmtime', side_effect=lambda: real_gmtime(clock[0])):
+        assert intake.take(director, lanes, state)[1] == ['lane1', 'lane2']
+        listener.work_loop()
+        assert admitted == [('turn', clock[0])], admitted
+        turn_record = json.loads((state / 'jobs/turn/job.json').read_text())
+        assert turn_record['conversation_id'] == 'con_fixture' and turn_record['turn_id'] == 'turn_fixture'
+        assert is_turn(read_jsonl(state / 'dispatch.jsonl', strict=True)[2])
+        listener.kick('next lane')
+        listener.kick('next lane')
+        assert [j for j, _ in admitted] == ['turn', 'lane1', 'lane2']
+        with patch.object(listener, 'kick') as kick:
+            clock[0] += 1
+            listener.retry_pending([{'state': 'queued', 'interactive': True}])
+            kick.assert_called_once_with('jobs pending')
+        assert is_turn({'conversation_id': 'con', 'turn_id': 'turn'})
+        with patch.object(tick, 'read_jsonl', return_value=[dict(id='job_turn', state='pending',
+                          conversation_id='con_fixture', turn_id='turn_fixture')]), \
+             patch.object(tick, 'child_env', return_value={}), \
+             patch.object(tick, 'run_teed', return_value=0) as run:
+            tick.one_executor_trial('spec.yaml', 'model: codex\n', 'tasks/turn', 1, job_id='job_turn')
+            payload = json.loads(run.call_args.kwargs['input'])
+            assert payload['conversation_id'] == 'con_fixture' and payload['turn_id'] == 'turn_fixture'
+
+        # Even a continuous supply of turns loses to an aged lane.
+        pending = read_jsonl(state / 'dispatch.jsonl', strict=True)[:2]
+        future = clock[0] + 600
+        pending.append({'id': 'new-turn', 'conversation_id': 'con', 'turn_id': 't'})
+        assert select(pending, now=future)['id'] == 'lane1'
+
+    with patch('platform.system', return_value='Darwin'), \
+         patch.object(intake, 'read_vitals', return_value={'memory_pressure': 'critical'}):
+        assert resource_held({'memory_pressure': 'critical'}, {'hold_at_memory_pressure': 'critical'})
+        assert intake.take(director, [job('held-turn', True)], state) == ([], [], [])
+        assert not (state / 'jobs/held-turn').exists()
+        # A job queued before pressure rose is held by tick too.
+        import _vitals
+        emitted = []
+        noop = lambda *args, **kwargs: None
+        overrides = {name: noop for name in (
+            'sweep_stale_locks', 'finalize_sweep', 'recover_orphaned_jobs',
+            'job_pull_pass', 'spool_pass', 'write_heartbeat', 'append_q')}
+        overrides.update(NODE=True, occupied=lambda: 0,
+                         jobs=lambda: [{'id': 'queued-turn'}],
+                         lockf=lambda blocking: open(state / 'guard.lock', 'a'),
+                         state_root_disk_free=lambda: 10**15,
+                         spool_low=lambda free: None,
+                         emit=lambda result, swept: emitted.append(result),
+                         output_fields=lambda *args: {})
+        with patch.dict(tick.main.__globals__, overrides), \
+             patch.object(_vitals, 'read_vitals', return_value={'memory_pressure': 'critical'}), \
+             patch.object(tick, 'admit', side_effect=AssertionError('admitted under pressure')):
+            tick.main()
+        assert emitted[-1]['skip'] == 'resource_held', emitted
+
+
+print('PASS: immediate turn priority, subsequent lanes, age cap, critical memory hold')

@@ -1,0 +1,12 @@
+id: fx-env-request-denied
+model: fake
+system: prompts/coder-min.md
+context: []
+tools: [fx_tool]
+post_turn: []
+mcp: []
+env: [FX_SECRET_NO]
+budget: {turns: 4, tool_calls: 10, usd: 1, seconds: 0}
+tasks: [tasks/fx]
+trials: 1
+hypothesis: "fixture-1972: characterisation fixture env-request-denied"

@@ -1,0 +1,8 @@
+{
+  "exit": 1,
+  "stdout": "Could not find edits[0] in a.txt. The oldText must match exactly including all whitespace and newlines.\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"edits\": [{\"newText\": \"y\", \"oldText\": \"zzz\"}], \"path\": \"a.txt\"}, \"name\": \"fs_edit\"}\n"
+  },
+  "untouched": true
+}

@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""#56: nan/inf/negative budgets are refused before upload or executor launch."""
+import math
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "ops/bin"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import cs_agents as agents  # noqa: E402
+from _cli_budget import validate_budget_mapping  # noqa: E402
+
+BAD = [
+    {"turns": float("nan"), "tool_calls": 0, "usd": 0, "seconds": 60},
+    {"turns": 3, "tool_calls": 0, "usd": float("inf"), "seconds": 60},
+    {"turns": -1, "tool_calls": 0, "usd": 0, "seconds": 60},
+    {"turns": 0, "tool_calls": -2, "usd": 0, "seconds": 60},
+]
+for budget in BAD:
+    try:
+        agents.check_budget(budget)
+        raise SystemExit("cs_agents accepted bad budget: %r" % budget)
+    except agents.Refused:
+        pass
+    try:
+        validate_budget_mapping(budget, label="work order budget")
+        raise SystemExit("validate_budget_mapping accepted: %r" % budget)
+    except ValueError:
+        pass
+
+good = {"turns": 0, "tool_calls": 0, "usd": 0.0, "seconds": 0}
+validate_budget_mapping(good, label="work order budget")
+agents.check_budget(good)
+
+print("sec-budget-finite: ok")

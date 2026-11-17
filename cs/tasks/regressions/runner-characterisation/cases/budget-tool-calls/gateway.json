@@ -1,0 +1,36 @@
+[
+ {
+  "ok": {
+   "text": "three calls, two allowed",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    },
+    {
+     "id": "2",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    },
+    {
+     "id": "3",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "never",
+   "tool_calls": []
+  }
+ }
+]

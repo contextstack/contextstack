@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "runtime_read": {
+    "macos": [
+      "$CODE_ROOT/tools/bin",
+      "$CODE_ROOT/tools",
+      "$CODE_ROOT/ops/bin",
+      "$CODE_ROOT/policy",
+      "$CODE_ROOT/scripts",
+      "$CODE_ROOT/hooks/bin",
+      "$CODE_ROOT/.venv",
+      "$REPO_ROOT/target/release",
+      "$REPO_ROOT/target/debug",
+      "/opt/homebrew", "/usr", "/bin", "/sbin", "/System", "/Library",
+      "/private/etc", "/private/var/select", "/private/var/db/timezone", "/dev",
+      "$HOME/.local/share/uv/python", "$TOOL_PYTHON",
+      "$HOME/Library/Application Support/Herd/config/nvm/versions/node/v22.21.1"
+    ],
+    "linux": [
+      "$CODE_ROOT/tools/bin",
+      "$CODE_ROOT/tools",
+      "$CODE_ROOT/ops/bin",
+      "$CODE_ROOT/policy",
+      "$CODE_ROOT/scripts",
+      "$CODE_ROOT/hooks/bin",
+      "$CODE_ROOT/.venv",
+      "$REPO_ROOT/target/release",
+      "$REPO_ROOT/target/debug",
+      "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt",
+      "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
+      "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+      "/etc/ssl", "/etc/ca-certificates", "/etc/pki", "/etc/alternatives", "/etc/mime.types",
+      "$HOME/.local/share/uv/python", "$TOOL_PYTHON"
+    ]
+  },
+  "allow_net": ["none", "all"],
+  "write_env": {"LAB_BROWSER_STATE": ["$HOME/.contextstack"]},
+  "profiles": {
+    "browser": {"read": {
+      "macos": ["$HOME/.claude/skills/gstack", "$HOME/Library/Caches/ms-playwright"],
+      "linux": ["$HOME/.claude/skills/gstack", "$HOME/.cache/ms-playwright", "/etc/fonts",
+                "/var/cache/fontconfig"]
+    }},
+    "cli-executor": {"read": {"macos": [], "linux": []}}
+  },
+  "sockets": {"browser-public": "$HOME/.contextstack/browser/sockets/public.sock"}
+}

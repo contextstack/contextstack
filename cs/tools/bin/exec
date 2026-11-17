@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# lab tool: run a command (argv array, no shell) in the workspace.
+# Argv: no absolute paths, no '..'. Writes: OS sandbox (cwd only).
+# Already confined by cs-sandbox -> run the command directly, since neither backend nests
+# (Seatbelt refuses; bwrap gets no user namespace); not confined -> wrap it in this tool's own
+# sandbox-exec profile (macOS) or bwrap (Linux).
+# Output clip: pi truncate.ts dual limits; spill full text to .lab-out/<n>.txt.
+# Child timeout: LAB_TOOL_TIMEOUT_SECONDS from the runner (max(descriptor, 60)), minus MARGIN
+# so this process can emit exec: timed out after N s before the runner kills it.
+import ctypes, json, os, shutil, subprocess, sys
+import _calllog
+
+MAX_LINES, MAX_BYTES = 2000, 50 * 1024
+MARGIN = 3
+TIMEOUT_EXIT = 124
+
+
+def already_confined():
+    """macOS: sandbox_check(getpid(), NULL, 0) is 1 under a Seatbelt profile. Linux: cs-sandbox's bwrap leaves a
+    seccomp filter and no_new_privs on the process and forbids new user namespaces (--disable-userns), so an
+    inner bwrap could not start; all three must hold. Any failure counts as not confined."""
+    if sys.platform.startswith("linux"):
+        try:
+            status = open("/proc/self/status").read()
+            if "\nSeccomp:\t2\n" not in status or "\nNoNewPrivs:\t1\n" not in status:
+                return False
+            pid = os.fork()
+            if pid == 0:  # child: try the namespace bwrap would need
+                try:
+                    os.unshare(os.CLONE_NEWUSER)
+                    os._exit(0)
+                except BaseException:
+                    os._exit(1)
+            return os.waitpid(pid, 0)[1] != 0
+        except (OSError, AttributeError):
+            return False
+    try:
+        lib = ctypes.CDLL("/usr/lib/system/libsystem_sandbox.dylib")
+        check = lib.sandbox_check
+        check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        check.restype = ctypes.c_int
+        return check(os.getpid(), None, 0) == 1
+    except Exception:
+        return False
+
+
+def runner_timeout_seconds():
+    raw = os.environ.get("LAB_TOOL_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    desc = os.path.join(os.path.dirname(__file__), "exec.json")
+    try:
+        seconds = int(json.load(open(desc, encoding="utf-8")).get("timeout_seconds", 0) or 0)
+    except (OSError, ValueError, json.JSONDecodeError):
+        seconds = 0
+    return max(seconds, 60)
+
+
+def emit(raw, code):
+    if not raw.strip():
+        print("(no output, exit %d)" % code, end="")
+        return
+    lines = raw.split("\n")
+    out, n = [], 0
+    truncated = False
+    if len(lines[0].encode("utf-8")) > MAX_BYTES:
+        truncated = True
+    else:
+        for i, line in enumerate(lines):
+            extra = len(line.encode("utf-8")) + (1 if i else 0)
+            if i >= MAX_LINES or n + extra > MAX_BYTES:
+                truncated = True
+                break
+            out.append(line)
+            n += extra
+    if truncated:
+        os.makedirs(".lab-out", exist_ok=True)
+        k = 1
+        while os.path.exists(".lab-out/%d.txt" % k):
+            k += 1
+        open(".lab-out/%d.txt" % k, "w", encoding="utf-8").write(raw)
+        shown = "\n".join(out)
+        end = len(out) if out else 0
+        print("lines 1-%d of %d — re-read with offset=%d; full output in .lab-out/%d.txt" % (
+            end, len(lines), end + 1, k))
+        print()
+        print(shown, end="")
+    else:
+        print(raw, end="")
+
+
+a = json.load(sys.stdin)
+_calllog.record("exec", a)
+cmd = a.get("cmd")
+if not cmd:
+    sys.exit("bad args: need cmd:[...]")
+for s in cmd:
+    if os.path.isabs(s) or ".." in s.split("/"):
+        sys.exit("path escapes workspace: " + s)
+
+cwd = os.path.realpath(os.getcwd())
+plat = sys.platform
+if already_confined():
+    wrapped = list(cmd)
+elif plat == "darwin":
+    if not shutil.which("sandbox-exec"):
+        sys.exit("exec sandbox unavailable: sandbox-exec not on PATH")
+    safe = cwd.replace("\\", "\\\\").replace('"', '\\"')
+    profile = (
+        '(version 1)\n(allow default)\n(deny file-write*)\n'
+        '(allow file-write* (subpath "%s"))\n'
+        '(allow file-write-data (literal "/dev/null"))\n' % safe
+    )
+    wrapped = ["sandbox-exec", "-p", profile] + list(cmd)
+elif plat.startswith("linux"):
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        sys.exit("exec sandbox unavailable: install bubblewrap (bwrap)")
+    wrapped = [bwrap, "--die-with-parent", "--unshare-net",
+               "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+               "--bind", cwd, cwd, "--chdir", cwd] + list(cmd)
+else:
+    sys.exit("exec sandbox unavailable on " + plat)
+
+budget = runner_timeout_seconds()
+timeout = max(1, budget - MARGIN)
+
+try:
+    # PHP/composer tools write to the system temp dir; the sandbox denies
+    # writes outside cwd, so point TMPDIR/TMP/TEMP at a workspace dir.
+    # Composer's package cache (~/.composer/cache) gets the same treatment.
+    t = os.path.join(cwd, ".lab-tmp")
+    os.makedirs(t, exist_ok=True)
+    env = dict(os.environ, TMPDIR=t, TMP=t, TEMP=t,
+               COMPOSER_CACHE_DIR=os.path.join(t, "composer"))
+    r = subprocess.run(wrapped, capture_output=True, text=True, timeout=timeout, env=env)
+except subprocess.TimeoutExpired as e:
+    partial = (e.stdout or "") + (e.stderr or "")
+    print("exec: timed out after %d s; output so far:" % budget, end="")
+    if partial:
+        print()
+        emit(partial, TIMEOUT_EXIT)
+    sys.exit(TIMEOUT_EXIT)
+except Exception as e:
+    sys.exit(str(e))
+
+raw = r.stdout + r.stderr
+if not raw.strip():
+    print("(no output, exit %d)" % r.returncode, end="")
+    sys.exit(0 if r.returncode == 0 else 1)
+
+emit(raw, r.returncode)
+sys.exit(0 if r.returncode == 0 else 1)

@@ -1,0 +1,250 @@
+{
+ "exit_code": 0,
+ "ops": [
+  {
+   "cwd": "<ESTATE>",
+   "env_names": [
+    "HOME",
+    "LANG",
+    "PATH",
+    "TMPDIR"
+   ],
+   "op": "capture-stimulus",
+   "stdin": {
+    "adapter": "runner",
+    "hooks": [],
+    "prompts": [
+     "prompts/coder-min.md"
+    ],
+    "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-contract-fx-t1",
+    "run_id": "<RUNSTAMP>-fx-tool-contract-fx-t1",
+    "spec": "specs/fx.yaml",
+    "spec_sha": "fc87f607f1409d37bc08a9cd02ef873af2b7036be1f55f6c1f93bd9c110dc215",
+    "task": "tasks/fx",
+    "tools": [
+     "fx_tool"
+    ],
+    "trial": 1,
+    "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-contract-fx-t1/workspace"
+   }
+  },
+  {
+   "cwd": "<ESTATE>",
+   "env_names": [
+    "HOME",
+    "LANG",
+    "PATH",
+    "TMPDIR"
+   ],
+   "op": "publish-evidence",
+   "stdin": {
+    "adapter": "runner",
+    "check_exit": 0,
+    "check_output": "",
+    "check_skipped": false,
+    "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-contract-fx-t1",
+    "stop": "done",
+    "verdict": "pass"
+   }
+  }
+ ],
+ "requests": [
+  {
+   "body": {
+    "budget": {
+     "max_output_tokens": 4096,
+     "timeout_ms": 120000
+    },
+    "capability": {
+     "kind": "generic",
+     "model_tier_hint": "fake"
+    },
+    "job_id": "lab",
+    "messages": [
+     {
+      "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+      "role": "system"
+     },
+     {
+      "content": "Create hello.txt containing exactly: hello\n",
+      "role": "user"
+     }
+    ],
+    "request_id": "<REQUEST_ID>",
+    "role": {
+     "role_name": "loop",
+     "role_pack_name": "lab",
+     "role_pack_version": "0"
+    },
+    "run_id": "fx-tool-contract",
+    "schema_version": "agent.gateway.model_call.v2",
+    "step_id": "<REQUEST_ID>",
+    "tool_schema": [
+     {
+      "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+      "name": "fx_tool",
+      "schema": {
+       "properties": {
+        "mode": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "mode"
+       ],
+       "type": "object"
+      }
+     }
+    ]
+   },
+   "content_type": "application/json",
+   "path": "/v1/agent/model.call"
+  },
+  {
+   "body": {
+    "budget": {
+     "max_output_tokens": 4096,
+     "timeout_ms": 120000
+    },
+    "capability": {
+     "kind": "generic",
+     "model_tier_hint": "fake"
+    },
+    "job_id": "lab",
+    "messages": [
+     {
+      "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+      "role": "system"
+     },
+     {
+      "content": "Create hello.txt containing exactly: hello\n",
+      "role": "user"
+     },
+     {
+      "content": "three calls",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "args": {
+         "k": "v",
+         "mode": "echo"
+        },
+        "id": "c1",
+        "name": "fx_tool"
+       },
+       {
+        "args": {
+         "mode": "both"
+        },
+        "id": "c2",
+        "name": "fx_tool"
+       },
+       {
+        "args": {
+         "code": 3,
+         "mode": "fail",
+         "out": "boom"
+        },
+        "id": "c3",
+        "name": "fx_tool"
+       }
+      ]
+     },
+     {
+      "content": "[fx_tool {\"k\":\"v\",\"mode\":\"echo\"}]\n{\"args\": {\"k\": \"v\", \"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
+      "role": "tool",
+      "tool_call_id": "c1"
+     },
+     {
+      "content": "[fx_tool {\"mode\":\"both\"}]\nout-line\nerr-line\n",
+      "role": "tool",
+      "tool_call_id": "c2"
+     },
+     {
+      "content": "[fx_tool {\"code\":3,\"mode\":\"fail\",\"out\":\"boom\"}] ERROR\nboom\n\nexit: exit status 3",
+      "is_error": true,
+      "role": "tool",
+      "tool_call_id": "c3"
+     }
+    ],
+    "request_id": "<REQUEST_ID>",
+    "role": {
+     "role_name": "loop",
+     "role_pack_name": "lab",
+     "role_pack_version": "0"
+    },
+    "run_id": "fx-tool-contract",
+    "schema_version": "agent.gateway.model_call.v2",
+    "step_id": "<REQUEST_ID>",
+    "tool_schema": [
+     {
+      "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+      "name": "fx_tool",
+      "schema": {
+       "properties": {
+        "mode": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "mode"
+       ],
+       "type": "object"
+      }
+     }
+    ]
+   },
+   "content_type": "application/json",
+   "path": "/v1/agent/model.call"
+  }
+ ],
+ "rows": [
+  {
+   "cost_class": "",
+   "cost_usd": 0.02,
+   "env_sha": "<ENV_SHA>",
+   "est_basis": "rate",
+   "est_usd": 0.02,
+   "estate": "dev",
+   "model": "fake-model",
+   "seconds": "<SECONDS>",
+   "spec": "fx-tool-contract",
+   "spec_sha": "fc87f607f1409d37bc08a9cd02ef873af2b7036be1f55f6c1f93bd9c110dc215",
+   "stimulus_sha": "<STIMULUS_SHA>",
+   "stop": "done",
+   "task": "tasks/fx",
+   "task_sha": "2fa288b80c39a119855af1a658911af6838eaae6085b7e4c96dc7a3af8f7ea79",
+   "tool_calls": 3,
+   "transcript": "ledger/runs/<RUNSTAMP>-fx-tool-contract-fx-t1",
+   "trial": 1,
+   "ts": "<TS>",
+   "turns": 2,
+   "verdict": "pass"
+  }
+ ],
+ "run_dirs_distinct": true,
+ "runs": [
+  {
+   "dir": "<RUNSTAMP>-fx-tool-contract-fx-t1",
+   "entries": [
+    "evidence",
+    "ready_for_inspection",
+    "stimulus",
+    "transcript.md",
+    "workspace"
+   ],
+   "frozen": {
+    "check": "#!/bin/sh\nexit 0\n",
+    "goal.md": "Create hello.txt containing exactly: hello\n"
+   },
+   "transcript": "# fx-tool-contract · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nthree calls\n\n`fx_tool {\"k\":\"v\",\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"k\": \"v\", \"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n`fx_tool {\"mode\":\"both\"}`\n\n```\nout-line\nerr-line\n\n```\n\n`fx_tool {\"code\":3,\"mode\":\"fail\",\"out\":\"boom\"}` ERROR\n\n```\nboom\n\nexit: exit status 3\n```\n\n### turn 2\n\ndone\n\n---\nstop done · verdict **pass** · turns 2 · tools 3 · cost $0.0200\n",
+   "workspace": {}
+  }
+ ],
+ "stderr": [],
+ "stdout": [
+  "fx-tool-contract: 1 task(s) x 1 trial(s)",
+  "  tasks/fx                       t1  pass stop=done turns=2 tools=3 $0.0200",
+  "  TOTAL 1/1 pass — rows in ledger/ledger.jsonl"
+ ]
+}

@@ -1,0 +1,752 @@
+{
+  "models": [
+    {
+      "name": "claude-sonnet-4-20250514",
+      "provider": "anthropic",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": true,
+      "cost_per_1k": 0.015,
+      "rates": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.3,
+        "cache_write": 3.75
+      }
+    },
+    {
+      "name": "claude-sonnet-4-5-20250929",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": true,
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "claude-haiku-4-5-20251001",
+      "provider": "anthropic",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.005
+    },
+    {
+      "name": "gpt-4o",
+      "provider": "openai",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "gpt-4o-mini",
+      "provider": "openai",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "o3",
+      "provider": "openai",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "cost_per_1k": 0.06
+    },
+    {
+      "name": "gemini-2.5-pro",
+      "provider": "gemini",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "gemini-2.5-flash",
+      "provider": "gemini",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "llama-3.3-70b-versatile",
+      "provider": "groq",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.001
+    },
+    {
+      "name": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "provider": "together",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.001
+    },
+    {
+      "name": "Qwen/Qwen2.5-Coder-32B-Instruct",
+      "provider": "together",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "local-coder",
+      "provider": "vllm",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": true,
+      "cost_per_1k": 0.0,
+      "cost_class": "free_local"
+    },
+    {
+      "name": "qwen3-coder:30b",
+      "provider": "ollama",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "qwen2.5-coder:32b",
+      "provider": "ollama",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "devstral:24b",
+      "provider": "ollama",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "deepseek-r1:latest",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "reasoning",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "deepseek-r1:70b",
+      "provider": "ollama",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "llama4:16x17b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "llama3:70b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "llama3.2:latest",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "firefunction-v2:70b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "gpt-oss:120b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "gpt-oss:20b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "gpt-oss:latest",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "glm-4.7-flash:latest",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "z-ai/glm-5.3-flash",
+      "provider": "openrouter",
+      "tier": 2,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.0002
+    },
+    {
+      "name": "codellama:7b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "minimax-m2.1:cloud",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "kimi-k2-thinking:cloud",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "reasoning",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "nomic-embed-text:latest",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "embedding",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "claude-sonnet-5",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": true,
+      "cost_per_1k": 0.01,
+      "cost_class": "api"
+    },
+    {
+      "name": "claude-opus-5",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "cost_per_1k": 0.025,
+      "cost_class": "api"
+    },
+    {
+      "name": "claude-code-sonnet",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": true,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "claude-code-opus",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.025
+    },
+    {
+      "name": "claude-code",
+      "provider": "anthropic",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": true,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "claude-code",
+      "provider": "anthropic",
+      "tier": 2,
+      "capability": "coding",
+      "preferred": true,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "claude-code",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": true,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "gemini-cli",
+      "provider": "gemini",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "gemini",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "claude-code-sonnet-planner",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "claude-code-opus-judge",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.025
+    },
+    {
+      "name": "cursor-agent",
+      "provider": "cursor",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "cursor-agent",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "cursor-sol",
+      "provider": "cursor",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "cursor-agent",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "cursor-codex",
+      "provider": "cursor",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "cursor-agent",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "cursor-composer",
+      "provider": "cursor",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "cursor-agent",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "cursor-grok",
+      "provider": "cursor",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "cursor-agent",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "cursor-sonnet",
+      "provider": "cursor",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "cursor-agent",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "antigravity",
+      "provider": "gemini",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "agy",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "antigravity-hydrogen",
+      "provider": "gemini",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "agy",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "opencode-go",
+      "provider": "opencode",
+      "tier": 2,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "opencode",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "pi",
+      "provider": "pi",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "pi",
+      "cost_class": "api"
+    },
+    {
+      "name": "goose",
+      "provider": "goose",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "goose",
+      "cost_class": "api"
+    },
+    {
+      "name": "grok",
+      "provider": "grok",
+      "tier": 3,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "grok",
+      "cost_class": "subscription"
+    }
+  ],
+  "deployments": [
+    {
+      "id": "ollama-deployment",
+      "provider": "ollama",
+      "endpoint": "http://localhost:11434/v1",
+      "models": [
+        "codellama:7b",
+        "deepseek-r1:70b",
+        "deepseek-r1:latest",
+        "devstral:24b",
+        "firefunction-v2:70b",
+        "glm-4.7-flash:latest",
+        "gpt-oss:120b",
+        "gpt-oss:20b",
+        "gpt-oss:latest",
+        "kimi-k2-thinking:cloud",
+        "llama3.2:latest",
+        "llama3:70b",
+        "llama4:16x17b",
+        "minimax-m2.1:cloud",
+        "nomic-embed-text:latest",
+        "qwen2.5-coder:32b",
+        "qwen3-coder-next:q4_K_M",
+        "qwen3-coder:30b",
+        "qwen3-embedding:latest",
+        "qwen3-vl:30b",
+        "qwen3-vl:latest",
+        "qwen3:30b"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-claude-code",
+      "provider": "cli",
+      "models": [
+        "claude-code",
+        "claude-code-sonnet",
+        "claude-code-sonnet-planner",
+        "claude-code-opus",
+        "claude-code-opus-judge",
+        "claude-auth-context-probe",
+        "claude-code-sonnet-patch"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-codex",
+      "provider": "cli",
+      "models": [
+        "codex"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-gemini-cli",
+      "provider": "cli",
+      "models": [
+        "gemini-cli"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-cursor-agent",
+      "provider": "cli",
+      "models": [
+        "cursor-agent",
+        "cursor-sol",
+        "cursor-codex",
+        "cursor-composer",
+        "cursor-grok",
+        "cursor-sonnet"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-antigravity",
+      "provider": "cli",
+      "models": [
+        "antigravity",
+        "antigravity-hydrogen"
+      ],
+      "max_concurrent": 2,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "subscription CLI (agy); a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "cli-test-echo",
+      "provider": "cli",
+      "models": [
+        "test-echo"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-muse-code",
+      "provider": "cli",
+      "models": [
+        "muse-code"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-opencode",
+      "provider": "cli",
+      "models": [
+        "opencode",
+        "opencode-go"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-pi",
+      "provider": "cli",
+      "models": [
+        "pi"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-grok",
+      "provider": "cli",
+      "models": [
+        "grok"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "operational ceiling retained from previous maximum; not benchmarked"
+    },
+    {
+      "id": "cli-goose",
+      "provider": "cli",
+      "models": [
+        "goose"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "subscription or API-key harness (goose); a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "api-anthropic",
+      "provider": "anthropic",
+      "endpoint": "https://api.anthropic.com",
+      "models": [
+        "claude-sonnet-4-20250514",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-5",
+        "claude-opus-5"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "pay-as-you-go API: spend is governed by the source budgets in limits.json; this concurrency is a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "api-openai",
+      "provider": "openai",
+      "endpoint": "https://api.openai.com/v1",
+      "models": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o3"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "pay-as-you-go API: spend is governed by the source budgets in limits.json; this concurrency is a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "api-gemini",
+      "provider": "gemini",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "models": [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "pay-as-you-go API: spend is governed by the source budgets in limits.json; this concurrency is a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "api-groq",
+      "provider": "groq",
+      "endpoint": "https://api.groq.com/openai/v1",
+      "models": [
+        "llama-3.3-70b-versatile"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "pay-as-you-go API: spend is governed by the source budgets in limits.json; this concurrency is a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "api-together",
+      "provider": "together",
+      "endpoint": "https://api.together.xyz/v1",
+      "models": [
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "Qwen/Qwen2.5-Coder-32B-Instruct"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "pay-as-you-go API: spend is governed by the source budgets in limits.json; this concurrency is a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "api-openrouter",
+      "provider": "openrouter",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "models": [
+        "z-ai/glm-5.3-flash"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "pay-as-you-go API: spend is governed by the source budgets in limits.json; this concurrency is a politeness ceiling, not benchmarked"
+    },
+    {
+      "id": "api-typesafe",
+      "provider": "typesafe",
+      "endpoint": "https://api.typesafe.ai/v1",
+      "models": [
+        "jev-latest",
+        "jev-preview",
+        "jev-1.14.0",
+        "jev-1.13.0"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 16,
+      "max_wait_ms": 60000,
+      "capacity_basis": "pay-as-you-go typed-question API (POST /v1/ai/typed-question): spend is governed by the typesafe source budget in limits.json; this concurrency is a politeness ceiling, not benchmarked"
+    }
+  ],
+  "lab_executor": "",
+  "estate": "dev"
+}

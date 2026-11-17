@@ -1,0 +1,13 @@
+{
+  "body_path": "_evidence/bodies/6b5a9c6e6bf4a6c40dec1a1d6a6a1e1e441439cf83d45f71406f6385c39d7c77.html",
+  "bytes": 485,
+  "content_type": "text/html; charset=utf-8",
+  "final_url": "https://93.184.216.34/study",
+  "kind": "fetch",
+  "redirects": [],
+  "requested_url": "https://93.184.216.34/study",
+  "retrieved_at": "2026-09-02T00:00:00Z",
+  "schema_version": "0.1",
+  "sha256": "6b5a9c6e6bf4a6c40dec1a1d6a6a1e1e441439cf83d45f71406f6385c39d7c77",
+  "status": 200
+}

@@ -1,0 +1,19 @@
+{
+  "description": "Adapter: publish the full candidate diff against the recorded base, file modes, original check result, and transcript reference into ledger/runs/<run>/evidence/, then mark ready_for_inspection when capture is complete. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "run_dir": {"type": "string"},
+      "adapter": {"type": "string"},
+      "verdict": {"type": "string"},
+      "stop": {"type": "string"},
+      "check_exit": {"type": ["integer", "null"]},
+      "check_skipped": {"type": "boolean"},
+      "check_output": {"type": "string"},
+      "workspace": {"type": "string"},
+      "archive": {"enum": ["changed_files"], "description": "A repo lane (_lanes): archive the changed files, never a walk of the whole repo"}
+    },
+    "required": ["run_dir"],
+    "additionalProperties": false
+  }
+}

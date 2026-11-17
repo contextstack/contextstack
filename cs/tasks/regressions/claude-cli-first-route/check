@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+
+lab = Path(__file__).resolve().parents[3]
+templates = json.loads((lab / "ops/bin/executor-templates.json").read_text())
+models = json.loads((lab.parent / "gateway/models.json").read_text())["models"]
+by_name = {row["name"]: row for row in models}
+
+for tier in ("sonnet", "opus"):
+    name = "claude-code-" + tier
+    row = templates.get(name) or {}
+    args = row.get("args") or []
+    if row.get("binary") != "claude" or "--model" not in args:
+        raise SystemExit("check: missing explicit Claude CLI model for " + name)
+    if args[args.index("--model") + 1] != tier or "--fallback-model" in args:
+        raise SystemExit("check: Claude CLI alias/fallback drift for " + name)
+    if row.get("cost_class") != "subscription" or row.get("auth") != "subscription":
+        raise SystemExit("check: Claude CLI is not subscription-class: " + name)
+    if "ANTHROPIC_API_KEY" not in (row.get("env_drop") or []):
+        raise SystemExit("check: Claude CLI can inherit API credentials: " + name)
+    inventory = by_name.get(name) or {}
+    if inventory.get("executor") != "cli" or inventory.get("cost_class") != "subscription":
+        raise SystemExit("check: gateway CLI inventory drift for " + name)
+
+for name in ("claude-sonnet-5", "claude-opus-5"):
+    row = by_name.get(name) or {}
+    if row.get("provider") != "anthropic" or row.get("cost_class") != "api":
+        raise SystemExit("check: explicit API last-resort model missing: " + name)
+
+pin = (lab / "PINNED.md").read_text()
+order = (pin.find("subscription CLIs first"), pin.find("local free"), pin.find("API last resort"))
+if -1 in order or order != tuple(sorted(order)):
+    raise SystemExit("check: pinned cost ladder is not CLI -> local -> API (reordered 2026-11-09)")
+
+executor = (lab / "ops/bin/_executor.py").read_text()
+required_refresh_rails = (
+    'cost_class == "subscription"',
+    'Path(binary).name != "claude"',
+    '"--tools", ""',
+    '"--disable-slash-commands"',
+    'AUTH_EXPIRED.search(auth_text)',
+)
+if any(rail not in executor for rail in required_refresh_rails):
+    raise SystemExit("check: Claude OAuth refresh is not constrained before retry")
+print("check: Claude Sonnet/Opus route is subscription CLI first, explicit API last")

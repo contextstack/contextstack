@@ -1,0 +1,2 @@
+#!/bin/sh
+[ "$(cat hello.txt 2>/dev/null)" = "hello" ]

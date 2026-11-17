@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Many leads per machine (offline)."""
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from types import SimpleNamespace
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+KIT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(KIT / "ops/bin"))
+sys.path.insert(0, str(KIT / "scripts"))
+import _lead_host
+import cs_lead
+
+problems = []
+
+def expect(cond, msg):
+    print(("ok   " if cond else "FAIL ") + msg)
+    if not cond:
+        problems.append(msg)
+
+class MintOwner:
+    mints = []
+
+    def __init__(self, url, cred):
+        self.url = url
+        self.cred = Path(cred)
+
+    def request(self, method, path, body=None, key=None):
+        if path == "credentials/lead":
+            cid = body["conversation_id"]
+            MintOwner.mints.append(cid)
+            return 201, {"token": "cslead_%s" % cid, "credential_id": "cred_" + cid}, b""
+        if method == "GET" and path.startswith("conversations/"):
+            cid = path.split("/", 1)[1]
+            return 200, {"conversation": {"conversation_id": cid, "lead": cid != "con_plain"}}, b""
+        raise AssertionError((method, path))
+
+with scratch_dir(prefix="many-leads-host-") as tmp:
+    root = Path(tmp)
+    cfg = root / "config"
+    state = root / "state"
+    cfg.mkdir(parents=True)
+    state.mkdir(parents=True)
+    (state / "director").mkdir(parents=True)
+    owner = state / "director/local-credential"
+    owner.write_text("owner-token")
+    os.chmod(owner, 0o600)
+    (cfg / "policy").mkdir()
+    (cfg / "policy/spool.json").write_text(json.dumps({"receiver": {"kind": "director", "url": "http://127.0.0.1:1"}}))
+    cid_a, cid_b = "con_lead_a", "con_lead_b"
+    sess_b = state / "lead-sessions" / cid_b
+    sess_b.mkdir(parents=True)
+    (sess_b / "meta.json").write_text(json.dumps({"director": "http://fixture", "model": "claude-code-sonnet", "conversation_id": cid_b}) + "\n")
+    (cfg / "hosted-lead.json").write_text(json.dumps({
+        "director": "http://fixture", "conversation_id": cid_a, "node": "workstation", "model": "claude-code-sonnet",
+        "credential_file": "lead-credential",
+    }) + "\n")
+    legacy_cred = cfg / "lead-credential"
+    legacy_cred.write_text("cslead_legacy\n")
+    os.chmod(legacy_cred, 0o600)
+    env = {**hermetic_env(), "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(cfg)}
+    with patch.dict(os.environ, env, clear=True):
+        _lead_host.migrate_legacy_lead_config(cfg, state)
+        expect((_lead_host.session_credential_path(state, cid_a)).is_file(), "legacy credential migrates")
+        expect(stat.S_IMODE(_lead_host.session_credential_path(state, cid_a).stat().st_mode) == 0o600, "migrated credential mode 0600")
+        MintOwner.mints.clear()
+        with patch.object(cs_lead, "OwnerClient", MintOwner):
+            _lead_host.ensure_lead_ready(cid_b, cfg, state, "sonnet")
+        expect(MintOwner.mints == [cid_b], "second conversation mints its own credential")
+        with patch.object(cs_lead, "OwnerClient", MintOwner):
+            _lead_host.ensure_lead_ready("con_client", cfg, state, "sonnet")
+            _lead_host.ensure_lead_ready("con_client", cfg, state, "sonnet")
+        meta = json.loads((state / "lead-sessions/con_client/meta.json").read_text())
+        expect(meta["director"] == "http://127.0.0.1:1", "client conversation uses node Director URL and saves it")
+        expect(MintOwner.mints == [cid_b, "con_client"], "first use mints once without fetching or installing bundles")
+        expect(_lead_host.conversation_meta(cfg, state, cid_b)["director"] == "http://fixture", "session URL takes precedence")
+        with patch.object(cs_lead, "OwnerClient", MintOwner):
+            try:
+                _lead_host.ensure_lead_ready("con_plain", cfg, state, "sonnet")
+                expect(False, "a conversation the Director does not mark as a lead must refuse")
+            except SystemExit as e:
+                expect("not a hosted lead" in str(e), "plain refusal for a non-lead conversation")
+        expect("con_plain" not in MintOwner.mints, "no credential minted for a non-lead conversation")
+        (state / "director/local-credential").unlink()
+        try:
+            _lead_host.ensure_lead_ready("con_new", cfg, state, "sonnet")
+            expect(False, "missing owner must refuse")
+        except SystemExit as e:
+            expect("owner credential" in str(e), "plain refusal without owner")
+
+print("many-leads-host: %s" % ("FAIL (%d)" % len(problems) if problems else "ok"))
+sys.exit(1 if problems else 0)

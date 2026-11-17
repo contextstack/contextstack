@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""finalize-run — the evidence service for one finished run (Plan.CS.v2.1 §4).
+
+See tasks/regressions/finalize-crash-loses-row. Runner-
+and operator-called, never palette. Input {"run_dir"}: a directory under the
+state root's runs/ (_roots: a path, or the row's "ledger/runs/<id>" identifier)
+holding terminal.json, the runner's durable record that execution is over.
+Steps, in order, each skipped only when its complete output exists:
+
+  1. check.json      run the frozen stimulus/check in the workspace
+                     (verdict void: skipped, never rerun on a retry; an
+                     existing file whose stimulus_sha differs from
+                     terminal.json's is a fixture failure: pending, not rerun)
+  2. transcript.md render the body from messages.jsonl (the
+                     runner's structured transcript) unless a body exists
+  3. transcript.md   append the footer line
+  4. evidence/       ops/bin/publish-evidence with the persisted check result;
+                     complete once ready_for_inspection exists, or once the
+                     manifest records an incomplete capture (never marked)
+  0. durability      fsync terminal.json and the run dir on entry (a power
+                     loss after the runner's rename cannot lose the record)
+  5a. sandbox/ the cs-sandbox reports whose cwd is this
+                     run's workspace move into <run dir>/sandbox/: from the
+                     --report-dir CS_TOOL_PREFIX names (the runner passes it
+                     through `always`), else from any cell dir under
+                     <state>/sandbox-reports (a sweep's retry); emptied cell
+                     dirs are removed. They are run evidence, kept with it
+  5. ledger row      append once; ledger.jsonl is scanned for this run's
+                     transcript first, under the same lock. row_version 2
+The row includes `error` {class, code, source, retryable,
+                     detail} when the stop is classified (_errors) and
+                     `call_errors` {class: count} when a call failed (the
+                     reports let _errors assign sandbox_denied), `sandbox`
+                     {class: [tool]} naming the tools the sandbox denied or
+                     could not confine, `executed_by` {runner {kind, path,
+                     sha256}, gateway} from the manifest; stop and
+                     verdict byte-identical to v1
+  6. envelope        <state>/outbox/<run_id>.json (S1): event_id, row_sha256,
+                     files [{path, bytes, sha256}] (sandbox/ and a streamed
+                     run's events.jsonl included),
+                     usage {input_tokens, output_tokens, est_usd, est_basis,
+                     charged_usd, source {class, model}} (node protocol 1),
+                     envelope_sha256, and `sandbox` {reports, backends,
+                     narrowed, tools} when there is one; a retry whose
+                     hashes differ from an existing envelope is pending
+  7. finalized.json  last; its presence is the only meaning of "finalized"
+
+Every artifact is written to a temp name in the run dir and renamed. One
+exclusive flock on finalize.lock is held for the whole op: a second
+finalizer acts on nothing and exits 3 with state "pending". A publish
+failure is recorded in finalize.error, still lets the row through, and
+leaves finalized.json absent so tick's sweep retries. A run that died before capture-stimulus has nothing to publish:
+publish is "skipped", not failed. The check and publish-evidence children
+inherit policy/env.json `always` (_env_policy.load_policy: the node policy,
+or the runner's compiled default DEFAULT_ENV when the file is absent). They are
+the node's children, not the spec's: no spec `env:` request applies, and
+LAB_CHILD_ENV is not consulted.
+
+Exit 0 {"ok": true, "state": "finalized", ...}; exit 3 {"ok": false, "state":
+"pending", "reason"}, finalize.error holding the error unless another
+finalizer held the lock; exit 2 refused input. FINALIZE_RUN_CRASH_AFTER=
+check|transcript|publish|row|envelope is TEST-ONLY fault injection: the op dies
+with os._exit(137) right after that step completes, so fixtures can kill at a
+known boundary. FINALIZE_RUN_ENOSPC_BEFORE=row|envelope (TEST-ONLY) raises
+ENOSPC before that step: finalize.error then carries class spool_full.
+"""
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from _estate_io import spec_intent, write_atomic
+
+from _env_policy import load_policy
+from _errors import call_errors, classify_stop, sandbox_tools
+from _estate_io import estate_id
+from _roots import RootsError, ledger_path, outbox_dir, roots, runs_dir, sandbox_reports_dir, workspace_dir
+from _roots import run_dir as run_dir_of
+
+try:  # the four roots (_roots): a refused LAB_*_ROOT is a refused input, before anything is written
+    ROOTS = roots()
+except RootsError as error:
+    print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
+    raise SystemExit(2)
+LAB, CONFIG = ROOTS["code"], ROOTS["config"]  # ops/bin and the policy, ESTATE
+RUNS = runs_dir().resolve()
+LEDGER = ledger_path()
+# The Go loop's format strings before extraction 4 (run.go), character for character.
+HEADER = "# %s · %s · trial %d\n\nmodel %s · budget %d turns / %d tools / $%.2f / %ds\n"
+EVENT = {"error": "\n**ERROR** %s\n", "turn": "\n### turn %d\n\n%s\n",
+         "tool": "\n`%s %s`%s\n\n```\n%s\n```\n",
+         "post_turn": "\n`post_turn`\n\n```\n%s\n```\n", "pre_tool": "\n`pre_tool`\n\n```\n%s\n```\n"}
+FOOTER = "\n---\nstop %s · verdict **%s** · turns %d · tools %d · cost %s\n"
+FOOTER_RE = re.compile(("\n---\nstop [^\n]* · verdict \\*\\*\\w+\\*\\* · turns \\d+"
+                        " · tools \\d+ · cost (?:\\$\\d+\\.\\d{4}|unmetered)\n\\Z").encode())
+ROW_KEYS = ("ts", "spec", "spec_sha", "task_sha", "env_sha", "stimulus_sha", "model",
+            "task", "trial", "verdict", "stop", "cost_usd", "est_usd", "est_basis", "cost_class",
+            "turns", "tool_calls", "seconds", "transcript")
+CLIP = 8 << 10
+CRASH_AFTER = os.environ.get("FINALIZE_RUN_CRASH_AFTER", "")
+ENOSPC_BEFORE = os.environ.get("FINALIZE_RUN_ENOSPC_BEFORE", "")
+ROW_VERSION = 2
+ENVELOPE_FILES = ("terminal.json", "messages.jsonl", "events.jsonl", "check.json", "transcript.md", "stuck.md")
+ENVELOPE_DIRS = ("stimulus", "evidence", "sandbox")
+
+
+class Pending(Exception):
+    """Finalization cannot complete now; the run stays pending and the sweep retries."""
+
+
+class GoFloat(float):
+    """A float that remembers the text Go wrote, so the row repeats it byte for byte."""
+
+    def __new__(cls, text):
+        self = float.__new__(cls, text)
+        self.text = text
+        return self
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def child_env():
+    """policy/env.json `always`: the node's list for the node's children (a malformed file is pending)."""
+    return {k: os.environ[k] for k in load_policy(CONFIG)["always"] if k in os.environ}
+
+
+def write_json(path, value):
+    write_atomic(path, (json.dumps(value, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def go_json(value):
+    """encoding/json bytes for a flat row: sorted keys, compact, HTML-safe escapes."""
+    if isinstance(value, GoFloat):
+        return value.text
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(k) + ":" + go_json(v) for k, v in sorted(value.items())) + "}"
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    for raw, escaped in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"),
+                         (" ", "\\u2028"), (" ", "\\u2029")):
+        text = text.replace(raw, escaped)
+    return text
+
+
+def crash_after(step):
+    if CRASH_AFTER == step:
+        sys.stderr.write("finalize-run: FINALIZE_RUN_CRASH_AFTER=%s (test-only)\n" % step)
+        sys.stderr.flush()
+        os._exit(137)
+
+
+def enospc_before(step):
+    if ENOSPC_BEFORE == step:
+        raise OSError(errno.ENOSPC, "No space left on device (FINALIZE_RUN_ENOSPC_BEFORE=%s, test-only)" % step)
+
+
+def fsync_path(path):
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def events_of(run_dir):
+    """messages.jsonl events; a torn line (a crash mid-append) ends the readable prefix."""
+    path, out = run_dir / "messages.jsonl", []
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                break
+    return out
+
+
+def clip(raw):
+    if len(raw) > CLIP:
+        raw = raw[:CLIP] + b"\n[truncated]"
+    return raw.decode("utf-8", "replace")
+
+
+def run_check(run_dir, term):
+    """Port of the runner's check(): frozen check, cwd workspace, combined output."""
+    window = int(term.get("check_window") or 60)
+    try:
+        done = subprocess.run([str(run_dir / "stimulus/check")], cwd=str(workspace_dir(run_dir)),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              env=child_env(), timeout=window)
+        output, code = done.stdout, done.returncode
+    except subprocess.TimeoutExpired as expired:
+        output, code = expired.stdout or b"", -1
+    except OSError:
+        output, code = b"", -1
+    return {"verdict": "pass" if code == 0 else "fail", "exit_code": code, "output": clip(output),
+            "skipped": False, "window": window, "stimulus_sha": term.get("stimulus_sha", "")}
+
+
+def step_check(run_dir, term, steps):
+    path = run_dir / "check.json"
+    if path.is_file():
+        check = json.loads(path.read_text(encoding="utf-8"))
+        ran, frozen = str(check.get("stimulus_sha") or ""), str(term.get("stimulus_sha") or "")
+        if ran != frozen:  # Plan §4: a fixture failure, never a rerun; both hashes on record
+            raise Pending('check.json stimulus_sha "%s" does not match terminal.json stimulus_sha "%s":'
+                          " fixture failure, not a rerun" % (ran, frozen))
+        steps["check"] = "existing"
+        return check
+    if term.get("verdict") == "void":
+        write_json(path, {"verdict": "void", "exit_code": 0, "output": "", "skipped": True,
+                          "window": int(term.get("check_window") or 60),
+                          "stimulus_sha": term.get("stimulus_sha", "")})
+        steps["check"] = "skipped"
+    else:
+        write_json(path, run_check(run_dir, term))
+        steps["check"] = "ran"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def raw_args(line, event):
+    """The bytes Go printed for call.Args (%s of a json.RawMessage). Go's encoder sorts
+    map keys, so the tool event starts with {"args": and the value is sliced, never re-encoded."""
+    if line.startswith('{"args":'):
+        return line[8:json.JSONDecoder().raw_decode(line, 8)[1]]
+    return json.dumps(event["args"], separators=(",", ":"), ensure_ascii=False)
+
+
+def render(lines):
+    """transcript.md body from messages.jsonl events; a torn last line (crash mid-append)
+    ends the readable prefix, a torn earlier line is a defect."""
+    out = []
+    for i, line in enumerate(lines):
+        try:
+            ev = json.loads(line, parse_float=GoFloat)
+        except ValueError:
+            if i == len(lines) - 1:
+                break
+            raise
+        kind = ev["event"]
+        if kind == "header":
+            b = ev["budget"]
+            out.append(HEADER % (ev["spec"], ev["task"], ev["trial"], ev["model"],
+                                 b["turns"], b["tool_calls"], b["usd"], b["seconds"]))
+        elif kind == "error":
+            out.append(EVENT[kind] % ev["error"])
+        elif kind == "turn":
+            out.append(EVENT[kind] % (ev["turn"], ev["text"]))
+        elif kind == "tool":
+            out.append(EVENT[kind] % (ev["name"], raw_args(line, ev), " ERROR" if ev["error"] else "", ev["content"]))
+        elif kind in ("post_turn", "pre_tool"):
+            out.append(EVENT[kind] % ev["output"])
+    return "".join(out)
+
+
+def step_render(run_dir, steps):
+    """The transcript body. An existing transcript.md (a pre-extraction-4 run dir, or a
+    retry) is kept; else it is rendered from messages.jsonl; no events = an empty body."""
+    path, events = run_dir / "transcript.md", run_dir / "messages.jsonl"
+    if path.is_file():
+        steps["render"] = "existing"
+        return
+    body = render(events.read_text(encoding="utf-8").splitlines()) if events.is_file() else ""
+    write_atomic(path, body.encode("utf-8"))
+    steps["render"] = "rendered" if body else "empty"
+
+
+def step_transcript(run_dir, term, check, steps):
+    path = run_dir / "transcript.md"
+    body = path.read_bytes() if path.is_file() else b""
+    if FOOTER_RE.search(body):
+        steps["transcript"] = "existing"
+        return
+    cost = "unmetered" if term["cost_usd"] is None else "$%.4f" % term["cost_usd"]
+    footer = FOOTER % (term["stop"], check["verdict"], term["turns"], term["tool_calls"],
+                       cost)
+    write_atomic(path, body + footer.encode("utf-8"))
+    steps["transcript"] = "appended"
+
+
+def step_publish(run_dir, term, check, steps):
+    """publish-evidence renames evidence/manifest.json into place and only then writes
+    ready_for_inspection, and only for capture_state "complete": an incomplete capture's
+    manifest is its whole record, so it alone is the complete output. A complete manifest
+    without the marker is the crash window between the two writes: publish-evidence is
+    called again (idempotent on an existing manifest: it verifies, re-publishes the marker
+    and exits 0)."""
+    manifest = run_dir / "evidence/manifest.json"
+    if (run_dir / "ready_for_inspection").is_file() or (
+            manifest.is_file()
+            and json.loads(manifest.read_text(encoding="utf-8")).get("capture_state") != "complete"):
+        steps["publish"] = "ok"
+        return ""
+    if not (run_dir / "stimulus/manifest.json").is_file():
+        steps["publish"] = "skipped"  # died before capture-stimulus: nothing to publish, ever
+        return ""
+    given = str(term.get("run_dir") or "")  # the runner's own spelling, unless the dir moved
+    run_dir_text = given if given and Path(given).resolve() == run_dir else str(run_dir)
+    payload = {"run_dir": run_dir_text, "adapter": term.get("adapter") or "runner",  # the executor names itself
+               "verdict": check["verdict"], "stop": term["stop"], "check_output": check["output"],
+               "check_exit": check["exit_code"], "check_skipped": check["skipped"]}
+    if workspace_dir(run_dir) != run_dir / "workspace":  # a separate LAB_WORKSPACES_ROOT; the default payload is unchanged
+        payload["workspace"] = str(workspace_dir(run_dir))
+    done = subprocess.run([str(LAB / "ops/bin/publish-evidence")], input=json.dumps(payload),
+                          text=True, capture_output=True, cwd=str(LAB), env=child_env())
+    if done.returncode == 0 and (run_dir / "evidence/manifest.json").is_file():
+        steps["publish"] = "ok"
+        return ""
+    steps["publish"] = "failed"
+    return "publish-evidence failed (exit %d): %s" % (
+        done.returncode, (done.stderr or done.stdout or "").strip()[-500:] or "no output")
+
+
+def load_report(path):
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None  # a report still being written by a live cell, or not one
+    return report if isinstance(report, dict) else None
+
+
+def report_cells():
+    """Cell dirs that may hold this run's reports: the --report-dir CS_TOOL_PREFIX names (the runner's call),
+    else every cell dir under the state root (a sweep, whose environment names no cell)."""
+    words = os.environ.get("CS_TOOL_PREFIX", "").split()  # as the runner splits it
+    words = words[:words.index("--")] if "--" in words else words
+    if "--report-dir" in words[:-1]:
+        hint = Path(words[words.index("--report-dir") + 1])
+        return [hint] if hint.is_dir() else []
+    root = sandbox_reports_dir()
+    return sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+
+
+def step_sandbox(run_dir, events, steps):
+    """5a: claim this run's reports (cwd = its workspace) into sandbox/; returns ({tool name: [report]}, reports)."""
+    dest, workspace, moved = run_dir / "sandbox", os.path.realpath(str(workspace_dir(run_dir))), 0
+    for cell in report_cells():
+        for path in sorted(cell.glob("*.json")):
+            report = load_report(path)
+            if report is None or os.path.realpath(str(report.get("cwd") or "")) != workspace:
+                continue
+            dest.mkdir(exist_ok=True)
+            shutil.move(str(path), str(dest / path.name))
+            moved += 1
+        try:
+            cell.rmdir()  # only when empty: another run's reports are never touched
+        except OSError:
+            pass
+    if moved:
+        fsync_path(dest)
+    reports = [r for r in (load_report(p) for p in sorted(dest.glob("*.json"))) if r] if dest.is_dir() else []
+    if not reports:
+        return {}, []
+    steps["sandbox"] = "claimed" if moved else "existing"
+    from _sandbox_policy import tool_argv  # only a wrapped run has reports; other estates need not ship it
+    keys = {}
+    for name in dict.fromkeys(e.get("name") for e in events if e.get("event") == "tool"):
+        try:
+            argv = tool_argv(LAB, str(name))
+        except (OSError, ValueError):
+            continue
+        keys.setdefault(os.path.realpath(argv[0]), []).append((name, argv[1:]))
+    by_tool = {}
+    for report in reports:
+        for name, args in keys.get(os.path.realpath(str(report.get("tool") or "")), []):
+            if "args" not in report or report["args"] == args:  # args: one binary, several exe tools
+                by_tool.setdefault(name, []).append(report)
+    return by_tool, reports
+
+
+def sandbox_summary(reports, tools):
+    if not reports and not tools:
+        return None
+    return {"reports": len(reports), "backends": sorted({str(r.get("backend")) for r in reports}),
+            "narrowed": sum(len(r.get("narrowed") or []) for r in reports), "tools": tools}
+
+
+def executed_by(run_dir):
+    """What ran this run, from its frozen manifest: runner {kind, path, sha256} and the gateway capture
+    saw {endpoint, implementation, version}; None for a run with no runner identity (another adapter, no capture)."""
+    try:
+        manifest = json.loads((run_dir / "stimulus/manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict) or not manifest.get("runner_implementation"):
+        return None
+    return {"runner": {"kind": manifest["runner_implementation"], "path": manifest.get("runner_path"),
+                       "sha256": manifest.get("runner_build")}, "gateway": manifest.get("gateway")}
+
+
+def step_row(run_dir, term, check, steps, result, by_tool=None):
+    try:
+        ident = estate_id(CONFIG)
+    except (OSError, ValueError) as error:
+        raise Pending("ledger row requires the local ESTATE identity: %s" % error)
+    transcript = term["transcript"]
+    started, scanned, present = time.monotonic(), 0, False
+    if LEDGER.is_file():
+        needle = json.dumps(transcript).encode("utf-8")
+        with LEDGER.open("rb") as rows:
+            for line in rows:
+                if not line.strip():
+                    continue
+                scanned += 1
+                if needle in line:
+                    try:
+                        present = json.loads(line).get("transcript") == transcript
+                    except (ValueError, AttributeError):
+                        present = False
+                    if present:
+                        result["row_line"] = line.rstrip(b"\n")
+                        break
+    result["scan_rows"], result["scan_ms"] = scanned, round((time.monotonic() - started) * 1000, 3)
+    if present:
+        steps["row"] = "existing"
+        return
+    row = {key: term.get(key) for key in ROW_KEYS}
+    row.update(spec_intent(term))
+    row.update({"ts": now(), "verdict": check["verdict"], "estate": ident, "row_version": ROW_VERSION})
+    events = events_of(run_dir)
+    error = classify_stop(term["stop"], events)
+    if error:
+        row["error"] = error
+    calls = call_errors(events, term["stop"], term.get("turns"), by_tool)
+    if calls:
+        row["call_errors"] = calls
+    if result.get("sandbox_tools"):
+        row["sandbox"] = result["sandbox_tools"]
+    executed = executed_by(run_dir)
+    if executed:
+        row["executed_by"] = executed
+    result["row_line"] = go_json(row).encode("utf-8")
+    with LEDGER.open("ab") as out:
+        out.write(result["row_line"] + b"\n")
+        out.flush()
+        os.fsync(out.fileno())
+    steps["row"] = "appended"
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _usd(value):
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+
+def envelope_usage(row, run_dir):
+    """Node protocol 1 usage (tests/director-spec/NODE-PROTOCOL.md §6): est_usd, actual charge (the row's
+    cost_usd), source class and model from the row; tokens from terminal.json when the runner reports them.
+    null means not reported."""
+    try:
+        term = json.loads((run_dir / "terminal.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        term = {}
+    term = term if isinstance(term, dict) else {}
+    tokens = {k: _count(row.get(k, term.get(k))) for k in ("input_tokens", "output_tokens")}
+    usage = {**tokens, "est_usd": _usd(row.get("est_usd")), "est_basis": row.get("est_basis") or None,
+             "charged_usd": _usd(row.get("cost_usd")),
+             "source": {"class": row.get("cost_class") if row.get("cost_class") in ("api", "subscription", "free_local") else None,
+                        "model": row.get("model") if isinstance(row.get("model"), str) and row.get("model") else None}}
+    # Additive and ignorable (NODE-PROTOCOL.md §8), present only when the agent reported them.
+    for key in ("cache_read_tokens", "cache_creation_tokens", "reasoning_tokens"):
+        if key in row:
+            usage[key] = _count(row[key])
+    if isinstance(row.get("reported_model"), str) and row["reported_model"]:
+        usage["source"]["reported_model"] = row["reported_model"]
+    if isinstance(row.get("allowance"), dict):
+        usage["allowance"] = row["allowance"]
+    return usage
+
+
+def step_envelope(run_dir, steps, result, sandbox=None):
+    """S1: the run's envelope in the outbox, written once (temp+fsync+rename, then the dir).
+    finalized.json is outside it (it names the envelope); a differing recompute is pending."""
+    files = []
+    for name in ENVELOPE_FILES:
+        if (run_dir / name).is_file():
+            files.append(run_dir / name)
+    for name in ENVELOPE_DIRS:
+        if (run_dir / name).is_dir():
+            files.extend(p for p in (run_dir / name).rglob("*") if p.is_file() and not p.is_symlink())
+    listed = sorted(({"path": p.relative_to(run_dir).as_posix(), "bytes": p.stat().st_size,
+                      "sha256": sha256_file(p)} for p in files), key=lambda f: f["path"])
+    line = result.get("row_line") or b""
+    try:
+        row = json.loads(line) if line else {}
+    except ValueError:
+        row = {}
+    envelope = {"envelope_version": 1, "event_id": "run_finalized:" + run_dir.name, "run_id": run_dir.name,
+                "transcript": row.get("transcript"), "row_sha256": hashlib.sha256(line).hexdigest() if line else None,
+                "row_version": row.get("row_version", 1) if row else None,
+                "error_class": (row.get("error") or {}).get("class") if row else None, "files": listed,
+                "usage": envelope_usage(row, run_dir),
+                "envelope_sha256": hashlib.sha256("".join("%s:%s\n" % (f["path"], f["sha256"])
+                                                          for f in listed).encode("utf-8")).hexdigest()}
+    if sandbox:
+        envelope["sandbox"] = sandbox
+    result["error_class"] = envelope["error_class"]
+    outbox = outbox_dir()
+    for prior_path in (outbox / (run_dir.name + ".json"), outbox / "acked" / (run_dir.name + ".json")):
+        if prior_path.is_file():
+            prior = json.loads(prior_path.read_text(encoding="utf-8"))
+            if prior.get("envelope_sha256") != envelope["envelope_sha256"]:
+                raise Pending('envelope %s envelope_sha256 "%s" differs from the recomputed "%s": not overwritten'
+                              % (prior_path, prior.get("envelope_sha256"), envelope["envelope_sha256"]))
+            steps["envelope"] = "existing"
+            return
+    outbox.mkdir(parents=True, exist_ok=True)
+    write_json(outbox / (run_dir.name + ".json"), envelope)
+    fsync_path(outbox)
+    steps["envelope"] = "written"
+
+
+def finalize(run_dir, term):
+    steps, result = {}, {}
+    check = step_check(run_dir, term, steps)
+    crash_after("check")
+    step_render(run_dir, steps)
+    step_transcript(run_dir, term, check, steps)
+    crash_after("transcript")
+    publish_error = step_publish(run_dir, term, check, steps)
+    crash_after("publish")
+    events = events_of(run_dir)
+    by_tool, reports = step_sandbox(run_dir, events, steps)
+    tools = sandbox_tools(events, term["stop"], term.get("turns"), by_tool)
+    result["sandbox_tools"] = tools
+    enospc_before("row")
+    step_row(run_dir, term, check, steps, result, by_tool)
+    crash_after("row")
+    if publish_error:
+        raise Pending(publish_error)
+    enospc_before("envelope")
+    step_envelope(run_dir, steps, result, sandbox_summary(reports, tools))
+    crash_after("envelope")
+    result.pop("row_line", None)
+    result.pop("sandbox_tools", None)
+    result.update({"ts": now(), "steps": steps, "verdict": check["verdict"], "stop": term["stop"]})
+    write_json(run_dir / "finalized.json", result)
+    return {"ok": True, "state": "finalized", "verdict": check["verdict"], "stop": term["stop"],
+            "row_appended": steps["row"] == "appended", "publish": steps["publish"]}
+
+
+def emit(value, code):
+    print(json.dumps(value, sort_keys=True))
+    raise SystemExit(code)
+
+
+def pending(run_dir, term, reason, record=True, cls=None):
+    if record:  # class: an _errors class when the failure is classified (spool_full on ENOSPC), else null
+        try:
+            write_json(run_dir / "finalize.error", {"ts": now(), "error": reason, "class": cls})
+        except OSError:
+            pass  # a full disk can refuse the record too; the reply and the sweep still say pending
+    out = {"ok": False, "state": "pending", "reason": reason, "stop": term.get("stop", "")}
+    if (run_dir / "check.json").is_file():
+        try:
+            out["verdict"] = json.loads((run_dir / "check.json").read_text(encoding="utf-8"))["verdict"]
+        except (OSError, ValueError, KeyError):
+            pass
+    emit(out, 3)
+
+
+def main():
+    try:
+        args = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as error:
+        emit({"ok": False, "error": "invalid JSON: %s" % error}, 2)
+    given = str(args.get("run_dir") or "")
+    try:  # a path, or the run's identifier ("ledger/runs/<id>" or <id>) resolved under the state root
+        run_dir = (Path(given) if os.path.isabs(given) else run_dir_of(given)).resolve() if given else None
+    except ValueError:
+        run_dir = None
+    if run_dir is None or run_dir.parent != RUNS or not run_dir.is_dir():
+        emit({"ok": False, "error": "run_dir must be a directory under %s" % RUNS}, 2)
+    terminal = run_dir / "terminal.json"
+    if not terminal.is_file():
+        emit({"ok": False, "error": "no terminal.json: execution has not ended"}, 2)
+    term = json.loads(terminal.read_text(encoding="utf-8"), parse_float=GoFloat)
+    lock = open(run_dir / "finalize.lock", "a")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pending(run_dir, term, "another finalizer holds the lock", record=False)
+    fsync_path(terminal)  # S0: neither runner fsyncs its temp+rename; the record is durable before any step
+    fsync_path(run_dir)
+    done = run_dir / "finalized.json"
+    if done.is_file():
+        prior = json.loads(done.read_text(encoding="utf-8"))
+        emit({"ok": True, "state": "finalized", "verdict": prior.get("verdict", ""),
+              "stop": prior.get("stop", term.get("stop", "")), "row_appended": False,
+              "publish": (prior.get("steps") or {}).get("publish", "")}, 0)
+    try:
+        emit(finalize(run_dir, term), 0)
+    except Pending as error:
+        pending(run_dir, term, str(error))
+    except OSError as error:
+        cls = "spool_full" if error.errno == errno.ENOSPC else None
+        pending(run_dir, term, "%s: %s" % (type(error).__name__, error), cls=cls)
+    except Exception as error:  # a broken finalizer is pending, never silent
+        pending(run_dir, term, "%s: %s" % (type(error).__name__, error))
+
+
+if __name__ == "__main__":
+    main()

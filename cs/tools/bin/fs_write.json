@@ -1,0 +1,6 @@
+{
+  "runtime": "python3",
+  "sandbox": {"net": "none"},
+  "description": "Write a file, creating parent dirs. Args: {path, content}.",
+  "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}
+}

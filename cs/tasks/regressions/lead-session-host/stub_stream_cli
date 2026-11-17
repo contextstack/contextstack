@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Stub Claude stream-json CLI for offline lead-session-host tests (no network)."""
+import json
+import os
+import sys
+import time
+import uuid
+
+session_id = None
+turn_delay = 0.0
+sandbox_probes = []
+for i, arg in enumerate(sys.argv):
+    if arg == "--resume" and i + 1 < len(sys.argv):
+        session_id = sys.argv[i + 1]
+    if arg == "--turn-delay" and i + 1 < len(sys.argv):
+        try:
+            turn_delay = float(sys.argv[i + 1])
+        except ValueError:
+            pass
+    if arg.startswith("--sandbox-probe="):
+        sandbox_probes.append(arg.split("=", 1)[1])
+if not session_id:
+    session_id = str(uuid.uuid4())
+# Like the real CLI, keep the session under HOME/.claude so the host can resume it next turn.
+_sessions = os.path.join(os.environ.get("HOME", ""), ".claude", "projects", "stub")
+try:
+    os.makedirs(_sessions, exist_ok=True)
+    open(os.path.join(_sessions, session_id + ".jsonl"), "a").close()
+except OSError:
+    pass
+
+seen_users = 0
+probe_note = ""
+if sys.platform == "darwin":
+    for cred in sandbox_probes:
+        try:
+            with open(cred, "rb") as stream:
+                stream.read(1)
+            probe_note += " SANDBOX_LEAK"
+        except OSError:
+            probe_note += " SANDBOX_DENY"
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    if msg.get("type") != "user":
+        continue
+    seen_users += 1
+    if turn_delay > 0:
+        time.sleep(turn_delay)
+    if seen_users == 1:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": session_id,
+                    "model": "stub-model",
+                    "tools": [],
+                    "mcp_servers": [],
+                }
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+    content = msg.get("message", {}).get("content", "")
+    if isinstance(content, list):
+        text = "".join(
+            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        text = str(content)
+    if text.startswith("Lane ") and " ended:" in text and "job " in text:
+        sys.stderr.write("NUDGE: %s\n" % text.strip()[:500])
+        sys.stderr.flush()
+        body = "lane ended"
+    else:
+        body = text.splitlines()[-1].strip()[:200]
+    if body.startswith("ECHO_TOKEN:"):
+        body = body.split(":", 1)[1].strip()
+    if text.startswith("Lane ") and " ended:" in text:
+        result = "WAKE-REPLY: %s" % text
+    else:
+        result = "STUB-REPLY: %s" % body
+    if probe_note and seen_users == 1:
+        result = "%s %s" % (probe_note, result)
+    sys.stdout.write(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "result": result,
+                "session_id": session_id,
+                "is_error": False,
+            }
+        )
+        + "\n"
+    )
+    sys.stdout.flush()

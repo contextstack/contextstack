@@ -1,0 +1,51 @@
+name: client-web tests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'clients/web/**'
+      - '.github/workflows/client-web-tests.yml'
+  pull_request:
+    paths:
+      - 'clients/web/**'
+      - '.github/workflows/client-web-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/web
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.5'
+          tools: composer:v2
+          coverage: none
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Setup Application
+        # Flux Pro installs from composer.fluxui.dev: FLUX_COMPOSER_AUTH holds only that http-basic entry,
+        # as composer auth JSON. It is never echoed; forks without the secret fail here by design.
+        env:
+          COMPOSER_AUTH: ${{ secrets.FLUX_COMPOSER_AUTH }}
+        run: composer setup
+
+      - name: Run CI Checks
+        run: composer ci:check

@@ -1,0 +1,65 @@
+{
+  "exit_code": 1,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-unknown-at-load-fx-t1"
+      }
+    }
+  ],
+  "requests": [],
+  "rows": [
+    {
+      "cost_class": "",
+      "cost_usd": 0,
+      "env_sha": "",
+      "est_basis": "rate",
+      "est_usd": 0,
+      "estate": "dev",
+      "model": "fake",
+      "seconds": "<SECONDS>",
+      "spec": "fx-tool-unknown-at-load",
+      "spec_sha": "9660e5774d067ff50fed67193fd7e37d212f91069f28315350a3c2fd17f18f09",
+      "stimulus_sha": "",
+      "stop": "error: tool \"warp_drive\": open <ESTATE>/tools/bin/warp_drive.json: no such file or directory — file pair in tools/bin",
+      "task": "tasks/fx",
+      "task_sha": "",
+      "tool_calls": 0,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-tool-unknown-at-load-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 0,
+      "verdict": "void"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-tool-unknown-at-load-fx-t1",
+      "entries": [
+        "check.json",
+        "finalize.lock",
+        "finalized.json",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "transcript": "\n---\nstop error: tool \"warp_drive\": open <ESTATE>/tools/bin/warp_drive.json: no such file or directory — file pair in tools/bin · verdict **void** · turns 0 · tools 0 · cost $0.0000\n",
+      "workspace": {}
+    }
+  ],
+  "stderr": [
+    "lab: tasks/fx — tool \"warp_drive\": open <ESTATE>/tools/bin/warp_drive.json: no such file or directory — file pair in tools/bin"
+  ],
+  "stdout": [
+    "  tasks/fx                       t1  void stop=error: tool \"warp_drive\": open <ESTATE>/tools/bin/warp_drive.json: no such file or directory — file pair in tools/bin turns=0 tools=0 $0.0000"
+  ]
+}

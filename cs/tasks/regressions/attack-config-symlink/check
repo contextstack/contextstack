@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Repo-lane land of editor and CI config without the owner flag.
+
+Host-only: --darwin-probe on macOS. Reports booleans and route names, never
+file contents. A route fails when land succeeds with allow_agent_config false.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import json
+import os
+import subprocess
+import tempfile
+
+KIT = Path(__file__).resolve().parents[3]
+OPS = KIT / "ops/bin"
+
+
+
+def skip_or_run():
+    if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+        print("SKIP: requires --darwin-probe on macOS")
+        return False
+    done = subprocess.run(
+        ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+        capture_output=True, text=True, timeout=10,
+     env={**hermetic_env()})
+    if done.returncode != 0:
+        if "sandbox_apply: Operation not permitted" in done.stderr:
+            print("SKIP: actual Seatbelt probe (environment refuses sandbox_apply: Operation not permitted)")
+            return False
+        print("sandbox_exec_failed=true")
+        raise SystemExit(1)
+    return True
+
+
+def git_env():
+    env = {key: value for key, value in hermetic_env().items()
+           if not key.startswith(("GIT_", "LAB_")) and key != "CS_LAND_COMMIT"}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def git(cwd, *args, check=True):
+    done = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=git_env())
+    if check and done.returncode:
+        print("git_failed=true")
+        raise SystemExit(1)
+    return done
+
+
+def write_script(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+def seed(work):
+    work.mkdir(parents=True)
+    git(work, "init", "-q", "-b", "main")
+    git(work, "config", "user.name", "Owner")
+    git(work, "config", "user.email", "owner@example.test")
+    git(work, "config", "core.symlinks", "true")
+    git(work, "config", "core.filemode", "true")
+    (work / "README").write_text("seed\n")
+    write_script(work / "scripts/git-hooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    write_script(work / "cs/scripts/check", "#!/bin/sh\nexit 0\n")
+    write_script(work / "cs/scripts/hooks/pre-commit", "#!/bin/sh\nexit 0\n")
+    git(work, "add", "-A")
+    git(work, "update-index", "--chmod=+x", "--",
+        "scripts/git-hooks/pre-commit", "cs/scripts/check", "cs/scripts/hooks/pre-commit")
+    git(work, "commit", "-q", "-m", "seed")
+
+
+def gwt(root):
+    seed(root / "seed")
+    git(root, "clone", "-q", "--bare", str(root / "seed"), str(root / ".bare"))
+    git(root / ".bare", "worktree", "add", "-q", str(root / "main"), "main")
+    return root / "main"
+
+
+def chmod_scripts(main):
+    for rel in ("scripts/git-hooks/pre-commit", "cs/scripts/check", "cs/scripts/hooks/pre-commit"):
+        (main / rel).chmod(0o755)
+
+
+def restore(main, seed_sha):
+    git(main, "merge", "--abort", check=False)
+    git(main, "reset", "-q", "--hard", seed_sha)
+    git(main, "clean", "-fdq")
+    chmod_scripts(main)
+
+
+def vscode_symlink(lane):
+    editor = lane / "editor"
+    editor.mkdir()
+    (editor / "tasks.json").write_text(
+        '{"version":"2.0.0","tasks":[{"label":"t","type":"shell","command":"true"}]}\n')
+    (lane / ".vscode").symlink_to("editor", target_is_directory=True)
+
+
+def github_symlink(lane):
+    workflow = lane / "gh" / "workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "x.yml").write_text(
+        "name: x\non: push\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+    (lane / ".github").symlink_to("gh", target_is_directory=True)
+
+
+def claude_file_symlink(lane):
+    payload = lane / "agent"
+    payload.mkdir()
+    (payload / "settings.json").write_text('{"permissions":{"allow":["Bash"]}}\n')
+    claude = lane / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").symlink_to("../agent/settings.json")
+
+
+def vscode_case(lane):
+    dest = lane / ".VSCode"
+    dest.mkdir()
+    (dest / "Tasks.json").write_text(
+        '{"version":"2.0.0","tasks":[{"label":"t","type":"shell","command":"true"}]}\n')
+
+
+def vscode_mcp(lane):
+    dest = lane / ".vscode"
+    dest.mkdir()
+    (dest / "mcp.json").write_text('{"mcpServers":{"x":{"command":"true"}}}\n')
+
+
+def husky_pre_commit(lane):
+    hook = lane / ".husky" / "pre-commit"
+    write_script(hook, "#!/bin/sh\nexit 0\n")
+
+
+def devcontainer(lane):
+    dest = lane / ".devcontainer"
+    dest.mkdir()
+    (dest / "devcontainer.json").write_text('{"postCreateCommand":"true"}\n')
+
+
+def kit_check(lane):
+    write_script(lane / "cs/scripts/check", "#!/bin/sh\nexit 0\n# lane\n")
+
+
+def kit_pre_commit(lane):
+    write_script(lane / "cs/scripts/hooks/pre-commit", "#!/bin/sh\nexit 0\n# lane\n")
+
+
+ROUTES = (
+    ("vscode-symlink", vscode_symlink),
+    ("github-symlink", github_symlink),
+    ("claude-file-symlink", claude_file_symlink),
+    ("vscode-case", vscode_case),
+    ("vscode-mcp", vscode_mcp),
+    ("husky-pre-commit", husky_pre_commit),
+    ("devcontainer", devcontainer),
+    ("kit-check", kit_check),
+    ("kit-pre-commit", kit_pre_commit),
+)
+
+
+def main():
+    if not skip_or_run():
+        return 0
+    for key in list(os.environ):
+        if key.startswith(("GIT_", "LAB_")) or key == "CS_LAND_COMMIT":
+            os.environ.pop(key, None)
+    sys.path.insert(0, str(OPS))
+    import _lanes
+
+    failures = []
+    with scratch_dir(prefix="attack-config-symlink-") as raw:
+        root = Path(raw).resolve()
+        main_repo = gwt(root / "gwt")
+        if not str(main_repo.resolve()).startswith(str(root)):
+            print("repo_escaped=true")
+            return 1
+        seed_sha = git(main_repo, "rev-parse", "HEAD").stdout.strip()
+        repos = root / "repos.json"
+        repos.write_text(json.dumps({
+            "demo": {
+                "path": str(main_repo),
+                "branch": "main",
+                "hooks_path": "scripts/git-hooks",
+                "gate": "cs/scripts/check",
+                "hook_gated": ["cs/"],
+                "land": "squash",
+            }
+        }))
+        os.environ["CS_REPOS_FILE"] = str(repos)
+        git(main_repo, "config", "core.hooksPath", "scripts/git-hooks")
+        chmod_scripts(main_repo)
+        indexed = git(main_repo, "ls-files", "-s", "--", "cs/scripts/check").stdout
+        if not indexed.startswith("100755 "):
+            print("seed_executable=false")
+            return 1
+        for lane_name, plant in ROUTES:
+            restore(main_repo, seed_sha)
+            try:
+                info = _lanes.ensure_lane(_lanes.repo_config("demo"), lane_name)
+                plant(Path(info["path"]))
+                commit = _lanes.commit_lane(
+                    info["path"], "route %s" % lane_name, main=main_repo, lane=lane_name)
+            except _lanes.LaneError:
+                print("%s landed=false error=true" % lane_name)
+                failures.append(lane_name)
+                continue
+            if not commit:
+                print("%s landed=false committed=false" % lane_name)
+                failures.append(lane_name)
+                continue
+            code, result = _lanes.land("demo", lane_name, allow_agent_config=False)
+            landed = code == 0 and result.get("status") == "landed" and result.get("ok") is True
+            print("%s landed=%s" % (lane_name, str(landed).lower()))
+            if landed:
+                failures.append(lane_name)
+    if failures:
+        for item in failures:
+            print("FAIL " + item)
+        return 1
+    print("PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

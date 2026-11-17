@@ -1,0 +1,11 @@
+{
+  "exit": 1,
+  "stdout": "browser_session: page text does not match the broker's sha256\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"url\": \"https://example.com/forged\"}, \"name\": \"browser_session\"}\n",
+    "broker-requests.jsonl": "{\"url\": \"https://example.com/forged\", \"verb\": \"open\"}\n",
+    "_evidence/manifest.jsonl": null,
+    "_evidence/fetches": null
+  },
+  "untouched": true
+}

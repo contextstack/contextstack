@@ -1,0 +1,5 @@
+{
+  "action": "lint",
+  "root": "corpus",
+  "version": "0.2"
+}

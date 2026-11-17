@@ -1,0 +1,6 @@
+#!/bin/sh
+# Re-run the task check. Nonzero + stdout keeps the loop alive.
+# Scope is checklib's: candidate-diff files and run outputs, never .git/inherited.
+test -n "$LAB_CHECK" || { echo "LAB_CHECK unset"; exit 2; }
+out=$("$LAB_CHECK" 2>&1) || { printf '%s\ncheck still failing\n' "$out"; exit 1; }
+exit 0

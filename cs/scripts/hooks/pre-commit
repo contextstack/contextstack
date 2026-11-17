@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Run scripts/check. Green commits pass. A red check with rules-tier
+# paths staged defers to commit-msg (check-red: marker); otherwise refuse.
+set -u
+root=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$root" || exit 1
+out=$(git rev-parse --git-path check-red-output)
+tmp=$(mktemp)
+set +e
+(
+  # Checks create foreign repositories; hook-local Git paths must not escape.
+  unset $(git rev-parse --local-env-vars)
+  "$root/scripts/check"
+) > "$tmp" 2>&1
+rc=$?
+set -e
+python3 "$root/scripts/check-red-gate" pre-commit "$tmp" "$rc"
+gate=$?
+cat "$tmp"
+rm -f "$tmp"
+exit "$gate"

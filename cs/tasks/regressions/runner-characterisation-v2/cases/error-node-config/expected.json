@@ -1,0 +1,73 @@
+{
+  "exit_code": 1,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-error-node-config-fx-t1"
+      }
+    }
+  ],
+  "requests": [],
+  "rows": [
+    {
+      "cost_class": "",
+      "cost_usd": 0,
+      "env_sha": "",
+      "error": {
+        "class": "node_config",
+        "code": null,
+        "detail": "post_turn \"ghost\": not in hooks/bin",
+        "retryable": false,
+        "source": "runner"
+      },
+      "est_basis": "rate",
+      "est_usd": 0,
+      "estate": "dev",
+      "model": "fake",
+      "row_version": 2,
+      "seconds": "<SECONDS>",
+      "spec": "fx-error-node-config",
+      "spec_sha": "91c3e0123a65e21b6fa1e2de608b9ed7e8d606974c22cd1441db2bd53679d35f",
+      "stimulus_sha": "",
+      "stop": "error: post_turn \"ghost\": not in hooks/bin",
+      "task": "tasks/fx",
+      "task_sha": "",
+      "tool_calls": 0,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-error-node-config-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 0,
+      "verdict": "void"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-error-node-config-fx-t1",
+      "entries": [
+        "check.json",
+        "finalize.lock",
+        "finalized.json",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "transcript": "\n---\nstop error: post_turn \"ghost\": not in hooks/bin · verdict **void** · turns 0 · tools 0 · cost $0.0000\n",
+      "workspace": {}
+    }
+  ],
+  "stderr": [
+    "lab: tasks/fx — post_turn \"ghost\": not in hooks/bin"
+  ],
+  "stdout": [
+    "  tasks/fx                       t1  void stop=error: post_turn \"ghost\": not in hooks/bin turns=0 tools=0 $0.0000"
+  ]
+}

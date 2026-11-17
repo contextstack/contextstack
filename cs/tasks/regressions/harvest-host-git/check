@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Finding 33: agent git metadata must never execute on or redirect the host."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+OPS = Path(__file__).resolve().parents[3] / "ops/bin"
+
+
+def git(path, *args):
+    result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+with scratch_dir(prefix="harvest-security-") as raw:
+    root = Path(raw)
+    other = root / "other"
+    other.mkdir()
+    git(other, "init", "-q")
+    git(other, "-c", "user.name=test", "-c", "user.email=test@local", "commit", "--allow-empty", "-qm", "base")
+    before = git(other, "rev-parse", "HEAD")
+    (other / "ordinary.txt").write_text("other must stay unchanged\n")
+    other_index = (other / ".git/index").read_bytes() if (other / ".git/index").exists() else None
+    for attack in ("config", "gitfile"):
+        run = root / attack
+        ws = run / "workspace"
+        ws.mkdir(parents=True)
+        marker = root / (attack + "-executed")
+        payload = root / (attack + "-payload")
+        payload.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\ncat\n')
+        payload.chmod(0o755)
+        git(ws, "init", "-q")
+        for key, value in (("filter.x.clean", str(payload)), ("gpg.program", str(payload)),
+                           ("commit.gpgsign", "true")):
+            git(ws, "config", key, value)
+        hook = ws / ".git/hooks/pre-commit"
+        hook.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
+        hook.chmod(0o755)
+        (ws / ".gitattributes").write_text("* filter=x\n")
+        (ws / "ordinary.txt").write_text("workspace content\n")
+        if attack == "gitfile":
+            import shutil
+            shutil.rmtree(ws / ".git")
+            (ws / ".git").write_text("gitdir: " + str(other / ".git") + "\n")
+        env = {**hermetic_env(), 'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': str(root), 'GIT_DIR': str(other / '.git')}
+        result = subprocess.run([str(OPS / "harvest")], input=json.dumps({"workspace": str(ws),
+                                "slug": "fixture", "run_id": attack}), text=True, capture_output=True, env=env)
+        assert result.returncode == 0, result.stderr
+        receipt = json.loads(result.stdout)
+        repo = receipt["git_dir"]
+        assert git(repo, "show", receipt["branch"] + ":ordinary.txt") == "workspace content"
+        assert ".git" not in git(repo, "ls-tree", "--name-only", "HEAD").splitlines()
+        assert not marker.exists(), "host executed agent payload"
+        assert git(other, "rev-parse", "HEAD") == before
+        assert (other / "ordinary.txt").read_text() == "other must stay unchanged\n"
+        assert ((other / ".git/index").read_bytes() if (other / ".git/index").exists() else None) == other_index
+    # Lane admin metadata lives outside the worktree and is sandbox-protected.
+    # Even owner-configured drivers must not be activated by agent attributes.
+    sys.path.insert(0, str(OPS))
+    import _lanes
+    marker = root / "lane-executed"
+    payload = root / "lane-payload"
+    payload.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\ncat\n')
+    payload.chmod(0o755)
+    git(other, "config", "filter.x.clean", str(payload))
+    git(other, "config", "filter.x.process", str(payload))
+    git(other, "config", "filter.x.required", "true")
+    git(other, "config", "gpg.program", str(payload))
+    git(other, "config", "commit.gpgsign", "true")
+    hook = other / ".git/hooks/pre-commit"
+    hook.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
+    hook.chmod(0o755)
+    cfg = {**_lanes.DEFAULTS, "name": "fixture", "path": other, "branch": git(other, "branch", "--show-current")}
+    info = _lanes.ensure_lane(cfg, "safe-lane")
+    lane_path = Path(info["path"])
+    (lane_path / ".gitattributes").write_text("* filter=x\n")
+    (lane_path / "ordinary.txt").write_text("lane content\n")
+    commit = _lanes.commit_lane(lane_path, "safe lane", main=other, lane="safe-lane")
+    assert git(other, "show", commit + ":ordinary.txt") == "lane content"
+    assert not marker.exists(), "lane commit executed a driver, signer or hook"
+print("PASS: harvest ignores agent metadata, drivers and pointers; ordinary files commit")

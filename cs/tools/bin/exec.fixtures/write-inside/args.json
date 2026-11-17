@@ -1,0 +1,7 @@
+{
+  "cmd": [
+    "sh",
+    "-c",
+    "printf made > out.txt"
+  ]
+}

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+python3 - "$here" <<'PYENV'
+import pathlib, subprocess, sys
+here = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(here.parent / "_lib"))
+from hermetic_env import hermetic_env
+for name in ("probe.py", "test_limits.py", "verify.py"):
+    subprocess.run([sys.executable, str(here / name)], env={**hermetic_env()}, check=True)
+PYENV

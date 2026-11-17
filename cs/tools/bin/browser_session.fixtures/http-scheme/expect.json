@@ -1,0 +1,11 @@
+{
+  "exit": 1,
+  "stdout": "browser_session: only https URLs are allowed\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"url\": \"http://example.com/\"}, \"name\": \"browser_session\"}\n",
+    "_evidence/manifest.jsonl": null,
+    "_evidence/fetches": null,
+    "broker-requests.jsonl": null
+  },
+  "untouched": true
+}

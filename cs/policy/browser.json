@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "chrome": {
+    "macos": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "linux": [
+      "/opt/google/chrome/chrome",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell",
+      "~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome"
+    ]
+  },
+  "sets": {
+    "public": ["https://example.com"]
+  }
+}

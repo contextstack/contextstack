@@ -1,0 +1,17 @@
+# cs-node: the node image's Python side (Plan.CS.v2.1 section 7 "Packaging the rest").
+# The twelve tools in tools/manifest.json and their helpers import only the standard library, so there
+# are no runtime dependencies: this file pins the interpreter (with .python-version) and gives uv a
+# project to lock and sync offline. Build: scripts/node-bundle; install: scripts/node-install.
+[project]
+name = "cs-node"
+version = "2.0.0"
+description = "ContextStack CS node image: manifest tools, pinned CPython, no third-party packages"
+requires-python = "==3.13.*"
+dependencies = []
+
+[tool.uv]
+# A script tree, not an installable package: sync creates the interpreter environment only.
+package = false
+# The interpreter is always the uv-managed python-build-standalone build the bundle carries,
+# never a system Python, so macOS and Linux nodes run the same bytes.
+python-preference = "only-managed"

@@ -1,0 +1,7 @@
+{
+ "entry": "run-spec",
+ "env": {
+  "FX_SECRET_OK": "requested-and-permitted",
+  "FX_SECRET_NO": "never-requested"
+ }
+}

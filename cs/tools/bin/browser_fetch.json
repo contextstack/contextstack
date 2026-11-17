@@ -1,0 +1,15 @@
+{
+  "runtime": "python3",
+  "sandbox": {"net": "all", "write_env": ["LAB_BROWSER_STATE"], "profile": "browser"},
+  "description": "Render one HTTPS URL through a short-lived gstack CDP browser. LAB_BROWSER_VISIBILITY defaults to auto: authenticated Google Tasks, X, and LinkedIn partitions use headed installed Google Chrome, while public pages use headless Playwright Chromium. Set LAB_BROWSER_VISIBILITY=headless for an authenticated comparison run or LAB_BROWSER_VISIBILITY=headed for a visible public diagnostic. Browser state stays outside run/setup trees in separate narrow cookie-import partitions. Saves visible text as canonical evidence and optionally an MHTML archive and link map; archives are omitted for authenticated sessions. Args: {url, archive?, links?}.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "url": {"type": "string", "description": "Public HTTPS URL to render."},
+      "archive": {"type": "boolean", "default": false},
+      "links": {"type": "boolean", "default": false, "description": "Save a content-addressed JSON map of rendered anchor text and resolved hrefs."}
+    },
+    "required": ["url"],
+    "additionalProperties": false
+  }
+}

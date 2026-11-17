@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""P0 sixth verification pass: process environments are a credential boundary.
+
+Offline checks always run. Host verification: check --darwin-probe runs a decoy
+attack under the production executor profile and proves the old launch shape leaks.
+Only temporary HOME/config data and fake tokens are used.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import ast
+import json
+import io
+import runpy
+import os
+import plistlib
+import re
+import shlex
+import time
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+
+KIT = Path(__file__).resolve().parents[3]
+OPS, SCRIPTS = KIT / 'ops/bin', KIT / 'scripts'
+sys.path[:0] = [str(OPS), str(SCRIPTS)]
+
+import _executor  # noqa: E402
+
+def executor_profile(home, ws, private, profile):
+    with patch.object(_executor, 'HOME', home), patch.object(sys, 'platform', 'darwin'):
+        _executor.sandbox_cmd('/usr/bin/true', [], ws, private, profile)
+    return profile.read_text()
+
+
+# This child reports only booleans, never process data or credential bytes.
+PROBE = r'''
+import ctypes, json, subprocess, sys
+pid, secret = int(sys.argv[1]), sys.argv[2].encode()
+results = {}
+for name, args in [('ps-E', ['/bin/ps', '-E', '-p', str(pid)]),
+                   ('ps-eww', ['/bin/ps', 'eww', '-p', str(pid)])]:
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=10)
+    except PermissionError:  # the profile refuses to exec ps at all: nothing leaks this way
+        results[name] = False
+        continue
+    results[name] = secret in result.stdout or secret in result.stderr
+libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                       ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+libc.sysctl.restype = ctypes.c_int
+mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, target pid
+size = ctypes.c_size_t(1024 * 1024)
+buffer = ctypes.create_string_buffer(size.value)
+rc = libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0)
+results['sysctl-procargs2'] = rc == 0 and secret in buffer.raw[:size.value]
+print(json.dumps(results))
+'''
+
+
+def attack(profile, script, pid, marker, home, ws):
+    done = subprocess.run(['sandbox-exec', '-f', str(profile), sys.executable, str(script), str(pid), marker],
+                          cwd=ws, env={'HOME': str(home), 'PATH': '/usr/bin:/bin'},
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, 'probe failed: ' + done.stderr
+    result = json.loads(done.stdout)
+    assert set(result) == {'ps-E', 'ps-eww', 'sysctl-procargs2'}, result
+    return result
+
+
+with scratch_dir(prefix='proc-env-isolation-') as raw:
+    root = Path(raw).resolve()
+    home, ws, private = (root / name for name in ('home', 'workspace', 'private'))
+    for directory in (home, ws, private):
+        directory.mkdir()
+    profile = root / 'executor.sb'
+    text = executor_profile(home, ws, private, profile)
+    from _node_env import node_env
+    import _director_client as director
+    fixture = root / 'settings.txt'  # arbitrary path: the lane itself denies all *.env files
+    fixture.write_text("# old node.env syntax\nexport CUSTOM_NODE_TOKEN='decoy-node token'\n"
+                       'CSGATEWAY_AUTH_TOKEN="decoy-gateway" # comment\n'
+                       "EMPTY=\nLITERAL='$(echo forbidden); $HOME'\n")
+    fixture.chmod(0o600)
+    before_env = dict(os.environ)
+    cs = runpy.run_path(str(SCRIPTS / "cs"), run_name="cs_parser_test")
+    parse_cs = cs["parse_node_env"]
+    values = node_env(fixture)
+    assert parse_cs(fixture) == values
+    assert values == {'CUSTOM_NODE_TOKEN': 'decoy-node token', 'CSGATEWAY_AUTH_TOKEN': 'decoy-gateway',
+                      'EMPTY': '', 'LITERAL': '$(echo forbidden); $HOME'}
+    assert dict(os.environ) == before_env, 'node loader changed process environment'
+    assert node_env(root / 'missing.txt') == parse_cs(root / 'missing.txt') == {}
+    configuration = {'url': 'http://127.0.0.1:1', 'token_env': 'CUSTOM_NODE_TOKEN'}
+    with patch.object(director, 'node_env', return_value=values):
+        assert director.Client(configuration).token == values['CUSTOM_NODE_TOKEN']
+    with patch.object(director, 'node_env', return_value={}), patch.dict(os.environ, {'CUSTOM_NODE_TOKEN': 'decoy-legacy-env'}):
+        try:
+            director.Client(configuration)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Director client fell back to token in process environment')
+    import _node_control as control
+    for settings, expected in ((values, 'Bearer decoy-gateway'), ({}, None)):
+        with patch.object(control, 'node_env', return_value=settings), \
+                patch.object(control.urllib.request, 'urlopen', return_value=io.BytesIO(b'{"cancelled": true}')) as send, \
+                patch.dict(os.environ, {'CSGATEWAY_AUTH_TOKEN': 'decoy-legacy-env'}):
+            assert control.gateway_cancel('fixture-job') == 'gateway cancelled'
+            request = send.call_args.args[0]
+            assert request.get_header('Authorization') == expected, 'gateway token did not come exclusively from loader'
+    for valid in ("A=plain\nA='last value'\n", 'A="hash # inside" # outside\n',
+                  "_NAME=escaped\\ space\n", "A=$HOME\nB=`literal`\n"):
+        fixture.write_text(valid)
+        assert parse_cs(fixture) == node_env(fixture)
+    for invalid in ('export INVALID NAME=value', 'TOKEN="unterminated', 'TOKEN=two words'):
+        fixture.write_text(invalid)
+        errors = []
+        for parse in (node_env, parse_cs):
+            try:
+                parse(fixture)
+            except ValueError as error:
+                assert 'line 1' in str(error) and invalid not in str(error), 'parser error exposed assignment'
+                errors.append(str(error))
+            else:
+                raise AssertionError('invalid assignment accepted')
+        assert errors[0] == errors[1]
+
+    # Exercise every generated service definition with decoy-only roots.
+    import _node_services as services
+    config, current = root / 'config', root / 'current'
+    config.mkdir()
+    marker = 'decoy-' + os.urandom(12).hex()
+    host_probe = False
+    if '--darwin-probe' in sys.argv and sys.platform == 'darwin':
+        capability = subprocess.run(['sandbox-exec', '-p', '(version 1)(allow default)', '/usr/bin/true'],
+                                    capture_output=True, text=True, timeout=10)
+        host_probe = capability.returncode == 0
+        if not host_probe:
+            assert 'sandbox_apply: Operation not permitted' in capability.stderr, capability.stderr
+    # Lanes deny *.env writes too; only the host creates the real fixture filename.
+    fixture_name = 'node.env' if host_probe else 'settings.txt'
+    (config / fixture_name).write_text('export CONTEXTSTACK_NODE_TOKEN=' + marker + '\n')
+    opdir = current / 'cs/ops/bin'
+    opdir.mkdir(parents=True)
+    venv = current / 'cs/.venv/bin'
+    venv.mkdir(parents=True)
+    (venv / 'python3').symlink_to(sys.executable)
+    (opdir / '_node_env.py').write_bytes((OPS / '_node_env.py').read_bytes())
+    standin = r'''import json, os, subprocess, sys, time
+from pathlib import Path
+from _node_env import node_env
+values = node_env()
+assert values.get("CONTEXTSTACK_NODE_TOKEN", "").startswith("decoy-")
+assert "CONTEXTSTACK_NODE_TOKEN" not in os.environ
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+try:
+    _ready = Path(__file__).with_suffix(".ready")
+    _ready.with_suffix(".ready-tmp").write_text(json.dumps([os.getpid(), child.pid]))
+    os.replace(_ready.with_suffix(".ready-tmp"), _ready)  # atomic: the reader never sees a half-written file
+    time.sleep(120)
+finally:
+    child.terminate()
+    child.wait(timeout=10)
+'''
+    for op in ('tick', 'node-listen'):
+        source = standin if host_probe else standin.replace(
+            'values = node_env()', 'values = node_env(Path(os.environ["LAB_CONFIG_ROOT"]) / "settings.txt")')
+        (opdir / op).write_text(source)
+    roots_env = {'HOME': str(home), 'LAB_CONFIG_ROOT': str(config),
+                 'LAB_STATE_ROOT': str(root / 'state'), 'LAB_WORKSPACES_ROOT': str(ws)}
+    with patch.object(services, 'CONFIG', config), patch.object(services, 'CURRENT', current), \
+            patch.object(services, 'ROOTS_ENV', roots_env):
+        rec = {'runner': 'rust', 'gateway': 'rust', 'credentials': 'off',
+               'director_rs_listen': ['127.0.0.1:8780'], 'client_web_php': '/usr/bin/php',
+               'serve_client_web': '127.0.0.1:8000'}
+        for svc in services.agent_specs(rec, 'cs', node=True, serve_rs=True, serve_cw=True):
+            plist_env = plistlib.loads(services.render_plist(svc))['EnvironmentVariables']
+            unit_env = {}
+            for line in services.render_unit(svc).decode().splitlines():
+                if line.startswith('Environment='):
+                    key, value = shlex.split(line.partition('=')[2])[0].split('=', 1)
+                    unit_env[key] = value
+            for generated in (plist_env, unit_env):
+                assert not any(re.search(r'_(TOKEN|SECRET|KEY)$', key) and value
+                               for key, value in generated.items()), 'secret literal in service environment'
+        launches = []
+        for op in ('tick', 'node-listen'):
+            args, env = services.node_args_env(rec, 'cs', op)
+            assert args == [str(venv / 'python3'), str(opdir / op)], 'node.env shell launch returned'
+            assert marker not in json.dumps([args, env]), 'secret in launch data'
+            launches.append((args, env))
+
+    def launch(args, env):
+        ready = Path(args[1]).with_suffix('.ready')
+        ready.unlink(missing_ok=True)
+        process = subprocess.Popen(args, env=env, cwd=ws, start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                assert process.poll() is None, 'stand-in failed: ' + process.stderr.read().decode()
+                assert time.monotonic() < deadline, 'stand-in readiness timeout'
+                time.sleep(0.02)
+            return process, json.loads(ready.read_text())
+        except BaseException:
+            stop(process)
+            raise
+
+    def stop(process):
+        import signal
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=10)
+        process.stderr.close()
+
+    # Always run the exact service command, loader and descendant offline too.
+    for args, env in launches:
+        process, pids = launch(args, env)
+        stop(process)
+
+    if '--darwin-probe' in sys.argv and sys.platform == 'darwin':
+        if not host_probe:
+            print('SKIP: host attack requires sandbox_apply (nested sandbox refused); run check --darwin-probe on host')
+        else:
+            script = ws / 'probe.py'
+            script.write_text(PROBE)
+            for args, env in launches:
+                process, pids = launch(args, env)
+                try:
+                    for pid in pids:
+                        result = attack(profile, script, pid, marker, home, ws)
+                        assert not any(result.values()), 'service or child leaked: ' + json.dumps(result)
+                finally:
+                    stop(process)
+            # OLD launch shape sources and exports the decoy before exec.
+            old_script = ws / 'old.py'
+            old_script.write_text('import time; time.sleep(120)\n')
+            old_env = dict(launches[0][1])
+            command = '. ' + shlex.quote(str(config / 'node.env')) + '; exec ' + \
+                      shlex.join([sys.executable, str(old_script)])
+            decoy = subprocess.Popen(['/bin/sh', '-c', command], env=old_env,
+                                     start_new_session=True, stderr=subprocess.PIPE)
+            try:
+                # Wait until sh has exec'd Python, so sysctl observes its initial env.
+                for _ in range(100):
+                    before = attack(profile, script, decoy.pid, marker, home, ws)
+                    if before['sysctl-procargs2']:
+                        break
+                    assert decoy.poll() is None, 'negative control exited'
+                    time.sleep(0.02)
+                assert before['sysctl-procargs2'], 'old launch negative control did not leak'
+                print('PASS: old launch leaks; loader service and child keep decoy out of exec env')
+            finally:
+                stop(decoy)
+    elif '--darwin-probe' in sys.argv:
+        print('SKIP: host attack requires macOS Seatbelt')
+print('proc-env-isolation: PASS (offline loader and service exec environment checks)')

@@ -1,0 +1,9 @@
+seatbelt_base_policy.sbpl and seatbelt_read_only_platform_defaults.sbpl are copied unchanged from
+OpenAI Codex CLI (https://github.com/openai/codex), path codex-rs/sandboxing/src/, commit e54a5713caf331f42a6eef0166186df5f7563c29 (release rust-v0.167.0 line), fetched 2026-11-09.
+Copyright 2025 OpenAI. Licensed under the Apache License, Version 2.0 (LICENSE in this directory).
+cs-sandbox does not load these files at run time; src/seatbelt.rs derives its allow rules from them and cites them.
+
+linux_sandbox_seccomp.rs.txt is codex-rs/linux-sandbox/src/seccomp.rs from the same repository, commit
+d92aae550180544fa2b7f656173c837271de6df3 (last change to that file, 2026-11-02), fetched 2026-11-09, copied
+unchanged (renamed .txt so no tool compiles or formats it). Same copyright and licence.
+cs-sandbox does not load it; src/seccomp.rs adapts its syscall denylist (phase 3b, Linux) and cites it.

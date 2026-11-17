@@ -1,0 +1,1 @@
+ A failed background check retains its rule name, stdout and stderr while preserving failure; successful check output remains quiet. This makes intermittent archival refusal diagnosable without relaxing the gate.

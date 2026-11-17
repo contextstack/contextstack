@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Strict Rust checks; the full comparison is a separate black-box task.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+# harness/tests/quality.py runs the release binaries, including a mock csgateway-rs for the streaming cases.
+cargo build --release --locked -p cs-harness -p cs-tools -p cs-sandbox -p cs-gateway
+cargo test --locked --all-targets
+python3 scripts/cs-size.py

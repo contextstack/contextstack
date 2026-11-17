@@ -1,0 +1,9 @@
+{
+  "description": "Operator, read-only: which runner executable (kind, path, sha256) and which gateway (implementation, version) ran a run, from its ledger row's executed_by or, for older rows, its frozen manifest. No run_id: the latest row. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "run_id": {"type": "string", "description": "A run id or the row's transcript (ledger/runs/<id>); default the latest row."}
+    }
+  }
+}

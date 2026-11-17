@@ -1,0 +1,1 @@
+Claude smart-model routing is CLI first and API last. Sonnet and Opus subscription executors must pin their Claude CLI aliases, strip `ANTHROPIC_API_KEY`, and remain distinct from the explicit current API fallback models in the gateway inventory.

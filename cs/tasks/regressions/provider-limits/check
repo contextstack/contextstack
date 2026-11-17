@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Provider limit detection, node state, and start_task fallback routing."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import ast
+import json
+import re
+import subprocess
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+FIX = HERE / "fixtures"
+OPS = HERE.parents[2] / "ops" / "bin"
+SCRIPTS = HERE.parents[2] / "scripts"
+sys.path[:0] = [str(OPS), str(SCRIPTS)]
+
+from _provider_limits import (  # noqa: E402
+    active_templates,
+    detect_limit,
+    enrich_allowance,
+    limit_from_event,
+    limit_signal,
+    load,
+    record_limit,
+    refuse_message,
+)
+from _cli_native import terminal_stop  # noqa: E402
+import cs_agents  # noqa: E402
+
+problems = []
+
+
+def expect(cond, msg):
+    print(("ok   " if cond else "FAIL ") + msg)
+    if not cond:
+        problems.append(msg)
+
+
+def main():
+    cursor = (FIX / "cursor-stderr.txt").read_text(encoding="utf-8")
+    hit = detect_limit("cursor-sol", "cursor-agent", "", cursor)
+    expect(hit and hit["resets_at"] == "2026-11-17T00:00:00Z", "cursor stderr: resets_at")
+    expect(hit and "usage limit" in hit["message"], "cursor stderr: message")
+
+    claude_text = (FIX / "claude-rejected.jsonl").read_text(encoding="utf-8")
+    line = claude_text.strip().splitlines()[-1]
+    ev = json.loads(line)
+    expect(limit_from_event(ev) and limit_from_event(ev)["resets_at"] == "2030-01-01T00:00:00Z",
+           "claude rate_limit_event: resets_at")
+    sig = limit_signal("claude", line.encode())
+    expect(sig and sig["stop"] == "provider_limit", "claude stream: forced stop")
+
+    gw = (FIX / "gateway-quota.txt").read_text(encoding="utf-8")
+    ghit = detect_limit("claude-code", "claude", gw, "")
+    expect(ghit and ghit["via"] == "gateway", "gateway.provider_quota_exhausted")
+
+    gem = (FIX / "gemini-stderr.txt").read_text(encoding="utf-8")
+    expect(detect_limit("gemini-cli", "gemini", "", gem), "gemini IneligibleTierError")
+
+    # False positives (2026-11-11: a codex lane editing this module was marked limited): a limit message
+    # in the agent's stdout, or in another CLI's stderr, is not that CLI's limit.
+    expect(detect_limit("codex", "codex", cursor, "") is None, "codex: a quoted cursor message on stdout is not a limit")
+    expect(detect_limit("cursor-sol", "cursor-agent", cursor, "") is None, "cursor: the message on stdout (agent text) is not a limit")
+    expect(detect_limit("claude-code", "claude", "We hit a rate limit exceeded case in the test", "") is None,
+           "prose on stdout never matches the generic quota pattern")
+
+    stream = (FIX / "opencode-go-limit.jsonl").read_text(encoding="utf-8")
+    decoy = (FIX / "opencode-go-decoy.jsonl").read_text(encoding="utf-8")
+    for template in ("opencode", "opencode-go"):
+        with patch("_provider_limits.time.time", return_value=1800000000):
+            ohit = detect_limit(template, "opencode", stream, "")
+        expect(ohit and ohit["resets_at"] == "2027-01-15T11:39:38Z",
+               template + ": stdout error event uses retryAfterMs")
+        expect(detect_limit(template, "opencode", decoy, "") is None,
+               template + ": agent text and non-error event cannot signal a limit")
+        for kind, status, expected in (("provider.usage-limit", 429, True),
+                                       ("provider.usage-limit", 500, False),
+                                       ("provider.network", 429, False)):
+            event = json.dumps({"type": "error", "error": {"type": kind, "status": status,
+                                                           "message": "usage limit"}})
+            expect(bool(detect_limit(template, "opencode", event, "")) == expected,
+                   template + ": structured type/status " + kind + "/" + str(status))
+    expect(detect_limit("codex", "codex", stream, "") is None,
+           "OpenCode event is scoped to OpenCode templates")
+
+    grok = (FIX / "grok-limit.jsonl").read_text()
+    grok_err = (FIX / "grok-stderr.txt").read_text()
+    grok_decoy = (FIX / "grok-decoy.jsonl").read_text()
+    for stdout, stderr, via in ((grok, "", "grok_error"), ("", grok_err, "stderr"),
+                                ("", grok, "grok_error")):
+        ghit = detect_limit("grok", "grok", stdout, stderr)
+        expect(ghit and ghit["resets_at"] is None and ghit["via"] == via,
+               "grok: native error with unknown reset via " + via)
+    expect(detect_limit("grok", "grok", grok_decoy, "") is None, "grok: agent message decoy")
+    expect(detect_limit("grok", "grok", grok_err, "") is None, "grok: plain stdout is agent text")
+    expect(detect_limit("codex", "codex", grok, grok_err) is None, "grok: scoped to its CLI")
+    for bad in (grok.replace("402", "500"), grok.replace("usage balance exhausted", "service unavailable")):
+        expect(detect_limit("grok", "grok", bad, "") is None, "grok: needs both 402 and exhausted balance")
+    expect(detect_limit("grok", "grok", "", "Agent says: " + grok_err) is None,
+           "grok: stderr needs native error prefix")
+
+    # Execute the standard executor's actual classification block, without launching a CLI or
+    # touching installed state. Grok has no profile and must reach this failure/recording path.
+    templates = json.loads((OPS / "executor-templates.json").read_text())
+    expect(not templates["grok"].get("profile"), "grok uses standard executor")
+    tree = ast.parse((OPS / "_executor.py").read_text())
+    main_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    start = next(i for i, node in enumerate(main_fn.body) if isinstance(node, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "native_stop" for t in node.targets))
+    end = next(i for i in range(start, len(main_fn.body)) if isinstance(main_fn.body[i], ast.If)
+               and isinstance(main_fn.body[i].test, ast.Name) and main_fn.body[i].test.id == "login_tampered")
+    classify = compile(ast.Module(body=main_fn.body[start:end], type_ignores=[]), "_executor.py", "exec")
+    completed = json.dumps({"stopReason": "end_turn", "text": grok_decoy,
+                            "num_turns": 1, "sessionId": "fixture", "requestId": "fixture"})
+    with scratch_dir() as raw:
+        state = Path(raw)
+        for code, stdout, stderr, expected in ((1, grok, "", "provider_limit"),
+                                               (1, "", grok_err, "provider_limit"),
+                                               (1, grok_decoy, "", "executor_exit_1"),
+                                               (0, completed, grok_err, "done"),
+                                               (0, grok, "", "provider_limit")):
+            (state / "provider-limits.json").unlink(missing_ok=True)
+            row = {}
+            context = dict(cli=subprocess.CompletedProcess([], code, stdout, stderr), row=row,
+                           tmpl=templates["grok"], name="grok", binary="grok", Path=Path,
+                           terminal_stop=terminal_stop, forced_meta=None, budget_broker=None,
+                           AUTH_EXPIRED=re.compile(r"never-match-fixture"), auth_text=stdout + stderr,
+                           LOGIN_REFRESH_CLIS=("pi", "codex", "grok"), LOGIN_EXPIRED=re.compile(r"never-match-fixture"),
+                           detect_limit=detect_limit, enrich_allowance=enrich_allowance,
+                           record_limit=record_limit, state_dir=lambda _: state, LAB=OPS.parents[1])
+            exec(classify, context)
+            expect(context["native_stop"] == expected, "grok executor: " + expected)
+            active = active_templates(state)
+            if expected == "provider_limit":
+                expect(row.get("allowance", {}).get("rejected") is True, "grok executor: allowance rejected")
+                chosen, _, error = cs_agents.choose_model("grok", None, active)
+                expect(chosen is None and error and "usage-limited" in error, "grok: future start refused")
+                import _provider_limits as plm
+                data = load(state)
+                data["templates"]["grok"]["recorded_at"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - plm.UNKNOWN_RESET_S - 1))
+                plm.save(state, data)
+                chosen, _, error = cs_agents.choose_model("grok", None, active_templates(state))
+                expect(chosen == "grok" and error is None, "grok: starts resume after UNKNOWN_RESET_S")
+            else:
+                expect(not active, "grok: completed/decoy run does not record limit")
+
+    allowance = json.loads((FIX / "codex-allowance.json").read_text(encoding="utf-8"))
+    chit = detect_limit("codex", "codex", "", "", allowance=allowance)
+    expect(chit and chit["resets_at"] == "2026-11-17T12:00:00Z", "codex allowance rollout")
+    row_allow = enrich_allowance(allowance, chit)
+    expect(row_allow.get("rejected") is True and row_allow.get("resets_at"), "allowance enriched")
+
+    # The fixtures' reset times are fixed dates; the fallback cases need limits still in force.
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 86400))
+    hit, chit = dict(hit, resets_at=future), dict(chit, resets_at=future)
+
+    with scratch_dir() as raw:
+        state = Path(raw)
+        profile = {"model": "cursor-sol", "fallback": ["codex", "cursor-composer"]}
+        keep, fb = cs_agents.pick_retry_model("cursor-sol", profile, [])
+        expect(keep == "cursor-sol" and fb is None, "retry keeps prior model when available")
+
+        record_limit(state, "cursor-sol", hit)
+        active = active_templates(state)
+        expect(len(active) == 1 and active[0]["template"] == "cursor-sol", "state records template")
+        chosen, skipped, err = cs_agents.choose_model("cursor-sol", profile, active)
+        expect(err is None and chosen == "codex" and skipped == [{"model": "cursor-sol", "until": hit["resets_at"]}], "fallback picks codex")
+
+        record_limit(state, "codex", {"message": "limited", "resets_at": "2099-01-01T00:00:00Z", "via": "test"})
+        active = active_templates(state)
+        chosen2, skipped2, err2 = cs_agents.choose_model("cursor-sol", profile, active)
+        expect(err2 is None and chosen2 == "cursor-composer" and len(skipped2) == 2
+               and skipped2[0]["model"] == "cursor-sol" and skipped2[1]["model"] == "codex",
+               "fallback skips limited codex")
+
+        try:
+            cs_agents.pick_retry_model("cursor-sol", profile, active, allow_fallback=False)
+            expect(False, "retry limited without allow_fallback should refuse")
+        except cs_agents.Refused as refused:
+            expect("allow_fallback=true" in str(refused) and "cursor-sol" in str(refused),
+                   "retry limited refusal names allow_fallback")
+        fall, fb_from = cs_agents.pick_retry_model("cursor-sol", profile, active, allow_fallback=True)
+        expect(fall == "cursor-composer" and fb_from == "cursor-sol",
+               "retry allow_fallback skips limited codex")
+
+        row = {"resets_at": "2099-06-01T00:00:00Z", "message": "cap"}
+        chosenx, skippedx, errx = cs_agents.choose_model("cursor-sol", profile, active, allow_fallback=False)
+        expect(chosenx is None and errx and "usage-limited" in errx
+               and skippedx == [{"model": "cursor-sol", "until": hit["resets_at"]}],
+               "explicit limited model refused with skipped detail")
+
+        msg = refuse_message("cursor-sol", row, None)
+        expect("2099-06-01" in msg and "cursor-sol" in msg, "refuse message names reset")
+
+        # expired limit is pruned on load
+        record_limit(state, "cursor-composer", {"message": "old", "resets_at": "2000-01-01T00:00:00Z", "via": "test"})
+        load(state)
+        names = {r["template"] for r in active_templates(state)}
+        expect("cursor-composer" not in names, "expired limit pruned")
+
+        # no reset time from the provider: active for a while, then expires (never limited forever)
+        import _provider_limits as plm
+        record_limit(state, "antigravity", {"message": "limited", "resets_at": None, "via": "test"})
+        expect("antigravity" in {r["template"] for r in active_templates(state)}, "unknown reset: still limited at first")
+        data = json.loads(plm.state_path(state).read_text())
+        data["templates"]["antigravity"]["recorded_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - plm.UNKNOWN_RESET_S - 60))
+        plm.save(state, data)
+        load(state)
+        expect("antigravity" not in {r["template"] for r in active_templates(state)},
+               "unknown reset: expires after UNKNOWN_RESET_S")
+
+    if problems:
+        print("check: provider-limits failed:", "; ".join(problems))
+        raise SystemExit(1)
+    print("check: provider limit signals, state, and fallback routing")
+
+
+if __name__ == "__main__":
+    main()

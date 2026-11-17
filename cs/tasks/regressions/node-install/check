@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""node-install regression (goal.md): stdlib-only tools, node-install's refusals, and an offline install of a release.
+
+Network-free. Part 3 runs only when this host has uv and a uv-managed interpreter of the pinned version;
+otherwise it prints SKIP and why. Temp dirs only; nothing under lab/ or $HOME is written (asserted).
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "node-install-layout"))
+import _bundle  # noqa: E402
+
+LAB = Path(__file__).resolve().parents[3]
+INSTALL = LAB / "scripts/node-install"
+problems = []
+
+
+def fail(msg):
+    problems.append(msg)
+    print("FAIL " + msg)
+
+
+def ok(msg):
+    print("ok   " + msg)
+
+
+def expect(cond, msg):
+    (ok if cond else fail)(msg)
+
+
+def run(argv, **kw):
+    kw.setdefault("env", {**hermetic_env()})
+    return subprocess.run(argv, capture_output=True, text=True, cwd=str(LAB), **kw)
+
+
+def load_node_bundle():
+    loader = importlib.machinery.SourceFileLoader("node_bundle", str(LAB / "scripts/node-bundle"))
+    spec = importlib.util.spec_from_loader("node_bundle", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def part_deps():
+    r = run([sys.executable, "scripts/node-bundle", "deps"])
+    rep = json.loads(r.stdout or "{}")
+    if r.returncode != 0 or rep.get("external_imports") != {}:
+        fail("node-bundle deps: exit %s, external %r" % (r.returncode, rep.get("external_imports")))
+    elif len(rep.get("tools", [])) != 12:
+        fail("node-bundle deps: %d tools, want 12" % len(rep["tools"]))
+    else:
+        ok("deps: 12 tools, %d python files, no non-stdlib import" % len(rep["python_files"]))
+
+
+def part_refusals(tmp):
+    r = run(["sh", str(INSTALL), "install"])
+    (fail if r.returncode != 1 or "usage" not in r.stderr else ok)("refuses install with no bundle: exit %s" % r.returncode)
+    r = run(["sh", str(INSTALL), "frobnicate"])
+    (fail if r.returncode != 1 or "usage" not in r.stderr else ok)("refuses an unknown command: exit %s" % r.returncode)
+    home = tmp / "home"
+    env = {**hermetic_env(), 'HOME': str(home)}
+    empty = tmp / "not-a-bundle"
+    empty.mkdir()
+    r = run(["sh", str(INSTALL), "install", str(empty)], env=env)
+    (fail if r.returncode != 1 or "not a bundle" not in r.stderr else ok)("refuses a non-bundle dir: exit %s" % r.returncode)
+    fake = tmp / "other-arch"
+    (fake / "uv").mkdir(parents=True)
+    (fake / "release/cs").mkdir(parents=True)
+    shutil.copy("/bin/sh", fake / "uv/uv")
+    (fake / "release/cs/.python-version").write_text("3.13.9\n")
+    (fake / "bundle.json").write_text(json.dumps({"target": "linux-armv7", "release": "x"}, indent=2) + "\n")
+    r = run(["sh", str(INSTALL), "install", str(fake)], env=env)
+    (fail if r.returncode != 1 or "bundle is for linux-armv7" not in r.stderr else ok)(
+        "refuses a bundle for another target: exit %s" % r.returncode)
+    r = run(["sh", str(INSTALL), "rollback"], env=env)
+    (fail if r.returncode != 1 or "no current release" not in r.stderr else ok)("rollback with nothing installed: exit %s" % r.returncode)
+    if home.exists():
+        fail("a refused install still wrote under HOME: %s" % sorted(str(p) for p in home.rglob("*"))[:5])
+
+
+
+def part_failed_build(tmp):
+    """node-bundle build writes a temp tree and moves it onto OUT_DIR only when finished."""
+    import argparse
+    nb = load_node_bundle()
+    parent = tmp / "place"
+    parent.mkdir()
+    staging = tmp / "staging-src"
+    (staging / "release").mkdir(parents=True)
+    (staging / "bundle.json").write_text("{}\n")
+    dest = parent / "done"
+    nb.place_bundle(staging, dest)
+    expect((dest / "bundle.json").read_text() == "{}\n" and not staging.exists()
+           and not any(name.startswith(".done.incoming.") for name in os.listdir(parent)),
+           "a finished bundle is moved into place in one step")
+    uv = os.environ.get("UV") or shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+    if not os.access(uv, os.X_OK):
+        print("SKIP failed build: no uv on this host")
+        return
+    bundles = tmp / "fail-bundles"
+    bundles.mkdir()
+    out = bundles / "partial"
+    made = []
+    orig = nb.tempfile.mkdtemp
+
+    def capture(*args, **kwargs):
+        path = orig(*args, **kwargs)
+        made.append(path)
+        return path
+
+    def fail():
+        scratch = Path(made[-1])
+        (scratch / "release").mkdir()
+        (scratch / "bundle.json").write_text("{")
+        sys.exit("node-bundle: simulated failure")
+
+    nb.tempfile.mkdtemp = capture
+    nb.requires_trees = fail
+    ns = argparse.Namespace(director=False, release_version=None, commit=None, out_dir=str(out), target=None,
+                            composer_auth=None, director_rs=False, client_web=False, publish_dir=None, channel="stable",
+                            allow_dirty=True)
+    try:
+        try:
+            nb.build(ns)
+            failed = False
+        except SystemExit as error:
+            failed = "simulated failure" in str(error)
+        expect(failed and not out.exists() and list(bundles.iterdir()) == [] and made and not Path(made[-1]).exists(),
+               "a failed build leaves no partial bundle (staging %s, left %s)" % (made, list(bundles.iterdir())))
+    finally:
+        nb.tempfile.mkdtemp = orig
+
+
+def part_install(tmp):
+    uv, managed = _bundle.host_python()
+    if uv is None:
+        print("SKIP install: %s" % managed)
+        return
+    version = (LAB / ".python-version").read_text().strip()
+    bins = _bundle.fake_bins(tmp / "fakebin")
+    bins["cs-tools"] = LAB.parent / "target/release/cs-tools"  # real: the fixtures below exec it
+    if not os.access(bins["cs-tools"], os.X_OK):
+        return fail("target/release/cs-tools is not built (scripts/check rule 0 builds it)")
+    bundle, home, rid = tmp / "bundle", tmp / "home-install", "20990101-000000000"
+    files = _bundle.bundle(bundle, uv, rid, bins)
+    _bundle.seed_python(home, rid, managed)
+    rel = home / ".contextstack/releases" / rid
+    bin_before = set(os.listdir(Path.home() / ".local/bin")) if (Path.home() / ".local/bin").is_dir() else set()
+    env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin" % home)
+    r = run(["sh", str(INSTALL), "install", str(bundle), "--no-load"], env=env)
+    if r.returncode != 0:
+        return fail("node-install exit %s\n%s%s" % (r.returncode, r.stdout[-1000:], r.stderr[-2000:]))
+    expect((rel / "bundle.json").read_bytes() == (bundle / "bundle.json").read_bytes(),
+           "installed release retains bundle creation time for development update ordering")
+    rep = json.loads((rel / "verify.json").read_text())
+    py = Path(rep["python"]["path"])
+    if rep["errors"] or rep["python"]["version"] != version or not str(py).startswith(str(rel.resolve())):
+        fail("report: errors %r, python %s at %s" % (rep["errors"], rep["python"]["version"], py))
+    elif rep["files_checked"] != len(files):
+        fail("report checked %d files, bundle has %d" % (rep["files_checked"], len(files)))
+    else:
+        ok("install offline: python %s in the release, %d files verified, missing host runtimes %s" %
+           (version, rep["files_checked"], sorted(rep["missing_host_runtimes"]) or "none"))
+    bin_after = set(os.listdir(Path.home() / ".local/bin")) if (Path.home() / ".local/bin").is_dir() else set()
+    (fail if bin_after != bin_before else ok)("nothing written to the real ~/.local/bin")
+    exe_ok = [t["name"] for t in rep["tools"] if t["runtime"] == "exe" and t["ok"]]
+    (ok if sorted(exe_ok) == ["fs_edit", "fs_read", "okf"] else fail)(
+        "cs-tools installed at release/target/release for fs_read, fs_edit, okf: %s" % exe_ok)
+    venv_py = rel / "cs/.venv/bin/python3"
+    r = run([str(venv_py), str(rel / "cs/scripts/tool-fixtures"), "--python", str(venv_py),
+             "--tool", "fs_read", "--tool", "okf"])
+    (fail if r.returncode != 0 else ok)("installed release runs fs_read and okf (cs-tools, no ruby) fixtures: %s"
+                                        % (r.stdout.strip().splitlines() or ["(no output)"])[-1])
+    (rel / "target/release/cs-tools").unlink()
+    r = run([str(venv_py), "-I", str(rel / "cs/scripts/node-bundle"), "verify", str(bundle), str(rel)])
+    rep = json.loads(r.stdout or "{}")
+    (ok if r.returncode == 1 and any("target/release/cs-tools missing" in e for e in rep.get("errors", [])) else fail)(
+        "verify refuses a release whose target/release/cs-tools is gone: exit %s" % r.returncode)
+
+
+def part_binaries(tmp):
+    """a target this host cannot build for records every binary required, not bundled."""
+    nb = load_node_bundle()
+    other = "linux-x86_64" if nb.host_target() != "linux-x86_64" else "linux-aarch64"
+    out = tmp / "other-target"
+    built = nb.build_binaries(other, out / "release/bin")
+    files, binaries = nb.stage(out, other, built)
+    (ok if built == {} and binaries and not any(b["bundled"] for b in binaries)
+     and all("phase 3b" in b.get("reason", "") for b in binaries) and not (out / "release/bin").exists()
+     else fail)("%s bundle records its %d binaries required, not bundled" % (other, len(binaries)))
+    (ok if "release/cs/scripts/node-release" in files and not any(f.startswith(("release/cs/ledger/", "release/cs/specs/",
+     "release/cs/tasks/", "release/lab/")) for f in files) and "release/gateway/models.json" in files else fail)(
+        "release tree: node-release and models.json in, ledger/, specs/, tasks/ out (%d files)" % len(files))
+
+
+HOST_BUILD = """import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+l = importlib.machinery.SourceFileLoader("nb", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("nb", l)); l.exec_module(m)
+out = Path(sys.argv[2])
+built = m.build_binaries(m.host_target(), out / "release/bin")
+files, binaries = m.stage(out, m.host_target(), built)
+print(json.dumps({"built": sorted(built), "binaries": binaries}))
+"""
+
+
+def part_host_binaries(tmp):
+    """This host's bundle carries only Rust binaries and builds with no Go toolchain (the owner 2026-11-10: the Go gateway
+    is out of releases, as cs-go was): build_binaries and stage run with every dir holding a `go` off PATH and a `go`
+    shim first that records any call. cargo builds nothing new after scripts/check rule 0 but re-links every target/release
+    binary, so scripts/check runs this rule serially, never beside rules that exec them."""
+    shim, out = tmp / "go-shim", tmp / "host-target"
+    shim.mkdir()
+    called = tmp / "go-called"
+    (shim / "go").write_text('#!/bin/sh\necho "$@" >> %s\nexit 1\n' % called)
+    (shim / "go").chmod(0o755)
+    path = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and not os.access(os.path.join(d, "go"), os.X_OK)]
+    env = {**hermetic_env(), 'PATH': os.pathsep.join([str(shim)] + path)}
+    r = run([sys.executable, "-I", "-c", HOST_BUILD, str(LAB / "scripts/node-bundle"), str(out)], env=env)
+    if r.returncode != 0:
+        return fail("host-target build_binaries + stage with no go on PATH: exit %s\n%s" % (r.returncode, r.stderr[-1500:]))
+    rep = json.loads(r.stdout)
+    built = ["cs-gateway", "cs-harness", "cs-sandbox", "cs-tools"]
+    want = sorted(built)
+    shipped = sorted(os.listdir(out / "release/bin"))
+    expect(rep["built"] == built and shipped == want and all(b["bundled"] for b in rep["binaries"])
+           and not called.exists() and "csgateway" not in shipped and "cs-go" not in shipped,
+           "host bundle with no go on PATH: bin/ holds %s, no csgateway (Go) or cs-go, go never called" % shipped)
+
+
+
+def part_tracked_only(tmp):
+    """A git work tree bundles tracked cs/ files only; a dirty tree is refused without --allow-dirty."""
+    repo = tmp / "tracked-only"
+    cs = repo / "cs"
+    fake_home = tmp / "tracked-home"
+    fake_home.mkdir()
+    (fake_home / ".gitconfig").write_text("[user]\n\tname = regression\n\temail = r@test\n")
+    (cs / "scripts").mkdir(parents=True)
+    # need valid .python-version for build() after the dirty gate
+    (cs / ".python-version").write_text("3.13.9\n")
+    shutil.copy2(LAB / "scripts/node-bundle", cs / "scripts/node-bundle")
+    (cs / "scripts/tracked.txt").write_text("ok\n")
+    env = {**hermetic_env(), "HOME": str(fake_home), "GIT_AUTHOR_NAME": "regression", "GIT_AUTHOR_EMAIL": "r@test",
+           "GIT_COMMITTER_NAME": "regression", "GIT_COMMITTER_EMAIL": "r@test"}
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "add", "cs/.python-version", "cs/scripts"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, env=env)
+    (cs / "local-only.txt").write_text("must not ship\n")
+    probe = ("import importlib.machinery, importlib.util, json, sys\n"
+             "l = importlib.machinery.SourceFileLoader('nb', sys.argv[1])\n"
+             "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('nb', l)); l.exec_module(m)\n"
+             "print(json.dumps(m.release_files()))\n")
+    r = run([sys.executable, "-I", "-c", probe, str(cs / "scripts/node-bundle")], env=env)
+    files = json.loads(r.stdout or "[]")
+    expect("local-only.txt" not in files and "scripts/tracked.txt" in files,
+           "git work tree: release_files() is tracked only (%r)" % [f for f in files if "local" in f or "tracked" in f])
+    out = tmp / "dirty-out"
+    r = run([sys.executable, str(cs / "scripts/node-bundle"), "build", str(out)], env=env)
+    expect(r.returncode != 0 and "refusing a dirty working tree" in (r.stderr or "") and not out.exists(),
+           "dirty tree without --allow-dirty: refused before writing")
+    r = run([sys.executable, str(cs / "scripts/node-bundle"), "build", "--allow-dirty", str(out)], env=env)
+    expect("refusing a dirty working tree" not in (r.stderr or ""),
+           "build --allow-dirty: passes the dirty-tree gate (exit %s)" % r.returncode)
+
+
+def part_export(tmp):
+    """A production build comes from `git archive HEAD | tar -x`: release_files() there lists the commit's lab files
+    (outside ledger/, specs/, tasks/), never the checkout's untracked files; build refuses an export without --commit."""
+    x = tmp / "export"
+    K = LAB.name  # the code root in the commit (cs)
+    x.mkdir()
+    arch = subprocess.run(["git", "-C", str(LAB.parent), "archive", "HEAD", K + "/scripts", K + "/ops", K + "/tools",
+                           K + "/policy", K + "/.python-version"], capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", str(x)], input=arch, check=True, env={**hermetic_env()})
+    shutil.copy2(LAB / "scripts/node-bundle", x / K / "scripts/node-bundle")  # this checkout's version under test
+    (x / K / "scripts/not-committed").write_text("an untracked file in the export dir itself\n")
+    probe = ("import importlib.machinery, importlib.util, json, sys\n"
+             "l = importlib.machinery.SourceFileLoader('nb', sys.argv[1])\n"
+             "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('nb', l)); l.exec_module(m)\n"
+             "print(json.dumps([m.in_git(), m.release_files()]))\n")
+    gitdir = subprocess.run(["git", "-C", str(LAB), "rev-parse", "--absolute-git-dir"], capture_output=True,
+                            text=True, check=True).stdout.strip()
+    hook_env = {**hermetic_env(), 'GIT_DIR': gitdir, 'GIT_INDEX_FILE': gitdir + '/index'}  # as a commit hook runs check
+    r = run([sys.executable, "-I", "-c", probe, str(x / K / "scripts/node-bundle")], env=hook_env)
+    in_git, files = json.loads(r.stdout or "[true, []]")
+    want = set(subprocess.run(["git", "-C", str(LAB.parent), "ls-tree", "-r", "--name-only", "HEAD", K + "/scripts",
+                               K + "/ops", K + "/tools", K + "/policy", K + "/.python-version"], capture_output=True,
+                              text=True, check=True).stdout.split())
+    want = {w[len(K) + 1:] for w in want if not w.startswith(K + "/tools/defuddle/node_modules")}
+    (ok if not in_git and set(files) == (want - {"scripts/node-bundle"}) | {"scripts/node-bundle", "scripts/not-committed"}
+     else fail)("export, with a commit hook's GIT_DIR and GIT_INDEX_FILE set: no .git, release_files() is the archived tree (%d files)" % len(files))
+    r = run([sys.executable, "-I", str(x / K / "scripts/node-bundle"), "build", str(tmp / "export-out")], env=hook_env)
+    (ok if r.returncode != 0 and "--commit" in r.stderr and not (tmp / "export-out").exists() else fail)(
+        "export: build without --commit refuses before writing: %s" % r.stderr.strip()[-120:])
+
+
+def part_director_retired(tmp):
+    """node-bundle --director (the Laravel director's release tree) is retired (2026-11-11): refused before writing."""
+    r = run([sys.executable, str(LAB / "scripts/node-bundle"), "build", "--director", str(tmp / "laravel-out")])
+    expect(r.returncode != 0 and "--director" in r.stderr and not (tmp / "laravel-out").exists(),
+           "build --director: refused before writing: %s" % r.stderr.strip()[-160:])
+
+
+def lab_files():
+    """The parts of lab/ the scripts could touch (never ledger/, which is huge)."""
+    roots = [p for p in LAB.iterdir() if p.is_file()] + [LAB / d for d in ("tools", "scripts", "ops", "policy")]
+    return {str(p) for r in roots for p in ([r] if r.is_file() else r.rglob("*")) if p.is_file() and "__pycache__" not in str(p)}
+
+
+def main():
+    before, agents = lab_files(), _bundle.real_agents()
+    tmp = Path(tempfile.mkdtemp(prefix="node-install-regression-", suffix=".noindex"))
+    try:
+        part_deps()
+        part_director_retired(tmp)
+        part_refusals(tmp)
+        part_binaries(tmp)
+        part_host_binaries(tmp)
+        part_tracked_only(tmp)
+        part_export(tmp)
+        part_failed_build(tmp)
+        part_install(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    after = lab_files()
+    if after - before:
+        fail("files created under lab/: %s" % sorted(after - before)[:5])
+    leak = _bundle.launchd_untouched(agents)
+    if leak:
+        fail(leak)
+    print("check: node-install %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1138 @@
+#!/usr/bin/env python3
+"""cs-init regression (goal.md): `cs init --yes` takes a fresh install to a finished first job, and a rerun is a no-op.
+
+Builds a bundle from this checkout's real binaries (node-install-layout's _bundle), installs it in a fake HOME, then
+runs the release's own cs. launchd is emulated by a launchctl shim that starts each plist's command; never the real one.
+"""
+import atexit
+import importlib.util
+import json
+import re
+import os
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "node-install-layout"))
+import _bundle  # noqa: E402
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+LAB = _bundle.LAB
+RID = "20990101-csinit000"
+REAL = {"cs-harness": "cs-harness", "cs-sandbox": "cs-sandbox", "cs-tools": "cs-tools", "cs-gateway": "cs-gateway",
+        "cs-director": "cs-director"}
+REPLY = "hello from ContextStack"
+problems = []
+
+# launchd for a fake HOME: bootstrap starts the plist's command (env as written, 9200 mapped to $EMU_GW_PORT)
+# in its own session and appends that child's pid and pgid. bootout SIGTERMs the group, then SIGKILLs a survivor.
+# print answers whether it runs, kickstart -k restarts it. The pidfile is only the current child; `children`
+# keeps every one, including a process a restart replaced.
+LAUNCHCTL = r'''#!%s
+import os, plistlib, signal, subprocess, sys, time
+emu, port = os.environ["LAUNCHD_EMU"], os.environ["EMU_GW_PORT"]
+args = sys.argv[1:]
+open(os.path.join(emu, "calls.log"), "a").write("launchctl %%s\n" %% " ".join(args))
+def read_int(path):
+    try:
+        return int(open(path).read())
+    except (OSError, ValueError):
+        return None
+def pid(label):
+    p = read_int(os.path.join(emu, label + ".pid"))
+    if not p:
+        return None
+    try:
+        os.kill(p, 0)
+    except OSError:
+        return None
+    return p
+def pgid_of(label):
+    return read_int(os.path.join(emu, label + ".pgid")) or pid(label)
+def group_alive(g):
+    try:
+        os.killpg(g, 0)
+        return True
+    except OSError:
+        return False
+def stop(label):
+    p, g = pid(label), pgid_of(label)
+    if not g or g <= 1 or g == os.getpgrp():
+        if p and p > 1:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(p, sig)
+                except OSError:
+                    pass
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(g, sig)
+        except OSError:
+            if p and p > 1:
+                try:
+                    os.kill(p, sig)
+                except OSError:
+                    pass
+        for _ in range(30):
+            if not group_alive(g) and pid(label) is None:
+                return
+            time.sleep(0.1)
+def track(proc, label, path):
+    try:
+        g = os.getpgid(proc.pid)
+    except OSError:
+        g = proc.pid
+    with open(os.path.join(emu, "children"), "a") as fh:
+        fh.write("%%d %%d\n" %% (proc.pid, g))
+    for name, value in ((label + ".pid", proc.pid), (label + ".pgid", g), (label + ".path", path)):
+        with open(os.path.join(emu, name), "w") as fh:
+            fh.write(str(value))
+def start(path):
+    d = plistlib.load(open(path, "rb"))
+    env = {k: str(v).replace("127.0.0.1:9200", "127.0.0.1:" + port) for k, v in d["EnvironmentVariables"].items()}
+    if env.get("CSGATEWAY_PORT") == "9200":
+        env["CSGATEWAY_PORT"] = port
+    env.update(HOME=os.environ["HOME"], CSGATEWAY_LAB_ENDPOINT="http://127.0.0.1:%%s/v1/ai/lab-execute" %% port)
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "NO_PROXY", "no_proxy"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    proc = subprocess.Popen(d["ProgramArguments"], cwd=d["WorkingDirectory"], env=env, stdin=subprocess.DEVNULL,
+                            stdout=open(d["StandardOutPath"], "a"), stderr=open(d["StandardErrorPath"], "a"),
+                            start_new_session=True)
+    track(proc, d["Label"], path)
+if args[0] == "print":
+    sys.exit(0 if pid(args[1].rsplit("/", 1)[1]) else 113)
+if args[0] == "bootstrap":
+    start(args[2])
+elif args[0] == "bootout":
+    stop(args[1].rsplit("/", 1)[1])
+elif args[0] == "kickstart":
+    label = args[-1].rsplit("/", 1)[1]
+    stop(label)
+    start(open(os.path.join(emu, label + ".path")).read())
+'''
+
+# A signed-in Claude Code: auth status says so, a run answers in stream-json; every call is logged.
+CLAUDE = r'''#!%s
+import json, os, sys
+open(os.path.join(os.environ.get("FAKE_CLAUDE_LOG_DIR", "%s"), "claude-calls.jsonl"), "a").write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1:] == ["--version"]:
+    print("9.9.9 (Claude Code)")
+elif sys.argv[1:3] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty"}))
+else:
+    for line in ({"type": "system", "subtype": "init", "model": "claude-fake", "session_id": "s", "tools": []},
+                 {"type": "assistant", "message": {"model": "claude-fake", "content": [{"type": "text", "text": "%s"}],
+                                                   "usage": {"input_tokens": 3, "output_tokens": 5}}},
+                 {"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "result": "%s",
+                  "duration_ms": 10, "total_cost_usd": 0, "usage": {"input_tokens": 3, "output_tokens": 5}}):
+        print(json.dumps(line), flush=True)
+'''
+
+
+def fail(msg):
+    problems.append(msg)
+    print("FAIL " + msg)
+
+
+def expect(cond, msg):
+    (print("ok   " + msg) if cond else fail(msg))
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def snapshot(*roots):
+    out = {}
+    for root in roots:
+        for p in sorted(root.rglob("*")) if root.exists() else []:
+            st = p.lstat()
+            out[str(p)] = (st.st_size, st.st_mtime_ns, st.st_mode)
+    return out
+
+
+def jobs(db):
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        return conn.execute("SELECT job_id, state FROM jobs").fetchall()
+    finally:
+        conn.close()
+
+
+# The fixture directory the services were started under. Set before any child, cleared only by process exit.
+# atexit and the SIGTERM handler both call cleanup_fixture, as does the test's finally (a timeout or an
+# exception still has to stop the session-leaders the pidfile kill used to miss).
+_fixture = {"prefixes": None, "emu": None}
+_in_cleanup = False
+
+
+def _usable_prefixes(paths):
+    """Absolute `csi-<unique>` directories only, so a sweep cannot match `/tmp` or a sibling name."""
+    out = []
+    for raw in paths:
+        text = str(raw).rstrip("/")
+        name = os.path.basename(text)
+        parent = os.path.dirname(text)
+        if (text.startswith("/") and parent not in ("", "/") and name.startswith("csi-")
+                and len(name) > len("csi-") and text not in out):
+            out.append(text)
+    return out
+
+
+def _command_matches(command, prefixes):
+    """True when `command` contains a prefix as a path, not as the start of a longer directory name."""
+    if not command:
+        return False
+    for prefix in prefixes:
+        start = 0
+        while True:
+            i = command.find(prefix, start)
+            if i < 0:
+                break
+            end = i + len(prefix)
+            before = i == 0 or command[i - 1] in " \t='\"::"
+            after = end == len(command) or command[end] in "/ \t'\"::"
+            if before and after:
+                return True
+            start = i + 1
+    return False
+
+
+def _ps_command_rows():
+    """`(rows, error)` from `ps -axo pid,command`. `-ww` keeps a long argv from being cut before the fixture path."""
+    try:
+        proc = subprocess.run(["ps", "-ww", "-axo", "pid,command"], capture_output=True, text=True)
+    except OSError as exc:
+        return [], "ps -axo pid,command: %s" % exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip() or "exit %s" % proc.returncode
+        return [], "ps -axo pid,command: %s" % detail
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        rows.append((pid, parts[1]))
+    return rows, None
+
+
+def _ps_pid_command(pid):
+    """`('ok', command)`, `('dead', None)`, or `('error', message)` for one pid."""
+    try:
+        proc = subprocess.run(["ps", "-p", str(pid), "-ww", "-o", "command="], capture_output=True, text=True)
+    except OSError as exc:
+        return "error", str(exc)
+    if proc.returncode < 0:
+        return "error", "ps exited %s" % proc.returncode
+    err = (proc.stderr or "").strip()
+    low = err.lower()
+    if "not permitted" in low or "operation not permitted" in low:
+        return "error", err or "ps not permitted"
+    if proc.returncode == 0:
+        return "ok", proc.stdout.strip()
+    if proc.returncode == 1 and (not err or "no matching" in low or "no such" in low or "invalid process" in low):
+        return "dead", None
+    if proc.returncode == 1 and not proc.stdout.strip():
+        return "dead", None
+    return "error", err or "ps exited %s" % proc.returncode
+
+
+def _tracked_groups(emu):
+    """Every pgid the fake launchctl recorded, pidfile and the append-only children list."""
+    groups, seen = [], set()
+
+    def add(pgid):
+        if isinstance(pgid, int) and pgid > 1 and pgid != os.getpgrp() and pgid not in seen:
+            seen.add(pgid)
+            groups.append(pgid)
+
+    root = Path(emu) if emu else None
+    if root is None or not root.is_dir():
+        return groups
+    children = root / "children"
+    if children.is_file():
+        for line in children.read_text().splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                add(int(parts[1] if len(parts) > 1 else parts[0]))
+            except ValueError:
+                continue
+    for pidfile in root.glob("*.pid"):
+        pgid_file = pidfile.with_suffix(".pgid")
+        try:
+            add(int(pgid_file.read_text()) if pgid_file.is_file() else int(pidfile.read_text()))
+        except (OSError, ValueError):
+            continue
+    return groups
+
+
+def _should_signal_group(pgid, prefixes):
+    """False when this pgid has been reused by a process outside the fixture. A dead leader is still ours:
+    its group can hold children. When ps cannot answer, the pgid is one this test recorded."""
+    if pgid <= 1 or pgid == os.getpgrp():
+        return False
+    state, info = _ps_pid_command(pgid)
+    if state == "ok":
+        return _command_matches(info or "", prefixes)
+    return True
+
+
+def _signal_group(pgid, sig):
+    if pgid <= 1 or pgid == os.getpgrp():
+        return
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        pass
+
+
+def _signal_if_fixture(pid, sig, prefixes):
+    """SIG* one pid only after a fresh command line still shows the fixture root."""
+    if pid <= 1 or pid in (os.getpid(), os.getppid()):
+        return False
+    state, info = _ps_pid_command(pid)
+    if state != "ok" or not _command_matches(info or "", prefixes):
+        return False
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
+    return True
+
+
+def _sweep(prefixes, sig):
+    """Last resort: `ps -axo pid,command`, exact fixture-root prefix only. Returns an error string or None."""
+    rows, err = _ps_command_rows()
+    if err:
+        return err
+    for pid, _cmd in rows:
+        if _command_matches(_cmd, prefixes):
+            _signal_if_fixture(pid, sig, prefixes)
+    return None
+
+
+def fixture_processes(prefixes):
+    """Command lines that still contain the fixture root, or `(None, error)` when ps cannot be read."""
+    prefixes = _usable_prefixes(prefixes)
+    rows, err = _ps_command_rows()
+    if err:
+        return None, err
+    left = []
+    for pid, cmd in rows:
+        if pid in (os.getpid(), os.getppid()) or not _command_matches(cmd, prefixes):
+            continue
+        left.append("%d %s" % (pid, cmd))
+    return left, None
+
+
+def stop_fixture(prefixes, emu):
+    """SIGTERM every tracked group, wait, SIGKILL whoever is still in it, then sweep the fixture root."""
+    prefixes = _usable_prefixes(prefixes)
+    if not prefixes:
+        return "no fixture prefix"
+    groups = [g for g in _tracked_groups(emu) if _should_signal_group(g, prefixes)]
+    for pgid in groups:
+        _signal_group(pgid, signal.SIGTERM)
+    if groups:
+        time.sleep(0.5)
+        for pgid in groups:
+            if _should_signal_group(pgid, prefixes):
+                _signal_group(pgid, signal.SIGKILL)
+    err = _sweep(prefixes, signal.SIGTERM)
+    rows, sweep_err = _ps_command_rows()
+    err = err or sweep_err
+    if not err and any(_command_matches(cmd, prefixes) for _pid, cmd in rows):
+        time.sleep(0.4)
+        err = _sweep(prefixes, signal.SIGKILL) or err
+    return err
+
+
+def cleanup_fixture():
+    global _in_cleanup
+    if _in_cleanup or not _fixture["prefixes"]:
+        return None
+    _in_cleanup = True
+    try:
+        return stop_fixture(_fixture["prefixes"], _fixture["emu"])
+    finally:
+        _in_cleanup = False
+
+
+atexit.register(cleanup_fixture)
+
+
+def _on_sigterm(signum, _frame):
+    cleanup_fixture()
+    raise SystemExit(128 + signum)
+
+
+def test_agent_probes():
+    spec = importlib.util.spec_from_file_location("cs_init_fixture", LAB / "scripts/cs_init.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with scratch_dir(prefix="cs-init-agents-") as raw:
+        home, binary = Path(raw) / "home", Path(raw) / "bin/goose"
+        (home / ".config/goose").mkdir(parents=True, exist_ok=True)
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\necho goose 9.9.9\n")
+        binary.chmod(0o755)
+        reads = []
+
+        class FakeCs:
+            HOME = home
+
+            @staticmethod
+            def read_json(path, default):
+                reads.append(path)
+                return default
+
+        init = module.Init.__new__(module.Init)
+        init.cs = FakeCs()
+        init.run = lambda argv, *args, **kwargs: subprocess.CompletedProcess(argv, 0, "goose 9.9.9\n", "")
+        agent = init.probe("goose", str(binary.parent))
+        expect(agent["signed_in"] is False, "goose: its config directory alone is not signed in")
+        config = home / ".config/goose/config.yaml"
+        config.write_text("active_provider: fixture\n")
+        config.chmod(0)
+        try:
+            agent = init.probe("goose", str(binary.parent))
+        finally:
+            config.chmod(0o600)
+        expect(agent["signed_in"] is True and reads == [],
+               "goose: config.yaml is the provider artifact, detected without reading its contents")
+
+        output = []
+        init.args = SimpleNamespace(no_first_job=False, first_job=False, agent=None)
+        init.marker_data = lambda: {}
+        init.say = output.append
+        agents = [{"name": name, "template": template, "path": str(binary), "signed_in": False}
+                  for name, template in module.AGENTS.items()]
+        rc = init.step_first_job("fixture", agents)
+        init.prepare_welcome = lambda: fail("no-agent init must not create a welcome conversation")
+        init.next_steps()
+        expect(rc == 1 and output[0] == "Almost ready: ContextStack needs a coding agent."
+               and output[-1] == "Then run: cs init" and len(output) == 6,
+               "no-agent ending names four agents and asks to rerun init")
+        expect(all(module.LABELS[n] in output[i] and module.sign_in_command(n) in output[i]
+                   for i, n in enumerate(("claude", "codex", "cursor-agent", "gemini"), 1)),
+               "no-agent ending uses shared sign-in commands")
+        expect(not any("ContextStack is ready" in line or "conversation" in line for line in output),
+               "no-agent ending has no ready line or conversation link")
+
+
+
+
+def test_failed_first_job_ending():
+    sys.path.insert(0, str(LAB / "scripts"))
+    import cs_init
+    init = cs_init.Init.__new__(cs_init.Init)
+    init.args = SimpleNamespace(no_first_job=False, first_job=False, no_open=True, yes=True, timeout=1)
+    init.url = "http://fixture"
+    init.data = Path("/fixture/state/director")
+    init.cs = SimpleNamespace(PLATFORM="macos")
+    init.nr = SimpleNamespace(load_record=lambda: {})
+    init.prepare_welcome = lambda: fail("failed first job must not create welcome")
+    init.marker_data = lambda: {"first_job": {"state": "timed_out", "job": "job-1", "agent": "codex"}}
+    init.first_job_rc = 1
+    output = []
+    init.say = output.append
+    init.detail = lambda *a, **kw: None
+    init.next_steps()
+    expect(output[0] == "Almost ready: The first job timed out before Codex answered."
+           and output[1] == "Next: run cs doctor, then cs init --first-job."
+           and not any("ContextStack is ready" in line for line in output),
+           "failed first job ending is almost-ready with doctor, not ready")
+
+
+def test_machine_name_refusal():
+    sys.path.insert(0, str(LAB / "scripts"))
+    import cs_init
+    with scratch_dir(prefix="cs-init-name-") as raw:
+        root = Path(raw)
+        config = root / "config"
+        config.mkdir()
+        (config / "ESTATE").write_text("kept-name\n")
+        init = cs_init.Init.__new__(cs_init.Init)
+        init.config = config
+        init.args = SimpleNamespace(name="other-name")
+        init.receiver = lambda: {}
+        class Stop(Exception):
+            def __init__(self, msg, code=1):
+                super().__init__(msg)
+                self.code = code
+        init.cs = SimpleNamespace(Stop=Stop)
+        try:
+            init.node_name()
+            fail("node_name must refuse a mismatched --name")
+        except Stop as stop:
+            expect(stop.code == 2 and "machine name" in str(stop) and "kept-name" in str(stop)
+                   and "estate keeps" not in str(stop),
+                   "name mismatch names machine name, not estate")
+
+
+
+def test_login_and_fallback():
+    spec = importlib.util.spec_from_file_location("cs_init_login", LAB / "scripts/cs_init.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with scratch_dir(prefix="cs-init-login-") as raw:
+        root = Path(raw)
+        exe = root / "codex"
+        state = root / "signed-in"
+        exe.write_text("#!/bin/sh\ncase \"$*\" in\n  --version) echo fake;;\n  'login status') test -f '%s' && echo 'Logged in';;\n  login) touch '%s';;\nesac\n" % (state, state))
+        exe.chmod(0o755)
+        init = module.Init.__new__(module.Init)
+        init.args = SimpleNamespace(yes=False, no_first_job=False, first_job=False, agent=None, timeout=1)
+        init.agent_path = lambda: str(root) + ":/usr/bin:/bin"
+        init.cs = SimpleNamespace(HOME=root)
+        init.config = root
+        init.nr = SimpleNamespace(write_atomic=lambda p, data, mode: p.write_bytes(data))
+        output, prompts = [], []
+        init.say = output.append
+        init.interactive = lambda: not init.args.yes
+        import builtins
+        old_input = builtins.input
+        builtins.input = lambda prompt: prompts.append(prompt) or ""
+        try:
+            agents = init.step_agents()
+            expect(prompts == ["Sign in to Codex now? [Y/n] "], "signed-out Codex is offered official login")
+            expect(state.exists() and any(a["name"] == "codex" and a["signed_in"] is True for a in agents),
+                   "fake login flips state and re-probe reports signed in")
+            expect("Found Codex — not signed in" in output and "Found Codex — signed in" in output,
+                   "plain-language status before and after login")
+            expect(any(a["name"] == "codex" and a["signed_in"] for a in json.loads((root / "agents.json").read_text())),
+                   "post-login capability snapshot records signed-in agent")
+            prompts.clear()
+            init.step_agents()
+            expect(not prompts, "one signed-in agent is enough; no further login prompts")
+            state.unlink()
+            prompts.clear()
+            init.args.yes = True
+            init.step_agents()
+            expect(not state.exists() and not prompts, "--yes never launches or prompts for login")
+            init.args.yes = False
+            init.interactive = lambda: False
+            init.step_agents()
+            expect(not state.exists() and not prompts, "non-TTY never launches or prompts for login")
+        finally:
+            builtins.input = old_input
+        init.config = root
+        install = {"keep": "existing"}
+        def write_atomic(path, data, mode):
+            path.write_bytes(data)
+        init.nr = SimpleNamespace(load_record=lambda: install, write_atomic=write_atomic)
+        init.marker_data = lambda: {"first_job": {"state": "failed"}}
+        init.write_marker = lambda data: None
+        init.wait_up = lambda: (True, True)
+        init.url = "http://fixture"
+        init.data = root
+        init.cs = SimpleNamespace(CURRENT=root, read_body=lambda text: json.loads(text))
+        init.run = lambda argv, *a, **kw: subprocess.CompletedProcess(argv, 0, '{"job_id":"fixture"}', '')
+        init.job_row = lambda job: ("done", "run", None)
+        replies = iter([module.REPLY])
+        rows = iter([("failed", "run", None), ("done", "run", None)])
+        init.job_row = lambda job: next(rows)
+        init.reply = lambda run: (next(replies), root)
+        candidates = [{"name": name, "template": module.AGENTS[name], "path": str(exe), "signed_in": True}
+                      for name in ("claude", "codex")]
+        rc = init.step_first_job("fixture", candidates)
+        expect(rc == 0 and any("Codex answered: hello from ContextStack ✓" == line for line in output),
+               "first agent has no answer; next signed-in agent answers")
+        saved = json.loads((root / "install.json").read_text()) if (root / "install.json").exists() else {}
+        expect(saved.get("default_agent") == "codex" and saved.get("default_model") == "codex" and saved.get("keep") == "existing",
+               "verified default agent and model recorded without discarding install fields")
+
+
+def test_activation_output():
+    import io
+    import contextlib
+    import importlib.machinery
+    loader = importlib.machinery.SourceFileLoader("node_release_progress", str(LAB / "scripts/node-release"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    release = importlib.util.module_from_spec(spec)
+    loader.exec_module(release)
+    record = {"ok": True, "plists": {"fixture": {"launchd": "loaded"}}, "director_rs": {}, "node": True}
+    record["director_rs"] = {"url": "http://fixture"}
+    release.activate = lambda *a: record
+    class Output(io.StringIO):
+        def isatty(self):
+            return self.tty
+    original = sys.argv
+    try:
+        for tty, flags in [(False, []), (True, []), (True, ["--json"]), (True, ["--verbose"])]:
+            out = Output()
+            out.tty = tty
+            sys.argv = ["node-release", "activate", "fixture", *flags]
+            with contextlib.redirect_stdout(out):
+                rc = release.main()
+            if tty and not flags:
+                expect(rc == 0 and out.getvalue().strip() == "Services started: Director, gateway, node ✓",
+                       "TTY activation is one readable summary")
+            else:
+                expect(rc == 0 and json.loads(out.getvalue())["plists"] == record["plists"],
+                       "activation preserves plists JSON for pipes and explicit details: %s" % (flags or "pipe"))
+    finally:
+        sys.argv = original
+
+
+def test_progress_retry():
+    spec = importlib.util.spec_from_file_location("cs_init_progress", LAB / "scripts/cs_init.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    init = module.Init.__new__(module.Init)
+    init.args = SimpleNamespace(yes=False, no_first_job=False, first_job=False, agent=None, timeout=0)
+    init.interactive = lambda: True
+    import builtins
+    original = builtins.input
+    prompts = []
+    try:
+        builtins.input = lambda prompt: prompts.append(prompt) or ""
+        expect(init.retry() and prompts == ["Try again? [Y/n] "], "TTY retry defaults to yes")
+        init.interactive = lambda: False
+        expect(not init.retry() and len(prompts) == 1, "non-TTY retry never prompts")
+    finally:
+        builtins.input = original
+    with scratch_dir(prefix="cs-init-progress-") as raw:
+        root = Path(raw)
+        init.cs = SimpleNamespace(CURRENT=root, read_body=json.loads)
+        init.data, init.url = root, "http://fixture"
+        init.bundle = lambda *a: None
+        init.run = lambda argv, *a, **kw: subprocess.CompletedProcess(argv, 0, '{"job_id":"timed-out"}', '')
+        init.marker_data = lambda: {}
+        records, cancelled, output = [], [], []
+        init.write_marker = records.append
+        init.cancel_job = cancelled.append
+        init.say = output.append
+        expect(init.try_first_job("fixture", {"name": "codex", "template": "codex"}) == 1
+               and cancelled == ["timed-out"] and records[-1]["first_job"]["state"] == "timed_out",
+               "timed-out first job is cancelled and recorded before retry")
+        with init.stage("Offline stage"):
+            pass
+        expect("Offline stage… (0s)" in output and "Offline stage (0s)" in output
+               and not any("\x1b" in line or "\r" in line for line in output),
+               "offline non-TTY stage reports elapsed seconds without control characters")
+        init.wait_up = lambda: (True, True)
+        init.marker_data = lambda: {"first_job": {"state": "failed"}}
+        attempts = []
+        init.try_first_job = lambda *a: attempts.append(a) or (0 if len(attempts) == 2 else 1)
+        init.retry = lambda: True
+        expect(init.step_first_job("fixture", [{"name": "codex", "template": "codex", "path": "fake", "signed_in": True}]) == 0
+               and len(attempts) == 2, "failed marker retries on plain rerun and interactive retry resumes")
+
+
+def test_api_keys():
+    spec = importlib.util.spec_from_file_location("cs_init_keys", LAB / "scripts/cs_init.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    init = module.Init.__new__(module.Init)
+    output = []
+    init.say = output.append
+    init.args = SimpleNamespace(api_key=None)
+    init.agent_path = lambda: ""
+    init.offer_login = lambda agent: False
+    init.write_agent_capabilities = lambda found: None
+    init.interactive = lambda: True
+    hint = "No signed-in agent? You can also use a paid API: cs init --api-key PROVIDER"
+    import builtins
+    old_input = builtins.input
+    def unexpected_prompt(prompt):
+        raise AssertionError("default init prompted: " + prompt)
+    builtins.input = unexpected_prompt
+    try:
+        for interactive in (True, False):
+            init.interactive = lambda: interactive
+            for ready in (False, True):
+                output.clear()
+                init.probe = lambda name, path: {"name": name, "template": module.AGENTS[name],
+                                                 "path": "/fake/" + name, "signed_in": ready}
+                init.step_agents()
+                init.step_keys()
+                expect(output.count(hint) == (0 if ready else 1),
+                       "paid API hint only with no ready agent (interactive=%s, ready=%s)" % (interactive, ready))
+                expect(not any("Add an API key" in line for line in output), "default init never offers a paid-key prompt")
+    finally:
+        builtins.input = old_input
+    with scratch_dir(prefix="cs-init-keys-") as raw:
+        root = Path(raw)
+        (root / "bin").mkdir()
+        gateway = root / "bin/cs-gateway"
+        gateway.write_text("#!%s\nimport os, pathlib, sys\n"
+                           "assert sys.argv[1:] == ['credentials', 'set', 'openai']\n"
+                           "pathlib.Path(os.environ['CSGATEWAY_CREDENTIALS']).write_text(input())\n" % sys.executable)
+        gateway.chmod(0o755)
+        store = root / "key"
+        init.cs = SimpleNamespace(CURRENT=root, GATEWAY="fixture-gateway",
+                                  load_plist=lambda label: (None, {"EnvironmentVariables": {"CSGATEWAY_CREDENTIALS": str(store)}}))
+        restarts = []
+        init.nr = SimpleNamespace(launchctl=lambda *args: restarts.append(args))
+        init.args.api_key = ["openai"]
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"fake-api-key\n")
+        os.close(write_fd)
+        saved_stdin = os.dup(0)
+        try:
+            os.dup2(read_fd, 0)
+            os.close(read_fd)
+            init.step_keys()
+        finally:
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+        expect(store.read_text() == "fake-api-key", "--api-key stores a key through the fake gateway")
+        expect(restarts == [("kickstart", "-k", "gui/%d/fixture-gateway" % os.getuid())],
+               "--api-key restarts the gateway")
+
+
+def test_browser_handoff():
+    from unittest.mock import patch
+    sys.path.insert(0, str(LAB / "scripts"))
+    import cs_init
+    import cs_ui
+    with scratch_dir(prefix="cs-init-test-") as tmp:
+        data = Path(tmp)
+        (data / "local-credential").write_text("fixture-only")
+        init = cs_init.Init.__new__(cs_init.Init)
+        init.data, init.url = data, "http://127.0.0.1:8780"
+        init.cs = SimpleNamespace(PLATFORM="macos")
+        init.nr = SimpleNamespace(load_record=lambda: {})
+        init.args = SimpleNamespace(yes=False, no_open=False, no_first_job=False, timeout=1)
+        marker = {"node": "fixture", "first_job": {"state": "done", "agent": "codex"}}
+        init.marker_data = lambda: marker.copy()
+        init.write_marker = lambda value: marker.update(value)
+        output = []
+        init.say = output.append
+        requests, opened = [], []
+
+        def response(req, timeout):
+            requests.append(req)
+            return __import__("io").BytesIO(json.dumps(
+                {"conversation": {"conversation_id": "welcome-1"}} if req.full_url.endswith("/conversations") else
+                {"turns": [{"turn_id": "turn-1", "state": "done", "reply": "Hello"}]} if req.full_url.endswith("/thread") else
+                {"turn": {"turn_id": "turn-1"}}
+            ).encode())
+
+        def opener(argv, **kwargs):
+            opened.append(Path(argv[1]).read_text())
+            expect(argv[0] == "open", "browser handoff invokes open")
+            return SimpleNamespace(returncode=0)
+
+        make_temp = tempfile.mkdtemp
+        with patch("urllib.request.urlopen", side_effect=response), patch("sys.stdin.isatty", return_value=True), \
+             patch.object(cs_ui, "issue_url", return_value="http://127.0.0.1:8780/ui/#code=secret"), \
+             patch.object(cs_ui.subprocess, "run", side_effect=opener), patch.object(cs_ui.subprocess, "Popen"), \
+             patch.object(cs_ui.tempfile, "mkdtemp", side_effect=lambda **kw: make_temp(dir=data, prefix="pair-")):
+            init.next_steps()
+            init.next_steps()
+            expect(len(requests) == 3, "welcome conversation and turn are created once, then verified on rerun")
+            expect(output == ["ContextStack is ready.", "Opened your first conversation in the browser.",
+                              "Later: cs ui opens it again · cs lead create sets up the hosted lead · cs doctor checks for problems"] * 2,
+                   "successful browser opens never print the pairing URL")
+            expect(all("#code=secret" in page and "conversation=welcome-1" in page for page in opened),
+                   "open receives a private redirect to the paired conversation")
+            init.args.no_open = True
+            init.next_steps()
+            expect(len(opened) == 2 and "#code=secret&conversation=welcome-1" in output[-2] and
+                   "expires in 5 minutes" in output[-2] and "works once" in output[-2],
+                   "--no-open prints the one-time URL and its expiry, skipping the opener")
+            init.args.no_open = False
+            with patch("sys.stdin.isatty", return_value=False):
+                init.next_steps()
+            expect(len(opened) == 2 and "#code=secret&conversation=welcome-1" in output[-2] and
+                   "expires in 5 minutes" in output[-2] and "works once" in output[-2],
+                   "non-TTY prints the one-time URL and its expiry, skipping the opener")
+            init.args.yes = True
+            init.next_steps()
+            expect(len(opened) == 2 and "#code=secret&conversation=welcome-1" in output[-2] and
+                   "expires in 5 minutes" in output[-2] and "works once" in output[-2],
+                   "--yes prints the paired conversation URL without opening")
+            init.args.yes = False
+            with patch.object(cs_ui, "open_browser", return_value=False):
+                init.next_steps()
+            expect(output[-3] == "ContextStack is ready." and "#code=secret" in output[-2],
+                   "opener failure prints URL and reason")
+            marker["welcome"].pop("turn")
+            marker["welcome"].pop("turn_id")
+            with patch("urllib.request.urlopen", side_effect=OSError("turn POST failed")):
+                init.next_steps()
+            expect("turn POST failed" in output[-4] and output[-2] == "Opened your first conversation in the browser."
+                   and "conversation=welcome-1" in opened[-1],
+                   "turn POST failure still opens the existing conversation and reports failure")
+            marker.pop("welcome")
+            with patch("urllib.request.urlopen", side_effect=OSError("fixture offline")):
+                init.next_steps()
+            expect("fixture offline" in output[-4] and output[-2] == "Opened your first conversation in the browser.",
+                   "welcome creation failure reports its reason and still opens the browser")
+            with patch.object(cs_ui, "issue_url", side_effect=RuntimeError("link unavailable")):
+                init.next_steps()
+            expect("http://127.0.0.1:8780/ui/" in output[-1] and "link unavailable" in output[-1],
+                   "link failure prints base URL and reason without failing init")
+
+
+def test_quiet_details():
+    from unittest.mock import patch
+    sys.path.insert(0, str(LAB / "scripts"))
+    import cs_init
+    import cs_ui
+    init = cs_init.Init.__new__(cs_init.Init)
+    init.args = SimpleNamespace(verbose=False, yes=True, no_open=True)
+    init.root = Path("/fixture/.contextstack")
+    init.data, init.url = init.root / "state/director", "http://fixture"
+    init.cs = SimpleNamespace(PLATFORM="macos")
+    init.nr = SimpleNamespace(load_record=lambda: {})
+    init.prepare_welcome = lambda: None
+    init.marker_data = lambda: {}
+    output = []
+    init.say = output.append
+    init.disk = lambda: (False, "FileVault", "FileVault is Off.")
+    for verbose in (False, True):
+        init.args.verbose = verbose
+        output.clear()
+        init.step_disk()
+        expect(output[:2] == ["Warning: FileVault is off.",
+               "Turn on FileVault: System Settings › Privacy & Security › FileVault"], "concise FileVault warning")
+        expect(("0600" in "\n".join(output)) == verbose, "disk explanation only under verbose")
+        with patch.object(cs_ui, "issue_url", return_value="http://fixture/ui/#code=once"):
+            init.next_steps()
+        expect(output[-3:] == ["ContextStack is ready.",
+               "Open your first conversation: http://fixture/ui/#code=once (works once, expires in 5 minutes)",
+               "Later: cs ui opens it again · cs lead create sets up the hosted lead · cs doctor checks for problems"],
+               "manual ending is exactly three lines")
+        for detail in ("next: cs status", "Director API:", "Owner credential:"):
+            expect((detail in "\n".join(output)) == verbose, detail + " only under verbose")
+        init.nr.load_record = lambda: {"serve_client_web": "127.0.0.1:8781"}
+        with patch.object(cs_ui, "issue_url", return_value="http://fixture/ui/#code=once"):
+            init.next_steps()
+        expect("Also available: client-web at http://127.0.0.1:8781" in output, "served client-web is optional")
+        init.nr.load_record = lambda: {}
+    with scratch_dir(prefix="cs-init-output-") as tmp:
+        init.pending = Path(tmp) / "registration"
+        init.listen = "127.0.0.1:8780"
+        init.cs.CURRENT = Path(tmp) / "current"
+        init.cs.CURRENT.symlink_to("release")
+        init.cs.KIT = LAB
+        init.cs.read_body = json.loads
+        init.run = lambda *args: SimpleNamespace(returncode=0, stdout=json.dumps(
+            {"ok": True, "plists": {"fixture-service": {"launchd": "loaded"}}}))
+        for verbose in (False, True):
+            init.args.verbose = verbose
+            output.clear()
+            init.pending.write_text("fixture registration")
+            init.register("fixture")
+            init.activate("fixture")
+            text = "\n".join(output)
+            for detail in ("registration", "fixture-service", "launchd", "loaded"):
+                expect((detail in text) == verbose, detail + " only under verbose")
+    output.clear()
+    init.disk = lambda: (True, "FileVault", "FileVault is On.")
+    init.step_disk()
+    expect(not output, "FileVault on is silent even under verbose")
+
+
+def test_welcome_completion():
+    from unittest.mock import patch
+    import io
+    sys.path.insert(0, str(LAB / "scripts"))
+    import cs_init
+    with scratch_dir(prefix="cs-welcome-test-") as tmp:
+        data = Path(tmp)
+        (data / "local-credential").write_text("fixture-only")
+        init = cs_init.Init.__new__(cs_init.Init)
+        init.data, init.url = data, "http://fixture"
+        init.args = SimpleNamespace(no_first_job=False, timeout=0)
+        marker = {"node": "fixture", "first_job": {"state": "done", "agent": "codex"}}
+        init.marker_data = lambda: json.loads(json.dumps(marker))
+        init.write_marker = lambda value: marker.update(value)
+        state, reply, calls = "queued", None, []
+        fail_post = False
+
+        def response(req, timeout):
+            calls.append(req)
+            if req.full_url.endswith("/conversations"):
+                value = {"conversation": {"conversation_id": "same-conversation"}}
+            elif req.full_url.endswith("/turns"):
+                if fail_post:
+                    raise OSError("POST failed")
+                expect(not marker["welcome"].get("turn"), "enqueue never marks welcome complete")
+                value = {"turn": {"turn_id": "turn-%d" % marker["welcome"].get("attempt", 0)}}
+            else:
+                value = {"turns": [{"turn_id": marker["welcome"]["turn_id"], "state": state, "reply": reply}]}
+            return io.BytesIO(json.dumps(value).encode())
+
+        def prepare_error(expected):
+            try:
+                init.prepare_welcome()
+            except Exception as error:
+                expect(expected in str(error), "welcome reports %s: %s" % (expected, error))
+            else:
+                expect(False, "welcome must report %s" % expected)
+
+        with patch("urllib.request.urlopen", side_effect=response):
+            prepare_error("timed out")
+            expect(not marker["welcome"].get("turn") and marker["welcome"].get("turn_id"),
+                   "timeout retains conversation and pending turn without marking completion")
+            before = len([r for r in calls if r.get_method() == "POST"])
+            prepare_error("timed out")
+            expect(len([r for r in calls if r.get_method() == "POST"]) == before,
+                   "rerun reconciles the timed-out pending turn instead of enqueuing another")
+            state = "error"
+            prepare_error("ended error")
+            expect(marker["welcome"]["conversation"] == "same-conversation" and not marker["welcome"].get("turn_id"),
+                   "failed welcome keeps conversation and permits a new attempt")
+            fail_post = True
+            prepare_error("POST failed")
+            expect(marker["welcome"]["conversation"] == "same-conversation" and not marker["welcome"].get("turn"),
+                   "POST failure retains conversation without marking completion")
+            fail_post = False
+            state = "done"
+            prepare_error("without a reply")
+            reply = "Welcome!"
+            init.prepare_welcome()
+            expect(marker["welcome"].get("turn") is True, "only a finished turn with a reply marks welcome complete")
+            expect(sum(r.full_url.endswith("/conversations") for r in calls) == 1,
+                   "every welcome retry uses the original conversation")
+            keys = [r.get_header("Idempotency-key") for r in calls if r.full_url.endswith("/turns")]
+            expect(keys[0] != keys[1] and keys[1] == keys[2] and keys[2] != keys[3],
+                   "terminal failures use new turn keys; ambiguous POST failures retain their key")
+
+
+
+def test_toolchains():
+    with scratch_dir(prefix="cs-init-toolchains-") as tmp:
+        home = Path(tmp).resolve() / "home"
+        home.mkdir()
+        config = home / ".contextstack/config"
+        config.mkdir(parents=True, exist_ok=True)
+        destination = config / "toolchains.json"
+        binaries = home / "Library/Application Support/Herd/bin"
+        binaries.mkdir(parents=True, exist_ok=True)
+        for name in ("php", "composer"):
+            (binaries / name).write_bytes(b"fixture binary")
+            (binaries / name).chmod(0o755)
+        shell = home / "fixture-shell"
+        env = hermetic_env()
+        env.update(HOME=str(home), SHELL=str(shell), CS_SERVICE_PATH="/usr/bin:/bin")
+        (home / ".contextstack/current/code/.venv/bin").mkdir(parents=True, exist_ok=True)
+        sys.path.insert(0, str(LAB / "scripts"))
+        import cs_init
+        lookup = ";".join("command -v %s" % name for name in cs_init.TOOLCHAIN_BINARIES)
+        program = (
+            "def _write_atomic(path, data, mode):\n from pathlib import Path\n path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)\n path.write_bytes(data); path.chmod(mode)\n"
+            "import sys; from pathlib import Path; from types import SimpleNamespace; "
+            "sys.path.insert(0, %r); import cs_init; "
+            "init = cs_init.Init.__new__(cs_init.Init); "
+            "init.config = Path.home() / '.contextstack/config'; "
+            "init.args = SimpleNamespace(verbose='--verbose' in sys.argv); "
+            "init.cs = SimpleNamespace(HOME=Path.home(), CURRENT=Path.home() / '.contextstack/current'); "
+            "init.nr = __import__('types').SimpleNamespace(SYSTEM_PATH='/usr/bin:/bin', write_atomic=_write_atomic); "
+            "lines = []; init.say = lines.append; "
+            "init.detail = (lambda line: lines.append(line)) if ('--verbose' in sys.argv) else (lambda line: None); "
+            "init.step_toolchains(); print('\\n'.join(lines))"
+        ) % (str(LAB / "scripts"),)
+
+        def detect(paths, verbose=False):
+            shell.write_text("#!%s\nimport sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')"
+                             % (sys.executable, lookup, "".join(str(p) + "\n" for p in paths)))
+            shell.chmod(0o755)
+            result = subprocess.run([sys.executable, "-c", program, *(["--verbose"] if verbose else [])],
+                                    env=env, capture_output=True, text=True, timeout=15)
+            expect(result.returncode == 0, "toolchain detection succeeds: " + result.stderr)
+            return result.stdout
+
+        paths = [binaries / name for name in ("php", "composer")]
+        output = detect(paths)
+        expected = [{"name": name, "bin": str(binaries)} for name in ("php", "composer")]
+        expect(destination.is_file() and json.loads(destination.read_text()) == expected,
+               "login shell tools written with real directories")
+        expect(destination.stat().st_mode & 0o777 == 0o644, "toolchains mode is 0644")
+        expect(output.strip().splitlines() == ["php: %s" % binaries, "composer: %s" % binaries],
+               "one plain line per toolchain added")
+        custom = '[{"name": "custom", "bin": "/custom"}]\n'
+        destination.write_text(custom)
+        detect(paths)
+        expect('"custom"' in destination.read_text() and '"php"' in destination.read_text(),
+               "existing toolchains merged, not dropped")
+        destination.unlink()
+        (home / "php").write_text("fixture")
+        expect(detect([home / "php"]).strip() == "" and not destination.exists(), "HOME tool directory skipped")
+        credential = home / ".ssh"
+        credential.mkdir()
+        (credential / "php").write_text("fixture")
+        expect(detect([credential / "php"]).strip() == "" and not destination.exists(), "credential directory skipped")
+        expect(detect([]).strip() == "" and not destination.exists(), "no tools leaves no file or output")
+        output = detect(paths, verbose=True)
+        expect(all("%s: %s" % (name, binaries) in output for name in ("php", "composer")),
+               "verbose toolchain output includes directories")
+
+
+
+def main():
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    test_toolchains()
+    test_activation_output()
+    test_progress_retry()
+    test_agent_probes()
+    test_login_and_fallback()
+    test_failed_first_job_ending()
+    test_machine_name_refusal()
+    test_api_keys()
+    test_quiet_details()
+    test_browser_handoff()
+    test_welcome_completion()
+    target = LAB.parent / "target/release"
+    missing = [f for f in REAL.values() if not os.access(target / f, os.X_OK)]
+    if missing:
+        print("SKIP cs-init: not built: %s (cargo build --release -p cs-harness -p cs-sandbox -p cs-tools -p cs-gateway "
+              "-p cs-director)" % ", ".join(missing))
+        return 1 if problems else 0
+    uv, managed = _bundle.host_python()
+    if uv is None:
+        print("SKIP cs-init: %s" % managed)
+        return 1 if problems else 0
+    before = _bundle.real_agents()
+    # short: the gateway's socket under HOME/.contextstack/gateway must fit in sun_path (104 bytes on macOS)
+    created = tempfile.mkdtemp(prefix="csi-", dir="/tmp" if os.path.isdir("/tmp") else None, suffix=".noindex")
+    tmp = Path(created).resolve()
+    home, emu, shims = tmp / "home", tmp / "launchd", tmp / "shims"
+    _fixture["prefixes"] = _usable_prefixes([tmp, created])
+    _fixture["emu"] = emu
+    if not _fixture["prefixes"]:
+        fail("fixture root is not a unique csi- directory: %s" % tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("cs-init: FAIL (%d)" % len(problems))
+        return 1
+    print("fixture root: %s" % tmp, flush=True)
+    for d in (home / ".local/bin", home / "Library/Keychains", emu, shims):
+        d.mkdir(parents=True, exist_ok=True)
+    try:
+        (shims / "launchctl").write_text(LAUNCHCTL % sys.executable)
+        (shims / "fdesetup").write_text("#!/bin/sh\necho 'FileVault is Off.'\n")
+        (home / ".local/bin/claude").write_text(CLAUDE % (sys.executable, tmp, REPLY, REPLY))
+        for p in (shims / "launchctl", shims / "fdesetup", home / ".local/bin/claude"):
+            p.chmod(0o755)
+        _bundle.bundle(tmp / "bundle", uv, RID, {name: target / f for name, f in REAL.items()})
+        _bundle.seed_python(home, RID, managed)
+        port, gw_port = free_port(), free_port()
+        env = _bundle.dead_network_env(
+            home, PATH="%s:/usr/bin:/bin:/usr/sbin:/sbin" % shims, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home,
+            NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost", LAUNCHD_EMU=str(emu), EMU_GW_PORT=str(gw_port),
+            CS_AGENT_PATH="%s/.local/bin:/usr/bin:/bin" % home, CS_PLATFORM="macos")
+        env.pop("LAB_STATE_ROOT", None)
+        env.pop("CSGATEWAY_ENDPOINT", None)
+        r = subprocess.run(["sh", str(LAB / "scripts/node-install"), "install", str(tmp / "bundle")], env=env, cwd="/",
+                           capture_output=True, text=True)
+        expect(r.returncode == 0, "node-install install BUNDLE (no options): %s" % (r.stderr[-400:] if r.returncode else "ok"))
+        root, cs = home / ".contextstack", home / ".local/bin/cs"
+        argv = [str(cs), "init", "--yes", "--name", "test-mac", "--director-listen", "127.0.0.1:%d" % port, "--timeout", "120"]
+        started = time.monotonic()
+        r = subprocess.run(argv, env=env, cwd="/", capture_output=True, text=True, timeout=400)
+        took = time.monotonic() - started
+        out = r.stdout + r.stderr
+        print("---- cs init (%.1fs) ----\n%s----" % (took, out))
+        expect(r.returncode == 0, "cs init --yes exits 0 (%d)" % r.returncode)
+        stages = ["Checking disk encryption", "Checking agents", "Starting services", "Waiting for services", "Running first job"]
+        positions = [out.find(stage + "… (0s)") for stage in stages]
+        expect(all(p >= 0 for p in positions) and positions == sorted(positions)
+               and all(re.search(re.escape(stage) + r" \(\d+s\)", out) for stage in stages),
+               "stage lines appear in order with elapsed seconds")
+        expect("Services started:" not in out and '"plists"' not in out,
+               "activation is a short summary, not raw JSON")
+        expect("\x1b" not in out and "\r" not in out, "non-TTY progress has no control characters")
+        expect("Warning: FileVault is off.\nTurn on FileVault: System Settings › Privacy & Security › FileVault\n" in out,
+               "FileVault off: one warning line plus the fix")
+        expect("Found Claude Code — signed in" in out, "claude reported signed in by its own status command")
+        agents = root.parent / "Library/LaunchAgents"
+        labels = ("com.contextstack.director-rs", "com.contextstack.csgateway-socket", "com.contextstack.node",
+                  "com.contextstack.node-listen")
+        expect(all((agents / (l + ".plist")).is_file() for l in labels), "plists written: Director, gateway, node, listener")
+        node_env = root / "config/node.env"
+        token_line = [l for l in node_env.read_text().splitlines() if "CONTEXTSTACK_NODE_TOKEN=" in l] if node_env.is_file() else []
+        token = token_line[0].split("=", 1)[1] if token_line else ""
+        expect(len(token) >= 8 and node_env.stat().st_mode & 0o777 == 0o600, "node token in config/node.env, 0600")
+        expect(token and token not in out, "the token is never printed")
+        expect(not (root / "config/.cs-init-node-token").exists(), "no registration file left behind")
+        spool = json.loads((root / "config/policy/spool.json").read_text())
+        expect(spool.get("receiver", {}).get("url") == "http://127.0.0.1:%d" % port and spool["receiver"].get("node") == "test-mac",
+               "the node's receiver is its own Director: %s" % spool.get("receiver"))
+        marker = json.loads((root / "config/cs-init.json").read_text()) if (root / "config/cs-init.json").is_file() else {}
+        first = marker.get("first_job") or {}
+        expect(first.get("state") == "done" and first.get("agent") == "claude", "first job done through claude: %s" % first)
+        expect("Claude Code answered: %s" % REPLY in out and "first job: done" not in out, "the reply is printed once")
+        db = root / "state/director/director.sqlite"
+        done = jobs(db)
+        expect(len(done) == 2 and any(j == first.get("job") and state == "done" for j, state in done),
+               "the Director has the completed hello and welcome turn: %s" % done)
+        calls = [json.loads(l) for l in (tmp / "claude-calls.jsonl").read_text().splitlines()]
+        expect(any("--print" in c for c in calls), "the job ran the fake claude through the claude-code template")
+        calls_before = (emu / "calls.log").read_text()
+        snap = snapshot(root / "config", agents)
+        r2 = subprocess.run(argv[:3] + argv[5:], env=env, cwd="/", capture_output=True, text=True, timeout=120)
+        out2 = r2.stdout + r2.stderr
+        print("---- rerun ----\n%s----" % out2)
+        expect(r2.returncode == 0 and "services:" not in out2 and "done earlier" in out2, "a rerun reports the state")
+        expect(snapshot(root / "config", agents) == snap, "a rerun rewrites nothing under config/ or LaunchAgents")
+        new_calls = (emu / "calls.log").read_text()[len(calls_before):]
+        expect("bootstrap" not in new_calls and "kickstart" not in new_calls, "a rerun loads nothing: %r" % new_calls)
+        expect({j for j, _ in jobs(db)} == {j for j, _ in done}, "a rerun creates no job")
+        fake_key = "sk-FAKEtestkey0123456789"  # a stand-in: never a real key
+        r3 = subprocess.run(argv[:3] + ["--api-key", "openai", "--no-first-job"], env=env, cwd="/", capture_output=True,
+                            text=True, timeout=120, input=fake_key + "\n")
+        stored = sorted(p.name for p in (root / "credentials").iterdir()) if (root / "credentials").is_dir() else []
+        modes = {oct(p.stat().st_mode & 0o777) for p in (root / "credentials").iterdir()} if stored else set()
+        expect(r3.returncode == 0 and stored and modes == {"0o600"}, "--api-key: stored in the file store, 0600: %s %s %s"
+               % (stored, modes, (r3.stdout + r3.stderr)[-300:] if r3.returncode else ""))
+        expect(fake_key not in r3.stdout + r3.stderr, "--api-key: the key is never printed")
+        expect("kickstart" in (emu / "calls.log").read_text(), "--api-key: the gateway restarts to read it")
+        print("cs init took %.1fs on a fresh install (first job included)" % took)
+    finally:
+        try:
+            try:
+                cleanup_error = cleanup_fixture()
+            except Exception as exc:
+                cleanup_error = str(exc)
+            if cleanup_error:
+                fail("fixture cleanup: %s" % cleanup_error)
+            left, ps_err = None, None
+            for _ in range(5):
+                left, ps_err = fixture_processes(_fixture["prefixes"] or [])
+                if ps_err or not left:
+                    break
+                time.sleep(0.2)
+            if ps_err:
+                fail("no process left whose command line contains the fixture root: %s" % ps_err)
+            else:
+                shown = (left or [])[:8]
+                extra = "" if not left or len(left) <= 8 else " ... +%d" % (len(left) - 8)
+                expect(not left, "no process left whose command line contains the fixture root%s" % (
+                    ": " + "; ".join(shown) + extra if left else ""))
+            why = _bundle.launchd_untouched(before)
+            expect(not why, "the real launchd domain is untouched%s" % (": " + why if why else ""))
+        finally:
+            if problems and os.environ.get("CS_INIT_KEEP"):
+                print("kept %s" % tmp)
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
+    print("cs-init: %s" % ("FAIL (%d)" % len(problems) if problems else "ok"))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

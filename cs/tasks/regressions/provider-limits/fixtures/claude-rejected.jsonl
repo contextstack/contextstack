@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1893456000,"rateLimitType":"five_hour","utilization":1.0}}

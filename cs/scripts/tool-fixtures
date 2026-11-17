@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""tool-fixtures: run every manifest tool's contract fixtures, exec'd as the Go runner execs a tool.
+
+Case layout, tools/bin/<name>.fixtures/<case>/ (Plan.CS.v2.1 section 7; ):
+  args.json     stdin: the tool's JSON args (required).
+  expect.json   {"exit": int,                                   required
+                 "stdout": "exact" | {"contains": [..]} | {"regex": ".."},   combined stdout+stderr, as the runner sees it
+                 "files": {"<relpath>": "exact" | {"sha256": ".."} | {"contains": [..]} | null},   null = must not exist
+                 "untouched": true,                             every workspace file not named in files is byte-identical
+                 "ts": true}                                    opt in to the timestamp rule below
+  workspace/    optional: copied into a fresh temp workspace before the run (an empty workspace otherwise).
+  env.json      optional: extra child variables {"NAME": "value"}; <ws>, <case>, <tmp> expand in values, and
+                <state>: a fresh dir per case under $HOME/.contextstack/tmp/tool-fixtures/ (the state root,
+                where cs-sandbox's write_env lets a named state dir live), removed after the case.
+                Use it only to point a tool at a fake binary or a state dir; never for a real credential.
+
+Exec contract (internal/lab/run.go Tool.Run): argv is CS_TOOL_PREFIX's whitespace-split words (the cs-sandbox
+wrapper the launcher sets; --prefix WORDS overrides, "" for none) then the tool path, or a runtime exe descriptor's
+bin and args (_sandbox_policy.tool_argv), cwd the workspace, stdin args.json,
+stdout and stderr combined, timeout max(descriptor timeout_seconds, 60) s, env the names in policy/env.json
+"always" (ops/bin/_env_policy.load_policy) with this process's values, LAB_TRIAL=1 when unset, plus env.json.
+--python P launches a python3 tool (descriptor "runtime", else the shebang) through P instead of the shebang
+(no manifest tool runs on Ruby since ), so an offline-installed interpreter can run the same fixtures. Tools are never imported.
+
+Normalisation, applied to the combined output and to "exact"/"contains" file contents before comparison
+("sha256" compares raw bytes): the workspace's absolute path (realpath and as given) -> "<ws>", the case dir
+-> "<case>", the temp root -> "<tmp>", the state dir -> "<state>"; with "ts": true, RFC 3339 instants (2026-11-09T12:34:56.123456Z or
+with an offset) -> "<ts>". Nothing else is rewritten.
+
+Report: one line per case, then `check: tool-fixtures N case(s), M failed` (+ ` prefix: WORDS` when one is in use);
+exit 1 on any failure.
+Default tool set: the names in tools/manifest.json (a manifest tool with no fixtures dir fails);
+--no-manifest or an absent manifest: every tools/bin/*.fixtures dir. --tool NAME (repeatable) narrows.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(LAB / "ops/bin"))
+import _env_policy  # noqa: E402
+import _sandbox_policy  # noqa: E402
+
+STATE_PARENT = Path.home() / ".contextstack/tmp/tool-fixtures"
+TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+
+def manifest_tools(path):
+    tools = json.loads(path.read_text(encoding="utf-8")).get("tools", [])
+    if isinstance(tools, dict):
+        return sorted(tools)
+    return sorted(t["name"] if isinstance(t, dict) else str(t) for t in tools)
+
+
+def fixture_tools():
+    return sorted(p.name[: -len(".fixtures")] for p in (LAB / "tools/bin").glob("*.fixtures") if p.is_dir())
+
+
+def runtime_of(tool):
+    desc = LAB / "tools/bin" / (tool.name + ".json")
+    if desc.is_file():
+        rt = json.loads(desc.read_text(encoding="utf-8")).get("runtime")
+        if rt:
+            return rt, desc
+    first = tool.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+    return ("ruby" if "ruby" in first else "python3" if "python" in first else "exe"), desc
+
+
+def child_env(extra):
+    env = {}
+    for name in _env_policy.load_policy(LAB)["always"]:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    env.setdefault("LAB_TRIAL", "1")
+    env.update(extra)
+    return env
+
+
+def snapshot(ws):
+    files = {}
+    for p in ws.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            files[str(p.relative_to(ws))] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return files
+
+
+def normalise(text, subs, ts):
+    for old, new in subs:
+        text = text.replace(old, new)
+    return TS.sub("<ts>", text) if ts else text
+
+
+def match(spec, got, where):
+    if isinstance(spec, str):
+        return [] if got == spec else ["%s differs\n  want: %r\n  got:  %r" % (where, spec, got)]
+    if "contains" in spec:
+        return ["%s lacks %r\n  got: %r" % (where, s, got) for s in spec["contains"] if s not in got]
+    if "regex" in spec:
+        return [] if re.search(spec["regex"], got, re.S) else ["%s does not match %r\n  got: %r" % (where, spec["regex"], got)]
+    return ["%s: unknown expectation %r" % (where, spec)]
+
+
+def run_case(tool, case, interp, prefix=()):
+    name, problems = tool.name + "/" + case.name, []
+    expect = json.loads((case / "expect.json").read_text(encoding="utf-8"))
+    args = (case / "args.json").read_bytes()
+    runtime, desc = runtime_of(tool)
+    timeout = max(int(json.loads(desc.read_text()).get("timeout_seconds", 0) or 0) if desc.is_file() else 0, 60)
+    argv = _sandbox_policy.tool_argv(LAB, tool.name)  # runtime exe: [bin, *args]; else [tool]
+    if interp.get(runtime):
+        argv = [interp[runtime]] + argv
+    argv = list(prefix) + argv
+    tmp = Path(tempfile.mkdtemp(prefix="tool-fixtures-"))
+    state = None
+    try:
+        ws = tmp / "workspace"
+        if (case / "workspace").is_dir():
+            shutil.copytree(case / "workspace", ws, symlinks=True)
+        else:
+            ws.mkdir()
+        subs = [(str(ws.resolve()), "<ws>"), (str(ws), "<ws>"), (str(case.resolve()), "<case>"), (str(tmp), "<tmp>")]
+        extra = {}
+        if (case / "env.json").is_file():
+            for k, v in json.loads((case / "env.json").read_text(encoding="utf-8")).items():
+                if "<state>" in v and state is None:
+                    STATE_PARENT.mkdir(parents=True, exist_ok=True)
+                    state = Path(tempfile.mkdtemp(prefix=tool.name + "-", dir=str(STATE_PARENT)))
+                    subs.insert(0, (str(state.resolve()), "<state>"))
+                    subs.insert(1, (str(state), "<state>"))
+                v = v.replace("<state>", str(state)) if state else v
+                extra[k] = v.replace("<ws>", str(ws)).replace("<case>", str(case.resolve())).replace("<tmp>", str(tmp))
+        before = snapshot(ws)
+        extra.setdefault("LAB_TOOL_TIMEOUT_SECONDS", str(timeout))
+        try:
+            r = subprocess.run(argv, cwd=str(ws), input=args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               env=child_env(extra), timeout=timeout)
+            code, out = r.returncode, r.stdout
+        except subprocess.TimeoutExpired as e:
+            code, out = "timeout", e.stdout or b""
+        except OSError as e:
+            code, out = "not started", str(e).encode()
+        ts = bool(expect.get("ts"))
+        out = normalise(out.decode("utf-8", errors="replace"), subs, ts)
+        if code != expect["exit"]:
+            problems.append("exit want %r got %r\n  output: %r" % (expect["exit"], code, out))
+        if "stdout" in expect:
+            problems += match(expect["stdout"], out, "output")
+        files = expect.get("files", {})
+        for rel, spec in files.items():
+            p = ws / rel
+            if spec is None:
+                if p.exists():
+                    problems.append("%s exists, must not" % rel)
+                continue
+            if not p.is_file():
+                problems.append("%s missing" % rel)
+                continue
+            raw = p.read_bytes()
+            if isinstance(spec, dict) and "sha256" in spec:
+                got = hashlib.sha256(raw).hexdigest()
+                if got != spec["sha256"]:
+                    problems.append("%s sha256 want %s got %s" % (rel, spec["sha256"], got))
+            else:
+                problems += match(spec, normalise(raw.decode("utf-8", errors="replace"), subs, ts), rel)
+        if expect.get("untouched"):
+            after = snapshot(ws)
+            for rel in sorted(set(before) | set(after)):
+                if rel in files:
+                    continue
+                if before.get(rel) != after.get(rel):
+                    problems.append("%s %s" % (rel, "changed" if rel in before and rel in after else
+                                                 "created" if rel in after else "deleted"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if state is not None:
+            shutil.rmtree(state, ignore_errors=True)
+    return name, problems
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--tool", action="append", default=[], help="run one tool's fixtures (repeatable)")
+    ap.add_argument("--python", help="interpreter for python3 tools (default: the shebang)")
+    ap.add_argument("--prefix", help="words prepended to every tool argv (default: $CS_TOOL_PREFIX)")
+    ap.add_argument("--manifest", dest="manifest", action="store_true", default=True,
+                    help="tool set = tools/manifest.json (default when it exists)")
+    ap.add_argument("--no-manifest", dest="manifest", action="store_false", help="tool set = every *.fixtures dir")
+    a = ap.parse_args()
+    interp = {"python3": a.python}
+    prefix = (a.prefix if a.prefix is not None else os.environ.get("CS_TOOL_PREFIX", "")).split()  # as strings.Fields
+    manifest = LAB / "tools/manifest.json"
+    tools = manifest_tools(manifest) if a.manifest and manifest.is_file() else fixture_tools()
+    if a.tool:
+        tools = a.tool
+    total = failed = 0
+    for tool in tools:
+        fixtures = LAB / "tools/bin" / (tool + ".fixtures")
+        cases = sorted(p for p in fixtures.iterdir() if p.is_dir() and (p / "args.json").is_file()) if fixtures.is_dir() else []
+        if not cases:
+            total += 1; failed += 1
+            print("FAIL %s: no fixtures under %s" % (tool, fixtures.relative_to(LAB)))
+            continue
+        if not Path(_sandbox_policy.tool_argv(LAB, tool)[0]).is_file():  # the file pair, or a runtime exe's bin
+            total += 1; failed += 1
+            print("FAIL %s: fixtures without a tool (%s)" % (tool, _sandbox_policy.tool_argv(LAB, tool)[0]))
+            continue
+        for case in cases:
+            total += 1
+            name, problems = run_case(LAB / "tools/bin" / tool, case, interp, prefix)
+            if problems:
+                failed += 1
+                print("FAIL %s" % name)
+                for p in problems:
+                    print("  " + p.replace("\n", "\n  "))
+            else:
+                print("ok   %s" % name)
+    print("check: tool-fixtures %d case(s), %d failed" % (total, failed) + (" prefix: " + " ".join(prefix) if prefix else ""))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

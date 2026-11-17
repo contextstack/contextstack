@@ -1,0 +1,7 @@
+{
+  "runtime": "exe",
+  "bin": "estate/fixture/fx_exe_bin",
+  "args": ["--fixed", "two words"],
+  "description": "Fixture-only runtime exe tool. Args: any object; echoed back with the argv it ran under.",
+  "inputSchema": {"type": "object", "properties": {"k": {"type": "string"}}}
+}

@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""a run launched with the default configuration is executed by the Rust runner, and says so.
+
+A temp code root (every op copied, one spec, one task) with the checkout's built Rust runner copied to where
+the default selector looks (<code root>/../target/release/cs-harness), a fake gateway whose /v1/health names
+itself, and no runner selector, no LAB_*_ROOT and no credentials in the environment. `run-spec` runs the
+one cell; the row's executed_by must name the Rust runner at that path with that binary's sha256 and the
+gateway's implementation and version, and `run-identity` must report the same. Static half: the real
+selector's default (_runner, no env) and node-release's install default are the Rust runner. Never touches
+the real state root or lab/ledger; no model call leaves the machine.
+"""
+import hashlib
+import http.server
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+sys.path.insert(0, str(LAB / "ops/bin"))
+sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation-v2"))
+import _runner  # noqa: E402
+from _fake_gateway import dumps, ok_body  # noqa: E402
+
+FAILED = []
+SPEC = """id: fx-runner-identity
+model: fake
+system: prompts/coder-min.md
+context: []
+tools: []
+post_turn: []
+mcp: []
+budget: {turns: 1, tool_calls: 0, usd: 0, seconds: 30}
+tasks: [tasks/fx]
+trials: 1
+hypothesis: "fixture-2267: runner-identity regression"
+"""
+HEALTH = {"status": "healthy", "implementation": "rust", "version": "v0.1.0-fixture"}
+
+
+def expect(ok, what, detail=""):
+    print(("ok   " if ok else "FAIL ") + what + ("" if ok or detail == "" else " : %r" % (detail,)))
+    if not ok:
+        FAILED.append(what)
+
+
+class Gateway:
+    """POST: one canned completion. GET /v1/health: names its implementation."""
+
+    def __init__(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, payload):
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                self.reply(200, dumps(HEALTH)) if self.path == "/v1/health" else self.reply(404, b"{}")
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.reply(200, dumps(ok_body({"text": "done"})))
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.endpoint = "http://127.0.0.1:%d/v1/agent/model.call" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def estate(scratch):
+    e = scratch / "lab"
+    for d in ("specs", "tasks/fx", "ops/bin", "prompts"):
+        (e / d).mkdir(parents=True)
+    (e / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
+    (e / "ESTATE").write_text("dev\n", encoding="utf-8")
+    (e / "specs/fx.yaml").write_text(SPEC, encoding="utf-8")
+    (e / "tasks/fx/goal.md").write_text("fixture\n", encoding="utf-8")
+    (e / "tasks/fx/check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (e / "tasks/fx/check").chmod(0o755)
+    shutil.copy2(LAB / "prompts/coder-min.md", e / "prompts/coder-min.md")
+    for p in (LAB / "ops/bin").iterdir():
+        if p.is_file():
+            shutil.copy2(p, e / "ops/bin" / p.name)
+    return e
+
+
+def static_defaults():
+    chosen = _runner.runner_path(LAB, {})
+    expect(chosen == _runner.default_runner(LAB).absolute() and _runner.runner_kind(LAB, chosen) == "rust",
+           "selector: no CS_RUNNER_BIN/LAB_RUNNER_BIN chooses the Rust runner (target/release/cs-harness)", str(chosen))
+    # node-release's install defaults live in its helpers (_node_layout, _node_services) since the systemd split.
+    sys.path.insert(0, str(LAB / "scripts"))
+    import _node_layout
+    import _node_services
+    expect(_node_layout.DEFAULTS.get("runner") == "rust" and _node_services.RUNNER_BIN.get("rust") == "cs-harness",
+           "node-release: an install with no --runner selects rust (bin/cs-harness)",
+           (_node_layout.DEFAULTS.get("runner"), _node_services.RUNNER_BIN))
+
+
+def run_default(scratch):
+    built = _runner.default_runner(LAB)
+    if not built.is_file():
+        expect(False, "the default Rust runner is built (cargo build --release -p cs-harness at the repo root)", str(built))
+        return
+    e = estate(scratch)
+    (scratch / "target/release").mkdir(parents=True)
+    runner = scratch / "target/release/cs-harness"
+    shutil.copy2(built, runner)
+    sha = "sha256:" + hashlib.sha256(runner.read_bytes()).hexdigest()
+    gateway = Gateway()
+    try:
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(scratch), "TMPDIR": str(scratch),
+               "LANG": os.environ.get("LANG", "en_US.UTF-8"), "PYTHONDONTWRITEBYTECODE": "1",
+               "CSGATEWAY_ENDPOINT": gateway.endpoint}  # no runner selector, no roots: the default configuration
+        r = subprocess.run([str(e / "ops/bin/run-spec"), "specs/fx.yaml"], cwd=str(e), env=env, text=True,
+                           capture_output=True, timeout=120)
+        expect(r.returncode == 0, "run-spec: the one cell ran to a pass", (r.returncode, r.stdout[-400:], r.stderr[-800:]))
+        ledger = e / "ledger/ledger.jsonl"
+        rows = [json.loads(l) for l in ledger.read_text().splitlines() if l.strip()] if ledger.is_file() else []
+        expect(len(rows) == 1, "one row", rows)
+        executed = rows[-1].get("executed_by") if rows else None
+        want = {"runner": {"kind": "rust", "path": str(runner), "sha256": sha},
+                "gateway": {"endpoint": gateway.endpoint, "implementation": "rust", "version": HEALTH["version"]}}
+        got = json.loads(json.dumps(executed)) if executed else None
+        if got and got.get("runner", {}).get("path"):
+            got["runner"]["path"] = str(Path(got["runner"]["path"]).resolve()).replace(str(scratch.resolve()), str(scratch))
+        expect(got == want, "row executed_by: the Rust runner at the default path, its sha256, and the rust gateway",
+               (got, want))
+        r = subprocess.run([str(e / "ops/bin/run-identity")], input="{}", cwd=str(e), env=env, text=True,
+                           capture_output=True, timeout=30)
+        out = json.loads(r.stdout) if r.stdout.strip() else {}
+        expect(r.returncode == 0 and out.get("source") == "row" and out.get("runner", {}).get("kind") == "rust"
+               and out.get("runner", {}).get("sha256") == sha == out.get("runner_sha_now")
+               and out.get("gateway", {}).get("implementation") == "rust",
+               "run-identity (latest run): runner rust, its sha256 now and then, gateway rust", (r.returncode, out, r.stderr[-300:]))
+    finally:
+        gateway.close()
+
+
+def main():
+    live = LAB / "ledger"
+    existed = live.exists()
+    scratch = Path(tempfile.mkdtemp(prefix="runner-identity-", suffix=".noindex"))
+    try:
+        static_defaults()
+        run_default(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    expect(live.exists() == existed, "lab/ledger neither created nor removed")
+    print("check: runner-identity %d failed" % len(FAILED))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

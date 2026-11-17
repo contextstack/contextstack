@@ -1,0 +1,13 @@
+{
+  "runtime": "python3",
+  "sandbox": {"net": "none"},
+  "description": "Convert one existing raw HTML fetch receipt into locally-derived Defuddle Markdown. Never fetches; preserves the original bytes as authoritative evidence. Args: {evidence}.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "evidence": {"type": "string"}
+    },
+    "required": ["evidence"],
+    "additionalProperties": false
+  }
+}

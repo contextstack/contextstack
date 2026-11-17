@@ -1,0 +1,247 @@
+{
+  "exit_code": 0,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "setup-workspace",
+      "stdin": {
+        "setup": "tasks/fx/setup",
+        "task": "tasks/fx",
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-image-malformed-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "capture-stimulus",
+      "stdin": {
+        "adapter": "runner",
+        "hooks": [],
+        "prompts": [
+          "prompts/coder-min.md"
+        ],
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-image-malformed-fx-t1",
+        "run_id": "<RUNSTAMP>-fx-tool-image-malformed-fx-t1",
+        "runner_implementation": "<RUNNER>",
+        "runner_path": "<RUNNER_PATH>",
+        "spec": "specs/fx.yaml",
+        "spec_sha": "0e23c7e87853dc646a6e4aff05a288737f875dd916957ffa038d89bc92b7acfe",
+        "task": "tasks/fx",
+        "tools": [
+          "fx_snap"
+        ],
+        "trial": 1,
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-image-malformed-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-image-malformed-fx-t1"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "publish-evidence",
+      "stdin": {
+        "adapter": "runner",
+        "check_exit": 0,
+        "check_output": "",
+        "check_skipped": false,
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-image-malformed-fx-t1",
+        "stop": "done",
+        "verdict": "pass"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "1.000000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Take a screenshot.\n",
+            "role": "user"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-tool-image-malformed",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only screenshot tool. Args: {}.",
+            "name": "fx_snap",
+            "schema": {
+              "properties": {},
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.990000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Take a screenshot.\n",
+            "role": "user"
+          },
+          {
+            "content": "snapping",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "mode": "plain"
+                },
+                "id": "1",
+                "name": "fx_snap"
+              }
+            ]
+          },
+          {
+            "content": "[fx_snap {\"mode\":\"plain\"}] ERROR\nfx_snap: image_out expects {text, image{media_type, base64}}",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "1"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-tool-image-malformed",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only screenshot tool. Args: {}.",
+            "name": "fx_snap",
+            "schema": {
+              "properties": {},
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    }
+  ],
+  "rows": [
+    {
+      "cost_class": "api",
+      "cost_usd": 0.02,
+      "env_sha": "<ENV_SHA>",
+      "est_basis": "rate",
+      "est_usd": 0.02,
+      "estate": "dev",
+      "model": "fake-model",
+      "seconds": "<SECONDS>",
+      "spec": "fx-tool-image-malformed",
+      "spec_sha": "0e23c7e87853dc646a6e4aff05a288737f875dd916957ffa038d89bc92b7acfe",
+      "stimulus_sha": "<STIMULUS_SHA>",
+      "stop": "done",
+      "task": "tasks/fx",
+      "task_sha": "0190507762c3d0ff3bf1eeec0bf47774e9583c7965570af93bbab94945f17226",
+      "tool_calls": 1,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-tool-image-malformed-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 2,
+      "verdict": "pass"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-tool-image-malformed-fx-t1",
+      "entries": [
+        "check.json",
+        "evidence",
+        "finalize.lock",
+        "finalized.json",
+        "harvest-workspace.git",
+        "messages.jsonl",
+        "ready_for_inspection",
+        "stimulus",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "frozen": {
+        "check": "#!/bin/sh\nexit 0\n",
+        "goal.md": "Take a screenshot.\n"
+      },
+      "transcript": "# fx-tool-image-malformed · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nsnapping\n\n`fx_snap {\"mode\":\"plain\"}` ERROR\n\n```\nfx_snap: image_out expects {text, image{media_type, base64}}\n```\n\n### turn 2\n\ndone\n\n---\nstop done · verdict **pass** · turns 2 · tools 1 · cost $0.0200\n",
+      "workspace": {
+        "shot.png": "sha256:6ba92f98d2d118a750f5c1f12b8eb96651854c35e2ac5dcca6d16185b470fa6a"
+      }
+    }
+  ],
+  "stderr": [],
+  "stdout": [
+    "  tasks/fx                       t1  pass stop=done turns=2 tools=1 $0.0200"
+  ]
+}

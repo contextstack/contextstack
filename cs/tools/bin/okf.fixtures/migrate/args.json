@@ -1,0 +1,6 @@
+{
+  "action": "migrate",
+  "root": "corpus",
+  "from": "0.1",
+  "to": "0.2"
+}

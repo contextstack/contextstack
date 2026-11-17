@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""release-tool-runtime regression (goal.md): Python tools run inside cs-sandbox from an installed release.
+
+Fake HOME, offline, temp dirs only; the gateway is a local script. SKIP (exit 0) with the reason when uv, the pinned
+uv-managed interpreter, the built binaries or a sandbox backend is missing.
+"""
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "node-install-layout"))
+import _bundle  # noqa: E402
+
+LAB = _bundle.LAB
+REPO = LAB.parent
+ID = "20990101-ttttttttt"
+BUILT = {"cs-harness": "cs-harness", "cs-sandbox": "cs-sandbox", "cs-tools": "cs-tools"}  # bin name -> target/release name
+SPEC = """id: release-tool-runtime
+model: fixture
+system: prompts/coder-min.md
+context: []
+tools: [fs_read, fs_write, exec]
+mcp: []
+budget: {turns: 6, tool_calls: 6, usd: 0, seconds: 60}
+tasks: [TASK]
+trials: 1
+hypothesis: "fixture-2267: Python tools run inside the sandbox from an installed release"
+"""
+CALLS = [("fs_write", {"path": "hello.txt", "content": "hello"}),
+         ("exec", {"cmd": ["cat", "hello.txt"]}),
+         ("exec", {"cmd": ["python3", "-c", "import sys; print('BASE=' + sys.base_prefix)"]})]
+problems = []
+
+
+def expect(cond, msg, detail=None):
+    print(("ok   " if cond else "FAIL ") + msg + ("" if cond or detail is None else " : %s" % (detail,)))
+    if not cond:
+        problems.append(msg)
+
+
+def reply(turn):
+    """The runner's gateway reply (WIRE): one scripted tool call per turn, then a text turn."""
+    calls = [] if turn >= len(CALLS) else [{"id": "c%d" % turn, "name": CALLS[turn][0], "args": CALLS[turn][1]}]
+    return json.dumps({"status": "ok", "model": "fixture", "message": {"content": "" if calls else "done"},
+                       "tool_calls": calls, "cost": {"class": "free_local", "est_usd": 0, "charged_usd": 0}}).encode()
+
+
+class Gateway(BaseHTTPRequestHandler):
+    posts = []
+
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):  # no stream probe: the runner stays unary
+        self.send_error(501, "no probe")
+
+    def do_POST(self):
+        Gateway.posts.append(self.rfile.read(int(self.headers["Content-Length"])))
+        body = reply(len(Gateway.posts) - 1)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def skip_reason():
+    if sys.platform != "darwin" and not shutil.which("bwrap"):
+        return "no sandbox backend (bwrap) on this host"
+    missing = [n for n in BUILT.values() if not os.access(REPO / "target/release" / n, os.X_OK)]
+    if missing:
+        return "not built: target/release/%s (cargo build --release -p cs-harness -p cs-sandbox -p cs-tools)" % ", ".join(missing)
+    return None
+
+
+def install(tmp, uv, managed):
+    """The release as node-install lays it out, from this checkout's binaries. Returns (home, release, node plist)."""
+    home = tmp / "home"
+    bins = _bundle.fake_bins(tmp / "fakebin")
+    bins.update({name: REPO / "target/release" / built for name, built in BUILT.items()})
+    _bundle.bundle(tmp / "bundle", uv, ID, bins)
+    _bundle.seed_python(home, ID, managed)
+    env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home)
+    r = subprocess.run(["sh", str(LAB / "scripts/node-install"), "install", str(tmp / "bundle"), "--node", "test-node",
+                        "--director", "http://127.0.0.1:9", "--installation", "inst-test", "--no-load"],
+                       capture_output=True, text=True, env=env, cwd="/")
+    rel = home / ".contextstack/releases" / ID
+    expect(r.returncode == 0 and (rel / ".complete").is_file(), "install: the release is complete", r.stdout[-800:] + r.stderr[-800:])
+    node = plistlib.loads((home / "Library/LaunchAgents/com.contextstack.node.plist").read_bytes())
+    return home, rel, node
+
+
+def run_smoke(tmp, home, node, task):
+    """The release's run-spec under the node plist's environment and working directory, as tick runs a director job
+    (its spec frozen in <state>/jobs/<job>/, the task materialised beside it)."""
+    spec = task.parent / "spec.yaml"
+    (task.parent / "prompts").mkdir()
+    shutil.copy2(LAB / "prompts/coder-min.md", task.parent / "prompts/coder-min.md")
+    spec.write_text(SPEC.replace("TASK", str(task)))
+    with ThreadingHTTPServer(("127.0.0.1", 0), Gateway) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        env = dict(node["EnvironmentVariables"], HOME=str(home), TMPDIR=str(tmp / "t"), LANG="C.UTF-8",
+                   CSGATEWAY_ENDPOINT="http://127.0.0.1:%d/v1/agent/model.call" % server.server_port)
+        (tmp / "t").mkdir()
+        venv = Path(node["WorkingDirectory"]) / ".venv/bin/python3"
+        r = subprocess.run([str(venv), "ops/bin/run-spec", str(spec), "-task", str(task)], cwd=node["WorkingDirectory"],
+                           env=env, capture_output=True, text=True, timeout=120)
+        server.shutdown()
+    return r
+
+
+def check_reports(root, rel, base):
+    runs = sorted((root / "state/runs").iterdir()) if (root / "state/runs").is_dir() else []
+    expect(len(runs) == 1, "one run dir under the fake state root", runs)
+    if not runs:
+        return
+    run = runs[0]
+    reports = [json.loads(p.read_text()) for p in sorted((run / "sandbox").glob("*.json"))] if (run / "sandbox").is_dir() else []
+    py = [r for r in reports if Path(r["tool"]).name in ("fs_write", "exec")]
+    expect(len(py) == 3, "a sandbox report for every Python tool call (fs_write, exec x2)", [r.get("tool") for r in reports])
+    for r in reports:
+        name, eff = Path(r["tool"]).name, r["effective_policy"]
+        reads, writes = set(eff["read"]), set(eff["write"])
+        expect(r["exit"] == 0 and r["signal"] is None, "%s: exit 0, no signal (was SIGABRT in dyld on workstation)" % name, (r["exit"], r["signal"]))
+        expect(str(base) in reads and str(base.parent) not in reads and str(rel) not in reads,
+               "%s: reads the release's python/%s, not python/ or the release root" % (name, base.name), sorted(reads))
+        expect(writes == {eff["workspace"], eff["tmp"]}, "%s: writes only the workspace and its tmp" % name, sorted(writes))
+    transcript = (run / "transcript.md").read_text()
+    expect("BASE=%s" % base in transcript, "python3 inside the sandbox runs on the release's install (sys.base_prefix)",
+           transcript[-1200:])
+
+
+def control(tmp, rel):
+    """The pre-fix policy (no $TOOL_PYTHON): the release's wrapper aborts fs_write as workstation did."""
+    pol = json.loads((rel / "cs/policy/sandbox.json").read_text())
+    for os_ in pol["runtime_read"]:
+        pol["runtime_read"][os_] = [p for p in pol["runtime_read"][os_] if p != "$TOOL_PYTHON"]
+    (tmp / "old/policy").mkdir(parents=True)
+    (tmp / "old/policy/sandbox.json").write_text(json.dumps(pol))
+    ws = tmp / "old/ws"
+    ws.mkdir()
+    venv = rel / "cs/.venv/bin"
+    env = {"PATH": "%s:/usr/bin:/bin" % venv, "HOME": str(tmp / "home"), "LAB_CODE_ROOT": str(rel / "cs"),
+           "TMPDIR": str(tmp / "t"), "LANG": "C.UTF-8"}
+    r = subprocess.run([str(rel / "bin/cs-sandbox"), "--policy", str(tmp / "old/policy/sandbox.json"), "--",
+                        str(rel / "cs/tools/bin/fs_write")], input='{"path": "x.txt", "content": "x"}', cwd=ws,
+                       env=env, capture_output=True, text=True, timeout=60)
+    expect(r.returncode != 0 and "libpython" in r.stderr and not (ws / "x.txt").exists(),
+           "control: without $TOOL_PYTHON the release's fs_write dies loading libpython (the workstation fall)",
+           (r.returncode, r.stderr[-400:]))
+
+
+def main():
+    uv, managed = _bundle.host_python()
+    reason = managed if uv is None else skip_reason()
+    if reason:
+        print("SKIP release-tool-runtime: %s" % reason)
+        return 0
+    agents = _bundle.real_agents()
+    tmp = Path(tempfile.mkdtemp(prefix="release-tool-runtime-", suffix=".noindex")).resolve()
+    try:
+        home, rel, node = install(tmp, uv, managed)
+        base = (rel / "python" / managed.name).resolve()
+        expect(os.path.realpath(rel / "cs/.venv/bin/python").startswith(str(base) + "/"),
+               "layout: the venv's python links into releases/<id>/python/%s, outside the code root" % managed.name)
+        task = home / ".contextstack/state/jobs/job-1/task"
+        shutil.copytree(LAB / "tasks/create-file", task)
+        r = run_smoke(tmp, home, node, task)
+        expect(r.returncode == 0, "run-spec under the node plist's environment passes the create-file check",
+               (r.returncode, r.stdout[-800:], r.stderr[-800:]))
+        expect(len(Gateway.posts) == len(CALLS) + 1, "the scripted gateway served every turn", len(Gateway.posts))
+        check_reports(home / ".contextstack", rel, base)
+        control(tmp, rel)
+    finally:
+        if os.environ.get("KEEP") and problems:
+            print("kept %s" % tmp)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
+    leak = _bundle.launchd_untouched(agents)
+    expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")
+    print("check: release-tool-runtime %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

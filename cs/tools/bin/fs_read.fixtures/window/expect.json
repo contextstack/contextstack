@@ -1,0 +1,8 @@
+{
+  "exit": 0,
+  "stdout": "lines 2-2 of 4 — re-read with offset=3\n\nbeta",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"limit\": 1, \"offset\": 2, \"path\": \"a.txt\"}, \"name\": \"fs_read\"}\n"
+  },
+  "untouched": true
+}

@@ -1,0 +1,2 @@
+Loaded cached credentials.
+{"session_id":"<redacted>","response":"done","stats":{"models":{"gemini-3-flash-preview":{"api":{"totalRequests":1,"totalErrors":0,"totalLatencyMs":900},"tokens":{"input":12993,"prompt":12993,"candidates":213,"total":13206,"cached":0,"thoughts":0,"tool":0}}},"tools":{"totalCalls":0,"totalSuccess":0,"totalFail":0}}}

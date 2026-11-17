@@ -1,0 +1,10 @@
+id: hosted-lead
+model: claude-code-sonnet
+system: prompts/system.md
+context: [conversation/context.md]
+tools: []
+mcp: []
+budget: {turns: 80, tool_calls: 0, usd: 0, seconds: 3600}
+tasks: [tasks/turn]
+trials: 1
+hypothesis: "Hosted lead orchestrates task lanes through cs mcp (Design.HostedLead 2026-11-11)."

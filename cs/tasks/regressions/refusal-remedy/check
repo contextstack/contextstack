@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Refusal remedies: every grant/enqueue refusal carries a remedy clause."""
+import json, os, shutil, subprocess, sys, tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+# Directly imported estate helpers must see the same isolated roots as children.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _grant import cover, remedy, record_refusal
+
+
+def write_grant(lab, gid, **fields):
+    body = ["id: %s" % gid]
+    for k, v in fields.items():
+        if isinstance(v, list):
+            body.append("%s: [%s]" % (k, ", ".join(json.dumps(x) if isinstance(x, str) else str(x) for x in v)))
+        elif isinstance(v, bool):
+            body.append("%s: %s" % (k, "true" if v else "false"))
+        else:
+            body.append("%s: %s" % (k, v))
+    (lab / "grants" / (gid + ".yaml")).write_text("\n".join(body) + "\n", encoding="utf-8")
+
+
+root = Path(tempfile.mkdtemp(prefix="refusal-remedy-", suffix=".noindex"))
+lab = root / "lab"
+try:
+    for name in ("ops/bin", "grants", "ledger", "specs", "scripts"):
+        (lab / name).mkdir(parents=True)
+    for name in ("_grant.py", "_estate_io.py", "_dispatch.py", "_roots.py", "_corpus_contract.py", "_workspace_setup.py",
+                 "enqueue", "enqueue.json"):
+        src = LAB / "ops/bin" / name
+        if src.is_file():
+            shutil.copy2(src, lab / "ops/bin" / name)
+    # Point _grant.LAB at the fixture lab by rewriting the copied module path... 
+    # cover imports LAB from module load path; copy uses HERE.parent.parent = lab. OK.
+    (lab / "ESTATE").write_text("dev\n")
+    dest = root / "dest"
+    dest.mkdir()
+    expiry = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expired = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_grant(lab, "g-assesskit", estate="prod-1", repo=str(dest),
+                paths=["app"], gates=["true"], commit=True, expiry=expiry, status="active")
+    write_grant(lab, "g-expired", estate="dev", repo=str(dest),
+                paths=["app"], gates=["true"], commit=True, expiry=expired, status="active")
+
+    # Patch sys modules to load fixture copies
+    sys.path.insert(0, str(lab / "ops/bin"))
+    import importlib
+    for mod in list(sys.modules):
+        if mod in ("_grant", "_estate_io") or mod.startswith("_grant"):
+            del sys.modules[mod]
+    from _grant import cover as cover2, remedy as remedy2, record_refusal as record2
+
+    ok, err, grant = cover2("g-assesskit", repo=str(dest), paths=["app"], commit=True)
+    assert not ok, (ok, err)
+    assert "grant g-assesskit is estate: prod-1; this lab is dev; run on prod-1." == err, err
+    assert ";" in err and "run on" in err
+
+    ok, err, grant = cover2("g-expired", repo=str(dest), paths=["app"], commit=True)
+    assert not ok and "expired" in err and "renew by tag" in err, err
+
+    ok, err, grant = cover2("g-missing", repo=str(dest), paths=["app"], commit=True)
+    assert not ok and "unregistered" in err and "create a grant" in err, err
+
+    # Every remedy() output for known codes contains a remedy clause
+    codes = [
+        "grant estate mismatch", "expired", "grant not found", "grant id mismatch",
+        "revoked", "grant estate required", "repo mismatch", "grant.commit is not true",
+        "path not in grant: app", "effect not in grant: send",
+    ]
+    g = {"id": "g-assesskit", "estate": "prod-1"}
+    for code in codes:
+        msg = remedy2(code, grant=g, gid="g-assesskit")
+        assert ";" in msg or "create a grant" in msg or "renew by tag" in msg or "run on" in msg, (code, msg)
+
+    rid = record2(lab, code="grant estate mismatch",
+                  message=err if 'err' in dir() else "x",
+                  grant={"id": "g-assesskit"}, gid="g-assesskit")
+    assert rid
+    rows = [json.loads(l) for l in (lab / "ledger/refusals.jsonl").read_text().splitlines() if l.strip()]
+    assert any(r["id"] == rid for r in rows), rows
+
+    # Live enqueue writes a refusal receipt and prints the remedy
+    (lab / "specs/exp-demo.yaml").write_text(
+        "id: exp-demo\nmodel: local-coder\ntools: []\nbudget: {turns: 1, tool_calls: 1, usd: 0, seconds: 10}\n"
+        "tasks: [tasks/work/demo]\ntrials: 1\nhypothesis: demo\n", encoding="utf-8")
+    (lab / "tasks/work/demo").mkdir(parents=True)
+    (lab / "tasks/work/demo/notes.md").write_text("repo: %s\n" % dest, encoding="utf-8")
+    (lab / "tasks/work/demo/goal.md").write_text("demo\n")
+    (lab / "tasks/work/demo/check").write_text("#!/bin/sh\nexit 0\n")
+    (lab / "tasks/work/demo/check").chmod(0o755)
+    r = subprocess.run([str(lab / "ops/bin/enqueue")],
+                       input=json.dumps({"spec": "specs/exp-demo.yaml", "task": "tasks/work/demo",
+                                         "dest": str(dest), "grant": "g-assesskit"}),
+                       text=True, capture_output=True, cwd=str(lab), env={**hermetic_env()})
+    blob = (r.stdout or "") + (r.stderr or "")
+    assert r.returncode != 0, blob
+    assert "grant g-assesskit is estate: prod-1; this lab is dev; run on prod-1." in blob, blob
+    assert "[refusal " in blob, blob
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+print("check: refusal remedies carry a remedy clause; enqueue records a receipt")

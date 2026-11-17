@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+import importlib.machinery,importlib.util,json,os,subprocess,tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+here=Path(__file__).resolve().parent;lab=here.parents[2]
+loader=importlib.machinery.SourceFileLoader('auth_probe',str(here/'claude'))
+spec=importlib.util.spec_from_loader(loader.name,loader);module=importlib.util.module_from_spec(spec);loader.exec_module(module)
+expected=['/usr/bin/security','find-generic-password','-s','Claude Code-credentials']
+for code in (0,44):
+ with tempfile.TemporaryDirectory() as raw:
+  def lookup(args,**kw):
+   if args==["/fixture/bin/claude", "--version"]:
+    assert kw=={"capture_output":True,"text":True,"timeout":10}
+    return SimpleNamespace(returncode=0,stdout="2.fixture (Claude Code)\n")
+   assert args==expected
+   assert kw=={'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL,'timeout':10}
+   return SimpleNamespace(returncode=code)
+  with patch.dict(os.environ,{'HOME':raw,'USER':'fixture-user','OPENAI_API_KEY':'NEVER_EXPORT','CLAUDE_CONFIG_DIR':'/fixture/config'},clear=True),patch.object(module.subprocess,'run',lookup),patch.object(module.shutil,'which',return_value='/fixture/bin/claude'):
+   d=module.observe()
+  assert d['HOME']==raw and d['USER']=='fixture-user' and d['CLAUDE_CONFIG_DIR']=='/fixture/config'
+  assert d['cli_path']=='/fixture/bin/claude' and d['cli_version']=='2.fixture (Claude Code)' and d['config_names']==[]
+  assert d['keychain_find_exit']==code and 'NEVER_EXPORT' not in json.dumps(d)
+  (Path(raw)/'auth-context.json').write_text(json.dumps(d))
+  subprocess.run([str(here/'check')],cwd=raw,check=True)
+templates=json.loads((lab/'ops/bin/executor-templates.json').read_text());probe=templates['claude-auth-context-probe'].copy();real=templates['claude-code-sonnet-planner'].copy()
+assert Path(probe.pop('binary')).name=='claude';assert real.pop('binary')=='claude';assert probe==real
+print('check: fake auth child exports only bounded metadata; lookup never prints credentials; real planner unchanged')

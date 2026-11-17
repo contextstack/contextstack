@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Unit coverage for core ops/bin libraries (py-core-units)."""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CS = HERE.parents[2]
+LIB = HERE.parent / "_lib"
+OPS = CS / "ops" / "bin"
+
+sys.path.insert(0, str(LIB))
+from hermetic_env import hermetic_env  # noqa: E402
+
+MODULES = (
+    "_toolchains.py",
+    "_estate_io.py",
+    "_provider_limits.py",
+    "_vitals.py",
+    "_job_reason.py",
+    "_agent_stream.py",
+    "_lane_policy.py",
+    "_lanes.py",
+    "_stuck.py",
+    "_cli_budget.py",
+    "_cli_native.py",
+    "_lead_host.py",
+    "node-listen",
+    "tick",
+)
+INCLUDES = ",".join("ops/bin/%s" % name for name in MODULES)
+
+
+def coverage_available():
+    return subprocess.run(
+        [sys.executable, "-m", "coverage", "--version"],
+        capture_output=True,
+        env={**hermetic_env(), "COVERAGE_FILE": str(HERE / ".coverage")},
+    ).returncode == 0
+
+
+def module_percents():
+    proc = subprocess.run(
+        [sys.executable, "-m", "coverage", "report", "-m", f"--include={INCLUDES}"],
+        capture_output=True,
+        text=True,
+        env={**hermetic_env(), "COVERAGE_FILE": str(HERE / ".coverage")},
+        cwd=str(CS),
+    )
+    if proc.returncode != 0:
+        return {}
+    out = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or Path(parts[0]).name not in MODULES:
+            continue
+        try:
+            out[Path(parts[0]).name] = int(parts[3].rstrip("%"))
+        except ValueError:
+            continue
+    return out
+
+
+def main():
+    env = {**hermetic_env(), "PYTHONDONTWRITEBYTECODE": "1",
+           "COVERAGE_FILE": str(HERE / ".coverage")}
+    for name in (
+        "LAB_STATE_ROOT", "LAB_CONFIG_ROOT", "LAB_CODE_ROOT", "CS_TOOLCHAINS_FILE",
+        "CS_REPOS_FILE", "RUSTUP_HOME", "CARGO_HOME",
+    ):
+        env.pop(name, None)
+
+    before = {}
+    if coverage_available():
+        subprocess.run(
+            [
+                sys.executable, "-m", "coverage", "run", "--source", str(OPS),
+                "-m", "unittest", "discover", "-s", str(HERE), "-p", "test_*.py", "-q",
+            ],
+            env=env,
+            cwd=str(HERE),
+            check=False,
+        )
+        before = module_percents()
+        subprocess.run([sys.executable, "-m", "coverage", "erase"], env=env, cwd=str(CS), check=False)
+
+    tests = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", str(HERE), "-p", "test_*.py", "-v"],
+        env=env,
+        cwd=str(HERE),
+    )
+    if tests.returncode != 0:
+        print("check: py-core-units failed (unittest exit %d)" % tests.returncode)
+        raise SystemExit(tests.returncode)
+
+    after = {}
+    if coverage_available():
+        subprocess.run(
+            [
+                sys.executable, "-m", "coverage", "run", "--source", str(OPS),
+                "-m", "unittest", "discover", "-s", str(HERE), "-p", "test_*.py", "-q",
+            ],
+            env=env,
+            cwd=str(HERE),
+            check=True,
+        )
+        after = module_percents()
+        if before:
+            print("coverage before:", " ".join("%s=%d%%" % (m, before.get(m, 0)) for m in MODULES))
+        print("coverage after:", " ".join("%s=%d%%" % (m, after.get(m, 0)) for m in MODULES))
+
+    summary = "check: py-core-units PASS"
+    if after:
+        summary += " (" + ", ".join("%s %d%%" % (m.replace(".py", ""), after[m]) for m in MODULES if m in after) + ")"
+    print(summary)
+
+
+if __name__ == "__main__":
+    main()

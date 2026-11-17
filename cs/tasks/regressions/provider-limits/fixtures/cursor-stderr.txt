@@ -1,0 +1,1 @@
+ActionRequiredError: You've hit your usage limit for Cursor Pro+. Your usage limits will reset when your monthly cycle ends on 11/17/2026.

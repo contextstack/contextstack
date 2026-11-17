@@ -1,0 +1,40 @@
+#!/usr/bin/env ruby
+require 'yaml'
+root = File.expand_path('../../../..', __dir__)
+source = File.read(File.join(root, '.github/workflows/desktop-app.yml'))
+workflow = YAML.load(source)
+def check(condition, message)
+  abort "FAIL: #{message}" unless condition
+end
+job = workflow.fetch('jobs').fetch('build')
+steps = job.fetch('steps')
+runs = steps.map { |s| s['run'] }.compact.join("\n")
+envs = steps.map { |s| s['env'] }.compact.reduce({}, :merge)
+check(job['runs-on'] == 'macos-latest', 'macos-latest runner')
+check(workflow.fetch('on').key?('workflow_dispatch'), 'manual trigger')
+check(workflow['on'].dig('push', 'tags') == ['desktop-v*'], 'desktop tag trigger')
+{
+  'CSC_LINK' => 'MACOS_CERT_P12_BASE64', 'CSC_KEY_PASSWORD' => 'MACOS_CERT_PASSWORD',
+  'APPLE_TEAM_ID' => 'APPLE_TEAM_ID', 'ASC_KEY_ID' => 'ASC_KEY_ID',
+  'ASC_ISSUER_ID' => 'ASC_ISSUER_ID', 'ASC_KEY_P8_BASE64' => 'ASC_KEY_P8_BASE64',
+  'COMPOSER_AUTH' => 'FLUX_COMPOSER_AUTH'
+}.each { |key, secret| check(envs[key] == '${{ secrets.' + secret + ' }}', "secret wiring #{key}") }
+check(!source.include?('NATIVEPHP_APPLE_ID'), 'Apple-ID hook must stay unset')
+# Building, signing, notarizing and stapling live in clients/web/scripts/build-desktop; the workflow
+# calls it with the API key and verifies the result. Check both, so no guarantee is lost.
+script = File.read(File.join(root, 'clients/web/scripts/build-desktop'))
+check(runs.include?('scripts/build-desktop arm64'), 'arm64 build through build-desktop')
+check(script.include?('php artisan native:build mac "$ARCH"'), 'build-desktop runs the native build')
+check(script.match?(/codesign --force --deep --options runtime --timestamp/), 'hardened-runtime re-sign of the app')
+check(script.match?(/notarytool submit[^\n]*--wait/), 'wait for notarization')
+check(script.include?('"$status" != Accepted') && script.include?('notarytool log') && script.include?('exit 1'), 'reject and diagnose failed notarization')
+check(script.include?('xcrun stapler staple "$APP"') && script.include?('xcrun stapler staple "$DMG"'), 'staple app and DMG')
+check(runs.include?('NOTARY_KEY="$key"') && runs.include?('NOTARY_KEY_ID=') && runs.include?('NOTARY_ISSUER='), 'API-key notarization, no Keychain profile')
+check(runs.include?('spctl -a -vv -t exec') && runs.include?('source=Notarized Developer ID'), 'Gatekeeper verification')
+check(runs.include?('LSEnvironment:PHP_CLI_SERVER_WORKERS') && runs.include?('= 8'), 'eight PHP workers in the packaged app')
+check(runs.include?('umask 077') && runs.include?('chmod 600'), 'private temporary key')
+check(steps.any? { |s| s['if'] == 'always()' && s.fetch('run', '').include?('rm -f "$RUNNER_TEMP/desktop-notary.p8"') && s.fetch('run', '').include?('security delete-keychain') }, 'always delete key and temporary keychain')
+check(runs.include?('! -d "$electron/dist"') && runs.include?('node install.js'), 'Electron download fallback')
+check(steps.any? { |s| s.fetch('uses', '').start_with?('actions/upload-artifact@') && s.dig('with', 'path').to_s.include?('/*.dmg') }, 'DMG artifact')
+check(steps.any? { |s| s.fetch('if', '').include?("github.event_name == 'push'") && s.fetch('run', '').include?('gh release upload') }, 'tag release attachment')
+puts 'PASS: signed and notarized desktop workflow'

@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""stuck-lanes regression: stop spinning runs early with stuck:* and keep healthy runs alive."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import importlib.util
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+sys.dont_write_bytecode = True
+LAB = Path(__file__).resolve().parents[3]
+OPS = LAB / "ops/bin"
+FILES = (
+    "_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py",
+    "_yaml.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_cli_native.py",
+    "_harness_usage.py", "_provider_limits.py", "_run_record.py", "_env_policy.py", "_errors.py", "_job_reason.py",
+    "_stuck.py", "_cli_budget.py",
+    "capture-stimulus", "publish-evidence", "harvest", "finalize-run",
+)
+
+FAKE = """#!/usr/bin/env python3
+import json, signal, sys, time
+from pathlib import Path
+
+mode = Path(__file__).parent.joinpath("lab", "mode.txt").read_text(encoding="utf-8").strip()
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+def fail_loop(total, pause, secret=False):
+    for i in range(total):
+        tid = "call-%d" % i
+        command = ("OPENAI_API_KEY=fake-api-key-123456789 pytest -q" if secret else "pytest -q")
+        emit({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": command}}
+        ]}})
+        emit({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": True,
+             "content": ("Authorization: Bearer fake-bearer-token-123456789\\n"
+                         "OPENAI_API_KEY=fake-api-key-123456789\\n"
+                         if secret else "") + "FAIL: tests/red.py::test_main\\nE assert 1 == 2"}
+        ]}})
+        time.sleep(pause)
+
+if mode == "stuck":
+    fail_loop(8, 0.15)
+    time.sleep(20)
+elif mode == "off":
+    fail_loop(4, 0.01)
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}})
+    emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": 5,
+          "result": "done", "total_cost_usd": 0.001})
+elif mode == "secret":
+    fail_loop(3, 0.01, True)
+    time.sleep(20)
+elif mode == "green_repeat":
+    for i in range(3):
+        tid = "green-%d" % i
+        emit({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": "pytest -q"}}
+        ]}})
+        emit({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": False,
+             "content": "120 passed, 0 failed"}
+        ]}})
+    emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": 4,
+          "result": "done", "total_cost_usd": 0.001})
+else:
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "ok-1", "name": "Bash", "input": {"command": "pytest -q"}},
+        {"type": "text", "text": "fixed it"},
+    ]}})
+    emit({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "ok-1", "is_error": False, "content": "1 passed"}
+    ]}})
+    emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": 2,
+          "result": "done", "total_cost_usd": 0.001})
+"""
+
+
+def make_spec(path, task, hypothesis, stuck):
+    if stuck is None:
+        budget = "{turns: 80, tool_calls: 20, usd: 0.25, seconds: 120}"
+    elif stuck == "off":
+        budget = "{turns: 80, tool_calls: 20, usd: 0.25, seconds: 120, stuck: off}"
+    else:
+        budget = "{turns: 80, tool_calls: 20, usd: 0.25, seconds: 120, stuck: {repeat: %d, idle_turns: 40}}" % int(stuck)
+    path.write_text(
+        "\n".join((
+            "id: fixture-" + path.stem,
+            "model: fake-claude",
+            "system: prompts/system.md",
+            "context: []",
+            "tools: []",
+            "mcp: []",
+            "budget: " + budget,
+            "check_window: %d" % max(5, int(5 * float(os.environ.get("CHECK_TIMEOUT_SCALE", "1")))),  # harness wait
+            "tasks: [tasks/%s]" % task,
+            "trials: 1",
+            "hypothesis: %s" % json.dumps(hypothesis),
+            "",
+        )),
+        encoding="utf-8",
+    )
+
+
+def run_case(lab, mode, task, spec):
+    (lab / "mode.txt").write_text(mode + "\n", encoding="utf-8")
+    payload = {
+        "executor": "fake-claude",
+        "task": "tasks/%s" % task,
+        "spec": "specs/%s.yaml" % spec,
+        "exp": "task-stuck",
+        "trial": 1,
+        "timeout_s": 120,
+    }
+    started = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, str(lab / "ops/bin/_executor.py")],
+        cwd=lab,
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=40,
+        env={**hermetic_env(), "HOME": str(lab / "home"), "CS_TOOLS_BIN": str(LAB.parent / "target/release/cs-tools")},
+    )
+    assert done.stdout.strip(), (mode, done.stderr)
+    result = json.loads(done.stdout.strip().splitlines()[-1])
+    run = Path("ledger/runs") / result["run_id"]
+    row = json.loads((lab / "ledger/ledger.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    return done, result, row, lab / run, round(time.monotonic() - started, 2)
+
+
+sys.path.insert(0, str(OPS))
+from _stuck import Monitor, REPORT_CHARS  # noqa: E402
+from _agent_stream import signals  # noqa: E402
+
+
+class State:
+    def __init__(self, **files):
+        self.files = files
+
+    def __call__(self, paths=None):
+        selected = paths if paths is not None else self.files
+        return {path: self.files.get(path, "missing") for path in selected}
+
+
+def monitor(**overrides):
+    config = {"enabled": True, "repeat": 99, "idle_turns": 99, "edit_churn": 99}
+    config.update(overrides)
+    state = State(**{"app.py": "A"})
+    return Monitor(config, state), state
+
+
+def edit(mon, state, value):
+    ident = "edit-%s" % value
+    assert mon.feed([{"kind": "tool_call", "id": ident, "name": "fs_edit", "args": {"path": "app.py"}}]) is None
+    state.files["app.py"] = value
+    return mon.feed([{"kind": "tool_result", "id": ident, "failed": False, "text": "updated"}])
+
+
+def failed_check(mon, ident, exit_code=None):
+    assert mon.feed([{"kind": "tool_call", "id": ident, "name": "bash", "args": {"command": "pytest -q"}}]) is None
+    event = {"kind": "tool_result", "id": ident, "text": "same check output"}
+    if exit_code is None:
+        event["failed"] = True
+    else:
+        event["exit_code"] = exit_code
+    return mon.feed([event])
+
+
+def passed_check(mon, ident, command="pytest -q"):
+    assert mon.feed([{"kind": "tool_call", "id": ident, "name": "bash", "args": {"command": command}}]) is None
+    return mon.feed([{"kind": "tool_result", "id": ident, "failed": False, "text": "all checks passed"}])
+
+
+# Structured status wins over words in output, while an exit code still detects a text-free failure.
+mapped = signals("codex", json.dumps({
+    "type": "item.completed",
+    "item": {"id": "cmd-1", "type": "command_execution", "command": "pytest -q",
+             "aggregated_output": "quiet failure", "exit_code": 2},
+}).encode())
+assert mapped == [{"kind": "tool_result", "id": "cmd-1", "name": "shell",
+                   "text": "quiet failure", "exit_code": 2}], mapped
+mon, _state = monitor(repeat=3)
+for n in range(3):
+    mon.feed([{"kind": "tool_call", "id": "green-%d" % n, "name": "bash", "args": {"command": "pytest -q"}}])
+    stopped = mon.feed([{"kind": "tool_result", "id": "green-%d" % n, "failed": False,
+                        "text": "120 passed, 0 failed"}])
+assert stopped is None and mon.stopped is None, mon.stopped
+mon, _state = monitor(repeat=3)
+for n in range(3):
+    mon.feed([{"kind": "tool_call", "id": "fallback-%d" % n, "name": "bash",
+              "args": {"command": "pytest -q"}}])
+    stopped = mon.feed([{"kind": "tool_result", "id": "fallback-%d" % n,
+                        "text": "120 passed, 0 failed, 0 errors"}])
+assert stopped is None and mon.stopped is None, mon.stopped
+mon, _state = monitor(repeat=2)
+assert failed_check(mon, "exit-1", 1) is None
+stopped = failed_check(mon, "exit-2", 1)
+assert stopped and stopped["stop"] == "stuck:repeat", stopped
+
+# Only failures repeated without a passing check in between are stuck.
+mon, _state = monitor(repeat=3)
+assert failed_check(mon, "repeat-1") is None
+assert failed_check(mon, "repeat-2") is None
+assert passed_check(mon, "repeat-green") is None
+assert failed_check(mon, "repeat-after-green") is None
+assert mon.stopped is None, mon.stopped
+assert passed_check(mon, "other-green", "vendor/bin/phpstan analyse") is None
+assert failed_check(mon, "repeat-after-other-green") is None
+assert mon.stopped is None, mon.stopped
+mon, _state = monitor(repeat=3)
+assert failed_check(mon, "consecutive-1") is None
+assert failed_check(mon, "consecutive-2") is None
+stopped = failed_check(mon, "consecutive-3")
+assert stopped and stopped["stop"] == "stuck:repeat", stopped
+
+# Edit churn needs a cycle or the same failed check between edits; monotonic edits are progress.
+mon, state = monitor(edit_churn=2)
+assert edit(mon, state, "B") is None
+stopped = edit(mon, state, "A")
+assert stopped and stopped["stop"] == "stuck:edit_churn" and "earlier state" in stopped["reason"], stopped
+mon, state = monitor(edit_churn=4)
+for value in ("B", "C", "D", "E", "F", "G"):
+    assert edit(mon, state, value) is None, mon.stopped
+mon, state = monitor(edit_churn=2)
+assert failed_check(mon, "check-1") is None
+assert edit(mon, state, "B") is None
+assert failed_check(mon, "check-2") is None
+stopped = edit(mon, state, "C")
+assert stopped and "same failing check" in stopped["reason"], stopped
+
+# Idle turns stop true inactivity, but edits to an already-dirty path reset the counter.
+mon, state = monitor(idle_turns=2)
+assert mon.feed([{"kind": "turn"}]) is None
+stopped = mon.feed([{"kind": "turn"}])
+assert stopped and stopped["stop"] == "stuck:idle_turns", stopped
+mon, state = monitor(idle_turns=2)
+assert mon.feed([{"kind": "turn"}]) is None
+assert edit(mon, state, "B") is None
+assert mon.feed([{"kind": "turn"}]) is None
+assert mon.feed([{"kind": "turn"}]) is None
+assert edit(mon, state, "C") is None
+assert mon.feed([{"kind": "turn"}]) is None
+
+# The artifact and task_output defense both redact credentials and cap returned text.
+mon, _state = monitor(repeat=1)
+mon.feed([{"kind": "tool_call", "id": "secret", "name": "bash",
+           "args": {"command": "OPENAI_API_KEY=fake-api-key-123456789 pytest"}}])
+stopped = mon.feed([{"kind": "tool_result", "id": "secret", "failed": True,
+                     "text": "Bearer fake-bearer-token-123456789 OPENAI_API_KEY=fake-api-key-123456789 failed"}])
+report = mon.report("G" * (REPORT_CHARS * 2), stopped["stop"], stopped["reason"])
+assert "fake-bearer-token" not in report and "fake-api-key" not in report and "<redacted>" in report, report
+assert len(report.encode()) <= REPORT_CHARS, len(report.encode())
+
+spec = importlib.util.spec_from_file_location("stuck_cs_mcp", LAB / "scripts/cs_mcp.py")
+cs_mcp = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cs_mcp)
+
+
+class FakeDirector:
+    raw = b"Bearer fake-bearer-token-123456789 OPENAI_API_KEY=fake-api-key-123456789\n" + b"x" * 20000
+
+    def get(self, path):
+        if path.startswith("jobs/"):
+            return {"job": {"job_id": "job-1", "state": "error", "run_id": "run-1"}}
+        return {"run": {"run_id": "run-1", "files": [{"path": "stuck.md"}]}}
+
+    def request(self, method, path):
+        if path == "runs/run-1":  # the run itself is JSON, like the Director's; files are raw bytes
+            return 200, self.get(path)
+        return 200, self.raw
+
+
+shown = cs_mcp.Tools(FakeDirector(), "dev").task_output("job-1", 50000)["stuck"]
+assert "fake-bearer-token" not in shown and "fake-api-key" not in shown and "<redacted>" in shown, shown[:500]
+assert len(shown.encode()) <= cs_mcp.STUCK_CHARS, len(shown.encode())
+
+
+with scratch_dir(prefix="stuck-lanes-") as raw:
+    root = Path(raw)
+    lab = root / "lab"
+    ops = lab / "ops/bin"
+    for path in (ops, lab / "tasks", lab / "specs", lab / "prompts", lab / "home/Library/Keychains", lab / "ledger"):
+        path.mkdir(parents=True, exist_ok=True)
+    for name in FILES:
+        shutil.copy2(OPS / name, ops / name)
+    from native_runtime import stage_native_runtime
+    stage_native_runtime(ops)
+    binary = root / "claude"
+    binary.write_text(FAKE, encoding="utf-8")
+    binary.chmod(0o755)
+    (ops / "executor-templates.json").write_text(json.dumps({
+        "fake-claude": {
+            "binary": str(binary),
+            "args": ["--print", "--output-format", "stream-json", "{{prompt}}"],
+            "cost_class": "subscription",
+            "cost_usd": 0,
+            "cost_per_1k": 0.01,
+            "auth": "subscription",
+        },
+    }), encoding="utf-8")
+    (lab / "ESTATE").write_text("dev\n", encoding="utf-8")
+    (lab / "prompts/system.md").write_text("You are a fixture.\n", encoding="utf-8")
+
+    for task in ("stuck", "healthy", "off", "green", "secret"):
+        work = lab / "tasks" / task
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "goal.md").write_text("Keep working.\n", encoding="utf-8")
+        (work / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (work / "check").chmod(0o755)
+
+    make_spec(lab / "specs/stuck.yaml", "stuck", "fixture stuck repeat", 3)
+    make_spec(lab / "specs/healthy.yaml", "healthy", "fixture healthy", None)
+    make_spec(lab / "specs/off.yaml", "off", "fixture stuck off", "off")
+    make_spec(lab / "specs/green.yaml", "green", "fixture repeated green check", 3)
+    make_spec(lab / "specs/secret.yaml", "secret", "fixture redacted stuck report", 3)
+
+    done, result, row, run_dir, seconds = run_case(lab, "stuck", "stuck", "stuck")
+    assert done.returncode == 1, (done.returncode, done.stderr, result)
+    assert result["stop"] == "stuck:repeat", result
+    assert row["stop"] == "stuck:repeat", row
+    assert isinstance(row.get("reason"), str) and "failed" in row["reason"], row
+    assert (run_dir / "stuck.md").is_file(), sorted(p.name for p in run_dir.iterdir())
+    stuck_text = (run_dir / "stuck.md").read_text(encoding="utf-8")
+    assert "Stop: stuck:repeat" in stuck_text and "Recent tool calls" in stuck_text, stuck_text
+    assert seconds < 12, seconds  # the fixture would otherwise sleep for 20s after repeating failures
+
+    done, result, row, run_dir, _seconds = run_case(lab, "healthy", "healthy", "healthy")
+    assert done.returncode == 0, (done.returncode, done.stderr, result)
+    assert result["stop"] == "done" and row["stop"] == "done", (result, row)
+    assert not (run_dir / "stuck.md").exists()
+
+    done, result, row, run_dir, _seconds = run_case(lab, "green_repeat", "green", "green")
+    assert done.returncode == 0, (done.returncode, done.stderr, result)
+    assert result["stop"] == "done" and row["stop"] == "done", (result, row)
+    assert not (run_dir / "stuck.md").exists()
+
+    done, result, row, run_dir, seconds = run_case(lab, "secret", "secret", "secret")
+    assert done.returncode == 1 and result["stop"] == "stuck:repeat", (done.returncode, result)
+    stuck_text = (run_dir / "stuck.md").read_text(encoding="utf-8")
+    assert "fake-bearer-token" not in stuck_text and "fake-api-key" not in stuck_text, stuck_text
+    assert stuck_text.count("<redacted>") >= 2 and len(stuck_text.encode()) <= REPORT_CHARS, stuck_text
+    assert "fake-bearer-token" not in json.dumps(row) and "fake-api-key" not in json.dumps(row), row
+    assert seconds < 12, seconds
+
+    done, result, row, run_dir, _seconds = run_case(lab, "off", "off", "off")
+    assert done.returncode == 0, (done.returncode, done.stderr, result)
+    assert result["stop"] == "done" and row["stop"] == "done", (result, row)
+    assert not (run_dir / "stuck.md").exists()
+
+print("check: stuck-lanes — structured failures, redaction, edit churn, idle turns, healthy reruns and stuck:off")

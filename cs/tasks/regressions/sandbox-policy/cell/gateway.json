@@ -1,0 +1,6 @@
+[
+ {"ok": {"text": "write", "tool_calls": [{"id": "1", "name": "fs_write", "args": {"path": "hello.txt", "content": "hello"}}]}},
+ {"ok": {"text": "read and list", "tool_calls": [{"id": "2", "name": "fs_read", "args": {"path": "hello.txt"}},
+                                                 {"id": "3", "name": "exec", "args": {"cmd": ["ls"]}}]}},
+ {"ok": {"text": "done", "tool_calls": []}}
+]

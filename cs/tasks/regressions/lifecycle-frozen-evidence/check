@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Frozen stimulus and published evidence survive edits and harvest.
+
+Demanded-by the 2026-09-05 lifecycle audit (L02, L03, L04):
+- a mid-run edit to goal.md or check must not change what was consumed;
+- the full candidate change must survive commit, staging, and harvest;
+- incomplete capture must never present itself as a clean empty tree.
+
+Isolated temporary estates only; never touches lab/ledger.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+CAPTURE = LAB / "ops/bin/capture-stimulus"
+PUBLISH = LAB / "ops/bin/publish-evidence"
+
+
+def op(binary, payload, cwd):
+    result = subprocess.run([str(binary)], input=json.dumps(payload), text=True,
+                            capture_output=True, cwd=str(cwd), env={**hermetic_env()})
+    if result.returncode != 0:
+        raise SystemExit("check: %s failed: %s" % (binary.name,
+                                                   (result.stderr or result.stdout)[:400]))
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env={**hermetic_env()})
+
+
+def estate():
+    root = Path(tempfile.mkdtemp(prefix="lifecycle-", suffix=".noindex"))
+    task = root / "tasks/work/demo"
+    task.mkdir(parents=True)
+    (task / "goal.md").write_text("Add a greeting to hello.txt.\n", encoding="utf-8")
+    check = task / "check"
+    check.write_text("#!/bin/sh\ngrep -q hello hello.txt\n", encoding="utf-8")
+    check.chmod(0o755)
+    (task / "notes.md").write_text("LEAK: the check greps hello\n", encoding="utf-8")
+    run_dir = root / "ledger/runs/run-1"
+    ws = run_dir / "workspace"
+    ws.mkdir(parents=True)
+    git(ws, "init", "-q", "-b", "main")
+    git(ws, "config", "user.email", "fixture@example.test")
+    git(ws, "config", "user.name", "Fixture")
+    (ws / "base.txt").write_text("base\n", encoding="utf-8")
+    git(ws, "add", "-A")
+    git(ws, "commit", "-qm", "base")
+    return root, task, run_dir, ws
+
+
+# L02 — a mid-run edit to goal and check changes neither what the model
+# consumed nor the recorded identity.
+root, task, run_dir, ws = estate()
+first = op(CAPTURE, {"run_dir": str(run_dir), "task": str(task), "run_id": "run-1",
+                     "adapter": "fixture", "workspace": str(ws)}, LAB)
+frozen_goal = (run_dir / "stimulus/goal.md").read_text(encoding="utf-8")
+(task / "goal.md").write_text("No greeting is currently authorized.\n", encoding="utf-8")
+(task / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+assert (run_dir / "stimulus/goal.md").read_text(encoding="utf-8") == frozen_goal, \
+    "the frozen goal changed when the live task was edited"
+assert "greeting to hello.txt" in frozen_goal
+again = op(CAPTURE, {"run_dir": str(run_dir), "task": str(task), "run_id": "run-1",
+                     "adapter": "fixture", "workspace": str(ws)}, LAB)
+assert again["existing"] is True, "a second capture must not open a new boundary"
+assert again["task_sha"] == first["task_sha"], "task_sha drifted after a live edit"
+assert first["stimulus_sha"] and first["stimulus_sha"] != first["task_sha"], \
+    "stimulus_sha must be a distinct hash, not task_sha"
+
+# The frozen check still verifies, and lab-facing notes never enter the
+# stimulus the model reads.
+assert (run_dir / "stimulus/check").read_text(encoding="utf-8").strip().endswith(
+    "grep -q hello hello.txt"), "the frozen check was replaced by the live edit"
+assert not (run_dir / "stimulus/notes.md").exists(), "notes.md must not be frozen in"
+assert not (run_dir / "stimulus/solution").exists()
+
+# L03 — commit some changes, stage more, add an untracked file and a deletion.
+# All of it must appear in evidence taken against the recorded base.
+(ws / "hello.txt").write_text("hello\n", encoding="utf-8")
+git(ws, "add", "hello.txt")
+git(ws, "commit", "-qm", "candidate commit")
+(ws / "staged.txt").write_text("staged\n", encoding="utf-8")
+git(ws, "add", "staged.txt")
+(ws / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+os.unlink(ws / "base.txt")
+
+published = op(PUBLISH, {"run_dir": str(run_dir), "adapter": "fixture",
+                         "verdict": "pass", "stop": "done",
+                         "check_output": "all good\n", "check_exit": 0}, LAB)
+assert published["capture_state"] == "complete", published
+assert published["ready"] is True
+evidence = json.loads((run_dir / "evidence/manifest.json").read_text(encoding="utf-8"))
+paths = {f["path"]: f["status"] for f in evidence["files"]}
+for name in ("hello.txt", "staged.txt", "untracked.txt"):
+    assert name in paths, "%s missing from candidate evidence: %s" % (name, paths)
+assert any(status.startswith("D") for status in paths.values()), \
+    "a deletion must appear in candidate evidence: %s" % paths
+diff_text = (run_dir / "evidence/candidate.diff").read_text(encoding="utf-8")
+assert "untracked.txt" in diff_text, "untracked content missing from the diff"
+
+# The original check result is preserved without rerunning anything.
+assert evidence["check"]["output"] == "all good\n"
+assert evidence["check"]["exit_code"] == 0 and evidence["check"]["verdict"] == "pass"
+assert evidence["evidence_sha"] and evidence["stimulus_sha"] == first["stimulus_sha"], \
+    "evidence_sha must bind the stimulus it came from"
+
+# The audit's exact failure: harvest commits the workspace, and an ordinary
+# `git diff` then reads empty. The published evidence must not.
+git(ws, "add", "-A")
+git(ws, "commit", "-qm", "lab: harvest")
+assert git(ws, "diff").stdout.strip() == "", "fixture did not reproduce the empty diff"
+after = json.loads((run_dir / "evidence/manifest.json").read_text(encoding="utf-8"))
+assert after == evidence, "harvest changed the published evidence"
+assert len(after["files"]) >= 4, "harvest erased the recorded candidate change"
+
+# L04 — capture that cannot be taken is incomplete, never a clean empty tree,
+# and publishes no ready_for_inspection marker.
+root2, task2, run_dir2, ws2 = estate()
+op(CAPTURE, {"run_dir": str(run_dir2), "task": str(task2), "run_id": "run-2",
+             "adapter": "fixture", "workspace": str(ws2)}, LAB)
+subprocess.run(["rm", "-rf", str(ws2 / ".git")], check=True, env={**hermetic_env()})
+broken = op(PUBLISH, {"run_dir": str(run_dir2), "adapter": "fixture",
+                      "verdict": "pass", "stop": "done"}, LAB)
+assert broken["capture_state"] == "incomplete", broken
+assert broken["ready"] is False
+assert not (run_dir2 / "ready_for_inspection").exists(), \
+    "an incomplete capture must not be marked ready for inspection"
+manifest2 = json.loads((run_dir2 / "evidence/manifest.json").read_text(encoding="utf-8"))
+assert manifest2["diff"]["available"] is False
+assert manifest2["incomplete_reasons"], "incomplete capture must say why"
+
+# Integrity is checked against the frozen snapshot, not the live task: editing
+# a task after its run is ordinary estate work and must not spoil the evidence.
+# (This estate's live goal and check were rewritten during the L02 block above.)
+assert evidence["input_drift"] == [], \
+    "a later live task edit must not mark a frozen run's evidence incomplete"
+
+# Tampering with the snapshot itself is drift, and it is loud.
+root3, task3, run_dir3, ws3 = estate()
+op(CAPTURE, {"run_dir": str(run_dir3), "task": str(task3), "run_id": "run-3",
+             "adapter": "fixture", "workspace": str(ws3)}, LAB)
+(run_dir3 / "stimulus/check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+drifted = op(PUBLISH, {"run_dir": str(run_dir3), "adapter": "fixture",
+                       "verdict": "pass", "stop": "done"}, LAB)
+assert drifted["capture_state"] == "incomplete", drifted
+manifest3 = json.loads((run_dir3 / "evidence/manifest.json").read_text(encoding="utf-8"))
+assert any(d["reason"] == "frozen input altered" for d in manifest3["input_drift"]), \
+    manifest3["input_drift"]
+
+# Publishing must refuse without a stimulus: evidence cannot exist for a run
+# whose inputs were never frozen.
+empty = Path(tempfile.mkdtemp(prefix="lifecycle-nostim-", suffix=".noindex"))
+result = subprocess.run([str(PUBLISH)], input=json.dumps({"run_dir": str(empty)}),
+                        text=True, capture_output=True, cwd=str(LAB), env={**hermetic_env()})
+assert result.returncode != 0 and "capture-stimulus must run" in result.stderr, result.stderr
+
+# Inspection serves the PUBLISHED diff, not a live reconstruction.
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _lifecycle_evidence import verify, read_gzip  # noqa: E402
+stored_path = run_dir / "evidence/candidate.diff"
+stored = stored_path.stat().st_size
+assert stored > 0, "fixture stored no diff to serve"
+data, err = verify(run_dir)
+assert err is None and data, (err, data)
+diff_blob = run_dir / "evidence" / str(data["diff"]["path"])
+published = diff_blob.read_bytes()
+assert len(published) == stored, (len(published), stored)
+assert data.get("evidence_sha")
+# Same holds once the workspace is gone entirely.
+shutil.rmtree(ws)
+data2, err2 = verify(run_dir)
+assert err2 is None and data2, err2
+assert (run_dir / "evidence" / data2["diff"]["path"]).read_bytes() == published
+# A snapshot whose blob is gone is visible and ineligible, never rebuilt.
+stored_path.unlink()
+data3, err3 = verify(run_dir)
+assert err3 and "missing" in err3.lower(), err3
+
+# A delegated check must EXECUTE the frozen dependency, not merely have a copy
+# of it. The repository idiom resolves shared libraries through
+# `git rev-parse --show-toplevel` from the check's own directory; from inside
+# ledger/runs that used to resolve to the live lab.
+dep_root = Path(tempfile.mkdtemp(prefix="lifecycle-dep-", suffix=".noindex"))
+dep_lab = dep_root / "lab"
+(dep_lab / "scripts").mkdir(parents=True)
+(dep_lab / "ops/bin").mkdir(parents=True)
+# capture-stimulus resolves shared dependencies against its own lab root, so
+# the fixture must run its own copy.
+for _name in ('_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "capture-stimulus", "capture-stimulus.json"):
+    shutil.copy2(LAB / "ops/bin" / _name, dep_lab / "ops/bin" / _name)
+(dep_lab / "ops/bin/capture-stimulus").chmod(0o755)
+git(dep_lab, "init", "-q")
+(dep_lab / "scripts/checklib.sh").write_text("exit 0\n", encoding="utf-8")
+dep_task = dep_lab / "tasks/work/dep"
+dep_task.mkdir(parents=True)
+(dep_task / "goal.md").write_text("delegate the check\n", encoding="utf-8")
+dep_check = dep_task / "check"
+dep_check.write_text(
+    '#!/bin/sh\n. "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)'
+    '/scripts/checklib.sh"\n', encoding="utf-8")
+dep_check.chmod(0o755)
+dep_run = dep_lab / "ledger/runs/run-dep"
+dep_ws = dep_run / "workspace"
+dep_ws.mkdir(parents=True)
+result = subprocess.run([str(dep_lab / "ops/bin/capture-stimulus")],
+                        input=json.dumps({"run_dir": str(dep_run), "run_id": "run-dep",
+                                          "task": str(dep_task), "adapter": "fixture",
+                                          "workspace": str(dep_ws)}),
+                        text=True, capture_output=True, cwd=str(dep_lab), env={**hermetic_env()})
+assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+assert (dep_run / "stimulus/scripts/checklib.sh").read_text().strip() == "exit 0"
+# Change the live dependency. The frozen check must not notice.
+(dep_lab / "scripts/checklib.sh").write_text("exit 9\n", encoding="utf-8")
+ran = subprocess.run([str(dep_run / "stimulus/check")], cwd=str(dep_ws),
+                     capture_output=True, text=True, env={**hermetic_env()})
+assert ran.returncode == 0, (
+    "the frozen check executed the live dependency (exit %s); copying a file "
+    "does not redirect its resolution" % ran.returncode)
+shutil.rmtree(dep_root, ignore_errors=True)
+
+# The runner (the default Rust one) consumes the frozen material rather than the live task.
+runner_rs = (LAB.parent / "harness/src/runner.rs").read_text(encoding="utf-8")
+assert 'self.dir.join("stimulus").join(name)' in runner_rs, "runner no longer reads from the frozen stimulus"
+assert 'read_frozen("goal.md")' in runner_rs, "runner still reads the live goal"
+assert 'read_frozen("system.txt")' in runner_rs, "runner still assembles live prompts"
+assert 'cell.dir.join("stimulus/check")' in runner_rs, "post_turn hooks still verify against the live check"
+assert "check(" not in runner_rs, "the runner grew a check again; finalize-run owns final verification"
+finalize_run = (LAB / "ops/bin/finalize-run").read_text(encoding="utf-8")
+assert 'run_dir / "stimulus/check"' in finalize_run, "final verification still runs the live check"
+assert 'text(&cell.stimulus, "task_sha")' in runner_rs, "task_sha is no longer the frozen stimulus's"
+
+print("check: stimulus is frozen, candidate evidence survives harvest, gaps stay incomplete")

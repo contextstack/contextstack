@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""cs-cli regression (goal.md): `cs` against a fake-HOME install with launchctl, curl and ssh shims.
+
+Network-free. Builds the install as node-install-layout does (its _bundle); needs uv and a uv-managed interpreter of
+the pinned version, else SKIP with the reason. Temp dirs only; the real ~/.local/bin and ~/Library/LaunchAgents are
+never written (asserted).
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import json
+import os
+import plistlib
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "node-install-layout"))
+import _bundle  # noqa: E402
+
+LAB = _bundle.LAB
+sys.path.insert(0, str(LAB / "scripts"))
+from check_timeout import timeout as check_timeout
+A, B = "20990101-aaaaaaaaa", "20990102-bbbbbbbbb"
+TOKEN = "tok-SECRETnode-7f3a9c"              # config/node.env
+CRED = "sk-SECRETcred-11aa22bb33"            # ~/.contextstack/credentials/openai: never read
+PLIST_KEY = "SECRETplistkey-55cc66"          # a tunnel plist's env, and launchctl print's environment section
+LOG_KEY = "SECRETlogkey-99dd"                # ANTHROPIC_API_KEY=... in a log line
+SECRETS = (TOKEN, CRED, PLIST_KEY, LOG_KEY)
+GW, NODE = "com.contextstack.csgateway-socket", "com.contextstack.node"
+T1, T2 = "com.contextstack.spark-tunnel", "com.contextstack.spark2-tunnel"
+problems, outputs = [], []
+
+
+def fail(msg):
+    problems.append(msg)
+    print("FAIL " + msg)
+
+
+def expect(cond, msg):
+    (print("ok   " + msg) if cond else fail(msg))
+
+
+SHIMS = {
+    "launchctl": r'''
+a = sys.argv[1:]
+loaded = os.path.join(S, "loaded")
+os.makedirs(loaded, exist_ok=True)
+if a[0] == "print":
+    f = os.path.join(loaded, a[1].rsplit("/", 1)[-1])
+    if not os.path.exists(f):
+        sys.stderr.write("Could not find service\n"); sys.exit(113)
+    sys.stdout.write("%s = {\n" % a[1] + open(f).read() + "}\n")
+elif a[0] == "bootstrap":
+    open(os.path.join(loaded, os.path.basename(a[2])[:-6]), "w").write("\tstate = running\n\tpid = 5151\n")
+elif a[0] == "bootout":
+    f = os.path.join(loaded, a[1].rsplit("/", 1)[-1])
+    os.path.exists(f) and os.unlink(f)
+''',
+    "curl": r'''
+url = sys.argv[-1]
+for key, (code, body) in json.load(open(os.path.join(S, "http.json"))):
+    if key in url:
+        sys.stdout.write((body if isinstance(body, str) else json.dumps(body)) + "\n%d" % code); sys.exit(0)
+sys.stdout.write("\n000"); sys.exit(7)
+''',
+    "ssh": r'''
+sys.exit(int(open(os.path.join(S, "ssh_rc")).read()) if os.path.exists(os.path.join(S, "ssh_rc")) else 255)
+''',
+    "fdesetup": r'''
+f = os.path.join(S, "fdesetup.txt")
+sys.stdout.write(open(f).read() if os.path.exists(f) else "FileVault is On.\n")
+''',
+}
+
+
+def write_shims(shim):
+    (shim / "bin").mkdir(parents=True)
+    for name, body in SHIMS.items():
+        p = shim / "bin" / name
+        p.write_text("#!%s\nimport json, os, sys\nS = %r\nopen(os.path.join(S, 'calls.log'), 'a').write(%r + ' ' + "
+                     "' '.join(sys.argv[1:]) + '\\n')\n%s" % (sys.executable, str(shim), name, body))
+        p.chmod(0o755)
+
+
+def cs(home, shim, *args, platform=None, timeout=120):
+    env = _bundle.dead_network_env(home, PATH="%s:%s" % (shim / "bin", os.environ.get("PATH", "/usr/bin:/bin")))
+    env.pop("CS_PLATFORM", None)
+    if platform:
+        env["CS_PLATFORM"] = platform
+    script = home / ".contextstack/current/cs/scripts/cs"
+    if not script.is_file():
+        script = CS_SCRIPT
+    r = subprocess.run([str(script), *args], capture_output=True, text=True, env=env, cwd="/", timeout=timeout)
+    outputs.append(r.stdout + r.stderr)
+    return r
+
+
+def loaded(shim, label, text):
+    (shim / "loaded").mkdir(exist_ok=True)
+    (shim / "loaded" / label).write_text(text)
+
+
+def tunnel_plist(home, label, port, sock, **extra):
+    d = {"Label": label, "ProgramArguments": ["/usr/bin/ssh", "-M", "-S", str(sock), "-N", "-L",
+                                              "127.0.0.1:%d:127.0.0.1:%d" % (port, port + 10), "spark"],
+         "KeepAlive": True, "StandardOutPath": str(home / ".contextstack/logs" / (label + ".out.log")),
+         "StandardErrorPath": str(home / ".contextstack/logs" / (label + ".err.log")), **extra}
+    (home / "Library/LaunchAgents" / (label + ".plist")).write_bytes(plistlib.dumps(d))
+
+
+def plant(home, root, shim):
+    """The faces of a running node: logs, state shelves, node.env, a credentials file, tunnels, launchd, HTTP."""
+    (root / "config/node.env").write_text("export CONTEXTSTACK_NODE_TOKEN=%s\n" % TOKEN)
+    (root / "config/node.env").chmod(0o600)
+    (root / "credentials").mkdir(mode=0o700)
+    (root / "credentials/openai").write_text(CRED + "\n")
+    (root / "credentials/openai").chmod(0o600)
+    logs = root / "logs"
+    (logs / "csgateway.out.log").write_text("gateway line 1\ngateway line 2\ngateway line 3\n")
+    (logs / "csgateway.err.log").write_text("warn: ANTHROPIC_API_KEY=%s from env\n" % LOG_KEY)
+    (logs / "node.out.log").write_text("debug Authorization: Bearer %s\n" % TOKEN + json.dumps(
+        {"ok": True, "skip": "empty", "job_pull": {"ok": True, "error": "director unreachable: connection refused"}}) + "\n")
+    (logs / (T1 + ".err.log")).write_text("ssh: tunnel line\n")
+    state = root / "state"
+    for j in ("j1", "j2", "j3"):
+        (state / "jobs" / j).mkdir(parents=True)
+        (state / "jobs" / j / "job.json").write_text(json.dumps({"job_id": j, "spec": "spec-%s.yaml" % j}))
+    rows = [("d1", "pending", "j1"), ("d1", "running", None), ("d1", "done", None), ("d2", "pending", "j2"), ("d2", "running", None)]
+    with open(state / "dispatch.jsonl", "a") as f:
+        for i, (d, st, job) in enumerate(rows):
+            row = {"id": d, "state": st, "ts": "2026-11-10T10:0%d:00Z" % i, **({"director_job": job, "spec": str(state / "jobs" / job / ("spec-%s.yaml" % job))} if job else {})}
+            row.update({"verdict": "pass"} if st == "done" else {})
+            f.write(json.dumps(row) + "\n")
+    (state / "outbox/acked").mkdir(parents=True)
+    (state / "outbox/job_j1.json").write_text("{}\n")
+    (state / "outbox/run-r1.json").write_text("{}\n")
+    sockdir = home / ".local/share/dgx-spark/ssh"
+    sockdir.mkdir(parents=True)
+    (sockdir / "api-tunnel.sock").write_text("")  # left behind by a dead master
+    tunnel_plist(home, T1, 8000, sockdir / "api-tunnel.sock", WorkingDirectory=str(home / "sites/contextstack/modelgateway"),
+                 EnvironmentVariables={"OPENAI_API_KEY": PLIST_KEY})
+    tunnel_plist(home, T2, 8001, sockdir / "api2-tunnel.sock")
+    gw_plist = home / "Library/LaunchAgents" / (GW + ".plist")  # as on prod-1: installed before --credentials existed
+    p = plistlib.loads(gw_plist.read_bytes())
+    p["EnvironmentVariables"].pop("CSGATEWAY_CREDENTIALS", None)
+    gw_plist.write_bytes(plistlib.dumps(p))
+    loaded(shim, GW, "\tstate = running\n\tpid = 4242\n\tenvironment = {\n\t\tOPENAI_API_KEY => %s\n\t}\n" % PLIST_KEY)
+    loaded(shim, NODE, "\tstate = not running\n\tlast exit code = 0\n")
+    loaded(shim, T1, "\tstate = spawn failed\n\tlast exit code = 78: EX_CONFIG\n")
+    loaded(shim, T2, "\tstate = running\n\tpid = 6262\n")
+    health = {"status": "healthy", "catalog_revision": "r-test123", "models_available": 2, "providers_active": ["vllm"],
+              "discovery_stale": ["vllm-spark2"]}
+    models = {"models": [{"name": "local-coder", "provider": "vllm", "available": True, "tier": 2},
+                         {"name": "local-reasoner", "provider": "vllm-spark2", "available": False, "tier": 3}]}
+    (shim / "http.json").write_text(json.dumps([["127.0.0.1:8000/", [200, "{}"]], [":9200/v1/health", [200, health]],
+                                                [":9200/v1/models", [200, models]], ["/api/v1/nodes/me", [401, {"error": "unauthenticated"}]]]))
+
+
+def doctor(home, shim, **kw):
+    r = cs(home, shim, "doctor", "--json", **kw)
+    try:
+        return r, {f["check"]: f for f in json.loads(r.stdout)}
+    except ValueError:
+        return r, {}
+
+
+def part_install(tmp, uv, managed):
+    home, shim = tmp / "home", tmp / "shim"
+    root = home / ".contextstack"
+    write_shims(shim)
+    bins = _bundle.fake_bins(tmp / "fakebin")
+    _bundle.bundle(tmp / "bundle-a", uv, A, bins)
+    _bundle.bundle(tmp / "bundle-b", uv, B, bins, extra={"RELEASE-B": "b\n"})
+    _bundle.seed_python(home, A, managed)
+    _bundle.seed_python(home, B, managed)
+    env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home)
+    for bundle, extra in (("bundle-a", ["--node", "test-node", "--director", "http://127.0.0.1:9"]), ("bundle-b", [])):
+        r = subprocess.run(["sh", str(LAB / "scripts/node-install"), "install", str(tmp / bundle), *extra, "--no-load"],
+                           capture_output=True, text=True, env=env, cwd="/")
+        if r.returncode != 0:
+            return fail("node-install install %s: %s %s" % (bundle, r.stdout[-600:], r.stderr[-600:]))
+    if not (root / "current/cs/scripts/cs").is_file():
+        return fail("the release has no cs/scripts/cs (cs does not exist)")
+
+    r = cs(home, shim, "release", "list")
+    expect(r.returncode == 0 and "* " + B in r.stdout and A in r.stdout, "release list: both releases, B current: %r" % r.stdout[-300:])
+    r = cs(home, shim, "release", "rollback")
+    calls = (shim / "calls.log").read_text() if (shim / "calls.log").exists() else ""
+    expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + A and "current: %s (was %s)" % (A, B) in r.stdout
+           and "launchctl bootstrap" in calls, "release rollback delegates to node-install (current -> A, launchd through the shim): %r" % r.stdout[-300:])
+    r = cs(home, shim, "release", "switch", B)
+    expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + B, "release switch B: current -> B")
+    r = cs(home, shim, "release", "switch", "no-such-release")
+    expect(r.returncode == 1 and "refused" in r.stdout and os.readlink(root / "current") == "releases/" + B,
+           "release switch to an unknown id: refused, current unchanged")
+
+    plant(home, root, shim)
+    r = cs(home, shim, "status", "--json")
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        d = {}
+        fail("status --json is not JSON: %s %s" % (r.stdout[-400:], r.stderr[-800:]))
+    if d:
+        svc = d["services"]
+        expect(d["release"] == B and len(d["releases"]) == 2, "status --json: release B, two kept")
+        expect(svc["gateway"][0]["up"] and svc["gateway"][0]["pid"] == 4242 and svc["node"][0]["up"],
+               "status --json: gateway up (pid 4242), node tick up")
+        t1 = svc["tunnels"][0]
+        expect(not t1["up"] and t1["last_exit"].startswith("78") and "WorkingDirectory" in t1["reason"] and svc["tunnels"][1]["up"],
+               "status --json: spark-tunnel down, exit 78, WorkingDirectory named; spark2 up: %s" % t1["reason"])
+        g, n = d["gateway"], d["node"]
+        expect(g["status"] == "healthy" and g["catalog_revision"] == "r-test123" and g["discovery_stale"] == ["vllm-spark2"]
+               and "keychain" in g["credentials"], "status --json: gateway health, catalog revision, stale discovery, credential mode")
+        expect(n["estate"] == "test-node" and n["director"] == "http://127.0.0.1:9" and n["director_answers"]
+               and n["token"].startswith("set") and "director unreachable" in n["last_pull"]["result"] and n["outbox_waiting"] == 2,
+               "status --json: estate, director answers, token set, last pull, outbox backlog 2: %s" % n)
+        expect([t["answers"] for t in d["tunnels"]] == [True, False] and d["disk"]["free_gb"] > 0,
+               "status --json: :8000 answers, :8001 does not; free disk")
+    r = cs(home, shim, "status")
+    want = [B, "pid 4242", "spark-tunnel", "78: EX_CONFIG", "catalog r-test123", "answers HTTP 401", "token set",
+            "director unreachable", "outbox 2 waiting", ":8000 answers", ":8001 no answer", "GB free"]
+    missing = [w for w in want if w not in r.stdout]
+    expect(r.returncode == 0 and not missing and len(r.stdout.splitlines()) <= 24,
+           "status: one screen with every field (missing %s)\n%s" % (missing, r.stdout))
+    estate = root / "config/ESTATE"
+    saved_estate = estate.read_text() if estate.is_file() else None
+    estate.unlink(missing_ok=True)
+    try:
+        r = cs(home, shim, "status")
+        expect("ContextStack test-node" in r.stdout and "ContextStack ?" not in r.stdout,
+               "status without ESTATE shows machine name from the install record\n%s" % r.stdout)
+        rec_path = root / "config/install.json"
+        rec = json.loads(rec_path.read_text())
+        saved_node = rec.get("node")
+        rec.pop("node", None)
+        rec_path.write_text(json.dumps(rec, indent=2) + "\n")
+        (root / "config/cs-init.json").write_text(json.dumps({"node": "from-init"}) + "\n")
+        r = cs(home, shim, "status")
+        expect("ContextStack from-init" in r.stdout and "?" not in r.stdout.split(",")[0],
+               "status falls back to cs-init.json machine name\n%s" % r.stdout)
+        (root / "config/cs-init.json").unlink(missing_ok=True)
+        r = cs(home, shim, "status")  # no ESTATE, no install-record node, no cs-init marker: no name, and no "?"
+        first = r.stdout.split(",")[0]
+        expect(first.startswith("ContextStack (") and "?" not in first,
+               "status omits machine name when none is recorded\n%s" % r.stdout)
+        if saved_node is not None:
+            rec["node"] = saved_node
+        else:
+            rec.pop("node", None)
+        rec_path.write_text(json.dumps(rec, indent=2) + "\n")
+    finally:
+        if saved_estate is not None:
+            estate.write_text(saved_estate)
+
+    for label in ("com.contextstack.spark-tunnel", "com.contextstack.spark2-tunnel"):
+        plist = home / "Library/LaunchAgents" / (label + ".plist")
+        original = plist.read_bytes()
+        plist.unlink()
+        try:
+            data = json.loads(cs(home, shim, "status", "--json").stdout)
+            expect(all(v["label"] != label for v in data["services"]["tunnels"])
+                   and all(v["label"] != label for v in data["tunnels"])
+                   and label.removeprefix("com.contextstack.") not in cs(home, shim, "status").stdout,
+                   "status hides absent tunnel plist: " + label)
+            expect(all(data["services"][name] for name in ("gateway", "node", "director", "client-web")),
+                   "status retains other service rows")
+        finally:
+            plist.write_bytes(original)
+
+    r = cs(home, shim, "models")
+    lines = r.stdout.splitlines()
+    expect(r.returncode == 0 and any("local-coder" in l and "vllm" in l and "yes" in l for l in lines)
+           and any("local-reasoner" in l and "no" in l for l in lines), "models: name, provider, available:\n%s" % r.stdout)
+    r = cs(home, shim, "jobs", "--json")
+    jobs = {j["job"]: j for j in json.loads(r.stdout or "{}").get("jobs", [])} if r.returncode == 0 else {}
+    expect(jobs.get("j1", {}).get("state") == "finished done/pass" and jobs["j1"]["send"] == "waiting to send"
+           and jobs.get("j2", {}).get("state") == "running" and jobs.get("j3", {}).get("state") == "accepted",
+           "jobs: j1 finished and waiting to send, j2 running, j3 accepted: %s %s" % (jobs, r.stderr[-400:]))
+    r = cs(home, shim, "jobs")
+    expect(r.returncode == 0 and "run envelopes waiting to send: 1" in r.stdout, "jobs: the run-envelope backlog")
+
+    r = cs(home, shim, "logs", "gateway", "-n", "2")
+    expect(r.returncode == 0 and "gateway line 2\ngateway line 3" in r.stdout and "gateway line 1" not in r.stdout
+           and "ANTHROPIC_API_KEY=<redacted>" in r.stdout, "logs gateway -n 2: the tail of both files, the key redacted")
+    r = cs(home, shim, "logs", "node")
+    expect(r.returncode == 0 and "Bearer <redacted>" in r.stdout, "logs node: the node token redacted")
+    r = cs(home, shim, "logs", "tunnels")
+    expect(r.returncode == 0 and "ssh: tunnel line" in r.stdout and "(no such file)" in r.stdout, "logs tunnels: the plists' log paths")
+    follow_env = _bundle.dead_network_env(home, PATH="%s:%s" % (shim / "bin", os.environ["PATH"]))
+    p = subprocess.Popen([str(root / "current/cs/scripts/cs"), "logs", "gateway", "-n", "0", "-f"], env=follow_env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd="/")
+    out = b""
+    def wait_output(marker):
+        nonlocal out
+        deadline = time.monotonic() + check_timeout(30)
+        while marker not in out and time.monotonic() < deadline:
+            readable, _, _ = select.select([p.stdout], [], [], max(0, deadline - time.monotonic()))
+            if not readable:
+                break
+            chunk = os.read(p.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out += chunk
+        return marker in out
+
+    try:
+        # The last header is flushed after the follower captures all starting offsets.
+        ready = wait_output(("==> %s <==" % (root / "logs/csgateway.err.log")).encode())
+        expect(ready, "logs -f: follower is ready before appending")
+        if ready:
+            with open(root / "logs/csgateway.out.log", "a") as f:
+                f.write("followed ANTHROPIC_API_KEY=%s\n" % LOG_KEY)
+            wait_output(b"followed ANTHROPIC_API_KEY=<redacted>")
+    finally:
+        p.terminate()
+        try:
+            rest, err = p.communicate(timeout=check_timeout(10))
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rest, err = p.communicate()
+        out = out.decode("utf-8", "replace") + rest
+    outputs.append(out + err)
+    expect("followed ANTHROPIC_API_KEY=<redacted>" in out, "logs -f: a new line arrives, redacted: %r" % out[-300:])
+
+    part_ui(home, root, shim)
+
+    r, f = doctor(home, shim)
+    bad = {k for k, v in f.items() if not v["ok"]}
+    want = {"plist paths %s" % T1, "tunnel socket %s" % T1, "gateway credentials"}
+    expect(bad == want and all(f[k]["fix"] for k in want) and r.returncode == 1,
+           "doctor: exit-78 WorkingDirectory, stale tunnel socket, Keychain credential mode; nothing else: %s" % sorted(bad))
+    calls = (shim / "calls.log").read_text()
+    expect("ssh -S %s -O check spark" % (home / ".local/share/dgx-spark/ssh/api-tunnel.sock") in calls,
+           "doctor asks ssh whether the control socket has a live master")
+    node_plist = home / "Library/LaunchAgents" / (NODE + ".plist")
+    p = plistlib.loads(node_plist.read_bytes())
+    p["EnvironmentVariables"]["PATH"] = "/usr/bin:/bin"
+    node_plist.write_bytes(plistlib.dumps(p))
+    (root / "state").chmod(0o755)
+    (root / "workspaces").rmdir()
+    link = home / ".local/bin/cs"  # the runner's PATH command (cs-go / cs-harness); `lab` is retired
+    link.unlink()
+    os.symlink(str(root / "releases/20990000-gone/bin/cs-go"), link)
+    r, f = doctor(home, shim)
+    r_text = cs(home, shim, "doctor")
+    want = {"agent PATH %s" % NODE: "/opt/homebrew/bin", "root state": "chmod 700", "root workspaces": "mkdir -m 700",
+            "link cs": "cs release switch"}
+    expect(all(k in f and not f[k]["ok"] and v in (f[k]["detail"] + f[k]["fix"]) for k, v in want.items()),
+           "doctor: agent PATH without Homebrew, wrong-mode and missing roots, a link into a missing release: %s"
+           % {k: f.get(k) for k in want})
+    expect(r_text.returncode == 1 and r_text.stdout.count("fix: ") == 7, "doctor text: one fix line per problem (7)\n%s" % r_text.stdout)
+    (root / "state").chmod(0o700)
+
+    # Model health uses the installed node's state, with no gateway calls.
+    state = shim / "model-state"
+    state.mkdir()
+    node_plist = home / "Library/LaunchAgents" / (NODE + ".plist")
+    original = node_plist.read_bytes()
+    data = plistlib.loads(original)
+    data.setdefault("EnvironmentVariables", {})["LAB_STATE_ROOT"] = str(state)
+    node_plist.write_bytes(plistlib.dumps(data))
+    def row(model, stop, age=60, **extra):
+        return dict(ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age)),
+                    model=model, stop=stop, **extra)
+    rows = [row("cursor-agent:grok", "provider_unavailable"), row("claude-code", "auth_expired"),
+            row("codex", "provider_limit", allowance={"resets_at": "2099-01-01T12:00:00Z"}),
+            row("gemini-cli", "rate_limit"), row("cleared", "done", 10),
+            row("cleared", "provider_unavailable", 120), row("old", "auth_expired", 90000)]
+    (state / "ledger.jsonl").write_text("bad json\n[]\n" + "".join(json.dumps(r) + "\n" for r in rows))
+    r, findings = doctor(home, shim)
+    models = {k: v for k, v in findings.items() if k.startswith("models:")}
+    expect(len(models) == 4, "doctor models: all four stops, old and cleared runs excluded: %s" % models)
+    expect("Cursor Grok couldn't reach" in models.get("models: cursor-agent:grok", {}).get("detail", ""),
+           "doctor models: readable Cursor Grok name")
+    expect(models.get("models: claude-code", {}).get("fix") == "Run claude, then /login.",
+           "doctor models: shared Claude sign-in command")
+    expect("2099-01-01T12:00:00Z" in models.get("models: codex", {}).get("detail", ""),
+           "doctor models: allowance reset time")
+    text = cs(home, shim, "doctor").stdout
+    expect(all(v["detail"] in text and v["fix"] in text for v in models.values()),
+           "doctor models: text and JSON have the same problems and fixes")
+    node_plist.write_bytes(original)
+
+    # the owner 2026-11-10: the credential store is plain files, so its modes and FileVault are doctor checks (stat only).
+    (root / "credentials/openai").chmod(0o644)
+    (shim / "fdesetup.txt").write_text("FileVault is Off.\n")
+    r, f = doctor(home, shim)
+    cred, fv = f.get("mode credentials/openai") or {}, f.get("filevault") or {}
+    expect(not cred.get("ok", True) and "chmod 600" in cred.get("fix", "") and not fv.get("ok", True)
+           and "Privacy & Security" in fv.get("fix", "") and "FileVault" in fv.get("fix", ""),
+           "doctor: a credential file not 0600 and FileVault off, each with its fix: %s %s" % (cred, fv))
+    expect(CRED not in r.stdout + r.stderr, "doctor never prints a credential while checking its mode")
+    (root / "credentials").chmod(0o755)
+    r, f = doctor(home, shim)
+    expect(not (f.get("mode credentials") or {}).get("ok", True), "doctor: the credentials dir not 0700: %s" % f.get("mode credentials"))
+    (root / "credentials").chmod(0o700)
+    (root / "credentials/openai").chmod(0o600)
+    (shim / "fdesetup.txt").unlink()
+    r, f = doctor(home, shim)
+    expect((f.get("filevault") or {}).get("ok") is True and "mode credentials/openai" not in f,
+           "doctor: FileVault on and 0600 files raise nothing")
+    part_limits(home, root, shim)
+
+    (shim / "calls.log").write_text("")
+    r1, r2, r3 = cs(home, shim, "stop", "gateway"), cs(home, shim, "start", "gateway"), cs(home, shim, "restart", "gateway")
+    calls = (shim / "calls.log").read_text()
+    uid, plist = os.getuid(), home / "Library/LaunchAgents" / (GW + ".plist")
+    expect(all(x.returncode == 0 for x in (r1, r2, r3)) and "booted out; now down" in r1.stdout
+           and "bootstrapped; now up" in r2.stdout and "restarted; now up" in r3.stdout
+           and "launchctl bootout gui/%d/%s" % (uid, GW) in calls and "launchctl bootstrap gui/%d %s" % (uid, plist) in calls
+           and "launchctl kickstart -k gui/%d/%s" % (uid, GW) in calls,
+           "stop/start/restart gateway: bootout, bootstrap, kickstart -k through launchctl:\n%s%s%s" % (r1.stdout, r2.stdout, r3.stdout))
+    r = cs(home, shim, "restart", "tunnels")
+    expect(r.returncode == 0 and r.stdout.count("restarted") == 2, "restart tunnels: both tunnel agents")
+
+    r = cs(home, shim, "start", "gateway", platform="linux")
+    expect(r.returncode == 2 and "not supported here yet" in r.stderr and "Traceback" not in r.stderr, "linux: start says not supported here yet")
+    r = cs(home, shim, "status", platform="linux")
+    expect(r.returncode == 0 and "not supported here yet" in r.stdout and "Traceback" not in r.stderr, "linux: status degrades, no crash")
+    r = cs(home, shim, "doctor", platform="linux")
+    expect("not supported here yet" in r.stdout and "Traceback" not in r.stderr, "linux: doctor skips launchd checks, no crash")
+
+    empty = tmp / "home-empty"
+    empty.mkdir()
+    for args in (("status",), ("doctor",), ("jobs",), ("ui",), ("ui", "--print")):
+        r = cs(empty, shim, *args)
+        expect(r.returncode == 1 and "no ContextStack install on this machine" in r.stderr
+               and "cs update" in r.stderr and "node-install" not in r.stderr and "Traceback" not in r.stderr,
+               "no install: cs %s says so" % " ".join(args))
+
+    calls = (shim / "calls.log").read_text()
+    leaked = [s for s in SECRETS if any(s in o for o in outputs) or s in calls]
+    expect(not leaked, "no secret value in any output or shim call (%d outputs)" % len(outputs))
+    expect("security" not in calls and not [l for l in calls.splitlines() if TOKEN in l], "never security, never the token in a call")
+
+
+def part_limits(home, root, shim):
+    """The paid-API daily limit in status (text and --json); above the default warns. Today's CLI runs are a
+    count with no limit (ADR 0018: the 50-calls-a-day cap is gone); a leftover cli_calls_per_day is ignored."""
+    r = cs(home, shim, "status", "--json")
+    m = (json.loads(r.stdout) if r.returncode == 0 else {}).get("limits")
+    expect(m == {"api_usd_today": 0, "api_usd_per_day": 0, "api_problem": None, "cli_runs_today": 0},
+           "status --json: no limit files mean $0, and no CLI limit: %s" % m)
+    r = cs(home, shim, "status")
+    expect("API today $0.00 of $0.00" in r.stdout and "CLI runs today 0" in r.stdout and " of 50" not in r.stdout,
+           "status: API limit at its default, CLI runs a bare count\n%s" % r.stdout)
+    before = (cs(home, shim, "doctor").stdout.splitlines() or [""])[-1]
+    (root / "config/gateway/limits.json").write_text('{"api_usd_per_day": 2.5}')
+    (root / "config/policy/limits.json").write_text('{"cli_calls_per_day": 80}')
+    (root / "gateway/spend.json").write_text(json.dumps({"day": time.strftime("%Y-%m-%d"), "api_usd": 0.0123}))
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with open(root / "state/ledger.jsonl", "a") as f:
+        for calls in (1, 2):
+            f.write(json.dumps({"ts": now, "cli_invoked": True, "calls": [{"stage": "task"}] * calls}) + "\n")
+        f.write(json.dumps({"ts": now, "cli_invoked": False}) + "\n")
+        f.write(json.dumps({"ts": "2000-01-01T00:00:00Z", "cli_invoked": True}) + "\n")
+    r = cs(home, shim, "status", "--json")
+    m = (json.loads(r.stdout) if r.returncode == 0 else {}).get("limits") or {}
+    expect(m == {"api_usd_today": 0.0123, "api_usd_per_day": 2.5, "api_problem": None, "cli_runs_today": 2},
+           "status --json: today's spend from the gateway counter, today's CLI runs from the ledger: %s" % m)
+    r = cs(home, shim, "status")
+    expect("API today $0.01 of $2.50" in r.stdout and "CLI runs today 2" in r.stdout and "CLI calls" not in r.stdout,
+           "status: API limit and CLI runs\n%s" % r.stdout)
+    r, f = doctor(home, shim)
+    warn = {k for k, v in f.items() if v.get("warn")}
+    text = cs(home, shim, "doctor").stdout
+    last = (text.splitlines() or [""])[-1]
+    expect(warn == {"paid API limit"} and f["paid API limit"]["fix"] and text.count("WARN  ") == 1
+           and "cli_calls_per_day" not in text and last == before + ", 1 warning(s)",
+           "doctor: an API limit above the default warns; a leftover cli_calls_per_day is ignored: %s %r"
+           % (sorted(warn), last))
+    (root / "config/policy/limits.json").write_text("{bad")
+    r, f = doctor(home, shim)
+    expect(f and "spend limits" not in f and not f["paid API limit"].get("ok", True),
+           "doctor: policy/limits.json is no longer read, even unreadable: %s" % f.get("spend limits"))
+    (root / "config/gateway/limits.json").write_text("{bad")
+    r, f = doctor(home, shim)
+    expect(not (f.get("spend limits") or {}).get("ok", True), "doctor: an unreadable limit file is a problem: %s" % f.get("spend limits"))
+    for p in ("config/gateway/limits.json", "config/policy/limits.json", "gateway/spend.json"):
+        (root / p).unlink()
+
+
+UI_URL = "http://127.0.0.1:8799/ui/#code=fixture-ui-code-9f3a"
+
+
+def write_browser_shims(shim, fail=False):
+    """Fake open/xdg-open first on PATH. Record the opener name, never the URL."""
+    (shim / "bin").mkdir(parents=True, exist_ok=True)
+    body = ("#!%s\nimport json, os, stat, sys\nfrom pathlib import Path\n"
+            "name = os.path.basename(sys.argv[0])\n"
+            "page = Path(sys.argv[1])\n"
+            "ok = len(sys.argv) == 2 and 'code=' not in sys.argv[1] and page.is_file()\n"
+            "ok = ok and stat.S_IMODE(page.stat().st_mode) == 0o600 and stat.S_IMODE(page.parent.stat().st_mode) == 0o700\n"
+            "ok = ok and 'location.replace(' in page.read_text() and '#code=' in page.read_text()\n"
+            "open(os.path.join(%r, 'browser-argv.json'), 'w').write(json.dumps(sys.argv[1:]))\n"
+            "open(os.path.join(%r, 'browser.log'), 'a').write(name + (' ok\\n' if ok else ' bad\\n'))\n"
+            "sys.exit(%d)\n")
+    for name in ("open", "xdg-open"):
+        p = shim / "bin" / name
+        p.write_text(body % (sys.executable, str(shim), str(shim), 1 if fail else 0))
+        p.chmod(0o755)
+
+
+def plant_director_rs(root, record):
+    p = root / "current/bin/cs-director"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("#!%s\nimport json, sys\nopen(%r, 'w').write(json.dumps(sys.argv[1:]))\nprint(%r)\n"
+                 % (sys.executable, str(record), UI_URL))
+    p.chmod(0o755)
+
+
+def url_in_files(root, shim):
+    """Paths under the fake HOME or shim whose contents hold the fixture URL (the stub script itself is expected)."""
+    found = []
+    stub = (root / "current/bin/cs-director").resolve()
+    for base in (root, shim):
+        if not base.exists():
+            continue
+        for p in base.rglob("*"):
+            try:
+                if not p.is_file() or p.resolve() == stub:
+                    continue
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if UI_URL in text or "fixture-ui-code-9f3a" in text:
+                found.append(str(p.relative_to(base)))
+    return found
+
+
+def part_ui(home, root, shim):
+    """cs ui against a stub director-rs: --print, browser openers, missing director, no log of the URL."""
+    rec_path = root / "config/install.json"
+    rec_orig = rec_path.read_text() if rec_path.is_file() else None
+    plist_path = home / "Library/LaunchAgents" / "com.contextstack.director-rs.plist"
+    try:
+        kit_scripts = root / "current/cs/scripts"
+        src = LAB / "scripts/cs_ui.py"
+        if src.is_file() and kit_scripts.is_dir() and not (kit_scripts / "cs_ui.py").is_file():
+            shutil.copy2(src, kit_scripts / "cs_ui.py")
+        r = cs(home, shim, "ui", "--print")
+        expect(r.returncode == 1 and "not installed" in r.stderr and "cs-director" in r.stderr
+               and "Traceback" not in r.stderr,
+               "cs ui: no cs-director binary is a clear error: %s" % r.stderr[-300:])
+
+        record = shim / "director-rs.args"
+        plant_director_rs(root, record)
+        r = cs(home, shim, "--help")
+        expect(r.returncode == 0 and "cs ui" in r.stdout and "--print" in r.stdout, "cs --help names cs ui [--print]")
+        expect("task lane" in r.stdout and "Demanded-by" not in r.stdout and "node-install" not in r.stdout
+               and "launchctl bootstrap" not in r.stdout,
+               "cs --help uses public vocabulary only")
+
+        r = cs(home, shim, "ui", "--print")
+        try:
+            argv = json.loads(record.read_text())
+        except (OSError, ValueError):
+            argv = []
+        data = str(root / "state/director")
+        expect(r.returncode == 0 and r.stdout.strip() == UI_URL and "five minutes" not in r.stdout,
+               "cs ui --print: the fixture URL only:\n%s" % r.stdout[-300:])
+        expect(argv[:1] == ["ui-link"] and "--data-dir" in argv and argv[argv.index("--data-dir") + 1] == data
+               and "--listen" not in argv,
+               "cs ui --print: ui-link --data-dir %s, no --listen at the default: %s" % (data, argv))
+
+        rec = json.loads(rec_path.read_text())
+        rec["director_rs_listen"] = ["127.0.0.1:8799"]
+        rec["serve_director_rs"] = True
+        rec_path.write_text(json.dumps(rec, indent=2) + "\n")
+        r = cs(home, shim, "ui", "--print")
+        argv = json.loads(record.read_text()) if record.is_file() else []
+        expect(r.returncode == 0 and r.stdout.strip() == UI_URL and "--listen" in argv
+               and argv[argv.index("--listen") + 1] == "127.0.0.1:8799",
+               "cs ui --print: passes non-default --listen from install.json: %s" % argv)
+
+        rec.pop("director_rs_listen", None)
+        rec_path.write_text(json.dumps(rec, indent=2) + "\n")
+        plist = {"Label": "com.contextstack.director-rs",
+                 "ProgramArguments": [str(root / "current/bin/cs-director"), "serve",
+                                      "--data-dir", str(root / "state/director"), "--listen", "127.0.0.1:8777"]}
+        plist_path.write_bytes(plistlib.dumps(plist))
+        r = cs(home, shim, "ui", "--print")
+        argv = json.loads(record.read_text()) if record.is_file() else []
+        expect(r.returncode == 0 and "--listen" in argv and argv[argv.index("--listen") + 1] == "127.0.0.1:8777",
+               "cs ui --print: --listen from the plist when install.json has none: %s" % argv)
+
+        write_browser_shims(shim)
+        r = cs(home, shim, "ui")
+        blog = (shim / "browser.log").read_text() if (shim / "browser.log").exists() else ""
+        expect(r.returncode == 0 and UI_URL not in r.stdout + r.stderr and "open ok" in blog,
+               "cs ui: fake open on PATH, URL not printed: %r %r" % (r.stdout[-200:], blog))
+
+        (shim / "browser.log").write_text("")
+        r = cs(home, shim, "ui", platform="linux")
+        blog = (shim / "browser.log").read_text() if (shim / "browser.log").exists() else ""
+        expect(r.returncode == 0 and UI_URL not in r.stdout + r.stderr and "xdg-open ok" in blog,
+               "cs ui on linux: fake xdg-open on PATH: %r %r" % (r.stdout[-200:], blog))
+
+        opener_argv = json.loads((shim / "browser-argv.json").read_text())
+        expect(all("code=" not in a for a in opener_argv), "browser argv contains only a private file path, no pairing code")
+
+        write_browser_shims(shim, fail=True)
+        (shim / "browser.log").write_text("")
+        r = cs(home, shim, "ui")
+        expect(r.returncode == 0 and UI_URL in r.stdout and "one-time" in r.stdout and "five minutes" in r.stdout,
+               "cs ui: opener failure prints the one-time five-minute URL:\n%s" % r.stdout[-300:])
+
+        leaked = url_in_files(root, shim)
+        expect(not leaked, "cs ui never writes the URL or code under the install or logs: %s" % leaked)
+    finally:
+        if rec_orig is not None:
+            rec_path.write_text(rec_orig)
+        if plist_path.exists():
+            plist_path.unlink()
+        for name in ("open", "xdg-open"):
+            p = shim / "bin" / name
+            if p.exists():
+                p.unlink()
+
+
+CS_SCRIPT = LAB / "scripts/cs"
+
+
+def part_init_agent():
+    """cs init --agent takes exactly the agents of cs_init.AGENTS that have a template (no other list to drift)."""
+    import contextlib
+    import importlib.machinery
+    import importlib.util
+    import io
+
+    def load(name, path):
+        loader = importlib.machinery.SourceFileLoader(name, str(path))
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+        loader.exec_module(mod)
+        return mod
+
+    init = load("cs_init_check", LAB / "scripts/cs_init.py")
+    cs_mod = load("cs_check_mod", CS_SCRIPT)
+    cs_mod.node_env = lambda: {}
+    cs_mod.client_web_env = lambda: {}
+    # Exercise status without an installed release or access to the real HOME.
+    from unittest.mock import patch
+    with scratch_dir(prefix="cs-status-") as tmp:
+        root = Path(tmp)
+        (root / "releases/fixture").mkdir(parents=True)
+        (root / "current").symlink_to("releases/fixture")
+        agents = root / "agents"
+        agents.mkdir()
+        with patch.multiple(cs_mod, ROOT=root, CURRENT=root / "current", CONFIG=root / "config", AGENTS=agents,
+                            read_json=lambda *a: {}, node_env=lambda: {}, gateway_get=lambda *a: (0, ""),
+                            load_plist=lambda *a: (None, None), credential_mode=lambda *a: "none",
+                            receiver=lambda: {}, read_text=lambda *a: "", last_tick=lambda: {},
+                            state_root=lambda: root, director_data=lambda: {}, client_web_data=lambda: {},
+                            limits_data=lambda: {}, agent=lambda label: {"label": label},
+                            curl=lambda *a, **kw: (0, "")):
+            for present in ((), cs_mod.TUNNELS[:1], cs_mod.TUNNELS):
+                for label in cs_mod.TUNNELS:
+                    plist = agents / (label + ".plist")
+                    if label in present:
+                        plist.touch()
+                    elif plist.exists():
+                        plist.unlink()
+                data = cs_mod.status_data()
+                expect([v["label"] for v in data["services"]["tunnels"]] == list(present)
+                       and [v["label"] for v in data["tunnels"]] == list(present),
+                       "status includes exactly tunnels with plists: %s" % (present,))
+                expect(all(data["services"][name] for name in ("gateway", "node", "director", "client-web")),
+                       "status keeps all other services without plists")
+    templated = sorted(n for n, t in init.AGENTS.items() if t)
+    seen = []
+    cs_mod.cmd_init = lambda args: seen.append(args.agent) or 0
+
+    def run(*argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cs_mod.main(["init", *argv])
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue() + err.getvalue()
+
+    code, _ = run("--agent", "cursor-agent")
+    expect("cursor-agent" in templated and code == 0 and seen == ["cursor-agent"],
+           "init --agent cursor-agent is accepted: %s %s" % (code, seen))
+    code, text = run("--agent", "no-such-agent")
+    expect(code == 2 and seen == ["cursor-agent"] and all(n in text for n in templated),
+           "init --agent no-such-agent is refused, naming the agents that can run: %s" % text)
+    untemplated = [n for n, t in init.AGENTS.items() if not t]
+    for n in untemplated:
+        code, text = run("--agent", n)
+        expect(code == 2 and all(a in text for a in templated), "init --agent %s (no template) is refused: %s" % (n, text))
+    code, text = run("--help")
+    expect(all(n in " ".join(text.split()) for n in templated) and not any(" " + n + "," in text for n in untemplated),
+           "init --help lists the choices")
+    for n in templated:
+        expect(run("--agent", n)[0] == 0 and seen[-1] == n, "init --agent %s is accepted" % n)
+
+
+def main():
+    part_init_agent()
+    uv, managed = _bundle.host_python()
+    if uv is None:
+        print("SKIP cs-cli: %s" % managed)
+        return 1 if problems else 0
+    real = Path.home()
+    watched = [real / ".local/bin", real / "Library/LaunchAgents"]
+    before = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    agents = _bundle.real_agents()
+    tmp = Path(tempfile.mkdtemp(prefix="cs-cli-", suffix=".noindex"))
+    try:
+        part_install(tmp, uv, managed)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    after = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    expect(before == after, "the real ~/.local/bin and ~/Library/LaunchAgents are unchanged")
+    leak = _bundle.launchd_untouched(agents)
+    expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")
+    print("check: cs-cli %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

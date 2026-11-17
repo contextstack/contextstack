@@ -1,0 +1,9 @@
+{
+  "exit": 1,
+  "stdout": "defuddle_extract: Defuddle source content_type is not text/html\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"evidence\": \"_evidence/fetches/study.json\"}, \"name\": \"defuddle_extract\"}\n",
+    "_evidence/derivations/manifest.jsonl": null
+  },
+  "untouched": true
+}

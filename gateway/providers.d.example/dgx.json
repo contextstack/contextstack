@@ -1,0 +1,60 @@
+{
+  "schema": "csgateway.providers.v2",
+  "providers": [
+    {
+      "name": "vllm",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "host": "example-host-1",
+      "capabilities": {
+        "images": false,
+        "tools": true,
+        "streaming": false
+      }
+    },
+    {
+      "name": "vllm-spark2",
+      "protocol": "openai_chat_completions",
+      "endpoint": "http://127.0.0.1:8001/v1",
+      "host": "example-host-2",
+      "capabilities": {
+        "images": false,
+        "tools": true,
+        "streaming": false
+      }
+    }
+  ],
+  "models": [
+    {
+      "name": "local-reasoner",
+      "provider": "vllm-spark2",
+      "tier": 2,
+      "capability": "reasoning",
+      "preferred": false,
+      "candidate": true,
+      "candidate_profiles": [
+        "reasoner",
+        "coder"
+      ],
+      "cost_per_1k": 0,
+      "cost_class": "free_local"
+    }
+  ],
+  "deployments": [
+    {
+      "id": "example-spark2-reasoner",
+      "provider": "vllm-spark2",
+      "endpoint": "http://127.0.0.1:8001/v1",
+      "models": [
+        "local-reasoner"
+      ],
+      "host": "example-host-2",
+      "max_concurrent": 2,
+      "max_queued": 64,
+      "max_wait_ms": 60000,
+      "capacity_basis": "example host overlay; set max_concurrent to what the host can serve"
+    }
+  ],
+  "deployment_hosts": {
+    "example-host-2": 2
+  }
+}

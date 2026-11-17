@@ -1,0 +1,22 @@
+[
+ {
+  "ok": {
+   "text": "calling a tool I was not given",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "warp_drive",
+     "args": {
+      "x": 1
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

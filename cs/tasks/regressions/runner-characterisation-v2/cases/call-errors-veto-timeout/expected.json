@@ -1,0 +1,535 @@
+{
+  "exit_code": 0,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "capture-stimulus",
+      "stdin": {
+        "adapter": "runner",
+        "hooks": [
+          "fx_gate"
+        ],
+        "prompts": [
+          "prompts/coder-min.md"
+        ],
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1",
+        "run_id": "<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1",
+        "runner_implementation": "<RUNNER>",
+        "runner_path": "<RUNNER_PATH>",
+        "spec": "specs/fx.yaml",
+        "spec_sha": "47ab25983c7a0d60fcf0fabcddaedc137bd2365c7ab41bdeb3a1b6e3c055dbe3",
+        "task": "tasks/fx",
+        "tools": [
+          "fs_write",
+          "fx_tool"
+        ],
+        "trial": 1,
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "publish-evidence",
+      "stdin": {
+        "adapter": "runner",
+        "check_exit": 0,
+        "check_output": "",
+        "check_skipped": false,
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1",
+        "stop": "done",
+        "verdict": "pass"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "1.000000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-call-errors-veto-timeout",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
+            "schema": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.990000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          },
+          {
+            "content": "three calls that fail three ways",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "content": "hello",
+                  "path": "deny-hello.txt"
+                },
+                "id": "1",
+                "name": "fs_write"
+              },
+              {
+                "args": {
+                  "mode": "kill"
+                },
+                "id": "2",
+                "name": "fx_tool"
+              },
+              {
+                "args": {
+                  "code": 3,
+                  "mode": "fail",
+                  "out": "plain failure"
+                },
+                "id": "3",
+                "name": "fx_tool"
+              }
+            ]
+          },
+          {
+            "content": "[fs_write {\"content\":\"hello\",\"path\":\"deny-hello.txt\"}] ERROR\npre_tool fx_gate refused: fx_gate: denied deny-hello.txt\n",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "1"
+          },
+          {
+            "content": "[fx_tool {\"mode\":\"kill\"}] ERROR\n\nexit: signal: killed",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "2"
+          },
+          {
+            "content": "[fx_tool {\"code\":3,\"mode\":\"fail\",\"out\":\"plain failure\"}] ERROR\nplain failure\n\nexit: exit status 3",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "3"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-call-errors-veto-timeout",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
+            "schema": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.980000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          },
+          {
+            "content": "three calls that fail three ways",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "content": "hello",
+                  "path": "deny-hello.txt"
+                },
+                "id": "1",
+                "name": "fs_write"
+              },
+              {
+                "args": {
+                  "mode": "kill"
+                },
+                "id": "2",
+                "name": "fx_tool"
+              },
+              {
+                "args": {
+                  "code": 3,
+                  "mode": "fail",
+                  "out": "plain failure"
+                },
+                "id": "3",
+                "name": "fx_tool"
+              }
+            ]
+          },
+          {
+            "content": "[fs_write {\"content\":\"hello\",\"path\":\"deny-hello.txt\"}] ERROR\npre_tool fx_gate refused: fx_gate: denied deny-hello.txt\n",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "1"
+          },
+          {
+            "content": "[fx_tool {\"mode\":\"kill\"}] ERROR\n\nexit: signal: killed",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "2"
+          },
+          {
+            "content": "[fx_tool {\"code\":3,\"mode\":\"fail\",\"out\":\"plain failure\"}] ERROR\nplain failure\n\nexit: exit status 3",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "3"
+          },
+          {
+            "content": "writing",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "content": "hello",
+                  "path": "hello.txt"
+                },
+                "id": "4",
+                "name": "fs_write"
+              }
+            ]
+          },
+          {
+            "content": "[fs_write {\"content\":\"hello\",\"path\":\"hello.txt\"}]\nwrote hello.txt (5 bytes)",
+            "role": "tool",
+            "tool_call_id": "4"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-call-errors-veto-timeout",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
+            "schema": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    }
+  ],
+  "rows": [
+    {
+      "call_errors": {
+        "hook_rejected": 1,
+        "tool_exit": 1,
+        "tool_timeout": 1
+      },
+      "cost_class": "api",
+      "cost_usd": 0.03,
+      "env_sha": "<ENV_SHA>",
+      "est_basis": "rate",
+      "est_usd": 0.03,
+      "estate": "dev",
+      "model": "fake-model",
+      "row_version": 2,
+      "seconds": "<SECONDS>",
+      "spec": "fx-call-errors-veto-timeout",
+      "spec_sha": "47ab25983c7a0d60fcf0fabcddaedc137bd2365c7ab41bdeb3a1b6e3c055dbe3",
+      "stimulus_sha": "<STIMULUS_SHA>",
+      "stop": "done",
+      "task": "tasks/fx",
+      "task_sha": "93cb431da1cef22a7d34a14d103f90ad3987451606e052447cbe9aa28fa171dc",
+      "tool_calls": 4,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 3,
+      "verdict": "pass"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1",
+      "entries": [
+        "check.json",
+        "evidence",
+        "finalize.lock",
+        "finalized.json",
+        "messages.jsonl",
+        "ready_for_inspection",
+        "stimulus",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "frozen": {
+        "check": "#!/bin/sh\n[ \"$(cat hello.txt)\" = \"hello\" ]\n",
+        "goal.md": "Create hello.txt containing exactly: hello\n"
+      },
+      "messages": [
+        {
+          "budget": {
+            "seconds": 0,
+            "tool_calls": 10,
+            "turns": 4,
+            "usd": 1
+          },
+          "event": "header",
+          "model": "fake",
+          "spec": "fx-call-errors-veto-timeout",
+          "task": "tasks/fx",
+          "trial": 1
+        },
+        {
+          "event": "turn",
+          "text": "three calls that fail three ways",
+          "turn": 1
+        },
+        {
+          "args": {
+            "content": "hello",
+            "path": "deny-hello.txt"
+          },
+          "content": "pre_tool fx_gate refused: fx_gate: denied deny-hello.txt\n",
+          "error": true,
+          "event": "tool",
+          "name": "fs_write",
+          "turn": 1
+        },
+        {
+          "args": {
+            "mode": "kill"
+          },
+          "content": "\nexit: signal: killed",
+          "error": true,
+          "event": "tool",
+          "name": "fx_tool",
+          "turn": 1
+        },
+        {
+          "args": {
+            "code": 3,
+            "mode": "fail",
+            "out": "plain failure"
+          },
+          "content": "plain failure\n\nexit: exit status 3",
+          "error": true,
+          "event": "tool",
+          "name": "fx_tool",
+          "turn": 1
+        },
+        {
+          "event": "turn",
+          "text": "writing",
+          "turn": 2
+        },
+        {
+          "args": {
+            "content": "hello",
+            "path": "hello.txt"
+          },
+          "content": "wrote hello.txt (5 bytes)",
+          "error": false,
+          "event": "tool",
+          "name": "fs_write",
+          "turn": 2
+        },
+        {
+          "event": "turn",
+          "text": "done",
+          "turn": 3
+        }
+      ],
+      "transcript": "# fx-call-errors-veto-timeout · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nthree calls that fail three ways\n\n`fs_write {\"content\":\"hello\",\"path\":\"deny-hello.txt\"}` ERROR\n\n```\npre_tool fx_gate refused: fx_gate: denied deny-hello.txt\n\n```\n\n`fx_tool {\"mode\":\"kill\"}` ERROR\n\n```\n\nexit: signal: killed\n```\n\n`fx_tool {\"code\":3,\"mode\":\"fail\",\"out\":\"plain failure\"}` ERROR\n\n```\nplain failure\n\nexit: exit status 3\n```\n\n### turn 2\n\nwriting\n\n`fs_write {\"content\":\"hello\",\"path\":\"hello.txt\"}`\n\n```\nwrote hello.txt (5 bytes)\n```\n\n### turn 3\n\ndone\n\n---\nstop done · verdict **pass** · turns 3 · tools 4 · cost $0.0300\n",
+      "workspace": {
+        ".lab-calls.jsonl": "{\"args\": {\"content\": \"hello\", \"path\": \"hello.txt\"}, \"name\": \"fs_write\"}\n",
+        ".lab-pretool.jsonl": "{\"LAB_CHECK\": \"<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1/stimulus/check\", \"LAB_TOOL\": \"fs_write\", \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_CHECK\", \"LAB_TOOL\", \"LANG\", \"PATH\", \"TMPDIR\"], \"stdin\": {\"args\": {\"content\": \"hello\", \"path\": \"deny-hello.txt\"}, \"name\": \"fs_write\"}}\n{\"LAB_CHECK\": \"<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1/stimulus/check\", \"LAB_TOOL\": \"fx_tool\", \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_CHECK\", \"LAB_TOOL\", \"LANG\", \"PATH\", \"TMPDIR\"], \"stdin\": {\"args\": {\"mode\": \"kill\"}, \"name\": \"fx_tool\"}}\n{\"LAB_CHECK\": \"<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1/stimulus/check\", \"LAB_TOOL\": \"fx_tool\", \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_CHECK\", \"LAB_TOOL\", \"LANG\", \"PATH\", \"TMPDIR\"], \"stdin\": {\"args\": {\"code\": 3, \"mode\": \"fail\", \"out\": \"plain failure\"}, \"name\": \"fx_tool\"}}\n{\"LAB_CHECK\": \"<ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-veto-timeout-fx-t1/stimulus/check\", \"LAB_TOOL\": \"fs_write\", \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_CHECK\", \"LAB_TOOL\", \"LANG\", \"PATH\", \"TMPDIR\"], \"stdin\": {\"args\": {\"content\": \"hello\", \"path\": \"hello.txt\"}, \"name\": \"fs_write\"}}\n",
+        "hello.txt": "hello"
+      }
+    }
+  ],
+  "stderr": [],
+  "stdout": [
+    "  tasks/fx                       t1  pass stop=done turns=3 tools=4 $0.0300"
+  ]
+}

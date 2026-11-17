@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+# Fixture-only pre_tool hook. Records what the runner handed it (stdin JSON,
+# LAB_TOOL, LAB_CHECK, cwd, environment names) to .lab-pretool.jsonl in the
+# workspace, then decides by the call's args.path: "deny-*" exits 1 (veto this
+# call), "abort-*" exits 2 (abort the run), anything else exits 0 (run it).
+import json
+import os
+import sys
+
+call = json.load(sys.stdin)
+with open(".lab-pretool.jsonl", "a", encoding="utf-8") as f:
+    f.write(json.dumps({"stdin": call, "LAB_TOOL": os.environ.get("LAB_TOOL"),
+                        "LAB_CHECK": os.environ.get("LAB_CHECK"),
+                        "cwd_base": os.path.basename(os.getcwd()),
+                        "env_names": sorted(os.environ)}, sort_keys=True) + "\n")
+path = str((call.get("args") or {}).get("path", ""))
+if path.startswith("deny-"):
+    print("fx_gate: denied " + path)
+    sys.exit(1)
+if path.startswith("abort-"):
+    print("fx_gate: abort at " + path)
+    sys.exit(2)
+sys.exit(0)

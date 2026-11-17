@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+root=Path(__file__).resolve().parents[3]
+s=(root/'scripts/check').read_text();body=s[s.index('fail=0'):s.index('# Spec-queue isolation:')]
+# Never scan the checkout or leave retained failure logs in the shared temp root.
+# Poison grep's checkout scan: the extracted background harness must not run it.
+with scratch_dir(prefix="check-failure-output-") as raw:
+    tmp = Path(raw)
+    grep = tmp / "grep"
+    grep.write_text('#!/bin/sh\nif [ "$1" = -rlE ]; then echo synthetic-shared-scratch; else exec /usr/bin/grep "$@"; fi\n')
+    grep.chmod(0o755)
+    env = {**hermetic_env(), 'TMPDIR': raw, 'PATH': raw + os.pathsep + os.environ['PATH']}
+    for status in (0,7):
+        probe="\nbg_rule diagnostic-guard bash -c 'echo synthetic-stdout; echo synthetic-traceback >&2; exit %d'\nwait_rules\nexit \"$fail\"\n" % status
+        r=subprocess.run(['bash','-c',body+probe],text=True,capture_output=True,env=env,cwd=tmp)
+        assert r.returncode==(1 if status else 0),(r.returncode,r.stdout,r.stderr)
+        if status:
+            assert all(x in r.stdout for x in ('check: FAIL — diagnostic-guard','synthetic-stdout','synthetic-traceback')),r.stdout
+        else:assert not r.stdout and not r.stderr,(r.stdout,r.stderr)
+print('check: failed background checks retain diagnostics; successful checks stay quiet')

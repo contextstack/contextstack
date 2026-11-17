@@ -1,0 +1,9 @@
+{
+  "exit": 0,
+  "stdout": "{\"action\": \"registered\", \"body_path\": \"_evidence/bodies/4ad3a44e6d902a4ed27e71db6675c6e04d6569e1056973ccbd92d2deb7a16bf5.html\", \"ok\": true, \"source_url\": \"https://93.184.216.34/fixture\"}\n",
+  "files": {
+    "_evidence/assertions.jsonl": "{\"body_path\": \"_evidence/bodies/4ad3a44e6d902a4ed27e71db6675c6e04d6569e1056973ccbd92d2deb7a16bf5.html\", \"quote\": \"The fixture fact is stable.\", \"schema_version\": \"0.1\", \"source_url\": \"https://93.184.216.34/fixture\"}\n",
+    ".lab-calls.jsonl": "{\"args\": {\"quote\": \"The fixture fact is stable.\", \"source_url\": \"https://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
+  },
+  "untouched": true
+}

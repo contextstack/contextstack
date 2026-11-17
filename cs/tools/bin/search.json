@@ -1,0 +1,6 @@
+{
+  "runtime": "python3",
+  "sandbox": {"net": "none"},
+  "description": "Search workspace files for a regex pattern. Args: {pattern}. Output clipped to 8KB.",
+  "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}
+}

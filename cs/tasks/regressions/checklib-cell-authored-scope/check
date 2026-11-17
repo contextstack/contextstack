@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Every checklib rail: inherited violations pass; cell-authored fail by name."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+CHECKLIB = LAB / "scripts/checklib.sh"
+RERUN = LAB / "hooks/bin/rerun-check"
+WRAPPER = '#!/bin/sh\n. "$CHECKLIB_PATH"\necho check: ok\n'
+
+
+def git(cwd, env, *args):
+    git_env = {
+        **env,
+        "GIT_AUTHOR_NAME": "Fixture",
+        "GIT_AUTHOR_EMAIL": "f@example.test",
+        "GIT_COMMITTER_NAME": "Fixture",
+        "GIT_COMMITTER_EMAIL": "f@example.test",
+    }
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True, text=True, check=True, env=git_env,
+    )
+
+
+def write(path, body):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def run_check(ws, env, wrapper):
+    wrapper.write_text(WRAPPER, encoding="utf-8")
+    wrapper.chmod(0o755)
+    direct = subprocess.run([str(wrapper)], cwd=str(ws), capture_output=True, text=True, env=env)
+    rerun = subprocess.run(
+        [str(RERUN)], cwd=str(ws), capture_output=True, text=True,
+        env={**env, "LAB_CHECK": str(wrapper)},
+    )
+    return direct, rerun
+
+
+def assert_pass(direct, rerun):
+    text = direct.stdout + direct.stderr + rerun.stdout + rerun.stderr
+    assert direct.returncode == 0, text
+    assert rerun.returncode == 0, text
+    assert "syntax error" not in text, text
+    assert "check: ok" in direct.stdout, text
+
+
+def assert_fail(direct, rerun, needle, named):
+    text = direct.stdout + direct.stderr
+    assert direct.returncode != 0, text
+    assert needle in text, text
+    assert named in text, text
+    rtext = rerun.stdout + rerun.stderr
+    assert rerun.returncode != 0, rtext
+    assert needle in rtext, rtext
+    assert named in rtext, rtext
+    for inherited in (
+        "InheritedSeeTest.php", "InheritedAposTest.php", "InheritedAtTest.php",
+        "InheritedMethodTest.php", "InheritedSeeNoOkTest.php", "mockup-golden.json",
+        "app/View.php",
+    ):
+        assert inherited not in text, text
+        assert inherited not in rtext, rtext
+
+
+with scratch_dir(prefix="checklib-cell-authored-scope-") as raw:
+    root = Path(raw)
+    home = root / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != "LAB_CHECK"}
+    env.update(
+        CHECKLIB_PATH=str(CHECKLIB),
+        HOME=str(home),
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_CONFIG_SYSTEM="/dev/null",
+    )
+    ws = root / "workspace"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(ws)], check=True, env=env)
+    git(ws, env, "config", "user.email", "f@example.test")
+    git(ws, env, "config", "user.name", "Fixture")
+    write(ws / "tests/Feature/InheritedSeeTest.php",
+          "<?php\n        $response->assertOk()->assertSee(\"Today\", false);\n")
+    write(ws / "tests/Feature/InheritedAposTest.php",
+          "<?php\n        $response->assertOk()->assertSee('it&#039;s');\n")
+    write(ws / "tests/Feature/InheritedAtTest.php",
+          "<?php\n    /** @test */\n    public function test_ok() {}\n")
+    write(ws / "tests/Feature/InheritedMethodTest.php",
+          "<?php\n    public function itWorks() {}\n")
+    write(ws / "tests/Feature/InheritedSeeNoOkTest.php",
+          "<?php\n        $this->get('/')->assertSee('Today');\n")
+    write(ws / "tests/Fixtures/mockup-golden.json", home.as_posix() + "/secret.json\n")
+    write(ws / "app/View.php", "<?php echo \"\\u003cdiv\\u003e\";\n")
+    git(ws, env, "add", "-A")
+    git(ws, env, "commit", "-qm", "inherited dest violations")
+    gitdir = ws / ".git" / "config"
+    gitdir.write_text(gitdir.read_text() + "\n# " + home.as_posix() + "/git-home\n")
+
+    wrapper = ws / "check"
+    assert_pass(*run_check(ws, env, wrapper))
+
+    cases = [
+        (ws / "tests/Feature/CellSeeTest.php",
+         "<?php\n        $response->assertSee(\"Today\", false);\n",
+         "assertSee(..., false) is banned", "tests/Feature/CellSeeTest.php"),
+        (ws / "tests/Feature/CellAposTest.php",
+         "<?php\n        $response->assertOk()->assertSee('it&#039;s');\n",
+         "&#039; in tests is banned", "tests/Feature/CellAposTest.php"),
+        (ws / "tests/Feature/CellAtTest.php",
+         "<?php\n    /** @test */\n    public function test_ok() {}\n",
+         "PHPUnit @test is banned", "tests/Feature/CellAtTest.php"),
+        (ws / "tests/Feature/CellMethodTest.php",
+         "<?php\n    public function itWorks() {}\n",
+         "PHPUnit 12 methods must be test_*", "tests/Feature/CellMethodTest.php"),
+        (ws / "tests/Feature/CellSeeNoOkTest.php",
+         "<?php\n        $this->get('/')->assertSee('Today');\n",
+         "page assertSee must assert HTTP 200 first", "tests/Feature/CellSeeNoOkTest.php"),
+        (ws / "app/CellView.php",
+         "<?php echo \"\\u003cdiv\\u003e\";\n",
+         "write real HTML tags", "app/CellView.php"),
+        (ws / "out.txt",
+         home.as_posix() + "/candidate-home\n",
+         "absolute home path in candidate output", "out.txt"),
+    ]
+    for path, body, needle, named in cases:
+        write(path, body)
+        assert_fail(*run_check(ws, env, wrapper), needle, named)
+        path.unlink()
+
+    setup = root / "task/setup"
+    setup.mkdir(parents=True)
+    write(setup / "tests/Fixtures/mockup-golden.json", home.as_posix() + "/setup.json\n")
+    bare = root / "bare"
+    bare.mkdir()
+    write(bare / "tests/Fixtures/mockup-golden.json", home.as_posix() + "/setup.json\n")
+    check = root / "task/check"
+    check.write_text(WRAPPER, encoding="utf-8")
+    check.chmod(0o755)
+    bare_env = {**env, "LAB_CHECK": str(check)}
+    inherited_bare = subprocess.run(
+        [str(check)], cwd=str(bare), capture_output=True, text=True, env=bare_env)
+    assert inherited_bare.returncode == 0, inherited_bare.stdout + inherited_bare.stderr
+    write(bare / "out.txt", home.as_posix() + "/bare-home\n")
+    authored_bare = subprocess.run(
+        [str(check)], cwd=str(bare), capture_output=True, text=True, env=bare_env)
+    text = authored_bare.stdout + authored_bare.stderr
+    assert authored_bare.returncode != 0, text
+    assert "absolute home path in candidate output" in text, text
+    assert "out.txt" in text, text
+    assert "mockup-golden.json" not in text, text
+
+print("check: every checklib rail and post-turn rerun is candidate-diff scoped and names the file")

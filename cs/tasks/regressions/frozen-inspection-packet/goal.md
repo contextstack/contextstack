@@ -1,0 +1,1 @@
+Factory-readiness audit finding 1: all inspection facts and plain-file output content survive task/workspace edits and pruning under the same evidence identity. Missing frozen bytes refuse inspection.

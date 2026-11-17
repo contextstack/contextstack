@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""long evidence paths require a capable sender before transfer."""
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+BACKUP = Path.cwd() / "ops/bin/evidence-backup"
+
+
+def write_executable(path, text):
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+with scratch_dir(prefix="evidence-backup-long-path-") as raw:
+    base = Path(raw)
+    source = base / "source"
+    source.mkdir()
+    components = [("segment-%02d-" % n) + ("x" * 90) for n in range(10)]
+    cwd = Path.cwd()
+    os.chdir(source)
+    try:
+        relative = Path(".")
+        for component in components:
+            relative /= component
+            relative.mkdir()
+        directory = os.open(".", os.O_RDONLY)
+        try:
+            for component in components:
+                child = os.open(component, os.O_RDONLY, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            leaf = os.open(
+                "transcript.jsonl", os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o644, dir_fd=directory,
+            )
+            os.write(leaf, b"immutable evidence\n")
+            os.close(leaf)
+        finally:
+            os.close(directory)
+    finally:
+        os.chdir(cwd)
+
+    target = base / "target"
+    target.mkdir()
+    planted = source / "run-a"
+    (planted / "workspace").mkdir(parents=True)
+    (planted / "workspace" / "secret.bin").write_bytes(b"workspace")
+    (planted / "stimulus").mkdir()
+    (planted / "stimulus" / "in.txt").write_text("stimulus\n")
+    (planted / "evidence").mkdir()
+    (planted / "evidence" / "check.json").write_text("{}\n")
+    (planted / "check.out").write_text("check output\n")
+    (target / "retained").write_text("older evidence\n")
+    (target / "run-a" / "workspace").mkdir(parents=True)
+    (target / "run-a" / "workspace" / "old.bin").write_bytes(b"old")
+    socket = base / "socket"
+    socket.touch()
+    events = base / "events.jsonl"
+
+    ssh = base / "ssh"
+    write_executable(ssh, """#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+with open(os.environ['TEST_EVENTS'], 'a') as out:
+    out.write(json.dumps({'program':'ssh','args':sys.argv[1:]})+'\\n')
+argv = sys.argv[1:]
+while argv and argv[0].startswith('-'):
+    argv = argv[2:] if argv[0] in ('-S', '-o') else argv[1:]
+argv = argv[1:]
+if argv and argv[0] == 'mkdir':
+    pathlib.Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+elif argv and argv[0] == 'find':
+    root = pathlib.Path(argv[1])
+    if root.is_dir():
+        for path in list(root.rglob('workspace')):
+            if path.is_dir() and path.name == 'workspace':
+                shutil.rmtree(path)
+""")
+
+    openrsync = base / "openrsync"
+    write_executable(openrsync, """#!/usr/bin/env python3
+import json, os, sys
+if '--version' in sys.argv:
+    print('openrsync: protocol version 29')
+    print('rsync version 2.6.9 compatible')
+    raise SystemExit(0)
+with open(os.environ['TEST_EVENTS'], 'a') as out:
+    out.write(json.dumps({'program':'openrsync-transfer','args':sys.argv[1:]})+'\\n')
+print('Assertion failed: (pathbufsz > fts_pathlen), function flist_dirent_normalize', file=sys.stderr)
+raise SystemExit(134)
+""")
+
+    gnu_rsync = base / "gnu-rsync"
+    write_executable(gnu_rsync, """#!/usr/bin/env python3
+import json, os, pathlib, sys
+if '--version' in sys.argv:
+    print('rsync  version 3.2.7  protocol version 31')
+    raise SystemExit(0)
+source = pathlib.Path(sys.argv[-2].rstrip('/'))
+target = pathlib.Path(sys.argv[-1].split(':', 1)[1])
+with open(os.environ['TEST_EVENTS'], 'a') as out:
+    out.write(json.dumps({'program':'gnu-rsync-transfer','args':sys.argv[1:]})+'\\n')
+target.mkdir(parents=True, exist_ok=True)
+def copy_tree(source_fd, target_fd):
+    for entry in os.scandir(source_fd):
+        if entry.name == 'workspace':
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            try:
+                os.mkdir(entry.name, dir_fd=target_fd)
+            except FileExistsError:
+                pass
+            child_source = os.open(entry.name, os.O_RDONLY, dir_fd=source_fd)
+            child_target = os.open(entry.name, os.O_RDONLY, dir_fd=target_fd)
+            try:
+                copy_tree(child_source, child_target)
+            finally:
+                os.close(child_source); os.close(child_target)
+        elif entry.is_file(follow_symlinks=False):
+            incoming = os.open(entry.name, os.O_RDONLY, dir_fd=source_fd)
+            outgoing = os.open(entry.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                               0o644, dir_fd=target_fd)
+            try:
+                while True:
+                    block = os.read(incoming, 65536)
+                    if not block:
+                        break
+                    os.write(outgoing, block)
+            finally:
+                os.close(incoming); os.close(outgoing)
+source_fd = os.open(source, os.O_RDONLY)
+target_fd = os.open(target, os.O_RDONLY)
+try:
+    copy_tree(source_fd, target_fd)
+finally:
+    os.close(source_fd); os.close(target_fd)
+""")
+
+    common = {
+        **hermetic_env(),
+        "EVIDENCE_BACKUP_SOCKET": str(socket),
+        "EVIDENCE_BACKUP_SSH": str(ssh),
+        "EVIDENCE_BACKUP_SOURCE": str(source),
+        "EVIDENCE_BACKUP_TARGET": "fixture:" + str(target),
+        "TEST_EVENTS": str(events),
+        "TMPDIR": str(base),
+    }
+    rejected = subprocess.run(
+        [str(BACKUP)],
+        env={**common, "EVIDENCE_BACKUP_RSYNC": str(openrsync)},
+        text=True,
+        capture_output=True,
+    )
+    assert rejected.returncode != 0, rejected.stdout
+    rejection = json.loads(rejected.stderr)
+    assert "GNU rsync 3.x" in rejection["error"], rejection
+    rows = [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
+    assert not any(row["program"] in ("ssh", "openrsync-transfer") for row in rows), rows
+
+    completed = subprocess.run(
+        [str(BACKUP)],
+        env={**common, "EVIDENCE_BACKUP_RSYNC": str(gnu_rsync)},
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    result = json.loads(completed.stdout)
+    assert result["ok"] is True and result["source"] == str(source), result
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [row["program"] for row in rows] == ["ssh", "ssh", "gnu-rsync-transfer", "ssh"], rows
+    assert (target / "retained").read_text() == "older evidence\n"
+    assert (target / "run-a" / "stimulus" / "in.txt").read_text() == "stimulus\n"
+    assert (target / "run-a" / "evidence" / "check.json").read_text() == "{}\n"
+    assert (target / "run-a" / "check.out").read_text() == "check output\n"
+    assert not (target / "run-a" / "workspace").exists()
+    directory = os.open(target, os.O_RDONLY)
+    try:
+        for component in components:
+            child = os.open(component, os.O_RDONLY, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        leaf = os.open("transcript.jsonl", os.O_RDONLY, dir_fd=directory)
+        assert os.read(leaf, 1024) == b"immutable evidence\n"
+        os.close(leaf)
+    finally:
+        os.close(directory)
+
+print("evidence backup: rejects openrsync before effects and preserves long-path evidence with GNU rsync")

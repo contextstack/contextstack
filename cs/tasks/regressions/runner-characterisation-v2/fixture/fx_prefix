@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+# Fixture-only CS_TOOL_PREFIX. Not a wrapper: it prints its own words and the command after
+# its "--", then execs that command as cs-sandbox would, so tool-exe-dispatch shows the runner
+# prepending the prefix to a runtime exe tool's bin and args.
+import os
+import sys
+
+words = sys.argv[1:]
+cut = words.index("--")
+print("fx_prefix %s -- %s" % (" ".join(words[:cut]), " | ".join(words[cut + 1:])), flush=True)
+os.execv(words[cut + 1], words[cut + 1:])

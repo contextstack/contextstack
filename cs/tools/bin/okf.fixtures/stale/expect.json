@@ -1,0 +1,6 @@
+{
+  "exit": 0,
+  "stdout": "{\"ok\":true,\"action\":\"stale\",\"now\":\"2026-01-02T00:00:00Z\",\"stale\":[{\"path\":\"stale.md\",\"stale_after\":\"2026-01-01T00:00:00Z\",\"overdue_seconds\":86400}]}\n",
+  "files": {},
+  "untouched": true
+}

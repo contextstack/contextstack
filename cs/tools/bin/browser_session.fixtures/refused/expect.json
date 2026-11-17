@@ -1,0 +1,11 @@
+{
+  "exit": 1,
+  "stdout": "browser_session: browser broker refused: navigation failed: net::ERR_BLOCKED_BY_CLIENT; blocked ['https://evil.example/']\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"url\": \"https://example.com/out\"}, \"name\": \"browser_session\"}\n",
+    "broker-requests.jsonl": "{\"url\": \"https://example.com/out\", \"verb\": \"open\"}\n",
+    "_evidence/manifest.jsonl": null,
+    "_evidence/fetches": null
+  },
+  "untouched": true
+}

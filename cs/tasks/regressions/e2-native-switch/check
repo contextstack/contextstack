@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Exercise the switched native, Muse, adapter and lead request builders and Rust transport against frozen bytes."""
+from pathlib import Path
+import runpy
+import sys
+
+runpy.run_path(str(Path(__file__).with_name('failures.py')))
+sys.argv = [str(Path(__file__).parents[1] / 'e2-sbpl-baseline/reference.py'), '--production']
+runpy.run_path(sys.argv[0], run_name='__main__')

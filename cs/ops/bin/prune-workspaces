@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Delete settled run workspaces after a published evidence diff exists."""
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parent.parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from _estate_io import hardened_git_env, state_dir, append_jsonl, sha256_bytes
+
+TS = re.compile(r"^(\d{8})-\d{6}")
+FAMILIES = ("corpus-*", "exp-*", "flowchart/director", "probes", "other")
+LIFECYCLE = "20260905"
+
+
+def family_of(name):
+    rest = TS.sub("", name).lower()
+    if "flowchart" in rest or "director-delivery" in rest:
+        return "flowchart/director"
+    if rest.startswith("corpus-") or "-corpus-" in rest:
+        return "corpus-*"
+    if "probe" in rest or rest.startswith("hello-smoke") or "standing-" in rest:
+        return "probes"
+    if "exp-" in rest:
+        return "exp-*"
+    return "other"
+
+
+def run_date(name):
+    match = TS.match(name)
+    return match.group(1) if match else ""
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", str(cwd), *args], capture_output=True, text=True, env=hardened_git_env())
+
+
+def dir_size(path):
+    result = subprocess.run(["du", "-sk", str(path)], capture_output=True, text=True)
+    if result.returncode and not result.stdout.strip():
+        return 0
+    return int(result.stdout.splitlines()[-1].split()[0]) * 1024
+
+
+def tree_hash(workspace):
+    from _lifecycle_evidence import workspace_members
+    digest = hashlib.sha256()
+    for path, rel in workspace_members(workspace):
+        digest.update(rel.encode() + b"\0")
+        if path.is_symlink():
+            digest.update(b"link:" + os.readlink(path).encode())
+        else:
+            digest.update(sha256_bytes(path.read_bytes()).encode())
+    return digest.hexdigest()
+
+
+def ledger_index(lab):
+    index = {}
+    path = state_dir(lab) / "ledger.jsonl"
+    if not path.is_file():
+        return index
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        transcript = str(row.get("transcript") or "")
+        if not transcript:
+            continue
+        index[Path(transcript).name] = row
+    return index
+
+
+def settled(row):
+    return bool(row and str(row.get("verdict") or "").strip())
+
+
+def evidence_ready(run_dir):
+    manifest = run_dir / "evidence/manifest.json"
+    if not manifest.is_file():
+        return False, "", ""
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "", ""
+    if data.get("capture_state") != "complete":
+        return False, "", ""
+    block = data.get("diff") or {}
+    blob = run_dir / "evidence" / str(block.get("path") or "")
+    if not blob.is_file():
+        return False, "", ""
+    return True, str((data.get("base") or {}).get("commit") or data.get("base_sha") or ""), str(data.get("evidence_sha") or "")
+
+
+def workspace_base(workspace):
+    if not (workspace / ".git").exists():
+        return ""
+    for ref in ("refs/lab/base", "HEAD"):
+        result = git(workspace, "rev-parse", "--verify", ref)
+        if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", result.stdout.strip()):
+            return result.stdout.strip()
+    return ""
+
+
+def publish_diff(run_dir, workspace, base_sha):
+    evidence = run_dir / "evidence"
+    evidence.mkdir(parents=True, exist_ok=True)
+    if (workspace / ".git").exists() and base_sha:
+        diff = git(workspace, "diff", "--binary", base_sha)
+        if diff.returncode:
+            return False, "", "git diff failed"
+        payload = diff.stdout.encode()
+        kind = "git"
+    else:
+        return False, "", "base cannot be determined"
+    name = "candidate.diff"
+    (evidence / name).write_bytes(payload)
+    from _lifecycle_evidence import pack_workspace
+    raw = pack_workspace(workspace)
+    packed = gzip.compress(raw, compresslevel=9, mtime=0)
+    (evidence / "candidate.tar.gz").write_bytes(packed)
+    body = {
+        "base": {"kind": kind, "commit": base_sha},
+        "base_sha": base_sha,
+        "capture_state": "complete",
+        "contract_version": "lifecycle-v1",
+        "candidate_archive": {
+            "path": "candidate.tar.gz",
+            "sha256": sha256_bytes(packed),
+            "bytes": len(packed),
+            "source_bytes": len(raw),
+            "scope": "workspace_walk",
+        },
+        "diff": {"path": name, "sha256": sha256_bytes(payload), "bytes": len(payload)},
+        "run_id": run_dir.name,
+        "source": "prune-workspaces",
+    }
+    body["evidence_sha"] = hashlib.sha256(json.dumps(
+        {k: v for k, v in body.items() if k != "evidence_sha"},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    (evidence / "manifest.json").write_text(json.dumps(body, sort_keys=True) + "\n")
+    return True, body["evidence_sha"], ""
+
+
+def reconstruct_evidence(run_dir, source_repo, base_sha):
+    from _lifecycle_evidence import inspection_workspace
+    manifest = json.loads((run_dir / "evidence/manifest.json").read_text())
+    if manifest.get("candidate_archive"):
+        with inspection_workspace(run_dir, manifest) as frozen:
+            return tree_hash(frozen)
+    blob = run_dir / "evidence" / str((manifest.get("diff") or {}).get("path") or "")
+    return reconstruct(source_repo, base_sha, blob)
+
+
+def reconstruct(source_repo, base_sha, diff_path):
+    staging = Path(tempfile.mkdtemp(prefix="prune-rebuild-"))
+    try:
+        cloned = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "clone", "--quiet", str(source_repo), str(staging / "ws")],
+                                capture_output=True, text=True, env=hardened_git_env())
+        if cloned.returncode:
+            raise ValueError(cloned.stderr or "clone failed")
+        clone = staging / "ws"
+        checkout = git(clone, "checkout", "--force", base_sha)
+        if checkout.returncode:
+            raise ValueError(checkout.stderr or "checkout failed")
+        diff_path = Path(diff_path)
+        if diff_path.is_file() and diff_path.stat().st_size:
+            raw = diff_path.read_bytes()
+            if diff_path.name.endswith(".gz") or raw[:2] == b"\x1f\x8b":
+                import gzip
+                raw = gzip.decompress(raw)
+            patch = staging / "candidate.diff"
+            patch.write_bytes(raw)
+            applied = git(clone, "apply", "--whitespace=nowarn", str(patch))
+            if applied.returncode:
+                raise ValueError(applied.stderr or "apply failed")
+        return tree_hash(clone)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def safe_workspace(lab, run_dir):
+    workspace = (run_dir / "workspace").resolve()
+    runs = (state_dir(lab) / "runs").resolve()
+    if workspace.parent.parent != runs or workspace.name != "workspace":
+        raise ValueError("refusing workspace path " + str(workspace))
+    if not workspace.is_dir() or workspace.is_symlink():
+        raise ValueError("workspace is not a directory")
+    return workspace
+
+
+def prune_one(lab, run_dir, row, apply):
+    workspace = run_dir / "workspace"
+    if not workspace.is_dir() or workspace.is_symlink():
+        return {"status": "missing"}
+    if not settled(row):
+        return {"status": "unsettled"}
+    size = dir_size(workspace)
+    ready, base_sha, evidence_sha = evidence_ready(run_dir)
+    if not ready:
+        base_sha = workspace_base(workspace)
+        if not base_sha:
+            return {"status": "unreconstructable", "reason": "base cannot be determined",
+                    "bytes": size}
+        if apply:
+            ok, evidence_sha, why = publish_diff(run_dir, workspace, base_sha)
+            if not ok:
+                return {"status": "unreconstructable", "reason": why, "bytes": size}
+        else:
+            return {"status": "would_publish", "bytes": size, "base_sha": base_sha}
+    if not apply:
+        return {"status": "would_prune", "bytes": size, "base_sha": base_sha,
+                "evidence_sha": evidence_sha}
+    workspace = safe_workspace(lab, run_dir)
+    ready, base_sha, evidence_sha = evidence_ready(run_dir)
+    verify = os.environ.get("PRUNE_VERIFY", "1") != "0" and size < 32 * 1024 * 1024
+    if verify:
+        try:
+            rebuilt = reconstruct_evidence(run_dir, workspace, base_sha)
+        except ValueError as error:
+            return {"status": "unreconstructable", "reason": str(error), "bytes": size}
+        if rebuilt != tree_hash(workspace):
+            return {"status": "unreconstructable", "reason": "reconstruction hash mismatch",
+                    "bytes": size}
+    from _setup_workspace import forget_worktree
+    forget_worktree(workspace)
+    row_out = {
+        "event": "workspace_pruned",
+        "run_id": run_dir.name,
+        "base_sha": base_sha,
+        "evidence_sha": evidence_sha,
+        "bytes_freed": size,
+        "family": family_of(run_dir.name),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    append_jsonl(state_dir(lab) / "workspace-pruned.jsonl", row_out,
+                 sort_keys=True, compact=True, sync=True, encoding="utf-8")
+    return {"status": "pruned", **row_out}
+
+
+def selected_runs(lab, family):
+    root = state_dir(lab) / "runs"
+    if not root.is_dir():
+        return []
+    out = []
+    for path in sorted(root.iterdir()):
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        if family and family_of(path.name) != family:
+            continue
+        out.append(path)
+    return out
+
+
+def main():
+    raw = sys.stdin.read().strip()
+    try:
+        args = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        print(json.dumps({"error": "invalid JSON on stdin"}))
+        return 1
+    if not isinstance(args, dict) or set(args) - {"apply", "family", "lab"}:
+        print(json.dumps({"error": "expected optional apply, family, lab"}))
+        return 1
+    apply = args.get("apply", False)
+    if not isinstance(apply, bool):
+        print(json.dumps({"error": "apply must be boolean"}))
+        return 1
+    family = args.get("family")
+    if family is not None and family not in FAMILIES:
+        print(json.dumps({"error": "unknown family"}))
+        return 1
+    lab = Path(args["lab"]).resolve() if args.get("lab") else LAB
+    index = ledger_index(lab)
+    counts = {"pruned": 0, "unsettled": 0, "unreconstructable": 0, "missing": 0,
+              "would_prune": 0, "would_publish": 0}
+    bytes_freed = 0
+    listed = []
+    for run_dir in selected_runs(lab, family):
+        result = prune_one(lab, run_dir, index.get(run_dir.name), apply)
+        status = result["status"]
+        counts[status] = counts.get(status, 0) + 1
+        if status == "pruned":
+            bytes_freed += int(result.get("bytes_freed") or 0)
+        if status == "unreconstructable":
+            listed.append({"run": run_dir.name, "reason": result.get("reason")})
+    print(json.dumps({
+        "mode": "apply" if apply else "dry-run",
+        "family": family,
+        "counts": counts,
+        "bytes_freed": bytes_freed,
+        "unreconstructable": listed,
+    }, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

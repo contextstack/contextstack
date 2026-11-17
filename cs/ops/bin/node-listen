@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""node-listen — a fleet node's long-lived side of node protocol 2 (NODE-PROTOCOL.md §9; Director.Plan step 5).
+Run by launchd (com.contextstack.node-listen, KeepAlive; node-install writes it beside the
+node tick), never palette. Input {}; tests add "seconds": N (stop after N seconds) and "dispatch": false (never
+start tick or schedule-tick). One per state root
+(<state>/node/listen.lock); a second exits 0 {"skip": "already listening"}; a host without a director receiver
+exits 0 {"skip": "not a node"}.
+
+tick runs on offers and every 60 s: it pulls jobs (job-pull, GET jobs), admits one, runs it, finalizes
+and spools. This process runs beside the work, never queued behind it:
+  work      one GET work?after=<cursor> always open (45 s timeout; the Director answers within 30 s), asked again at
+            once with the returned cursor; after an error, a backoff (1 s doubling to 30 s) and a request without
+            `after`. Jobs go through _node_intake.take, the same path as job-pull (queued once, accepted). A newly
+            queued job starts tick at once when nothing is running. With work running, Director turns can
+            start a separate turn-only tick in the reserved seat. Pending turns retry every second;
+            other jobs retry every 15 s while nothing runs.
+  control   each message to _node_control.handle in its own thread (record first, received, act, outcome);
+            unreported outcomes are retried every 10 s. After a cancel, spool-send delivers its job_terminal.
+  status    POST status with the active dispatch jobs (queued, running with its run_id) whenever the set
+            changes and at least every 60 s while it is non-empty.
+  events    every second, each running Director job's run dirs: events.jsonl to POST runs/<id>/events
+            (_node_events), until terminal.json and confirmed; spool-send flushes a run before its envelope.
+  schedules every 60 s, schedule-tick fires the node's own schedules (<state>/schedules.jsonl, when it exists;
+            missed_default skip, the protocol's default for a schedule without `missed`);
+            POST schedules (_node_schedules: the complete set, new or changed firings) when anything changed, after
+            a schedule_change, and every 10 minutes.
+Against a Director that speaks only protocol 1 (the client falls back), the protocol-2 duties wait and the
+Director is asked again in 2 every 10 minutes; tick's job-pull keeps the node working meanwhile.
+Each event worth seeing is one JSON line on stdout (the agent's log). Exit 0 on SIGTERM or after `seconds`.
+"""
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from _node_env import node_env
+
+# Validate and retain node-local settings at startup without exporting them.
+NODE_SETTINGS = node_env()
+
+from _director_client import PROTOCOL, Client, DirectorUnreachable, receiver_config  # noqa: E402
+from _dispatch import TERMINAL, qid  # noqa: E402
+from _estate_io import append_jsonl, pid_live, read_jsonl  # noqa: E402
+from _repos import inventory as repo_inventory  # noqa: E402
+from _node_control import handle, prepare, read_json, report_pending, write_json  # noqa: E402
+from _node_events import live_runs, send as send_events  # noqa: E402
+from _node_intake import take  # noqa: E402
+from _node_schedules import digest, report as schedules_report  # noqa: E402
+from _node_spool import cancelled, spool_job_terminal  # noqa: E402
+from _node_restart import NODE_RESTART_REASON, ORPHANED_RUNNING_STOP, orphan_error  # noqa: E402
+from _roots import RootsError, outbox_dir, roots  # noqa: E402
+from _turn_priority import is_turn
+from _vitals import status_extras  # noqa: E402
+from _provider_limits import status_limits  # noqa: E402
+
+HOLD_S, STATUS_S, SCHEDULES_S, TICK_SCHEDULES_S, REPROBE_S, KICK_S = 45, 60, 600, 60, 600, 15
+VITALS_CACHE_S = 30
+
+
+def say(**fields):
+    print(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **fields}, sort_keys=True), flush=True)
+
+
+class Listener:
+    def __init__(self, client, state, code, config, dispatch=True):
+        self.client, self.state, self.code, self.config, self.dispatch = client, Path(state), code, Path(config), dispatch
+        self.stop, self.wake_schedules = threading.Event(), threading.Event()
+        self.lock, self.inflight, self.kicked, self.kicked_at = threading.Lock(), set(), None, 0.0
+        self.turn_kicked = None
+        self.downgraded_at = None
+        self._held_seen = None
+
+    def recover_orphaned_jobs(self):
+        """Close dead running rows before listener duties; spool director terminals immediately."""
+        shelf, lock = self.state / "dispatch.jsonl", self.state / "dispatch.lock"
+        if not shelf.is_file():
+            return []
+        recovered = []
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        held = open(lock, "a")
+        try:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            rows = read_jsonl(shelf, strict=True)
+            closed = {qid(row) for row in rows if row.get("state") in TERMINAL and qid(row)}
+            for row in rows:
+                jid = qid(row)
+                if row.get("state") != "running" or not jid or jid in closed or pid_live(int(row.get("pid") or 0)):
+                    continue
+                terminal = dict(row)
+                terminal.update({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "state": "cancelled" if cancelled(self.state, row.get("director_job")) else "error",
+                    "pid": 0,
+                    "code": 1,
+                    "verdict": "void",
+                    "stop": ORPHANED_RUNNING_STOP,
+                    "error": orphan_error(),
+                    "reason": NODE_RESTART_REASON,
+                })
+                append_jsonl(shelf, terminal, sort_keys=False, compact=False, sync=True, encoding="utf-8")
+                if terminal.get("director_job") and terminal.get("state") in TERMINAL:
+                    spool_job_terminal(outbox_dir(), shelf, terminal)
+                closed.add(jid)
+                recovered.append(str(terminal.get("director_job") or jid))
+        finally:
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+            held.close()
+        return recovered
+
+    # ---- shared ----
+    def speaks2(self, now=None):
+        now = time.time if now is None else now
+        if self.client.protocol >= PROTOCOL:
+            return True
+        if self.downgraded_at is None:
+            self.downgraded_at = now()
+            say(event="protocol", detail="the Director speaks protocol 1: protocol-2 duties wait, job-pull works")
+        if now() - self.downgraded_at >= REPROBE_S:
+            self.client.protocol, self.downgraded_at = PROTOCOL, None
+            return True
+        return False
+
+    def call(self, what, *args):
+        try:
+            return self.client.call(*args)
+        except DirectorUnreachable as error:
+            say(event="error", what=what, detail=str(error)[:500])
+            return None
+
+    def op(self, name, timeout=300, run=None):
+        run = subprocess.run if run is None else run
+        try:
+            r = run([sys.executable, str(HERE / name)], input="{}", text=True, capture_output=True,
+                    cwd=str(self.code), timeout=timeout)
+            return json.loads((r.stdout or "").strip().splitlines()[-1])
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as error:
+            return {"ok": False, "error": str(error)}
+
+    def kick(self, why, now=None, popen=None):
+        """Kick ordinary work when idle, or a turn-only tick beside running work."""
+        now = time.time if now is None else now
+        popen = subprocess.Popen if popen is None else popen
+        if not self.dispatch:
+            return
+        with self.lock:
+            active = self.active()
+            busy = (self.kicked is not None and self.kicked.poll() is None
+                    or any(a["state"] == "running" for a in active))
+            if busy and (not any(a["state"] == "queued" and a.get("interactive") for a in active)
+                         or any(a.get("reserved") for a in active)
+                         or (self.turn_kicked is not None and self.turn_kicked.poll() is None
+                             and now() - self.kicked_at < 1)):
+                return
+            args = [sys.executable, str(HERE / "tick")]
+            if busy:
+                args.append("--turn-seat")
+            proc = popen(args, stdin=subprocess.DEVNULL, cwd=str(self.code),
+                         start_new_session=True)
+            if busy:
+                self.turn_kicked = proc
+            else:
+                self.kicked = proc
+            self.kicked_at = now()
+        # Reaped as soon as it exits: an unreaped tick is a zombie, and a zombie's pid still looks alive to pid_live,
+        # so a "running" row it left was never closed (2026-11-11).
+        threading.Thread(target=proc.wait, daemon=True).start()
+        say(event="tick", why=why, pid=proc.pid)
+
+    def active(self):
+        """The dispatch shelf's jobs that have not ended: queued, or running under a live dispatcher."""
+        latest = {}
+        for r in read_jsonl(self.state / "dispatch.jsonl", strict=False) if (self.state / "dispatch.jsonl").is_file() else ():
+            j = qid(r)
+            if j and r.get("state") in TERMINAL | {"pending", "running"} and latest.get(j, {}).get("state") not in TERMINAL:
+                latest[j] = r
+        out = []
+        for j, r in latest.items():
+            if r["state"] == "pending" or (r["state"] == "running" and pid_live(int(r.get("pid") or 0))):
+                out.append({"job_id": str(r.get("director_job") or j), "run_id": None,
+                            "state": "queued" if r["state"] == "pending" else "running",
+                            "started_at": r.get("ts") if r["state"] == "running" else None,
+                            "interactive": is_turn(r) if r["state"] == "pending" else False,
+                            "reserved": r["state"] == "running" and r.get("dispatch_seat") == "reserved"})
+        return out[:1000]
+
+    # ---- the held-open request ----
+    def work_loop(self):
+        cursor, backoff = None, 1
+        while not self.stop.is_set():
+            if not self.speaks2():
+                self.stop.wait(30)
+                continue
+            path = "work" + ("?after=" + urllib.parse.quote(cursor, safe="") if cursor else "")
+            try:
+                answer = self.client.call("GET", path, None, None, HOLD_S)
+            except DirectorUnreachable as error:
+                cursor = None
+                if self.client.protocol >= PROTOCOL:
+                    say(event="error", what="work", detail=str(error)[:500])
+                    self.stop.wait(backoff)
+                    backoff = min(backoff * 2, 30)
+                continue
+            backoff, cursor = 1, answer.get("cursor") if isinstance(answer, dict) else None
+            if not isinstance(answer, dict) or answer.get("changed") is False:
+                continue
+            for message in answer.get("control") or []:
+                say(event="control_listed", control_id=message.get("control_id"), kind=message.get("kind"))
+                prepare(message, self.state)  # recorded (a cancel's marker too) before this answer's jobs are taken
+            if answer.get("jobs"):
+                accepted, queued, failed = take(self.client, answer["jobs"], self.state)
+                if queued or failed:
+                    say(event="jobs", queued=queued, failed=failed)
+                if queued:
+                    self.kick("job offered")
+            for message in answer.get("control") or []:
+                self.control(message)
+
+    def control(self, message):
+        cid = message.get("control_id")
+        with self.lock:
+            if cid in self.inflight:
+                return
+            self.inflight.add(cid)
+        threading.Thread(target=self.settle, args=(message,), daemon=True).start()
+
+    def settle(self, message):
+        try:
+            rec = handle(self.client, message, self.state, on_schedule_change=self.wake_schedules.set)
+            if rec:
+                say(event="control", control_id=rec["control_id"], kind=rec.get("kind"), outcome=rec.get("outcome"),
+                    detail=rec.get("detail"), reported=rec.get("reported"))
+                if rec.pop("applied_now", False) and rec.get("kind") == "cancel":
+                    self.op("spool-send")  # the job_terminal, after the first apply only (never on a re-list)
+        except Exception as error:  # noqa: BLE001 — one message's failure must not end the listener; it is retried
+            say(event="error", what="control", detail="%s: %s" % (type(error).__name__, str(error)[:500]))
+        finally:
+            with self.lock:
+                self.inflight.discard(message.get("control_id"))
+
+    # ---- status, events, outcomes ----
+    def duties_loop(self, now=None):
+        now = time.time if now is None else now
+        sent_status, status_at, outcomes_at = None, 0.0, 0.0
+        while not self.stop.wait(1):
+            if not self.speaks2(now=now):
+                continue
+            active = self.active()
+            runs = live_runs(self.state, active)
+            for run_id, (run_dir, job) in sorted(runs.items()):
+                try:
+                    send_events(self.client, self.state, run_dir, job)
+                except DirectorUnreachable as error:
+                    say(event="error", what="events", run_id=run_id, detail=str(error)[:300])
+                    break
+                for a in active:
+                    if a["job_id"] == job and a["state"] == "running":
+                        a["run_id"] = run_id
+            seen = digest([(a["job_id"], a["state"], a["run_id"]) for a in active])
+            extras = status_extras(self.state, self.config, cache_ttl=VITALS_CACHE_S)
+            limits = status_limits(self.state)  # usage-limited templates, so clients can show out-of-quota models
+            body = {"active": active, "node_version": "cs node-listen", **extras, **limits, "repos": repo_inventory()}
+            seen = digest([seen, body["repos"], [(r.get("template"), r.get("resets_at")) for r in limits.get("provider_limits", [])]])
+            held_seen = (extras.get("held") or {}).get("reason")
+            if seen != sent_status or held_seen != getattr(self, "_held_seen", None) \
+                    or (active and now() - status_at >= STATUS_S) \
+                    or (held_seen and now() - status_at >= STATUS_S):
+                if self.call("status", "POST", "status", body) is not None:
+                    sent_status, status_at, self._held_seen = seen, now(), held_seen
+            if now() - outcomes_at >= 10:
+                report_pending(self.client, self.state)
+                outcomes_at = now()
+            self.retry_pending(active, now=now)
+
+    def retry_pending(self, active, now=None):
+        now = time.time if now is None else now
+        retry_s = 1 if any(a.get("interactive") for a in active) else KICK_S
+        if any(a["state"] == "queued" for a in active) and now() - self.kicked_at >= retry_s:
+            self.kick("jobs pending")
+
+    # ---- schedules ----
+    def schedules_loop(self, now=None, run=None):
+        now = time.time if now is None else now
+        run = subprocess.run if run is None else run
+        memory = self.state / "node/schedules-reported.json"
+        fired_at, reported_at = 0.0, 0.0
+        while not self.stop.is_set():
+            if self.dispatch and (self.state / "schedules.jsonl").is_file() and now() - fired_at >= TICK_SCHEDULES_S:
+                fired_at = now()
+                r = run([sys.executable, str(HERE / "schedule-tick")], input='{"missed_default": "skip"}', text=True,
+                                   capture_output=True, cwd=str(self.code), timeout=600)
+                if r.returncode:
+                    say(event="error", what="schedule-tick", detail=(r.stderr or r.stdout)[-500:])
+                elif '"admitted": [{' in (r.stdout or ""):
+                    self.kick("schedule fired")
+            if self.speaks2(now=now):
+                kept = read_json(memory) or {}
+                body, sent = schedules_report(self.state, kept.get("firings") or {})
+                whole = digest(body["schedules"])
+                if body["firings"] or whole != kept.get("schedules") or self.wake_schedules.is_set() \
+                        or now() - reported_at >= SCHEDULES_S:
+                    self.wake_schedules.clear()
+                    if self.call("schedules", "POST", "schedules", body) is not None:
+                        write_json(memory, {"schedules": whole, "firings": sent})
+                        reported_at = now()
+            self.wake_schedules.wait(2)
+
+
+def main(config_root=None, env=None):
+    try:
+        args = json.loads(sys.stdin.read() or "{}") if not sys.stdin.isatty() else {}
+        found = roots(env=env)
+        if config_root is not None:
+            found["config"] = Path(config_root)
+        policy = found["config"] / "policy/spool.json"
+        receiver = json.loads(policy.read_text(encoding="utf-8")).get("receiver") if policy.is_file() else None
+        if not isinstance(receiver, dict) or receiver.get("kind") != "director":
+            say(ok=True, skip="not a node")
+            return 0
+        client = Client(receiver_config(receiver))
+    except (ValueError, RootsError, OSError) as error:
+        say(ok=False, error=str(error))
+        return 2
+    state = found["state"]
+    (state / "node").mkdir(parents=True, exist_ok=True)
+    held = open(state / "node/listen.lock", "a")
+    try:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        say(ok=True, skip="already listening")
+        return 0
+    listener = Listener(client, state, found["code"], found["config"],
+                        dispatch=not (isinstance(args, dict) and args.get("dispatch") is False))
+    recovered = listener.recover_orphaned_jobs()
+    if recovered:
+        say(event="recovered_orphans", count=len(recovered), jobs=recovered)
+    signal.signal(signal.SIGTERM, lambda *_: listener.stop.set())
+    say(event="listening", director=receiver_config(receiver)["url"], pid=os.getpid())
+    for loop in (listener.work_loop, listener.schedules_loop):
+        threading.Thread(target=loop, daemon=True).start()
+    seconds = args.get("seconds") if isinstance(args, dict) else None
+    if seconds:
+        timer = threading.Timer(float(seconds), listener.stop.set)
+        timer.daemon = True
+        timer.start()
+    listener.duties_loop()
+    say(event="stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

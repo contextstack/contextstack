@@ -1,0 +1,135 @@
+{
+ "exit_code": 0,
+ "ops": [
+  {
+   "cwd": "<ESTATE>",
+   "env_names": [
+    "HOME",
+    "LANG",
+    "PATH",
+    "TMPDIR"
+   ],
+   "op": "capture-stimulus",
+   "stdin": {
+    "adapter": "runner",
+    "hooks": [],
+    "prompts": [
+     "prompts/coder-min.md"
+    ],
+    "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-task-flag-fx2-t1",
+    "run_id": "<RUNSTAMP>-fx-task-flag-fx2-t1",
+    "spec": "specs/fx.yaml",
+    "spec_sha": "94a27f6477ebed0e78a5a45f35a1708301852451abfb46168bffb5f67a3e69f6",
+    "task": "tasks/fx2",
+    "tools": [],
+    "trial": 1,
+    "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-task-flag-fx2-t1/workspace"
+   }
+  },
+  {
+   "cwd": "<ESTATE>",
+   "env_names": [
+    "HOME",
+    "LANG",
+    "PATH",
+    "TMPDIR"
+   ],
+   "op": "publish-evidence",
+   "stdin": {
+    "adapter": "runner",
+    "check_exit": 0,
+    "check_output": "",
+    "check_skipped": false,
+    "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-task-flag-fx2-t1",
+    "stop": "done",
+    "verdict": "pass"
+   }
+  }
+ ],
+ "requests": [
+  {
+   "body": {
+    "budget": {
+     "max_output_tokens": 4096,
+     "timeout_ms": 120000
+    },
+    "capability": {
+     "kind": "generic",
+     "model_tier_hint": "fake"
+    },
+    "job_id": "lab",
+    "messages": [
+     {
+      "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+      "role": "system"
+     },
+     {
+      "content": "Create two.txt containing exactly: two\n",
+      "role": "user"
+     }
+    ],
+    "request_id": "<REQUEST_ID>",
+    "role": {
+     "role_name": "loop",
+     "role_pack_name": "lab",
+     "role_pack_version": "0"
+    },
+    "run_id": "fx-task-flag",
+    "schema_version": "agent.gateway.model_call.v2",
+    "step_id": "<REQUEST_ID>",
+    "tool_schema": null
+   },
+   "content_type": "application/json",
+   "path": "/v1/agent/model.call"
+  }
+ ],
+ "rows": [
+  {
+   "cost_class": "",
+   "cost_usd": 0.01,
+   "env_sha": "<ENV_SHA>",
+   "est_basis": "rate",
+   "est_usd": 0.01,
+   "estate": "dev",
+   "model": "fake-model",
+   "seconds": "<SECONDS>",
+   "spec": "fx-task-flag",
+   "spec_sha": "94a27f6477ebed0e78a5a45f35a1708301852451abfb46168bffb5f67a3e69f6",
+   "stimulus_sha": "<STIMULUS_SHA>",
+   "stop": "done",
+   "task": "tasks/fx2",
+   "task_sha": "200ef336314fe1c89fecd79278c69561c0bf04b83f709e9df13a3763cc0570b9",
+   "tool_calls": 0,
+   "transcript": "ledger/runs/<RUNSTAMP>-fx-task-flag-fx2-t1",
+   "trial": 1,
+   "ts": "<TS>",
+   "turns": 1,
+   "verdict": "pass"
+  }
+ ],
+ "run_dirs_distinct": true,
+ "runs": [
+  {
+   "dir": "<RUNSTAMP>-fx-task-flag-fx2-t1",
+   "entries": [
+    "evidence",
+    "ready_for_inspection",
+    "stimulus",
+    "transcript.md",
+    "workspace"
+   ],
+   "frozen": {
+    "check": "#!/bin/sh\nexit 0\n",
+    "goal.md": "Create two.txt containing exactly: two\n"
+   },
+   "transcript": "# fx-task-flag · tasks/fx2 · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\ndone\n\n---\nstop done · verdict **pass** · turns 1 · tools 0 · cost $0.0100\n",
+   "workspace": {}
+  }
+ ],
+ "stderr": [],
+ "stdout": [
+  "fx-task-flag: 1 task(s) x 1 trial(s)",
+  "  tasks/fx2                      t1  pass stop=done turns=1 tools=0 $0.0100",
+  "  TOTAL 1/1 pass — rows in ledger/ledger.jsonl"
+ ]
+}

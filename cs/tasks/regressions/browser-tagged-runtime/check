@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+
+with scratch_dir(prefix="browser-tagged-runtime-") as raw:
+    root = Path(raw)
+    home = root / "empty-home"
+    home.mkdir()
+    estate = root / "estate-runtime"
+    chromium = estate / "ms-playwright/chromium_headless_shell-1208/chrome-headless-shell"
+    chromium.parent.mkdir(parents=True)
+    chromium.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    chromium.chmod(0o755)
+    browse = estate / "browse"
+    browse.write_text(
+        """#!/usr/bin/env python3
+import os, pathlib, sys
+assert os.environ["GSTACK_CHROMIUM_PATH"] == os.environ["EXPECTED_CHROMIUM"]
+assert os.environ["PLAYWRIGHT_BROWSERS_PATH"] == os.environ["EXPECTED_CACHE"]
+args = sys.argv[1:]
+if args and args[0] == "--headed":
+    args = args[1:]
+if args[0] == "goto": print("loaded (200)")
+elif args[0] == "url": print("https://example.com/")
+elif args[0] == "js":
+    output = pathlib.Path(args[args.index("--out") + 1])
+    output.write_text("rendered from tagged runtime\\n")
+elif args[0] == "wait":
+    pass
+elif args[0] == "stop":
+    pass
+""", encoding="utf-8")
+    browse.chmod(0o755)
+    workspace = root / "workspace"
+    workspace.mkdir()
+
+    def run_fetch(env):
+        return subprocess.run(
+            [str(LAB / "tools/bin/browser_fetch")],
+            input=json.dumps({"url": "https://example.com/"}), cwd=workspace,
+            env=env, text=True, capture_output=True,
+        )
+
+    # Explicit PLAYWRIGHT_BROWSERS_PATH (launchd path).
+    env = {**hermetic_env(), "HOME": str(home), "LAB_BROWSE": str(browse),
+           "PLAYWRIGHT_BROWSERS_PATH": str(chromium.parents[1]),
+           "EXPECTED_CHROMIUM": str(chromium), "EXPECTED_CACHE": str(chromium.parents[1]),
+           "LAB_BROWSER_ENGINE": "chromium", "LAB_BROWSER_STATE": str(root / "state")}
+    result = run_fetch(env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["preview"] == "rendered from tagged runtime\n"
+
+    # Sandbox-stripped env: fall back to tagged estate runtime.
+    stripped = {k: v for k, v in hermetic_env().items()
+                if k not in {"PLAYWRIGHT_BROWSERS_PATH", "LAB_BROWSE"}}
+    stripped.update({
+        "HOME": str(home), "LAB_ESTATE_RUNTIME": str(estate),
+        "EXPECTED_CHROMIUM": str(chromium), "EXPECTED_CACHE": str(chromium.parents[1]),
+        "LAB_BROWSER_ENGINE": "chromium", "LAB_BROWSER_STATE": str(root / "state2"),
+    })
+    result = run_fetch(stripped)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["preview"] == "rendered from tagged runtime\n"
+
+print("check: browser_fetch uses tagged PLAYWRIGHT_BROWSERS_PATH without host cache")

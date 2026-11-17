@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""20261112-000503-opencode-go-missing-run-record-t1: all profiled outcomes close and send."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import hashlib
+import io
+import threading
+from contextlib import redirect_stdout, nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / 'ops/bin'))
+import _muse_adapter as adapter
+import _cli_adapter
+import _muse
+import _job_memory
+import _run_record
+from _estate_io import run_op, append_jsonl
+
+OP = [{'type': 'step_start', 'sessionID': 's', 'part': {'type': 'step-start'}},
+      {'type': 'step_finish', 'sessionID': 's', 'part': {'type': 'step-finish', 'reason': 'stop'}}]
+PI = [{'type': 'agent_start'}, {'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop'}},
+      {'type': 'agent_end', 'messages': [{'role': 'assistant', 'stopReason': 'stop'}]}]
+LIMIT = {'type': 'error', 'error': {'type': 'provider.go-limit', 'status': 429,
+         'message': 'OpenCode Go 5 hour usage limit reached', 'retryAfterMs': 13178000}}
+
+class Receiver(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def reply(self, body):
+        raw = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header('ContextStack-Protocol', '1')
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_PUT(self):
+        raw = self.rfile.read(int(self.headers['Content-Length']))
+        digest = self.path.rsplit('/', 1)[-1]
+        assert hashlib.sha256(raw).hexdigest() == digest
+        self.server.objects[digest] = raw
+        self.reply({})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        envelope = body['envelope']
+        assert hashlib.sha256(body['row_line'].encode()).hexdigest() == envelope['row_sha256']
+        missing = [f['sha256'] for f in envelope['files'] if f['sha256'] not in self.server.objects]
+        if missing:
+            self.reply({'status': 'missing', 'missing': missing})
+        else:
+            self.server.runs[envelope['run_id']] = envelope
+            self.reply({'status': 'acked', 'ack': {'event_id': envelope['event_id'],
+                       'envelope_sha256': envelope['envelope_sha256']}})
+
+
+server = ThreadingHTTPServer(('127.0.0.1', 0), Receiver)
+server.objects, server.runs = {}, {}
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+for name in ('opencode', 'opencode-go', 'pi'):
+    for mode in ('exit', 'pass', 'check', 'terminal', 'limit', 'timeout', 'cancel', 'launch', 'preflight', 'decoy-pass', 'decoy-exit', 'zero-limit', 'pending'):
+        with scratch_dir(prefix='profile-finalize-') as raw:
+            root = Path(raw).resolve(); estate = root / 'estate'; ops = estate / 'ops/bin'
+            ops.mkdir(parents=True); state = root / 'state'; state.mkdir()
+            for helper in (LAB / 'ops/bin').glob('_*.py'):
+                shutil.copy2(helper, ops / helper.name)
+            for filename in ('executor-templates.json', 'cli-profiles.json', 'capture-stimulus',
+                             'publish-evidence', 'harvest', 'finalize-run', 'spool-send'):
+                shutil.copy2(LAB / 'ops/bin' / filename, ops / filename)
+            (estate / 'INVARIANTS.md').write_text('fixture\n')
+            (estate / 'ESTATE').write_text('fixture\n')
+            task = estate / 'tasks/case'; task.mkdir(parents=True)
+            (task / 'goal.md').write_text('fixture\n')
+            (task / 'check').write_text('#!/bin/sh\nexit %s\n' % (1 if mode == 'check' else 0))
+            (task / 'check').chmod(0o755)
+            run = state / 'runs' / (name + '-' + mode); ws = run / 'workspace'; ws.mkdir(parents=True)
+            for args in (('init', '-q'), ('add', '-A'), ('-c', 'user.name=fixture', '-c',
+                         'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'base')):
+                subprocess.run(['git', '-C', str(ws), *args], check=True, capture_output=True, env={**hermetic_env()})
+            base = subprocess.check_output(['git', '-C', str(ws), 'rev-parse', 'HEAD'], text=True, env={**hermetic_env()}).strip()
+            (run / 'base.sha').write_text(base + '\n')
+            receiver = 'http://127.0.0.1:%s' % server.server_port
+            (estate / 'policy').mkdir()
+            (estate / 'policy/spool.json').write_text(json.dumps({'version': 1,
+                'receiver': {'kind': 'director', 'url': receiver, 'node': 'fixture', 'token_env': 'FIXTURE_NODE_TOKEN', 'protocol': 1}}))
+            env = {k: v for k, v in hermetic_env().items() if not k.startswith(('LAB_', 'CSGATEWAY_', 'GIT_'))}
+            (estate / 'node.env').write_text("FIXTURE_NODE_TOKEN=fixture-only\n")
+            (estate / 'node.env').chmod(0o600)
+            env.update(LAB_CODE_ROOT=str(estate), LAB_CONFIG_ROOT=str(estate), LAB_STATE_ROOT=str(state))
+            def prepare(c):
+                if mode == 'preflight':
+                    raise ValueError('fixture refused')
+                return Path(sys.executable), {}, [], {'provider': name, 'model': 'fixture', 'auth_source': 'none'}
+            def execute(*args, **kwargs):
+                kwargs['on_started']()
+                if mode == 'timeout':
+                    raise subprocess.TimeoutExpired('fixture', 1, output='partial', stderr='timeout')
+                if mode == 'cancel':
+                    raise _muse.Cancelled('partial', 'cancelled')
+                if mode == 'launch':
+                    raise OSError('fixture launch failure')
+                events = list(PI if name == 'pi' else OP)
+                if mode.startswith('decoy'):
+                    events.insert(1, {'type': 'text', 'part': {'type': 'text', 'text': json.dumps(LIMIT)}, 'sessionID': 's'})
+                stdout = '\n'.join(map(json.dumps, [LIMIT] if mode in ('limit', 'zero-limit') else events))
+                return subprocess.CompletedProcess([], 1 if mode in ('exit', 'limit', 'decoy-exit') else 0,
+                                                   '{}' if mode == 'terminal' else stdout, '')
+            c = dict(ws=ws, run_dir=run, HERE=ops, HOME=root, name=name, exp='fixture', spec_rel='',
+                     spec_path=None, spec_sha=lambda _: '', task=task, trial=1, cost_class='free_local',
+                     auth='none', base=base, run_id=run.name, LAB=estate, gid='', frozen_inputs=None,
+                     run_op=run_op, timeout=5, check_window=60, child_env=env, grant_paths=[],
+                     CRED_ENV=re.compile('TOKEN|SECRET|KEY'),
+                     append_ledger=lambda row: append_jsonl(state / 'ledger.jsonl', row, sort_keys=False, compact=False, sync=True, encoding='utf-8'))
+            with redirect_stdout(io.StringIO()), patch.dict(os.environ, env, clear=True), patch.object(_cli_adapter, 'prepare', prepare), \
+                 patch.object(adapter, 'load_frozen', return_value=SimpleNamespace(execute=execute)), \
+                 patch.object(_job_memory, 'JobProcesses', return_value=SimpleNamespace(kill=lambda: None, close=lambda: None)), \
+                 (patch.object(_run_record, 'finalize', return_value={'state': 'pending'}) if mode == 'pending' else nullcontext()):
+                try:
+                    adapter.run(c)
+                except SystemExit as done:
+                    assert done.code == (3 if mode == 'pending' else 0 if mode in ('pass', 'decoy-pass') else 1), (name, mode, done.code, (run / 'cli.log').read_text())
+            assert (run / 'terminal.json').is_file(), (name, mode, 'missing terminal.json')
+            term = json.loads((run / 'terminal.json').read_text())
+            expected = {'exit': 'executor_exit_1', 'pass': 'done', 'check': 'check', 'terminal': 'cli_terminal',
+                        'limit': 'provider_limit' if name != 'pi' else 'executor_exit_1',
+                        'pending': 'done', 'decoy-pass': 'done', 'decoy-exit': 'executor_exit_1',
+                        'zero-limit': 'provider_limit' if name != 'pi' else 'cli_terminal',
+                        'timeout': 'timeout', 'cancel': 'cancelled', 'launch': 'cli_launch', 'preflight': 'cli_preflight'}
+            assert term['stop'] == expected[mode], (name, mode, term)
+            if mode == 'pending':
+                assert not (run / 'finalized.json').exists()
+                result = _run_record.finalize(estate, run, env)
+                assert result['state'] == 'finalized', result
+            assert (run / 'check.json').is_file() and (run / 'finalized.json').is_file(), (name, mode)
+            assert len((state / 'ledger.jsonl').read_text().splitlines()) == 1
+            envelope = state / 'outbox' / (run.name + '.json')
+            assert envelope.is_file(), (name, mode, 'missing run envelope')
+            sent = subprocess.run([str(ops / 'spool-send')], input='{}', text=True, capture_output=True, env=env)
+            assert sent.returncode == 0, sent.stderr
+            assert json.loads(sent.stdout)['sent'] == 1, sent.stdout
+            delivered = server.runs[run.name]
+            terminal_file = next(f for f in delivered['files'] if f['path'] == 'terminal.json')
+            assert json.loads(server.objects[terminal_file['sha256']])['stop'] == expected[mode]
+            assert not envelope.exists() and (state / 'outbox/acked' / envelope.name).is_file()
+server.shutdown()
+server.server_close()
+print('check: profiled pass/fail/error/limit/timeout/cancel finalized once and sent')

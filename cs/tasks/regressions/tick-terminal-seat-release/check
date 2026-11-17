@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import json
+import os
+import tempfile
+from pathlib import Path
+import sys
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must use the same isolated roots as fixture subprocesses.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+loader = importlib.machinery.SourceFileLoader("lab_tick_seat_test", str(LAB / "ops/bin/tick"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+tick = importlib.util.module_from_spec(spec)
+loader.exec_module(tick)
+
+with scratch_dir(prefix="tick-terminal-seat-") as raw:
+    tick.Q = Path(raw) / "dispatch.jsonl"
+    tick.lab_count = lambda: 0
+
+    def write(rows):
+        tick.Q.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    running = {"id": "old-job", "state": "running", "pid": os.getpid()}
+    terminal = {"id": "old-job", "job": "old-job", "state": "done", "pid": 0}
+    write([running, terminal])
+    assert tick.occupied() == 0, "closed job with a reused live PID occupied a seat"
+
+    write([{"id": "live-job", "state": "running", "pid": os.getpid()}])
+    assert tick.occupied() == 1, "unclosed live job did not occupy a seat"
+    write([{"id": "live-job", "state": "running", "pid": os.getpid()},
+           {"id": "live-job", "job": "live-job", "state": "error", "pid": 0}])
+    assert tick.occupied() == 0, "terminal error did not release the seat"
+
+print("check: terminal jobs cannot occupy scheduler seats after PID reuse")

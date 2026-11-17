@@ -1,0 +1,4 @@
+#!/bin/sh
+# phpstan only — does not commit. For 12-larastan-class chores.
+test -x vendor/bin/phpstan || { echo "no phpstan"; exit 2; }
+php vendor/bin/phpstan analyse --no-progress --no-interaction

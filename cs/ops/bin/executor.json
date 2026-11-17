@@ -1,0 +1,100 @@
+{
+  "description": "Operator: run a CLI in a cloned task workspace, then check \u2192 harvest. Dest merge is parked (operator_close). Grant ids load grants/<id>.yaml; inline grant.paths is not authority. Not a model tool. If task/preflight exists, exit 3 with a structured no-work receipt skips the CLI only after the ordinary task check passes. Claude/macOS work orders derive limits from the frozen spec, refuse supplied mismatches, enforce native turns/usage cost plus parent-owned native-tool admission, and bound checks. Other providers have no new enforcement claim. A spec naming repo: and lane: (ops/bin/_lanes.py; repos in ~/.contextstack/config/repos.json or CS_REPOS_FILE) runs the agent in the lane worktree <repo parent>/<lane> on branch lane/<lane>, sandboxed to that worktree and its git metadata; a pass commits on the lane branch (no hooks; the gate runs at cs land).",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "executor": {
+        "type": "string"
+      },
+      "task": {
+        "type": "string"
+      },
+      "spec": {
+        "type": "string"
+      },
+      "conversation_id": {
+        "type": "string",
+        "description": "Director-owned conversation identity forwarded by tick, never spec or intent metadata."
+      },
+      "turn_id": {
+        "type": "string",
+        "description": "Director-owned turn identity forwarded by tick."
+      },
+      "trial": {
+        "type": "integer"
+      },
+      "timeout_s": {
+        "type": "integer"
+      },
+      "dest": {
+        "type": "string"
+      },
+      "grant": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "dest": {
+                "type": "string"
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "commit": {
+                "type": "boolean"
+              },
+              "merge": {
+                "type": "boolean"
+              }
+            }
+          }
+        ]
+      },
+      "budget": {
+        "type": "object",
+        "required": [
+          "turns",
+          "tool_calls",
+          "usd",
+          "seconds"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "turns": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "tool_calls": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "usd": {
+            "type": "number",
+            "minimum": 0
+          },
+          "seconds": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "check_window": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "required": [
+      "executor",
+      "task"
+    ]
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "description": "Operator: close a dispatch job by enqueue id. First-terminal-wins: a second close no-ops. Terminal state only for the dispatch job. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "job": {
+        "type": "string"
+      },
+      "state": {
+        "type": "string"
+      },
+      "spec": {
+        "type": "string"
+      },
+      "note": {
+        "type": "string"
+      },
+      "task": {
+        "type": "string"
+      },
+      "trial": {
+        "type": "integer"
+      },
+      "model": {
+        "type": "string"
+      },
+      "transcript": {
+        "type": "string"
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "run_ids": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string",
+        "enum": [
+          "model_miss",
+          "factory_gap",
+          "unseated"
+        ]
+      },
+      "grant": {
+        "type": "string"
+      },
+      "cause": {
+        "type": "string"
+      },
+      "wave": {
+        "type": "string"
+      },
+      "refusal_id": {
+        "type": "string"
+      },
+      "dest": {
+        "type": "string"
+      },
+      "dest_sha": {
+        "type": "string"
+      },
+      "stop": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "id"
+    ]
+  }
+}

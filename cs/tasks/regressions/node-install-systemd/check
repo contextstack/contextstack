@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""node-install-systemd regression (goal.md): Linux units from the same service defs as launchd plists.
+
+Renders into a temp HOME. systemctl on PATH is a recorder. Never the real systemctl, launchctl, or
+~/.contextstack. Runs on macOS (NODE_INSTALL_PLATFORM). env -u LAB_STATE_ROOT -u CSGATEWAY_ENDPOINT.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+KIT = Path(__file__).resolve().parents[3]
+RELEASE = KIT / "scripts/node-release"
+RID = "20990111-linuxunits"
+TOKEN = "csn_SECRETtoken_linux_units_test"
+APP_KEY = "base64:SECRETappkeylinuxunits"
+LABELS = ("com.contextstack.csgateway-socket", "com.contextstack.node", "com.contextstack.node-listen",
+          "com.contextstack.director-rs", "com.contextstack.client-web")
+problems = []
+
+
+def fail(msg):
+    problems.append(msg)
+    print("FAIL " + msg)
+
+
+def expect(cond, msg):
+    (print("ok   " + msg) if cond else fail(msg))
+
+
+def load_mod(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def spawn_env(home, path, **more):
+    env = {**hermetic_env()}
+    env["HOME"] = str(home)
+    env.pop("LAB_STATE_ROOT", None)
+    env.pop("CSGATEWAY_ENDPOINT", None)
+    env["PATH"] = path
+    env["NODE_INSTALL_USER_PATH"] = "%s/.local/bin:/usr/bin:/bin" % home
+    env.update(more)
+    return env
+
+
+def run_nr(home, path, *args, **more):
+    env = spawn_env(home, path, **more)
+    r = subprocess.run([sys.executable, "-I", str(RELEASE), *args], capture_output=True, text=True, env=env, cwd="/")
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        out = {"unparsed": (r.stdout or "")[-2000:], "stderr": (r.stderr or "")[-2000:]}
+    return r, out
+
+
+def lay_out(home, php):
+    rel = home / ".contextstack/releases" / RID
+    kit = rel / "cs"
+    (kit / "policy").mkdir(parents=True)
+    (kit / "ops/bin").mkdir(parents=True)
+    (kit / ".venv/bin").mkdir(parents=True)
+    shutil.copy2(KIT / "policy/spool.json", kit / "policy/spool.json")
+    shutil.copy2(KIT / "policy/env.json", kit / "policy/env.json")
+    (rel / "gateway").mkdir()
+    (rel / "gateway/models.json").write_text('{"lab_executor": "/dev/null"}\n')
+    (rel / "bin").mkdir()
+    for name in ("cs-gateway", "cs-harness", "cs-sandbox", "cs-tools", "cs-director"):
+        p = rel / "bin" / name
+        p.write_text("#!/bin/sh\necho %s\n" % name)
+        p.chmod(0o755)
+    (kit / ".venv/bin/python3").write_text("#!/bin/sh\necho python3\n")
+    (kit / ".venv/bin/python3").chmod(0o755)
+    pub = rel / "client-web/public"
+    pub.mkdir(parents=True)
+    (pub / "index.php").write_text("<?php\n")
+    router = rel / "client-web/vendor/laravel/framework/src/Illuminate/Foundation/resources"
+    router.mkdir(parents=True)
+    (router / "server.php").write_text("<?php\n")
+    (rel / ".complete").write_text("")
+    (home / ".local/bin").mkdir(parents=True)
+    tok = home / "token.json"
+    tok.write_text(json.dumps({"token": TOKEN, "installation": "inst_linuxunits", "node": "n"}) + "\n")
+    return tok, php
+
+
+def write_php(tmp):
+    php = tmp / "php"
+    php.write_text('#!/bin/sh\n[ "$1" = "-r" ] && { echo 80300; exit 0; }\necho php "$@"\n')
+    php.chmod(0o755)
+    return php
+
+
+def write_shims(tmp):
+    shim = tmp / "shim"
+    shim.mkdir()
+    (shim / "systemctl").write_text(
+        '#!/bin/sh\n[ -n "$SYSTEMCTL_SHIM_LOG" ] && echo "systemctl $*" >> "$SYSTEMCTL_SHIM_LOG"\nexit 0\n')
+    (shim / "systemctl").chmod(0o755)
+    (shim / "loginctl").write_text(
+        '#!/bin/sh\n[ -n "$LOGINCTL_SHIM_LOG" ] && echo "loginctl $*" >> "$LOGINCTL_SHIM_LOG"\nexit 0\n')
+    (shim / "loginctl").chmod(0o755)
+    (shim / "launchctl").write_text('#!/bin/sh\necho "FAIL launchctl reached: $*" >&2\nexit 99\n')
+    (shim / "launchctl").chmod(0o755)
+    empty = tmp / "empty"
+    empty.mkdir()
+    return shim, empty
+
+
+class UnitSyntax(Exception):
+    """A generated unit line is not valid systemd syntax. Callers report this; they do not traceback."""
+
+
+def unit_words(value):
+    """systemd.syntax(7) Quoting, not shell quoting (including C escapes).
+
+    https://www.freedesktop.org/software/systemd/man/latest/systemd.syntax.html#Quoting
+    Only the escape subset emitted by this generator is needed; reject unknown escapes.
+    """
+    words = []
+    while value:
+        value = value.lstrip()
+        if not value:
+            break
+        quote = value[0] if value[0] in ('"', "'") else None
+        i, out = (1 if quote else 0), ''
+        while i < len(value):
+            c = value[i]
+            if quote and c == quote:
+                i += 1
+                if i != len(value) and not value[i].isspace():
+                    raise UnitSyntax("quote not closed at a word boundary: %r" % value)
+                break
+            if not quote and c.isspace():
+                break
+            if c == '\\':
+                i += 1
+                c = value[i]
+                escapes = {'\\': '\\', '"': '"', "'": "'", 't': '\t', 's': ' '}
+                if c not in escapes:
+                    raise UnitSyntax("unsupported C escape %r" % c)
+                c = escapes[c]
+            out += c
+            i += 1
+        else:
+            if quote:
+                raise UnitSyntax("unterminated quote: %r" % value)
+        words.append(out)
+        value = value[i:]
+    return words
+
+
+def expand_literal(value, exec_start=False):
+    # systemd.unit(5) Specifiers: %% is a literal %. systemd.exec(5)
+    # Environment=: $ has NO special meaning. systemd.service(5) Command lines:
+    # $$ is literal $, ${VAR} substitutes and standalone $VAR splits into words.
+    # Refuse unescaped specifiers/variables so a generated expansion cannot pass.
+    if re.search(r'%(?!%)', value.replace('%%', '')):
+        raise UnitSyntax("unescaped specifier: %r" % value)
+    value = value.replace('%%', '%')
+    if exec_start and '$' in value.replace('$$', ''):
+        raise UnitSyntax("unescaped dollar in ExecStart: %r" % value)
+    if exec_start:
+        value = value.replace('$$', '$')
+    return value
+
+
+def parse_unit(text):
+    exec_start, env, restart, wanted = None, {}, None, None
+    for line in text.splitlines():
+        key, _, value = line.partition('=')
+        if key == 'ExecStart':
+            words = unit_words(value)
+            no_expansion = words[0].startswith(':')
+            if no_expansion:
+                words[0] = words[0][1:]
+            executable = expand_literal(words[0])  # executable path is never env-expanded
+            exec_start = [expand_literal(w, not no_expansion) for w in words]
+            if executable != exec_start[0]:
+                raise UnitSyntax("executable path differs from argv[0]: %r" % exec_start)
+        elif key == 'Environment':
+            for assignment in unit_words(value):
+                name, _, val = expand_literal(assignment).partition('=')
+                env[name] = val
+        elif key == 'Restart':
+            restart = value
+        elif key == 'WantedBy':
+            wanted = value
+    return exec_start, env, restart, wanted
+
+
+def activate_args(home, tok, php, client_web=False):
+    args = ["activate", RID, "--node", "n", "--director", "http://127.0.0.1:8780",
+            "--serve-director-rs", "--link-dir", str(home / ".local/bin"), "--director-token-from", str(tok)]
+    if client_web:
+        args += ["--serve-client-web", "127.0.0.1:8781", "--php", str(php)]
+    return args
+
+
+def compare_renders(home, php):
+    """All five services: unit ExecStart/Environment match the plist; no secrets; Restart/WantedBy."""
+    os.environ["HOME"] = str(home)
+    os.environ["NODE_INSTALL_PLATFORM"] = "linux"
+    sys.path.insert(0, str(KIT / "scripts"))
+    ns = load_mod("node_services_render", KIT / "scripts/_node_services.py")
+    rec = {"gateway": "rust", "runner": "rust", "credentials": "off",
+           "director_rs_listen": ["127.0.0.1:8780"], "serve_client_web": "127.0.0.1:8781",
+           "client_web_php": str(php)}
+    specs = ns.agent_specs(rec, "cs", node=True, serve_rs=True, serve_cw=True)
+    expect([s.label for s in specs] == list(LABELS), "shared defs cover gateway, node, listen, director-rs, client-web")
+    unit_text = ""
+    for svc in specs:
+        plist = plistlib.loads(ns.render_plist(svc))
+        exec_start, env, restart, wanted = parse_unit(ns.render_unit(svc).decode())
+        unit_text += ns.render_unit(svc).decode()
+        expect(exec_start == [str(a) for a in plist["ProgramArguments"]],
+               "%s ExecStart matches ProgramArguments" % svc.label)
+        expect(env == dict(plist["EnvironmentVariables"]),
+               "%s Environment matches EnvironmentVariables" % svc.label)
+        expect(plist.get("WorkingDirectory") == svc.cwd, "%s WorkingDirectory shared" % svc.label)
+        expect(restart == "on-failure" and wanted == "default.target",
+               "%s Restart=on-failure WantedBy=default.target" % svc.label)
+        expect("LAB_STATE_ROOT" in env and "LAB_CONFIG_ROOT" in env or svc.label in (
+            "com.contextstack.director-rs", "com.contextstack.client-web"),
+               "%s carries the shared env (or director/client-web's own)" % svc.label)
+    expect(TOKEN not in unit_text and APP_KEY not in unit_text and "APP_KEY=" not in unit_text,
+           "rendered units contain no secrets")
+    awkward = ['', 'two words', '%h %% %s', '$HOME ${TOKEN} $$',
+               '"double" and \'single\'', r'back\slash\t\"', 'café 雪', 'tab\tvalue',
+               'space %h $HOME "quote" \\ 雪']
+    svc = ns.Service('fixture', ['/bin/echo', *awkward],
+                     {'VALUE%d' % i: v for i, v in enumerate(awkward)}, '/tmp', 'fixture%h$LOG')
+    rendered = ns.render_unit(svc).decode()
+    args, env, _, _ = parse_unit(rendered)
+    # WorkingDirectory= is not unquoted by systemd, so a space, quote or backslash is refused
+    # rather than written raw (it would be a literal path character or a line continuation).
+    for bad_cwd in ('/tmp/space %h', '/tmp/foo"bar', "/tmp/foo'bar", '/tmp/foo\\', 'relative'):
+        svc.cwd = bad_cwd
+        try:
+            ns.render_unit(svc)
+        except ns.Refused as error:
+            expect("WorkingDirectory" in str(error), "clear WorkingDirectory refusal: %s" % error)
+        except UnitSyntax as error:
+            fail("WorkingDirectory %r raised a parse error instead of Refused: %s" % (bad_cwd, error))
+        else:
+            fail("WorkingDirectory accepted unsafe value %r" % bad_cwd)
+    svc.cwd = '/tmp/100%done'
+    try:
+        cwd_line = next(line for line in ns.render_unit(svc).decode().splitlines()
+                        if line.startswith('WorkingDirectory='))
+    except ns.Refused as error:
+        fail("safe WorkingDirectory was refused: %s" % error)
+        cwd_line = ""
+    expect(cwd_line == 'WorkingDirectory=/tmp/100%%done',
+           'scalar WorkingDirectory with %% round-trips unquoted: %r' % cwd_line)
+    pct = ns.Service('fixture', ['/opt/bin/tool%v', '--ok'], {}, '/tmp', 'fixture')
+    try:
+        pct_text = ns.render_unit(pct).decode()
+        pct_args, _, _, _ = parse_unit(pct_text)
+    except (ns.Refused, UnitSyntax) as error:
+        fail("ExecStart percent value: %s" % error)
+        pct_text, pct_args = "", None
+    expect('":/opt/bin/tool%%v"' in pct_text, 'ExecStart argument with %% is quoted, not bare: %r' % pct_text)
+    expect(pct_args == pct.args, 'quoted ExecStart percent argument round-trips')
+    named = ns.Service('fixture', ['/bin/true'], {}, '/tmp', 'fixture', user='cs-node')
+    try:
+        user_line = next(line for line in ns.render_unit(named).decode().splitlines() if line.startswith('User='))
+    except ns.Refused as error:
+        fail("safe User was refused: %s" % error)
+        user_line = ""
+    expect(user_line == 'User=cs-node', 'User= stays one unquoted token: %r' % user_line)
+    for bad_user in ('bad user', 'alice/bob', '-root', 'alice\\'):
+        try:
+            ns.render_unit(ns.Service('fixture', ['/bin/true'], {}, '/tmp', 'fixture', user=bad_user))
+        except ns.Refused as error:
+            expect("User" in str(error), "clear User refusal for %r: %s" % (bad_user, error))
+        else:
+            fail("User accepted unsafe value %r" % bad_user)
+    for bad_logs in ('fix ture', 'fix"ture', "fix'ture", 'fix\\ture'):
+        try:
+            ns.render_unit(ns.Service('fixture', ['/bin/true'], {}, '/tmp', bad_logs))
+        except ns.Refused as error:
+            expect("StandardOutput" in str(error) or "Description" in str(error),
+                   "clear log-path refusal for %r: %s" % (bad_logs, error))
+        else:
+            fail("log path accepted unsafe value %r" % bad_logs)
+    expect(args == svc.args, 'awkward ExecStart values round-trip exactly')
+    expect(env == svc.env, 'awkward Environment values round-trip exactly')
+    expect('Description=ContextStack fixture%%h$LOG' in rendered
+           and 'fixture%%h$LOG.out.log' in rendered, 'non-command dollars remain literal')
+    original_current = ns.CURRENT
+    try:
+        ns.CURRENT = home / 'space %h $HOME "quote" \\ 雪/current'
+        owned = ns.Service('fixture', [str(ns.CURRENT / 'bin/echo')], {}, '/tmp', 'fixture')
+        path = home / 'owned.service'
+        path.write_bytes(ns.render_unit(owned))
+        expect(ns.our_agent(path), 'escaped executable path still identifies our unit')
+        actual, _, _, _ = parse_unit(path.read_text())
+        expect(actual == owned.args, 'awkward executable path and argv round-trip exactly')
+        poison = home / "poison.service"
+        poison.write_text("[Service]\nExecStart=/bin/true\n")
+        ns.CURRENT = home / "bad\nname" / "current"
+        try:
+            ns.our_agent(poison)
+        except ns.Refused as error:
+            expect("cannot tell whether" in str(error) and "newline" in str(error).lower(),
+                   "our_agent reports a unit-path refusal: %s" % error)
+        else:
+            fail("our_agent did not surface Refused for a unit path")
+    finally:
+        ns.CURRENT = original_current
+    analyze = shutil.which('systemd-analyze') if sys.platform == 'linux' else None
+    if analyze:
+        unit = home / 'fixture.service'
+        unit.write_text(rendered)
+        checked = subprocess.run([analyze, 'verify', str(unit)], capture_output=True, text=True)
+        expect(checked.returncode == 0, 'systemd-analyze verify: ' + checked.stderr.strip())
+    else:
+        print('skip systemd-analyze verify (not installed or not Linux); using man-page parser')
+    for field in ('args', 'env', 'cwd', 'logs'):
+        for newline in ('\n', '\r', '\0'):
+            bad = ns.Service('fixture', ['/bin/true'], {'KEY': 'value'}, '/tmp', 'fixture')
+            setattr(bad, field, {'args': ['evil' + newline + 'ExecStart=/bin/false'],
+                                 'env': {'KEY': 'evil' + newline + 'ExecStart=/bin/false'},
+                                 'cwd': '/tmp' + newline, 'logs': 'fixture' + newline}[field])
+            try:
+                ns.render_unit(bad)
+            except ns.Refused as error:
+                expect("newline" in str(error).lower() or "NUL" in str(error),
+                       "newline or NUL in %s is a clear refusal: %s" % (field, error))
+            except UnitSyntax as error:
+                fail("newline in %s became a parse error: %s" % (field, error))
+            else:
+                fail('systemd accepted newline or NUL in ' + field)
+    return ns, rec, specs
+
+
+def main():
+    if '--render-only' in sys.argv:
+        with scratch_dir(prefix='unit-render-') as tmp:
+            try:
+                compare_renders(Path(tmp), Path('/usr/bin/php'))
+            except UnitSyntax as error:
+                fail("systemd unit parse escaped as an exception: %s" % error)
+            except Exception as error:
+                if type(error).__name__ != "Refused":
+                    raise
+                fail("systemd refusal escaped as an exception: %s" % error)
+        return bool(problems)
+    real = Path.home()
+    watched = [real / ".local/bin", real / "Library/LaunchAgents", real / ".config/systemd/user"]
+    before = {str(w): sorted(os.listdir(w)) if w.is_dir() else None for w in watched}
+    tmp = Path(tempfile.mkdtemp(prefix="node-install-systemd-", suffix=".noindex"))
+    old_home, old_plat, old_path = os.environ.get("HOME"), os.environ.get("NODE_INSTALL_PLATFORM"), os.environ.get("PATH")
+    try:
+        home, php = tmp / "home", write_php(tmp)
+        shim, empty = write_shims(tmp)
+        tok, php = lay_out(home, php)
+        slog, llog = tmp / "systemctl.log", tmp / "loginctl.log"
+        path_shim = "%s:/usr/bin:/bin" % shim
+        flags = activate_args(home, tok, php)
+
+        try:
+            compare_renders(home, php)
+        except UnitSyntax as error:
+            fail("systemd unit parse escaped as an exception: %s" % error)
+        except Exception as error:
+            if type(error).__name__ != "Refused":
+                raise
+            fail("systemd refusal escaped as an exception: %s" % error)
+
+        macos_flags = ["activate", RID, "--node", "n", "--director", "http://127.0.0.1:8780",
+                       "--serve-director-rs", "--link-dir", str(home / ".local/bin"), "--no-load"]
+        r, out = run_nr(home, path_shim, *macos_flags, NODE_INSTALL_PLATFORM="macos")
+        expect(r.returncode == 0 and out.get("ok") is True,
+               "macos --no-load activate still writes plists: %s %s" % (r.returncode, out.get("refused") or (r.stderr or "")[-400:]))
+        agents = home / "Library/LaunchAgents"
+        expect(all((agents / (l + ".plist")).is_file() for l in LABELS if l != "com.contextstack.client-web"),
+               "macos wrote gateway, node, listen, director-rs plists")
+
+        r, out = run_nr(home, str(empty), *flags, NODE_INSTALL_PLATFORM="linux")
+        expect(r.returncode == 1 and "systemctl --user is not available" in str(out.get("refused")),
+               "linux without systemctl is refused: %s" % (out.get("refused") or out.get("stderr") or r.stderr[-400:]))
+        expect(not (home / ".config/systemd/user").exists() or not list((home / ".config/systemd/user").glob("*.service")),
+               "refuse before writing units")
+
+        r, out = run_nr(home, path_shim, *flags, NODE_INSTALL_PLATFORM="linux",
+                        SYSTEMCTL_SHIM_LOG=str(slog), LOGINCTL_SHIM_LOG=str(llog))
+        expect(r.returncode == 0 and out.get("ok") is True,
+               "linux activate with fake systemctl: %s %s" % (r.returncode, out.get("refused") or (r.stderr or "")[-400:]))
+        expect("loginctl enable-linger" in str(out.get("linger")), "JSON notes loginctl enable-linger")
+        expect("loginctl enable-linger" in (r.stderr or ""), "stderr notes loginctl enable-linger")
+        units = home / ".config/systemd/user"
+        installed = [l for l in LABELS if l != "com.contextstack.client-web"]
+        expect(all((units / (l + ".service")).is_file() for l in installed),
+               "linux wrote gateway, node, listen, director-rs units")
+        unit_blob = "".join((units / (l + ".service")).read_text() for l in installed if (units / (l + ".service")).is_file())
+        expect(TOKEN not in unit_blob, "installed units do not embed the node token")
+
+        slog_text = slog.read_text() if slog.is_file() else ""
+        expect("systemctl --user daemon-reload" in slog_text, "install calls daemon-reload: %r" % slog_text)
+        for label in installed:
+            expect("systemctl --user enable --now %s.service" % label in slog_text,
+                   "install enable --now %s" % label)
+        expect(not llog.is_file() or not llog.read_text().strip(), "loginctl was not run")
+
+        r, out = run_nr(home, path_shim, "uninstall", "--purge", NODE_INSTALL_PLATFORM="linux",
+                        SYSTEMCTL_SHIM_LOG=str(slog), LOGINCTL_SHIM_LOG=str(llog))
+        expect(r.returncode == 0 and out.get("ok") is True,
+               "linux uninstall --purge: %s %s" % (r.returncode, out.get("refused") or (r.stderr or "")[-400:]))
+        slog_text = slog.read_text() if slog.is_file() else ""
+        for label in installed:
+            expect("systemctl --user disable --now %s.service" % label in slog_text,
+                   "uninstall disable --now %s" % label)
+            expect(not (units / (label + ".service")).exists(), "purge removed %s.service" % label)
+        expect(slog_text.count("systemctl --user daemon-reload") >= 2, "uninstall reloads after disable")
+        expect(not llog.is_file() or not llog.read_text().strip(), "loginctl was not run on uninstall")
+
+        space = tmp / "space home"
+        lay_out(space, php)
+        r, out = run_nr(space, path_shim, "activate", RID, "--node", "n", "--director", "http://127.0.0.1:8780",
+                        "--link-dir", str(space / ".local/bin"), "--no-load", NODE_INSTALL_PLATFORM="linux")
+        refused = str(out.get("refused") or "")
+        expect(r.returncode == 1 and "WorkingDirectory" in refused and "Traceback" not in (r.stderr or ""),
+               "a home path with a space is refused clearly: rc=%s refused=%r stderr=%r"
+               % (r.returncode, refused, (r.stderr or "")[-400:]))
+        written = list((space / ".config/systemd/user").glob("*.service")) if (space / ".config/systemd/user").is_dir() else []
+        expect(not written, "unsafe units were not written: %s" % written)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+        if old_plat is None:
+            os.environ.pop("NODE_INSTALL_PLATFORM", None)
+        else:
+            os.environ["NODE_INSTALL_PLATFORM"] = old_plat
+        if old_path is not None:
+            os.environ["PATH"] = old_path
+        shutil.rmtree(tmp, ignore_errors=True)
+    after = {str(w): sorted(os.listdir(w)) if w.is_dir() else None for w in watched}
+    expect(before == after, "real ~/.local/bin, LaunchAgents and systemd user dir unchanged")
+    print("check: node-install-systemd %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

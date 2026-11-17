@@ -1,0 +1,9 @@
+{
+ "darwin_only": true,
+ "env": {
+  "LAB_CHILD_ENV": "",
+  "LAB_VIDEO_MUTATION": "marker-in-the-parent",
+  "FX_SECRET_OK": "requested-and-permitted",
+  "FX_SECRET_NO": "never-requested"
+ }
+}

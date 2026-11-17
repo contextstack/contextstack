@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+import hashlib,json,os,re,shutil,subprocess,sys,tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must not resolve the caller's estate.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+LAB=Path(__file__).resolve().parents[3]
+for grant in (LAB/'grants').glob('*.yaml'):
+ assert re.search(r'^estate: [a-z][a-z0-9-]*$',grant.read_text(),re.M),f'{grant.name}: estate missing'
+with scratch_dir(prefix='schedule-estate-') as raw:
+ root=Path(raw);ops=root/'ops/bin';ops.mkdir(parents=True)
+ for name in ['schedule-tick','schedule-enable','schedule-enable.json','enqueue','_corpus_contract.py', '_workspace_setup.py','_dispatch.py','_grant.py','_estate_io.py','_roots.py','_void.py']:
+  shutil.copy2(LAB/'ops/bin'/name,ops/name)
+  if os.environ.get('FIXTURE_BEFORE') and name in ['schedule-tick','_grant.py']:
+   (ops/name).write_bytes(subprocess.check_output(['git','-C',str(LAB),'show','HEAD:ops/bin/'+name]))
+ (root/'ledger').mkdir();(root/'grants').mkdir();(root/'specs').mkdir()
+ (root/'specs/smoke.yaml').write_text('id: smoke\nmodel: local-coder\n')
+ (ops/'local-model-ready').write_text('#!/bin/sh\nexit 0\n');(ops/'local-model-ready').chmod(0o755)
+ (ops/'enqueue').write_text('''#!/usr/bin/env python3
+import json
+from pathlib import Path
+p=json.load(__import__('sys').stdin)
+Path('enqueued.json').write_text(json.dumps(p))
+print('{"id":"one-job"}')
+''');(ops/'enqueue').chmod(0o755)
+ schedule={'id':'probe-smoke','cron':'0 6 * * *','timezone':'America/New_York','enabled':True,'catch_up_window_minutes':30,'lane':'probe','spec':'specs/smoke.yaml','task':'tasks/create-file','grant':'smoke'}
+ (root/'ledger/schedules.jsonl').write_text(json.dumps(schedule)+'\n')
+ def run(estate,grant_estate,status='active'):
+  (root/'ESTATE').write_text(estate+'\n')
+  (root/'grants/smoke.yaml').write_text('id: smoke\n'+('estate: '+grant_estate+'\n' if grant_estate else '')+f'repo: {root}\npaths: [tasks/create-file]\ngates: ["true"]\ncommit: false\nstatus: {status}\nexpiry: 2099-01-01T00:00:00Z\n')
+  for p in ['ledger/schedule-fires.jsonl','enqueued.json']:(root/p).unlink(missing_ok=True)
+  r=subprocess.run([str(ops/'schedule-tick')],input=json.dumps({'now':'2026-09-10T10:00:00+00:00','scan_stale':False}),text=True,cwd=root,capture_output=True, env={**hermetic_env()})
+  assert r.returncode==0,r.stderr
+  return json.loads(r.stdout)
+ for estate,grant_estate,status,needle in [
+   ('prod-1','dev','active','grant smoke is estate: dev; this lab is prod-1; run on dev.'),
+   ('dev','prod-1','active','grant smoke is estate: prod-1; this lab is dev; run on prod-1.'),
+   ('prod-1',None,'active','missing estate'),
+   ('prod-1','prod-1','revoked','revoked'),
+ ]:
+  r=run(estate,grant_estate,status)
+  reason=r['deferred'][0]['reason']
+  assert not r['admitted'] and needle in reason,r
+  assert not (root/'enqueued.json').exists(),'unauthorized enqueue'
+ for estate in ['dev','prod-1']:
+  r=run(estate,estate)
+  assert len(r['admitted'])==1,r
+  assert json.loads((root/'enqueued.json').read_text())['grant']=='smoke','probe grant lost'
+ (root/'ledger/schedules.jsonl').unlink()
+ (root/'specs/hello-smoke.yaml').write_text('id: hello-smoke\nmodel: local-coder\n')
+ grant=root/'grants/smoke.yaml'
+ grant.write_text(grant.read_text().replace('paths: [tasks/create-file]','paths: [specs/hello-smoke.yaml, tasks/create-file]'))
+ payload={'schedule_id':'probe-hello-smoke','grant':'smoke','grant_digest':hashlib.sha256(grant.read_bytes()).hexdigest(),'actor_kind':'automated','actor_id':'director:automated:user:1','request_key':'fixture-enable','expected_digest':hashlib.sha256(b'null').hexdigest()}
+ def enable(body):
+  r=subprocess.run([str(ops/'schedule-enable')],input=json.dumps(body),text=True,cwd=root,capture_output=True, env={**hermetic_env()})
+  return json.loads(r.stdout)
+ first=enable(payload);assert first['ok'] and not first['replayed'],first
+ assert first['schedule']['estate']=='prod-1' and first['schedule']['actor_kind']=='automated'
+ second=enable(payload);assert second['ok'] and second['replayed'],second
+ assert len((root/'ledger/schedules.jsonl').read_text().splitlines())==1
+ assert not enable({**payload,'actor_id':'director:automated:user:2'})['ok']
+ assert not enable({**payload,'request_key':'new-key'})['ok'],'stale revision accepted'
+ assert not enable({**payload,'schedule_id':'probe-standing-shadow-manager'})['ok']
+ assert not enable({**payload,'cron':'* * * * *'})['ok']
+ third=enable({**payload,'request_key':'revision','expected_digest':first['digest']})
+ assert third['ok'] and third['schedule']['event']=='schedule_updated',third
+
+ # A setup-only judgment is bound to its corpus grant but cannot be treated
+ # as a destination write. The same commit:false grant must still refuse an
+ # explicit resource/destination request.
+ shutil.copy2(LAB/'ops/bin/enqueue',ops/'enqueue')
+ judgment=root/'tasks/judgment';judgment.mkdir(parents=True)
+ (judgment/'notes.md').write_text(f'repo: {root}\nsetup: ledger/setups/fixture\nwrites: judgment.json\n')
+ grant.write_text(grant.read_text().replace('commit: true','commit: false'))
+ probe={'spec':'specs/smoke.yaml','task':'tasks/judgment','lane':'probe','grant':'smoke'}
+ queued=subprocess.run([str(ops/'enqueue')],input=json.dumps(probe),text=True,cwd=root,capture_output=True, env={**hermetic_env()})
+ assert queued.returncode==0,queued.stderr
+ refused=subprocess.run([str(ops/'enqueue')],input=json.dumps({**probe,'resource':str(root)}),text=True,cwd=root,capture_output=True, env={**hermetic_env()})
+ assert refused.returncode!=0 and 'commit false' in refused.stderr and 'renew by tag' in refused.stderr,refused
+ sys.path.insert(0,str(ops));from _void import schedule_rows
+ assert len(schedule_rows(root/'ledger/schedules.jsonl'))==1
+ shelf=root/'ledger/repair-fixture.jsonl'
+ original={'id':'fixture','enabled':True}
+ malformed={**original,'enabled':False}
+ repair={**malformed,'event':'schedule_updated','repairs_revision_sha':hashlib.sha256(json.dumps(malformed,sort_keys=True,separators=(',', ':')).encode()).hexdigest()}
+ for rows,valid in [([original,malformed],False),([original,malformed,{**repair,'id':'foreign'}],False),([original,repair,malformed],False),([original,malformed,{**repair,'repairs_revision_sha':'wrong'}],False),([original,malformed,repair],True)]:
+  shelf.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+  try:
+   result=schedule_rows(shelf)
+   assert valid,'unrepaired duplicate accepted'
+   assert result==[repair]
+  except ValueError:
+   assert not valid,'explicit bound correction refused'
+
+print('check: schedules require matching estate grants and retain probe authority at enqueue')

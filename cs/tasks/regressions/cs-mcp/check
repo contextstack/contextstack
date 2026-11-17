@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""cs-mcp regression (goal.md): `cs mcp` over stdio against a real director-rs and a protocol-2 stand-in node.
+
+Temp data dir, free port, temp HOME for the Director (director-spec's RustTarget); never the installed Director or
+its credential. The node side is director-spec's Node2. SKIP when no director-rs binary is built.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+REPO = KIT.parent
+sys.dont_write_bytecode = True  # no __pycache__ left in director-spec
+sys.path.insert(0, str(REPO / "tests/director-spec"))
+from harness import wire  # noqa: E402
+from harness.node2 import delta, stop  # noqa: E402
+from harness.run import Ctx  # noqa: E402
+from harness.targets import RustTarget  # noqa: E402
+
+problems = []
+
+
+def expect(cond, msg, detail=""):
+    print(("ok   " if cond else "FAIL ") + msg + ("" if cond else " %s" % str(detail)[:600]))
+    if not cond:
+        problems.append(msg)
+
+
+class Server:
+    def __init__(self, url, credential, node, env=None, command=None):
+        self.proc = subprocess.Popen(command or [sys.executable, "-I", str(KIT / "scripts/cs"), "mcp", "--director", url,
+                                      "--credential-file", str(credential), "--node", node],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                     env=dict(env or {}, PATH=os.environ.get("PATH", "/usr/bin:/bin"), HOME=tempfile.mkdtemp(suffix=".noindex")))
+        self.serial, self.seen, self.pending = 0, [], {}
+
+    def send(self, method, params=None):
+        self.serial += 1
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self.serial, "method": method, "params": params or {}}) + "\n")
+        self.proc.stdin.flush()
+        return self.serial
+
+    def read(self, ident):
+        if ident in self.pending:
+            return self.pending.pop(ident)
+        while True:
+            line = self.proc.stdout.readline()
+            self.seen.append(line)
+            reply = json.loads(line)
+            rid = reply.get("id")
+            if rid == ident:
+                return reply
+            self.pending[rid] = reply
+
+    def rpc(self, method, params=None):
+        return self.read(self.send(method, params))
+
+    def tool(self, name, **args):
+        result = self.rpc("tools/call", {"name": name, "arguments": args})["result"]
+        return json.loads(result["content"][0]["text"]), result["isError"]
+
+    def close(self):
+        self.proc.stdin.close()
+        self.proc.wait(timeout=10)
+
+
+def finish_stuck(node, job_id, run_id, reason="stuck:repeat"):
+    stuck = b"Stop: stuck:repeat\n\nRecent tool calls\n- Bash: same failing cmd\n"
+    transcript = b"\n".join(json.dumps(e).encode() for e in (
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Spinning."}]}},
+        {"type": "result", "result": "Stuck."}))
+    run = wire.run_fixture(run_id, overrides={
+        "check.json": json.dumps({"verdict": "fail", "exit_code": 1, "skipped": False, "output": "fail\n"}).encode(),
+        "stuck.md": stuck, "transcript.md": transcript})
+    for data in run["files"].values():
+        node.call("PUT", "objects/" + wire.sha(data), raw=data)
+    a = node.call("POST", "envelopes", body={"envelope": run["envelope"], "row_line": run["row_line"]})
+    assert (a.json or {}).get("status") == "acked", a
+    body = {"state": "error", "director_job": job_id, "run_id": run_id, "reason": reason,
+            "stop": "error: no_row: " + reason}
+    row = json.dumps(body)
+    term = {"envelope_version": 1, "event_id": "job_terminal:" + job_id, "job_id": job_id, "files": [],
+            "envelope_sha256": wire.sha(b""), "row_sha256": wire.sha(row)}
+    a = node.call("POST", "envelopes", body={"envelope": term, "row_line": row})
+    assert (a.json or {}).get("status") == "acked", a
+
+
+def finish(node, job_id, run_id, state="done", reason=None):
+    """The node reports the run (check pass, a diff, a transcript) and the job's end, as spool-send would.
+    For an error end with no run, pass run_id=None and state='error' with a reason."""
+    if run_id:
+        transcript = b"\n".join(json.dumps(e).encode() for e in (
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Edited a.txt."}]}},
+            {"type": "result", "result": "Done: a.txt says hello."}))
+        run = wire.run_fixture(run_id, overrides={
+            "check.json": json.dumps({"verdict": "pass", "exit_code": 0, "skipped": False, "output": "ok\n"}).encode(),
+            "transcript.md": transcript, "evidence/candidate.diff": b"--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-hi\n+hello\n"})
+        for data in run["files"].values():
+            node.call("PUT", "objects/" + wire.sha(data), raw=data)
+        a = node.call("POST", "envelopes", body={"envelope": run["envelope"], "row_line": run["row_line"]})
+        assert (a.json or {}).get("status") == "acked", a
+    body = {"state": state, "director_job": job_id}
+    if run_id:
+        body["run_id"] = run_id
+    if reason:
+        body["reason"] = reason
+        body["stop"] = "error: no_row: " + reason
+    row = json.dumps(body)
+    term = {"envelope_version": 1, "event_id": "job_terminal:" + job_id, "job_id": job_id, "files": [],
+            "envelope_sha256": wire.sha(b""), "row_sha256": wire.sha(row)}
+    a = node.call("POST", "envelopes", body={"envelope": term, "row_line": row})
+    assert (a.json or {}).get("status") == "acked", a
+
+
+def model_injection_offline():
+    module_spec = importlib.util.spec_from_file_location("cs_mcp_security", KIT / "scripts/cs_mcp.py")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+
+    class NoDirectorAccess:
+        def __getattr__(self, name):
+            raise AssertionError("invalid model reached Director: " + name)
+
+    with scratch_dir(prefix="cs-mcp-model-") as root:
+        with patch.dict(os.environ, {"HOME": root, "CS_INSTALL_ROOT": root}), \
+             patch.object(module.agents, "kit_dir", return_value=KIT), \
+             patch.object(module.agents, "agents_dir", return_value=KIT / "agents"):
+            tools = module.Tools(NoDirectorAccess(), "fixture-node")
+            for value in ("codex\nid: hosted-lead", "codex\n", "co\ndex", " codex", "codex ",
+                          "codex:foo", "codex#foo", "[codex]", "unknown-executor"):
+                try:
+                    tools.start_task(title="x", goal="x", model=value)
+                except module.Refused as error:
+                    expect("model" in str(error), "offline invalid model refused before Director access: %r" % value)
+                else:
+                    expect(False, "invalid model was accepted: %r" % value)
+            expect(module.validate_model("codex") == "codex", "known executor model accepted")
+
+    class BuiltinDirector:
+        def get(self, path):
+            return {}
+
+        def post(self, path, body, key=None):
+            expect(key == body.get("dispatch_id"), "dispatch ID passed as transport key", (key, body))
+            expect(path == "intents" and "lane" in body and "files" not in body,
+                   "start_task sends built-in lane form without files", body)
+            return {"intent": {"intent_id": "built-in", "task": "tasks/test"},
+                    "jobs": [{"job_id": "built-in-job", "state": "offered"}]}
+
+    with patch.object(module.agents, "kit_dir", return_value=KIT):
+        module.Tools(BuiltinDirector(), "fixture-node").start_task(title="Test", goal="Do it", model="codex")
+        tools = module.Tools(BuiltinDirector(), "fixture-node")
+        tools.start_task(title="Test", goal="Do it", model="codex", dispatch_id="offline:1")
+        for bad in ("", "has space", "x" * 129, 42):
+            try:
+                tools.start_task(title="Test", goal="Do it", dispatch_id=bad)
+            except module.Refused as error:
+                expect("dispatch_id" in str(error), "invalid dispatch ID refused offline")
+            else:
+                expect(False, "invalid dispatch ID accepted")
+        with patch.object(tools.d, "get", return_value={"intents": [], "jobs": []}) as lookup:
+            expect(tools.find_task("offline:1") == {"intents": [], "jobs": []}, "offline recovery lookup")
+            lookup.assert_called_once_with("intents?dispatch_id=offline%3A1")
+
+
+    class RenamingDirector(BuiltinDirector):
+        def post(self, path, body, key=None):
+            answer = super().post(path, body, key)
+            answer["intent"]["task"] = "tasks/hello-1"
+            answer["jobs"][0]["meta"] = {"lane": "hello-1", "model": "claude-code"}
+            return answer
+
+    with patch.object(module.agents, "kit_dir", return_value=KIT):
+        result = module.Tools(RenamingDirector(), "fixture-node").start_task(
+            title="Hello", goal="Do it", model="codex", repo="hello", lane="hello")
+        expect(result["workspace"]["lane"] == "hello-1" and result["workspace"]["branch"] == "lane/hello-1"
+               and result["lane_renamed"] == {"from": "hello", "to": "hello-1"},
+               "MCP reports the Director's non-colliding lane", result)
+        expect(result["model"] == "claude-code" and result["model_chosen"] == "claude-code",
+               "MCP reports the executor selected for the offer", result)
+
+    class TaskDirector:
+        def get(self, path):
+            jobs = [{"job_id": "retry", "intent_id": "task", "state": "offered"},
+                    {"job_id": "first", "intent_id": "task", "state": "error"}]
+            if path == "intents":
+                return {"intents": [{"intent_id": "task", "title": "One task"}], "jobs": jobs}
+            if path == "intents/task":
+                return {"intent": {"intent_id": "task", "title": "One task"}, "jobs": jobs, "runs": []}
+            if path == "jobs/first":
+                return jobs[1]
+            if path == "runs":
+                return {"runs": []}
+            raise AssertionError(path)
+
+    tools = module.Tools(TaskDirector(), "fixture-node")
+    lanes = tools.list_tasks(active_only=True)["lanes"]
+    expect(len(lanes) == 1 and {j["job_id"] for j in lanes[0]["jobs"]} == {"first", "retry"},
+           "offline: one active task includes its failed and offered jobs", lanes)
+    status = tools.task_status("first")
+    expect(status.get("intent_id") == "task" and len(status.get("jobs", [])) == 2,
+           "offline: status of a prior job includes the task's attempts", status)
+    try:
+        tools.retry_task("first", model="codex")
+    except module.Refused as error:
+        expect("third attempt" in str(error), "offline: retry limit counts jobs without retry metadata")
+    else:
+        expect(False, "retry with two jobs was accepted")
+
+
+
+def bridged_watch(target, node):
+    """Real start_task through the sandbox proxy authenticates its host-side watch."""
+    spec = importlib.util.spec_from_file_location("lead_mcp", KIT / "ops/bin/_lead_mcp.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with scratch_dir(prefix="cs-mcp-watch-") as raw:
+        root = Path(raw).resolve()
+        path = root / "socket"
+        token = "serve-token-fixture"
+        (root / "token").write_text(token)
+        (root / "token").chmod(0o600)
+        received = []
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(path))
+            listener.listen(1)
+            listener.settimeout(10)
+
+            def watch():
+                with listener.accept()[0] as conn:
+                    received.append(json.loads(conn.recv(65536)))
+                    conn.sendall(b'{"ok":true}\n')
+
+            worker = threading.Thread(target=watch, daemon=True)
+            worker.start()
+            config = {"mcpServers": {"contextstack": {"command": sys.executable, "args": [
+                "-I", str(KIT / "scripts/cs"), "mcp", "--no-land", "--director", target.url,
+                "--credential-file", str(target.data / "local-credential"), "--node", node.name]}}}
+            bridge = module.HostMCPBridge(config, root,
+                env=dict(PATH=os.environ.get("PATH", "/usr/bin:/bin"), HOME=str(root), LEAD_HOST_SOCKET=str(path)))
+            try:
+                proxy = bridge.config["mcpServers"]["contextstack"]
+                server = Server(target.url, target.data / "local-credential", node.name,
+                                command=[proxy["command"], *proxy["args"]])
+                try:
+                    started, err = server.tool("start_task", title="Bridged watch", goal="Do nothing.",
+                                               repo="contextstack", lane="bridged-watch")
+                    worker.join(timeout=10)
+                    expect(not err and received == [{"op": "watch_job", "job_id": started.get("job_id"),
+                                                     "lane": "bridged-watch", "token": token}],
+                           "bridged host start_task authenticates watch_job with private serve token", received)
+                    expect(token not in "".join(server.seen) + json.dumps(bridge.config),
+                           "serve token stays out of MCP output and proxy config")
+                finally:
+                    server.close()
+            finally:
+                bridge.close()
+
+
+def main():
+    spec = importlib.util.spec_from_file_location("review_cases", HERE / "review_cases.py")
+    cases = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cases)
+    spec = importlib.util.spec_from_file_location("review_mcp", KIT / "scripts/cs_mcp.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cases.check(module, scratch_dir)
+    model_injection_offline()
+    subprocess.run([sys.executable, str(HERE / "output_fallback.py")], check=True, env={**hermetic_env()})
+    binary = Path(os.environ.get("DIRECTOR_BIN") or REPO / "target/release/cs-director")
+    if not binary.is_file():
+        print("SKIP cs-mcp: no director-rs at %s (cargo build --release -p cs-director)" % binary)
+        return 1 if problems else 0
+    tmp = tempfile.mkdtemp(prefix="cs-mcp-", suffix=".noindex")
+    target = RustTarget(tmp, binary)
+    try:
+        ctx = Ctx("cs-mcp", target)
+        node = ctx.node2()
+        bridged_watch(target, node)
+        token = target.local_token()
+        server = Server(target.url, target.data / "local-credential", node.name)
+        try:
+            scenario(server, node, target, token, tmp)
+        finally:
+            server.close()
+        expect(not any(token in line for line in server.seen), "the local credential never appears in the output")
+        fixture = fixture_agents(tmp)
+        profile_link = target.tmp / "code/cs/agents"
+        profile_link.unlink()
+        profile_link.mkdir()
+        for name, text in (("tester", TESTER), ("looker", LOOKER)):
+            (profile_link / (name + ".md")).write_text(text)
+        profiles = Server(target.url, target.data / "local-credential", node.name, env={"CS_AGENTS_DIR": fixture})
+        try:
+            agents_scenario(profiles, target, token)
+        finally:
+            profiles.close()
+    finally:
+        target.close()
+    print("cs-mcp: %s" % ("FAIL (%d)" % len(problems) if problems else "ok"))
+    return 1 if problems else 0
+
+
+LAND_STUB = """import json, sys, time
+print(json.dumps({"available": False, "repo": sys.argv[1], "lane": sys.argv[2]}))
+sys.stdout.flush()
+time.sleep(2)
+"""
+
+
+def scenario(server, node, target, token, tmp):
+    init = server.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})["result"]
+    expect(init["capabilities"] == {"tools": {}} and init["protocolVersion"] == "2025-06-18", "initialize", init)
+    server.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    names = {t["name"] for t in server.rpc("tools/list")["result"]["tools"]}
+    want = {"start_task", "list_agents", "list_tasks", "task_status", "task_output", "wait_tasks", "cancel_task", "decide", "usage",
+            "machines", "list_repos", "land_task", "needs_you", "clear_needs_you", "retry_task", "find_task"}
+    expect(names == want, "tools/list names the tools", names)
+
+    # 1b. the shipped profiles (cs/agents), and a budget over the gateway's hour refused before any upload.
+    shipped, err = server.tool("list_agents")
+    by = {a["name"]: a for a in shipped.get("agents", [])}
+    expect(not err and set(by) >= {"coder", "reviewer", "researcher", "verifier"} and not any("error" in a for a in by.values())
+           and by["coder"]["writes"] is True and by["reviewer"]["writes"] is False and by["researcher"]["lane"] is False
+           and all(set(a) >= {"name", "description", "model", "writes", "lane"} for a in by.values()),
+           "list_agents: the shipped profiles parse", shipped)
+    before = stored(target)
+    refused, err = server.tool("start_task", title="x", goal="x", budget={"seconds": 3601})
+    expect(err and "3600" in refused.get("error", "") and stored(target) == before, "seconds > 3600 refused, nothing uploaded", refused)
+
+    for model in ("codex\nid: hosted-lead", "codex\n", "co\ndex", " codex", "codex ",
+                  "codex:foo", "codex#foo", "[codex]", "unknown-executor"):
+        before = stored(target)
+        refused, err = server.tool("start_task", title="Injection", goal="x", model=model)
+        expect(err and "model" in refused.get("error", "") and stored(target) == before,
+               "invalid model refused before any upload: %r" % model, refused)
+
+    # 2. start_task builds and submits the bundle.
+    started, err = server.tool("start_task", title="Say hello", goal="Make a.txt say hello.\n", repo="contextstack",
+                               lane="say-hello", task_type="feature")
+    expect(not err and started.get("job_id") and started["task"] == "tasks/say-hello", "start_task submits", started)
+    job_id = started["job_id"]
+    owner = lambda path: wire.request(target.url, "GET", "/api/v1/client/" + path, token=token)
+    job = owner("jobs/" + job_id).json
+    job = job.get("job", job)
+    files = {f["path"]: f["mode"] for f in job["files"]}
+    expect(files == {"spec.yaml": 420, "prompts/system.md": 420, "tasks/say-hello/goal.md": 420,
+                     "tasks/say-hello/check": 493}, "the bundle: spec, prompt, goal, executable check", files)
+    spec = owner("jobs/%s/files/spec.yaml" % job_id).body.decode()
+    expect("model: cursor-sol\n" in spec and "\nintent: " in spec and "\nrepo: contextstack\n" in spec
+           and "\nlane: say-hello\n" in spec and "base" not in spec and "tasks: [tasks/say-hello]" in spec,
+           "spec names the model, the stamp and the workspace", spec)
+    expect(by["coder"]["model"] == "cursor-sol" and by["reviewer"]["model"] == "cursor-codex"
+           and by["researcher"]["model"] == "cursor-composer" and by["verifier"]["model"] == "cursor-agent",
+           "shipped profiles default off Claude onto Cursor templates", by)
+    check = owner("jobs/%s/files/tasks/say-hello/check" % job_id).body.decode()
+    expect(check.startswith("#!/bin/sh") and "exit 0" in check, "no check given: the no check", check)
+    expect(job["meta"].get("source") == "cs-mcp" and job["meta"].get("lane") == "say-hello"
+           and job["meta"].get("task_type") == "feature", "meta tags", job["meta"])
+
+    # 3. status while offered, then live.
+    lanes, _ = server.tool("list_tasks")
+    expect([l["state"] for l in lanes["lanes"] if l["job_id"] == job_id] == ["offered"]
+           and lanes["lanes"][0]["title"] == "Say hello", "list_tasks shows it offered", lanes)
+    node.accept(job_id)
+    run_id = "cs-mcp-run-%d" % int(time.time())
+    a = node.events(run_id, job_id, [delta(1, "Hel"), delta(2, "lo"), stop(3)])
+    expect(a.status in (200, 201, 202), "node sends live events", a)
+    status, _ = server.tool("task_status", job_id=job_id)
+    expect(status["state"] == "accepted" and status.get("live_run_id") == run_id and status.get("live_events") == 3,
+           "task_status names the live run", status)
+    out, _ = server.tool("task_output", job_id=job_id)
+    expect(out.get("partial_output") == "Hello", "task_output gives the partial text", out)
+
+    # 4. wait_tasks: a timeout, then an early return when the job ends during the wait.
+    slow = server.send("tools/call", {"name": "wait_tasks", "arguments": {"job_ids": [job_id], "timeout_seconds": 3}})
+    fast = server.send("tools/call", {"name": "list_tasks", "arguments": {}})
+    t0 = time.time()
+    fast_reply = server.read(fast)["result"]
+    fast_took = time.time() - t0
+    slow_reply = server.read(slow)["result"]
+    fast_lanes = json.loads(fast_reply["content"][0]["text"])
+    slow_wait = json.loads(slow_reply["content"][0]["text"])
+    expect(fast_took < 2 and not fast_reply.get("isError")
+           and [l["job_id"] for l in fast_lanes.get("lanes", []) if l.get("job_id") == job_id] == [job_id]
+           and slow_wait.get("timed_out") and slow_wait.get("still_running") == [job_id],
+           "a slow wait_tasks does not block concurrent list_tasks; replies stay matched by id", [fast_took, slow_wait])
+
+    waited, _ = server.tool("wait_tasks", job_ids=[job_id], timeout_seconds=1)
+    expect(waited["timed_out"] and waited["still_running"] == [job_id], "wait_tasks times out while running", waited)
+    ident = server.send("tools/call", {"name": "wait_tasks", "arguments": {"job_ids": [job_id], "timeout_seconds": 60}})
+    t0 = time.time()
+    threading.Timer(1.5, finish, (node, job_id, run_id)).start()
+    reply = server.read(ident)["result"]
+    waited, took = json.loads(reply["content"][0]["text"]), time.time() - t0
+    expect(not waited["timed_out"] and [e["job_id"] for e in waited["ended"]] == [job_id] and took < 2,
+           "wait_tasks returns when the job ends (%.1fs)" % took, waited)
+
+    # 5. output, decision.
+    out, _ = server.tool("task_output", job_id=job_id)
+    expect(out.get("check", {}).get("verdict") == "pass" and out.get("diff", {}).get("files") == ["a.txt"]
+           and "Done: a.txt says hello." in out.get("transcript_tail", ""), "task_output after the run", out)
+    decided, err = server.tool("decide", decision="approve", job_id=job_id, note="looks right")
+    expect(not err and decided.get("decision") == "approve" and decided.get("run_id") == run_id, "decide approves", decided)
+    status, _ = server.tool("task_status", job_id=job_id)
+    expect(status["state"] == "done" and status.get("run", {}).get("decision") == "approve", "status shows the decision", status)
+
+    # 5b. a check body without a #! line still execs on the node (it got "Exec format error", 2026-11-11).
+    sys.path.insert(0, str(REPO / "cs/scripts"))
+    import cs_mcp
+    expect(cs_mcp.as_script("test -f a.txt") == "#!/bin/sh\ntest -f a.txt\n"
+           and cs_mcp.as_script("#!/bin/bash\ntrue\n") == "#!/bin/bash\ntrue\n"
+           and cs_mcp.as_script("  ") == cs_mcp.NO_CHECK, "a plain check body gets #!/bin/sh")
+
+    # 5c. an errored job end carries its reason through task_status, list_tasks, wait_tasks and task_output.
+    failed, _ = server.tool("start_task", title="Boom", goal="Refuse.\n")
+    fail_id = failed["job_id"]
+    node.accept(fail_id)
+    why = "executor: gateway refused or unavailable: invalid executor or timeout"
+    finish(node, fail_id, None, state="error", reason=why)
+    status, _ = server.tool("task_status", job_id=fail_id)
+    expect(status.get("state") == "error" and status.get("error") == why, "task_status shows the error reason", status)
+    lanes, _ = server.tool("list_tasks")
+    listed = next((l for l in lanes["lanes"] if l["job_id"] == fail_id), {})
+    expect(listed.get("error") == why, "list_tasks shows the error reason", listed)
+    waited, _ = server.tool("wait_tasks", job_ids=[fail_id], timeout_seconds=5)
+    ended = next((e for e in waited.get("ended", []) if e["job_id"] == fail_id), {})
+    expect(ended.get("error") == why, "wait_tasks shows the error reason", waited)
+    out, _ = server.tool("task_output", job_id=fail_id)
+    expect(out.get("error") == why and out.get("note") != "no run yet",
+           "task_output returns the error instead of 'no run yet'", out)
+
+    # 6. cancel, usage, nodes, land, an unknown job.
+    second, _ = server.tool("start_task", title="Another", goal="Anything.\n", check="#!/bin/sh\ntest -f b.txt\n")
+    cancel, err = server.tool("cancel_task", job_id=second["job_id"], reason="not needed")
+    expect(not err and cancel.get("state") == "requested" and cancel.get("job_id") == second["job_id"], "cancel_task", cancel)
+    usage, err = server.tool("usage")
+    expect(not err and "total" in usage, "usage answers", usage)
+    nodes, err = server.tool("machines")
+    expect(not err and node.name in [n["name"] for n in nodes["machines"]], "machines lists the node", nodes)
+    repos = [{"name": "example", "path": "/tmp/example", "branch": "main"}]
+    reported = node.call("POST", "status", body={"repos": repos})
+    expect(reported.status == 200, "node reports repos", reported)
+    listed, err = server.tool("list_repos")
+    expect(not err and {**repos[0], "node": node.name} in listed.get("repos", []),
+           "list_repos returns Director inventory", listed)
+    land, err = server.tool("land_task", repo="contextstack", lane="say-hello")
+    expect(not err and (land.get("available") is False or land.get("status") == "refused"),
+           "land_task: cs land refuses an unknown repo, or is not in this release yet", land)
+    for bad in ({"repo": "contextstack"}, {"repo": "contextstack", "lane": "Bad Name"}):
+        refused, err = server.tool("start_task", title="x", goal="x", **bad)
+        expect(err and "error" in refused, "start_task refuses %s" % bad, refused)
+    missing, err = server.tool("task_status", job_id="no-such-job")
+    expect(err and "404" in missing.get("error", ""), "an unknown job is an isError result", missing)
+
+    # 7. a worker-thread tool fault is a JSON-RPC error (-32603) with the right id; the server keeps serving.
+    fault = Server(target.url, target.data / "local-credential", node.name, env={"CS_MCP_TEST_RAISE": "usage"})
+    try:
+        fault.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+        ident = fault.send("tools/call", {"name": "usage", "arguments": {}})
+        broke = fault.read(ident)
+        err = broke.get("error") or {}
+        expect(broke.get("id") == ident and err.get("code") == -32603 and "fixture fault" in err.get("message", "")
+               and "result" not in broke and "Traceback" not in json.dumps(broke),
+               "a tool fault on the worker pool is JSON-RPC -32603", broke)
+        lanes, err = fault.tool("list_tasks")
+        expect(not err and isinstance(lanes.get("lanes"), list), "list_tasks still works after a worker fault", lanes)
+    finally:
+        fault.close()
+
+    # 8. concurrent land_task on one repo: busy, not wait; another repo is not blocked.
+    stub = Path(tmp) / "slow-land.py"
+    stub.write_text(LAND_STUB)
+    lander = Server(target.url, target.data / "local-credential", node.name, env={"CS_MCP_LAND_STUB": str(stub)})
+    try:
+        lander.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+        desc = next(t for t in lander.rpc("tools/list")["result"]["tools"] if t["name"] == "land_task")["description"]
+        expect("busy" in desc.lower() and "not wait" in desc.lower(), "land_task documents busy, not wait", desc)
+        slow = lander.send("tools/call", {"name": "land_task", "arguments": {"repo": "contextstack", "lane": "say-hello"}})
+        busy_id = lander.send("tools/call", {"name": "land_task", "arguments": {"repo": "contextstack", "lane": "other"}})
+        other_id = lander.send("tools/call", {"name": "land_task", "arguments": {"repo": "other-repo", "lane": "x"}})
+        t0 = time.time()
+        busy = lander.read(busy_id)
+        busy_took = time.time() - t0
+        busy_body = json.loads(busy["result"]["content"][0]["text"])
+        expect(busy_took < 1 and busy["result"].get("isError") and "busy" in busy_body.get("error", "").lower()
+               and "contextstack" in busy_body.get("error", ""), "a concurrent land on the same repo is busy", busy_body)
+        other = lander.read(other_id)
+        other_took = time.time() - t0
+        expect(other_took < 2.5 and not other["result"].get("isError"),
+               "land_task on a different repo is not blocked (%.2fs)" % other_took, other)
+        lander.read(slow)
+    finally:
+        lander.close()
+
+    # 9. a long-running server follows ~/.contextstack/current: release A, switch to B, delete A.
+    release_switch(target.url, target.data / "local-credential", node.name, tmp)
+
+    # 10. retry_task: keeps model, allow_fallback for profile chain, previous-attempt goal, refuse pass and third attempt.
+    retry_task_scenario(target, node, token, tmp)
+
+
+# ---- sub-agent types (cs/agents; CS_AGENTS_DIR) -----------------------------------------------------------------
+TESTER = """---
+name: tester
+description: a fixture profile
+model: claude-code-sonnet
+writes: true
+lane: false
+check: "test -f done.txt"
+budget: {turns: 42, seconds: 900, usd: 0}
+task_type: test
+---
+You are the fixture tester. Say TESTER-PROMPT.
+"""
+LOOKER = TESTER.replace("name: tester", "name: looker").replace("writes: true", "writes: false").replace(
+    "lane: false", "lane: true").replace("TESTER-PROMPT", "LOOKER-PROMPT")
+BROKEN = "---\nname: broken\ndescription: x\nmodel: claude-code-opus\nwrites: maybe\nlane: false\n---\nbody\n"
+LONG = TESTER.replace("name: tester", "name: long").replace("seconds: 900", "seconds: 7200")
+
+
+MINI_CODER = """---
+name: coder
+description: fixture coder
+model: cursor-sol
+writes: true
+lane: true
+check: ""
+budget: {turns: 1, seconds: 60, usd: 0}
+task_type: feature
+---
+Fixture coder body.
+"""
+MINI_VERIFIER = MINI_CODER.replace("description: fixture coder", "description: fixture verifier").replace(
+    "Fixture coder body.", "Fixture verifier body.")
+
+RETRY_CODER = MINI_CODER.replace(
+    'task_type: feature\n---',
+    'task_type: feature\nfallback: ["codex", "cursor-composer"]\n---',
+)
+
+
+def lay_out_release(root, rid, agents_md, kit_src):
+    """One release under root/releases/<rid> with cs/scripts and a custom agents dir."""
+    rel = root / "releases" / rid
+    kit = rel / "cs"
+    scripts = kit / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("cs", "cs_mcp.py", "cs_agents.py", "cs_runs.py"):
+        shutil.copy2(kit_src / "scripts" / name, scripts / name)
+    ops = kit / "ops/bin"
+    ops.mkdir(parents=True)
+    shutil.copy2(kit_src / "ops/bin/executor-templates.json", ops / "executor-templates.json")
+    shutil.copy2(kit_src / "ops/bin/_lead_socket.py", ops / "_lead_socket.py")
+    (kit / "agents").mkdir()
+    for stem, text in agents_md.items():
+        (kit / "agents" / (stem + ".md")).write_text(text)
+    return kit
+
+
+def release_switch(director_url, credential, node, tmp):
+    root = Path(tmp) / "install"
+    root.mkdir()
+    releases = root / "releases"
+    releases.mkdir()
+    lay_a = lay_out_release(root, "rel-a", {"coder": MINI_CODER}, KIT)
+    lay_b = lay_out_release(root, "rel-b", {"coder": MINI_VERIFIER}, KIT)
+    current = root / "current"
+    current.symlink_to(releases / "rel-a")
+    stub = Path(tmp) / "rel-land-stub.py"
+    stub.write_text(LAND_STUB)
+    env = {"CS_INSTALL_ROOT": str(root), "CS_MCP_LAND_STUB": str(stub)}
+    rel_srv = Server(director_url, credential, node, env=env)
+    try:
+        rel_srv.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+        listed, err = rel_srv.tool("list_agents")
+        by = {a["name"]: a for a in listed.get("agents", []) if not a.get("error")}
+        expect(not err and by.get("coder", {}).get("description") != "fixture coder",
+               "list_agents ignores local release A profiles", listed)
+        land, err = rel_srv.tool("land_task", repo="contextstack", lane="say-hello")
+        expect(not err and land.get("lane") == "say-hello" and land.get("available") is False,
+               "land_task uses release A's cs while current points at A", land)
+        current.unlink()
+        current.symlink_to(releases / "rel-b")
+        shutil.rmtree(releases / "rel-a")
+        expect(not lay_a.exists(), "release A removed")
+        listed, err = rel_srv.tool("list_agents")
+        by = {a["name"]: a for a in listed.get("agents", []) if not a.get("error")}
+        expect(not err and by.get("coder", {}).get("description") != "fixture verifier",
+               "list_agents stays with Director after local release switch", listed)
+        land, err = rel_srv.tool("land_task", repo="contextstack", lane="lane-b")
+        expect(not err and land.get("lane") == "lane-b" and land.get("available") is False,
+               "land_task resolves cs through current release B", land)
+    finally:
+        rel_srv.close()
+
+
+def fixture_agents(tmp):
+    where = Path(tmp) / "agents"
+    where.mkdir()
+    for name, text in (("tester", TESTER.replace("claude-code-sonnet", "codex")), ("looker", LOOKER), ("broken", BROKEN), ("long", LONG)):
+        (where / (name + ".md")).write_text(text)
+    (where / "local-only.md").write_text(TESTER.replace("name: tester", "name: local-only"))
+    return str(where)
+
+
+def retry_agents_dir(tmp):
+    where = Path(tmp) / "retry-agents"
+    where.mkdir()
+    (where / "coder.md").write_text(RETRY_CODER.replace('fallback: ["codex", "cursor-composer"]', 'fallback: ["codex"]'))
+    return str(where)
+
+
+def retry_task_scenario(target, node, token, tmp):
+    agents_dir = retry_agents_dir(tmp)
+    state_root = Path(tmp) / "limits-state"
+    state_root.mkdir()
+    sys.path.insert(0, str(KIT / "ops" / "bin"))
+    from _provider_limits import record_limit  # noqa: E402
+
+    record_limit(state_root, "codex", {"message": "limited", "resets_at": "2099-01-01T00:00:00Z", "via": "test"})
+    plain = Server(target.url, target.data / "local-credential", node.name, env={"CS_AGENTS_DIR": agents_dir})
+    try:
+        plain.rpc("initialize", {})
+        s2, err = plain.tool("start_task", title="Stuck2", goal="Goal.\n", agent="coder", repo="contextstack", lane="stuck-plain")
+        s2_id = s2["job_id"]
+        node.accept(s2_id)
+        finish_stuck(node, s2_id, "run-plain", reason="provider_limit")
+        r2, err = plain.tool("retry_task", job_id=s2_id)
+        expect(not err and r2.get("model") == "cursor-sol", "retry_task keeps the prior model by default", r2)
+    finally:
+        plain.close()
+    server = Server(target.url, target.data / "local-credential", node.name,
+                    env={"CS_AGENTS_DIR": agents_dir, "LAB_STATE_ROOT": str(state_root)})
+    owner = lambda path: wire.request(target.url, "GET", "/api/v1/client/" + path, token=token)
+    try:
+        server.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+        record_limit(state_root, "cursor-sol", {"message": "limited", "resets_at": "2099-06-01T00:00:00Z", "via": "test"})
+        record_limit(state_root, "codex", {"message": "limited", "resets_at": "2099-01-01T00:00:00Z", "via": "test"})
+        fallback, err = server.tool("start_task", title="Limit pick", goal="Go.\n", agent="coder",
+                                    repo="contextstack", lane="limit-pick")
+        expect(not err and fallback.get("model") == "cursor-composer" and fallback.get("model_chosen") == "cursor-composer",
+               "start_task implicit model skips limited chain", fallback)
+        expect(fallback.get("skipped") == [{"model": "cursor-sol", "until": "2099-06-01T00:00:00Z"},
+                                           {"model": "codex", "until": "2099-01-01T00:00:00Z"}],
+               "start_task reports skipped limits", fallback)
+        explicit_bad, err = server.tool("start_task", title="No", goal="No.\n", model="cursor-sol")
+        expect(err and "usage-limited" in explicit_bad.get("error", "") and "2099-06-01" in explicit_bad.get("error", ""),
+               "explicit limited model refused with reset time", explicit_bad)
+        usage, err = server.tool("usage")
+        expect(not err and any(r.get("template") == "cursor-sol" and r.get("resets_at") for r in usage.get("provider_limits", [])),
+               "usage lists limited templates", usage)
+        from _provider_limits import load as load_limits, save as save_limits  # noqa: E402
+        cleared = load_limits(state_root)
+        cleared.get("templates", {}).pop("cursor-sol", None)
+        save_limits(state_root, cleared)
+        stuck, err = server.tool("start_task", title="Stuck work", goal="Do the thing.\n", agent="coder",
+                                 repo="contextstack", lane="stuck-retry")
+        expect(not err and stuck.get("model") == "cursor-sol", "retry fixture starts on cursor-sol", stuck)
+        job_id = stuck["job_id"]
+        node.accept(job_id)
+        run_id = "cs-mcp-retry-%d" % int(time.time())
+        finish_stuck(node, job_id, run_id, reason="stuck:repeat")
+        refused, err = server.tool("retry_task", job_id=job_id, model="codex")
+        expect(err and "usage-limited" in refused.get("error", ""), "explicit limited retry model refused", refused)
+        expect("allow_fallback=true" in refused.get("error", ""), "limited explicit retry names allow_fallback", refused)
+        keep, err = server.tool("start_task", title="Keep model", goal="Keep goal.\n", agent="coder",
+                                 repo="contextstack", lane="stuck-keep")
+        keep_id = keep["job_id"]
+        node.accept(keep_id)
+        finish_stuck(node, keep_id, "cs-mcp-keep-%d" % int(time.time()), reason="stuck:repeat")
+        kept, err = server.tool("retry_task", job_id=keep_id, note="same model path")
+        expect(not err and kept.get("model") == "cursor-sol" and kept.get("retry_of") == keep_id,
+               "retry_task keeps cursor-sol when it is not limited", kept)
+        original_spec = owner("jobs/%s/files/spec.yaml" % job_id).body.decode()
+        original_check = owner("jobs/%s/files/tasks/stuck-retry/check" % job_id).body
+        record_limit(state_root, "cursor-sol", {"message": "limited", "resets_at": "2099-06-01T00:00:00Z", "via": "test"})
+        limited_refuse, err = server.tool("retry_task", job_id=job_id)
+        expect(err and "cursor-sol" in limited_refuse.get("error", "") and "allow_fallback=true" in limited_refuse.get("error", ""),
+               "retry_task refuses limited prior model without allow_fallback", limited_refuse)
+        retried, err = server.tool("retry_task", job_id=job_id, allow_fallback=True, note="try codex path")
+        expect(not err and retried.get("model") == "cursor-composer" and retried.get("retry_of") == job_id,
+               "retry_task allow_fallback skips limited codex for cursor-composer", retried)
+        expect(retried.get("model_fallback") == {"from": "cursor-sol", "to": "cursor-composer"},
+               "retry_task allow_fallback reports model_fallback", retried)
+        expect(retried.get("intent_id") == stuck["intent_id"], "retry retains the task intent", retried)
+        bundle = owner("intents/" + stuck["intent_id"]).json
+        expect(len(bundle.get("jobs", [])) == 2, "one task has both attempt jobs", bundle)
+        lanes, err = server.tool("list_tasks", limit=100)
+        task_lanes = [lane for lane in lanes.get("lanes", []) if lane.get("intent_id") == stuck["intent_id"]]
+        expect(not err and len(task_lanes) == 1 and len(task_lanes[0].get("jobs", [])) == 2,
+               "list_tasks shows the task once with both jobs", lanes)
+        status, err = server.tool("task_status", job_id=retried["job_id"])
+        expect(not err and len(status.get("jobs", [])) == 2, "task_status includes both jobs", status)
+        job = owner("jobs/" + retried["job_id"]).json.get("job", owner("jobs/" + retried["job_id"]).json)
+        meta = job.get("meta") or {}
+        expect(meta.get("retry_of") == job_id and meta.get("attempt") == "2", "retry meta", meta)
+        goal = owner("jobs/%s/files/tasks/stuck-retry/goal.md" % retried["job_id"]).body.decode()
+        expect(goal.startswith("## Previous attempt") and "stuck:repeat" in goal and "Recent tool calls" in goal
+               and "try codex path" in goal and goal.rstrip().endswith("Do the thing."),
+               "goal prepends previous attempt", goal[:400])
+        spec = owner("jobs/%s/files/spec.yaml" % retried["job_id"]).body.decode()
+        expect("model: cursor-composer\n" in spec and retried["model"] == "cursor-composer",
+               "retry bundle uses the fallback model", spec)
+        expect(re.sub(r"^intent:.*\n?", "", spec, flags=re.M) == re.sub(r"^intent:.*\n?", "", original_spec, flags=re.M).replace("model: cursor-sol\n", "model: cursor-composer\n")
+               and owner("jobs/%s/files/tasks/stuck-retry/check" % retried["job_id"]).body == original_check,
+               "retry preserves the original spec and check except the model", spec)
+        again, err = server.tool("retry_task", job_id=job_id)
+        expect(err and ("third" in again.get("error", "").lower() or "already" in again.get("error", "").lower()),
+               "retry_task refuses a third attempt", again)
+        retry_id = retried["job_id"]
+        node.accept(retry_id)
+        finish_stuck(node, retry_id, "cs-mcp-retry2-%d" % int(time.time()), reason="stuck:idle_turns")
+        ok_retry, err = server.tool("retry_task", job_id=retry_id)
+        expect(err and "attempt 2" in ok_retry.get("error", ""), "retry_task refuses retrying the retry job", ok_retry)
+
+        # cursor-sol is usage-limited by the scenario above; this lane starts on a template that is not.
+        failed, err = server.tool("start_task", title="No profile", goal="Original goal.\n", model="cursor-composer")
+        failed_id = failed["job_id"]
+        node.accept(failed_id)
+        finish(node, failed_id, None, state="error", reason="provider_limit: quota exhausted")
+        explicit, err = server.tool("retry_task", job_id=failed_id, model="cursor-composer")
+        explicit_goal = owner("jobs/%s/files/tasks/no-profile/goal.md" % explicit["job_id"]).body.decode() if not err else ""
+        expect(not err and explicit.get("model") == "cursor-composer" and "quota exhausted" in explicit_goal
+               and explicit_goal.endswith("Original goal.\n"), "explicit retry without profile or run preserves error reason", explicit)
+
+        passed, _ = server.tool("start_task", title="Green", goal="Done.\n", agent="coder", repo="contextstack",
+                               lane="passed-lane")
+        pass_id = passed["job_id"]
+        node.accept(pass_id)
+        pass_run = "cs-mcp-pass-%d" % int(time.time())
+        finish(node, pass_id, pass_run)
+        refuse, err = server.tool("retry_task", job_id=pass_id)
+        expect(err and "passed" in refuse.get("error", "").lower(), "retry_task refuses a passed job", refuse)
+    finally:
+        server.close()
+
+
+def stored(target):
+    """Every file the Director keeps outside its database: an upload adds one."""
+    return sorted(str(p) for p in target.data.rglob("*") if p.is_file() and "sqlite" not in p.name)
+
+
+def agents_scenario(server, target, token):
+    owner = lambda path: wire.request(target.url, "GET", "/api/v1/client/" + path, token=token)
+    listed, err = server.tool("list_agents")
+    by = {a["name"]: a for a in listed.get("agents", [])}
+    expect(not err and set(by) == {"tester", "looker"} and by["tester"]["model"] == "claude-code-sonnet",
+           "list_agents reads Director profiles, excluding local-only profiles", listed)
+
+    def bundle(job_id, task):
+        job = owner("jobs/" + job_id).json
+        job = job.get("job", job)
+        get = lambda path: owner("jobs/%s/files/%s" % (job_id, path)).body.decode()
+        return job, get("spec.yaml"), get("prompts/system.md"), get(task + "/check")
+
+    dispatch = "mcp.lost-response:1"
+    args = dict(title="Dispatch", goal="Do it.\n", agent="tester", dispatch_id=dispatch)
+    server.tool("start_task", **args)  # Drop the accepted response.
+    recovered, err = server.tool("find_task", dispatch_id=dispatch)
+    replay, replay_err = server.tool("start_task", **args)
+    expect(not err and not replay_err and len(recovered["intents"]) == 1
+           and recovered["intents"][0]["intent_id"] == replay.get("intent_id")
+           and recovered["jobs"][0]["job_id"] == replay.get("job_id"), "dispatch recovery and replay", recovered)
+    conflict, err = server.tool("start_task", **dict(args, goal="Different"))
+    expect(err and "different request" in conflict.get("error", ""), "dispatch conflict refused", conflict)
+    recovered, err = server.tool("find_task", dispatch_id=dispatch)
+    expect(not err and len(recovered["jobs"]) == 1, "dispatch conflict adds no work", recovered)
+    a, err_a = server.tool("start_task", title="No dispatch", goal="Do it.\n", agent="tester")
+    b, err_b = server.tool("start_task", title="No dispatch", goal="Do it.\n", agent="tester")
+    expect(not err_a and not err_b and a.get("intent_id") != b.get("intent_id"), "no dispatch keeps fresh submissions")
+
+    empty = stored(target)
+    started, err = server.tool("start_task", title="Profiled", goal="Do it.\n", agent="tester")
+    expect(len(stored(target)) > len(empty), "an upload shows in the Director's stored files (so 'nothing uploaded' means it)")
+    job, spec, system, check = bundle(started.get("job_id"), started.get("task")) if not err else ({}, "", "", "")
+    sha = hashlib.sha256(TESTER.encode()).hexdigest()
+    expect(not err and "model: claude-code-sonnet\n" in spec and "budget: {turns: 42, tool_calls: 0, usd: 0.0, seconds: 900}" in spec
+           and "TESTER-PROMPT" in system and check.startswith("#!/bin/sh\n") and "test -f done.txt" in check
+           and started.get("agent") == "tester" and started.get("agent_sha256") == sha,
+           "start_task(agent=tester): the profile's model, budget, system prompt and check", [started, spec, system, check])
+    meta = job.get("meta") or {}
+    expect(meta.get("agent") == "tester" and meta.get("agent_sha256") == sha and meta.get("task_type") == "test"
+           and meta.get("model") == "claude-code-sonnet", "meta names the agent, its hash, its task type", meta)
+
+    started, err = server.tool("start_task", title="Overridden", goal="Do it.\n", agent="tester", model="codex",
+                               system="EXPLICIT-PROMPT\n", check="#!/bin/sh\nexit 0\n", budget={"turns": 7},
+                               task_type="bugfix")
+    job, spec, system, check = bundle(started.get("job_id"), started.get("task")) if not err else ({}, "", "", "")
+    expect(not err and "model: codex\n" in spec and "budget: {turns: 7, tool_calls: 0, usd: 0.0, seconds: 900}" in spec
+           and system == "EXPLICIT-PROMPT\n" and check == "#!/bin/sh\nexit 0\n"
+           and (job.get("meta") or {}).get("task_type") == "bugfix" and (job.get("meta") or {}).get("agent") == "tester",
+           "explicit arguments win over the profile (budget merged key by key)", [started, spec, system, check])
+
+    started, err = server.tool("start_task", title="Look", goal="Review it.\n", agent="looker", repo="contextstack", lane="look")
+    job, spec, system, check = bundle(started.get("job_id"), started.get("task")) if not err else ({}, "", "", "")
+    expect(not err and "read-only" in check and "git status --porcelain" in check and "test -f done.txt" in check
+           and "\nlane: look\n" in spec and "LOOKER-PROMPT" in system,
+           "a read-only profile in a lane: its check fails if the worktree changed, then runs the profile's", check)
+
+    before, intents = stored(target), len(owner("intents").json.get("intents", []))
+    for args, says, what in (
+            ({"agent": "nobody"}, "tester", "an unknown agent refused, naming the known ones"),
+            ({"agent": "local-only"}, "tester", "a valid local-only profile cannot start"),
+            ({"agent": "broken"}, "unknown agent", "a local-only profile cannot start"),
+            ({"agent": "long"}, "unknown agent", "another local-only profile cannot start"),
+            ({"agent": "tester", "budget": {"seconds": 4000}}, "3600", "an explicit seconds > 3600 refused"),
+            ({"agent": "tester", "repo": "contextstack", "lane": "t"}, "scratch", "a lane: false profile refuses repo+lane"),
+            ({"agent": "looker"}, "lane worktree", "a lane: true profile needs repo+lane")):
+        refused, err = server.tool("start_task", title="x", goal="x", **args)
+        expect(err and says in refused.get("error", ""), what, refused)
+    expect(stored(target) == before and len(owner("intents").json.get("intents", [])) == intents,
+           "nothing uploaded or submitted for a refused start_task")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

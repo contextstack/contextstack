@@ -1,0 +1,17 @@
+{
+  "runtime": "exe",
+  "bin": "target/release/cs-tools",
+  "args": ["fs_read"],
+  "sandbox": {"net": "none"},
+  "provenance": "Rust port in cs-tools (tools/src/fs_read.rs) of the Python tool removed here, itself ported from pi packages/agent/src/harness/tools/read.ts + packages/coding-agent/src/core/tools/truncate.ts (2000 lines / 50KB, first hit wins, never a partial line). Also refuses a path whose real location leaves the workspace (tools/README.md).",
+  "description": "Read a file or list a directory. Args: {path, offset?, limit?}. On a directory, returns one entry per line (directories end with /). On a file, offset is a 1-indexed line number; limit is a max line count. Output is truncated to 2000 lines or 50KB (whichever is hit first). When truncated, the observation starts with 'lines 1-N of M \u2014 re-read with offset' so the next read is directed, not blind.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {"type": "string", "description": "Path to the file or directory, relative to the workspace."},
+      "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)."},
+      "limit": {"type": "integer", "description": "Maximum number of lines to read."}
+    },
+    "required": ["path"]
+  }
+}

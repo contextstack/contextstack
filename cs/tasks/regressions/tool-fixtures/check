@@ -1,0 +1,12 @@
+#!/bin/sh
+# tool-fixtures regression (goal.md): every manifest tool's contract fixtures, exec'd as the runner execs a tool.
+# Temp workspaces only; nothing under lab/ is written. Exit = the harness's exit.
+cd "$(dirname "$0")/../../.." || exit 2
+# defuddle_extract runs tools/defuddle/extract.mjs; node_modules is gitignored (same as scripts/check rule 0b).
+if [ ! -d tools/defuddle/node_modules ] && command -v npm >/dev/null 2>&1; then
+  (cd tools/defuddle && npm ci --silent --no-audit --no-fund >/dev/null 2>&1) || {
+    echo "FAIL tool-fixtures: tools/defuddle dependencies do not install (cd tools/defuddle && npm ci)" >&2
+    exit 1
+  }
+fi
+exec scripts/tool-fixtures "$@"

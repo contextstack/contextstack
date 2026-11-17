@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+import os
+import sys
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must use the same isolated roots as fixture subprocesses.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+loader = importlib.machinery.SourceFileLoader("preflight_tick", str(LAB / "ops/bin/tick"))
+module_spec = importlib.util.spec_from_loader("preflight_tick", loader)
+tick = importlib.util.module_from_spec(module_spec)
+loader.exec_module(tick)
+
+with scratch_dir(prefix="scheduled-setup-preflight-") as raw:
+    root = Path(raw)
+    (root / "ledger").mkdir()
+    (root / "ESTATE").write_text("dev\n", encoding="utf-8")
+    task = root / "task"
+    task.mkdir()
+    (task / "goal.md").write_text("fixture\n", encoding="utf-8")
+    (task / "setup").symlink_to(root / "missing-setup")
+    refused = subprocess.run(
+        [str(LAB / "ops/bin/setup-preflight")],
+        input=json.dumps({"task": str(task), "require_ready": False}),
+        text=True, capture_output=True,
+     env={**hermetic_env()})
+    assert refused.returncode != 0
+    assert "task check is missing or not executable" in refused.stderr
+    assert "refusing at $0" in refused.stderr
+    tick.LAB = root
+    tick.Q = root / "ledger/dispatch.jsonl"
+    tick.LOCK = root / "ledger/dispatch.lock"
+    tick.LEDGER = root / "ledger/ledger.jsonl"
+    selected = {
+        "id": "fixture-job", "job": "fixture-job", "state": "pending",
+        "spec": "specs/fixture.yaml", "task": "tasks/fixture",
+        "resource": "/tmp/fixture-corpus", "schedule_id": "fixture-schedule",
+        "slot": "2026-09-11T16:00:00Z", "lane": "shadow",
+    }
+    tick.sweep_stale_locks = lambda: []
+    tick.write_heartbeat = lambda: None
+    tick.estate_commit_pass = lambda: None
+    tick.void_watch_pass = lambda: None
+    tick.recover_orphaned_jobs = lambda: []
+    tick.shadow_pass = lambda *args, **kwargs: {}
+    tick.schedule_pass = lambda: {}
+    tick.audit_pass = lambda: None
+    tick.occupied = lambda: 0
+    tick.jobs = lambda: [selected]
+    tick.admit = lambda pending: pending[0]
+    tick.local_model = lambda job: False
+    tick.refresh_job = lambda job: (_ for _ in ()).throw(
+        RuntimeError("setup-preflight: task check is missing or not executable (refusing at $0)"))
+    calls = []
+    tick.run_spec = lambda *args, **kwargs: calls.append(args)
+    held = []
+    tick.hold_schedule = lambda schedule_id, reason: held.append((schedule_id, reason))
+    emitted = []
+    tick.emit = lambda row, swept: emitted.append(row)
+    tick.main()
+
+    rows = [json.loads(line) for line in tick.Q.read_text().splitlines()]
+    terminal = rows[-1]
+    assert terminal["state"] == "error" and terminal["verdict"] == "void"
+    assert terminal["failure_class"] == "machinery_preflight"
+    assert terminal["stop"] == "preflight: preflight_refused"
+    assert terminal["turns"] == terminal["tool_calls"] == 0
+    assert terminal["cost_usd"] == terminal["est_usd"] == 0
+    assert "task check is missing" in terminal["note"]
+    assert calls == []
+    assert held == [("fixture-schedule", "preflight_refused")]
+    assert emitted[-1]["refusal"] == "preflight_refused"
+
+# Run both preparation ops in an estate with no corpus contract module.
+with scratch_dir(prefix="workspace-preparation-") as raw:
+    root = Path(raw)
+    ops = root / "kit/ops/bin"
+    ops.mkdir(parents=True)
+    for name in ("setup-refresh", "setup-preflight", "_workspace_setup.py", "_estate_io.py", "_roots.py"):
+        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+    dest = root / "destination"
+    dest.mkdir()
+    def git(*args):
+        return subprocess.run(["git", "-C", str(dest), *args], check=True,
+                              text=True, capture_output=True, env=hermetic_env()).stdout.strip()
+    git("init", "-q")
+    (dest / "hello.txt").write_text("original\n")
+    (dest / "composer.lock").write_text("locked\n")
+    git("add", ".")
+    git("-c", "user.name=Fixture", "-c", "user.email=f@example.test", "commit", "-qm", "base")
+    head = git("rev-parse", "HEAD")
+    (dest / "vendor").mkdir()
+    (dest / "vendor/dependency.php").write_text("dependency\n")
+    (dest / ".lab-private").write_text("private\n")
+    task = root / "task"
+    task.mkdir()
+    setup = root / "prepared"
+    (task / "setup").symlink_to(setup)
+    (task / "goal.md").write_text("fixture\n")
+    (task / "check").write_text("#!/bin/sh\nexit 0\n")
+    (task / "check").chmod(0o755)
+    (task / "notes.md").write_text("repo: " + str(dest) + "\nsetup: " + str(setup) + "\n")
+    (root / "state").mkdir()
+    env = {**hermetic_env(), "LAB_STATE_ROOT": str(root / "state")}
+    def prepare(name, payload):
+        result = subprocess.run([str(ops / name)], input=json.dumps(payload),
+                                text=True, capture_output=True, env=env)
+        assert result.returncode == 0, (name, result.stdout, result.stderr)
+        return json.loads(result.stdout)
+    refreshed = prepare("setup-refresh", {"task": str(task)})
+    assert refreshed["head"] == head
+    assert (setup / "hello.txt").read_text() == "original\n"
+    assert not (setup / ".lab-private").exists() and not (setup / "vendor").exists()
+    installs = list((root / "state/setups/installs").glob("*/vendor/dependency.php"))
+    assert len(installs) == 1 and installs[0].read_text() == "dependency\n"
+    assert installs[0].stat().st_mode & 0o222 == 0
+    ready = prepare("setup-preflight", {"task": str(task), "expected_head": head})
+    assert ready["ready"] and ready["head"] == head
+    prepare("setup-refresh", {"task": str(task)})
+    assert not (ops / "_corpus_contract.py").exists()
+
+print("check: missing scheduled check input is a preflight_refused zero-turn refusal")

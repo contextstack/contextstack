@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import json
+import os
+import subprocess
+import tempfile
+
+LAB = Path(__file__).resolve().parents[3]
+# refusing live lab root as a write target: the hook copies and every
+# commit, sidecar, and estate-commit.jsonl row stay in TemporaryDirectory.
+
+GATE = LAB / "scripts/check-red-gate"
+PRE = LAB / "scripts/hooks/pre-commit"
+MSG = LAB / "scripts/hooks/commit-msg"
+POST = LAB / "scripts/hooks/post-commit"
+CLASSIFY = LAB / "scripts/estate_classify.py"
+assert GATE.is_file() and PRE.is_file() and MSG.is_file()
+assert POST.is_file() and CLASSIFY.is_file()
+
+
+def git(lab, *args, check=True):
+    env = {**{k: v for k, v in hermetic_env().items() if not k.startswith("GIT_")},
+           "GIT_AUTHOR_NAME": "Fixture",
+           "GIT_AUTHOR_EMAIL": "fixture@example.test",
+           "GIT_COMMITTER_NAME": "Fixture",
+           "GIT_COMMITTER_EMAIL": "fixture@example.test"}
+    return subprocess.run(["git", "-c", "user.name=Fixture",
+                           "-c", "user.email=fixture@example.test", *args],
+                          cwd=lab, env=env, capture_output=True, text=True, check=check)
+
+
+def rows_of(lab):
+    alerts = lab / "ledger/estate-commit.jsonl"
+    if not alerts.is_file():
+        return []
+    return [json.loads(line) for line in alerts.read_text().splitlines() if line.strip()]
+
+
+FAIL = "omitted spec model no longer inherits the PINNED default"
+FAIL_CHECK = "#!/bin/sh\necho 'check: FAIL — %s'\nexit 1\n" % FAIL
+TRACE_CHECK = "#!/bin/sh\necho 'Traceback (most recent call last):'\nexit 1\n"
+
+with scratch_dir(prefix="check-red-") as raw:
+    lab = Path(raw)
+    (lab / "scripts/hooks").mkdir(parents=True)
+    (lab / "tools/bin").mkdir(parents=True)
+    (lab / "ledger").mkdir()
+    (lab / "specs").mkdir()
+    (lab / "scripts/check-red-gate").write_bytes(GATE.read_bytes())
+    (lab / "scripts/check-red-gate").chmod(0o755)
+    (lab / "scripts/estate_classify.py").write_bytes(CLASSIFY.read_bytes())
+    (lab / "scripts/ops-cap.py").write_bytes((LAB / "scripts/ops-cap.py").read_bytes())
+    (lab / "scripts/hooks/pre-commit").write_bytes(PRE.read_bytes())
+    (lab / "scripts/hooks/pre-commit").chmod(0o755)
+    (lab / "scripts/hooks/commit-msg").write_bytes(MSG.read_bytes())
+    (lab / "scripts/hooks/commit-msg").chmod(0o755)
+    (lab / "scripts/hooks/post-commit").write_bytes(POST.read_bytes())
+    (lab / "scripts/hooks/post-commit").chmod(0o755)
+    (lab / "scripts/check").write_text(FAIL_CHECK)
+    (lab / "scripts/check").chmod(0o755)
+    (lab / "tools/bin/video_intake_apply").write_text("#!/bin/sh\nexit 0\n")
+    (lab / "tools/bin/video_intake_apply").chmod(0o755)
+    (lab / "PINNED.md").write_text("pinned: local-coder\n")
+    (lab / "ledger/ledger.jsonl").write_text("{}\n")
+    (lab / "ESTATE").write_text("dev\n")
+    (lab / "grants").mkdir()
+    (lab / "ops/bin").mkdir(parents=True)
+    for name in ("_grant.py", "_estate_io.py"):
+        (lab / "ops/bin" / name).write_bytes((LAB / "ops/bin" / name).read_bytes())
+    expiry = "2099-01-01T00:00:00Z"
+    (lab / "grants/g-lab-session.yaml").write_text(
+        "\n".join([
+            "id: g-lab-session",
+            "estate: dev",
+            "repo: %s" % lab.resolve(),
+            "paths: [scripts/, tools/, specs/, tasks/, grants/, ops/bin/, PINNED.md]",
+            "gates: [scripts/check]",
+            "commit: true",
+            "status: active",
+            "expiry: %s" % expiry,
+            "",
+        ]))
+    git(lab, "init", "-q", "-b", "main")
+    git(lab, "config", "core.hooksPath", "scripts/hooks")
+    git(lab, "add", "-A", "-f", "scripts/check", "scripts/check-red-gate",
+        "scripts/estate_classify.py", "scripts/ops-cap.py", "scripts/hooks/pre-commit",
+        "scripts/hooks/commit-msg", "scripts/hooks/post-commit",
+        "tools/bin/video_intake_apply", "PINNED.md", "ledger/ledger.jsonl",
+        "ESTATE", "grants/g-lab-session.yaml", "ops/bin/_grant.py", "ops/bin/_estate_io.py")
+    git(lab, "commit", "--no-verify", "-qm", "base")
+    (lab / ".lab-session").write_text(
+        json.dumps({"grant": "g-lab-session", "via": "session-start"}) + "\n")
+
+    (lab / "tools/bin/video_intake_apply").write_text("#!/bin/sh\necho bounded\nexit 0\n")
+    git(lab, "add", "-f", "tools/bin/video_intake_apply")
+    refused = git(lab, "commit", "-m", "fix: bound video intake to capture capacity",
+                  check=False)
+    assert refused.returncode != 0, refused.stdout + refused.stderr
+    assert "check-red:" in (refused.stderr + refused.stdout)
+    head = git(lab, "rev-parse", "HEAD").stdout.strip()
+    assert not any(row.get("event", "").startswith("check_red_rules_") for row in rows_of(lab))
+
+    # Unrecognized failures cannot be excepted by an unnamed check-red: subject.
+    (lab / "scripts/check").write_text(TRACE_CHECK)
+    (lab / "scripts/check").chmod(0o755)
+    unnamed = git(lab, "commit", "-m", "check-red: unrelated adjustment", check=False)
+    assert unnamed.returncode != 0, unnamed.stdout + unnamed.stderr
+    combined = unnamed.stderr + unnamed.stdout
+    assert "cannot authorize an unnamed exception" in combined or "no 'FAIL — '" in combined
+    assert git(lab, "rev-parse", "HEAD").stdout.strip() == head
+    assert not any(row.get("event") in ("check_red_rules_commit", "check_red_rules_authorized")
+                   for row in rows_of(lab))
+
+    (lab / "scripts/check").write_text(FAIL_CHECK)
+    (lab / "scripts/check").chmod(0o755)
+
+    # Authorization must not be recorded as a landed commit when HEAD does not move.
+    hook = lab / "scripts/hooks/reference-transaction"
+    hook.write_text('#!/bin/sh\n[ "$1" = prepared ] && exit 1\nexit 0\n')
+    hook.chmod(0o755)
+    blocked = git(
+        lab, "commit", "-m",
+        "check-red: bound video intake; not responsible for omitted spec model no longer inherits",
+        check=False)
+    assert blocked.returncode != 0, blocked.stdout + blocked.stderr
+    assert git(lab, "rev-parse", "HEAD").stdout.strip() == head
+    authorized = [row for row in rows_of(lab) if row.get("event") == "check_red_rules_authorized"]
+    landed = [row for row in rows_of(lab) if row.get("event") == "check_red_rules_commit"]
+    assert len(authorized) == 1, authorized
+    assert authorized[0].get("state") == "authorized"
+    assert landed == [], landed
+    hook.unlink()
+
+    allowed = git(
+        lab, "commit", "-m",
+        "check-red: bound video intake; not responsible for omitted spec model no longer inherits",
+        check=False)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+    new_head = git(lab, "rev-parse", "HEAD").stdout.strip()
+    assert new_head != head
+    rows = rows_of(lab)
+    events = [row for row in rows if row.get("event") == "check_red_rules_commit"]
+    assert len(events) == 1, events
+    assert events[0].get("state") == "ok"
+    assert events[0].get("commit") == new_head
+    assert "tools/bin/video_intake_apply" in events[0].get("files", [])
+    assert FAIL in events[0].get("check_output", "")
+    assert "Fixture" in events[0].get("author", "")
+    assert any(row.get("event") == "check_red_rules_authorized" for row in rows)
+
+    # A real linked-worktree hook exports an absolute GIT_DIR. A foreign
+    # fixture must not reinitialize that repository or replace its index.
+    linked = lab / "linked"
+    git(lab, "worktree", "add", "-b", "hook-isolation", str(linked))
+    (linked / "grants").mkdir(exist_ok=True)
+    (linked / "grants/g-lab-session.yaml").write_text(
+        "\n".join([
+            "id: g-lab-session",
+            "estate: dev",
+            "repo: %s" % linked.resolve(),
+            "paths: [scripts/, tools/, specs/, tasks/, grants/, ops/bin/, PINNED.md]",
+            "gates: [scripts/check]",
+            "commit: true",
+            "status: active",
+            "expiry: 2099-01-01T00:00:00Z",
+            "",
+        ]))
+    (linked / ".lab-session").write_text(
+        json.dumps({"grant": "g-lab-session", "via": "session-start"}) + "\n")
+    (linked / "scripts/check").write_text("""#!/bin/sh
+set -eu
+before=$(git rev-parse HEAD)
+foreign=$(mktemp -d)
+trap 'rm -rf "$foreign"' EXIT
+(cd "$foreign" && git init --bare -q)
+test -f "$foreign/HEAD"
+test "$(git rev-parse --is-bare-repository)" = false
+test "$(git rev-parse HEAD)" = "$before"
+""")
+    (linked / "PINNED.md").write_text("pinned: local-coder; isolated hooks\n")
+    git(linked, "add", "scripts/check", "PINNED.md")
+    committed = git(linked, "commit", "-m", "fix: isolate hook fixtures", check=False)
+    assert committed.returncode == 0, committed.stdout + committed.stderr
+    assert git(linked, "show", "HEAD:PINNED.md").stdout == "pinned: local-coder; isolated hooks\n"
+    assert git(linked, "rev-parse", "HEAD^").stdout.strip() == new_head
+    assert git(lab, "rev-parse", "HEAD").stdout.strip() == new_head
+    assert git(lab, "rev-parse", "--is-bare-repository").stdout.strip() == "false"
+
+print("check: rules-tier red commits need check-red: and record the operator-queue event")

@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""kit-layout-guard (Director.Plan step 0b C5): lab/ holds only the archived Go runner, and nothing live
+names a path under it. Reads git's index of the checkout (tracked files only); writes nothing.
+
+1. lab/ tracks only cmd/, internal/, go.mod, go.sum, .gitignore and README.md.
+2. No live file names a moved item under lab/ (lab/ops, lab/scripts, lab/INVARIANTS.md, ...): the code outside
+   the kit, the kit's own code (ops, scripts, tools, hooks, policy, schedules, grants) and the docs in DOCS and
+   <project>/README.md. Not references: `<sha>:lab/...` (git show), a line saying "removed by" or "formerly",
+   ADRs, docs/dev/artifacts, task trees (their fixtures name their own estates lab), and not_named.
+3. No live file names the dev checkout's absolute ~/sites/contextstack/lab path, except .../lab/ledger/... (run
+   evidence from before the ledger left the repo) and the frozen inputs in FROZEN. Task checks included.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SELF = Path(__file__).resolve()
+KIT = SELF.parents[3]
+GO_ARCHIVE = ("lab/cmd/", "lab/internal/", "lab/go.mod", "lab/go.sum", "lab/.gitignore", "lab/README.md")
+HISTORY = re.compile(r"^(docs/adr/|docs/dev/artifacts/|lab/)")
+ABS = re.compile(r"(?:/Users/" r"[^/\s]+|~)/sites/contextstack/lab(?!/ledger/)(?=[/\"'<`\s)$;:,]|$)", re.M)
+HISTORIC = re.compile(r"removed by|formerly")
+ALIAS = "'lab/PINNED.md'"
+
+
+def problems(repo, kit):
+    k = re.escape(kit.name)
+    # Frozen or recorded inputs: hashed packets, casebook packs, specs, setup trees, task prose and data.
+    frozen = re.compile(r"^%s/(prompts/packs/|specs/|tasks/.*/setup/|tasks/.*\.(md|txt|json|jsonl)$|PINNED\.md$)" % k)
+    # The archived Go gateway (no Go changes), the legacy estate deploy (its target layout names a component lab/),
+    # director-spec's fixture estates (semantics untouched), ROUTE.md (dated lines; only its pointers moved) and
+    # task trees (their fixtures name their own estates lab).
+    not_named = re.compile(r"^(modelgateway/|docs/dev/scripts/deploy-estate|tests/director-spec/harness/|ROUTE\.md$|%s/tasks/)" % k)
+    docs = {"AGENTS.md", "README.md", "ROUTE.md"} | {"%s/%s" % (kit.name, n) for n in
+            ("CLAUDE.md", "INVARIANTS.md", "OPERATOR.md", "SCHEMA.md", "README.md")}
+    moved = sorted(p.name for p in kit.iterdir() if not p.name.startswith(".") or p.name == ".python-version")
+    named = re.compile(r"(?<![\w.:/$<{-])lab/(%s)(?![\w-])" % "|".join(re.escape(m) for m in moved))
+    out = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, check=True).stdout
+    files = [p for p in out.decode("utf-8", "replace").split("\0") if p]
+    found = []
+    stray = [p for p in files if p.startswith("lab/") and not p.startswith(GO_ARCHIVE)]
+    if stray:
+        found.append("lab/ tracks more than the Go archive: %s" % stray[:5])
+    if not (kit / "INVARIANTS.md").is_file():
+        found.append("%s/INVARIANTS.md is missing: the code root moved again?" % kit.name)
+    for rel in files:
+        path = repo / rel
+        try:
+            if HISTORY.search(rel) or path.is_symlink() or not path.is_file() or path.resolve() == SELF:
+                continue  # this file names the patterns it looks for
+        except OSError:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if rel.endswith(".md") and rel not in docs and not re.match(r"^[^/]+/README\.md$", rel):
+            continue
+        if not frozen.match(rel):
+            for m in ABS.finditer(text):
+                found.append("%s:%d names the dev checkout's lab/ (now %s/)" % (rel, text.count("\n", 0, m.start()) + 1, kit.name))
+        if frozen.match(rel) or not_named.match(rel):
+            continue
+        for m in named.finditer(text):
+            line = text[text.rfind("\n", 0, m.start()) + 1:text.find("\n", m.end()) % (len(text) + 1)]
+            if text[m.start() - 1:m.end() + 1] == ALIAS or HISTORIC.search(line):
+                continue
+            found.append("%s:%d names %s, which lives in %s/" % (rel, text.count("\n", 0, m.start()) + 1, m.group(0), kit.name))
+    return found
+
+
+def self_test():
+    """The guard fails a planted stray file, a stale relative and a stale absolute path; history passes."""
+    with scratch_dir(prefix="kit-layout-guard-") as raw:
+        repo = Path(raw)
+        files = {"lab/cmd/lab/main.go": "package main\n", "lab/ops/bin/tick": "stray\n", "cs/INVARIANTS.md": "x\n",
+                 "cs/ops/bin/tick": "x\n", "scripts/serve.py": 'LAB = OP.parent / "lab/ops/bin"\n',
+                 "README.md": "see `lab/INVARIANTS.md`\nhistory: `git show 1234567:lab/ops/bin/x`\n",
+                 "tools/src/a.rs": "//! Port of `lab/ops/bin/x` (removed by task-1)\n",
+                 "cs/scripts/x": 'P = "/Users/me/sites/contextstack/lab/ops/bin/y"\nR = "~/sites/contextstack/lab/ledger/runs/r"\n',
+                 "cs/tasks/regressions/f/check": 'lab = root / "lab/ops/bin"\n'}
+        for rel, text in files.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        got = problems(repo, repo / "cs")
+        want = ["lab/ tracks more than the Go archive", "README.md:1 names lab/INVARIANTS.md",
+                "scripts/serve.py:1 names lab/ops", "cs/scripts/x:1 names the dev checkout's lab/"]
+        assert len(got) == len(want) and all(any(g.startswith(w) for g in got) for w in want), got
+
+
+def main():
+    self_test()
+    found = problems(KIT.parent, KIT)
+    for p in found:
+        print("FAIL " + p)
+    print("check: kit-layout-guard %d problem(s); the planted violations are caught" % len(found))
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

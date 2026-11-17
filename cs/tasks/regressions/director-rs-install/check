@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""director-rs-install regression (goal.md): the Rust Director bundled, installed and served from a fake HOME.
+
+Network-free. Builds bundles and installs as node-install-layout does (its _bundle) and drives cs with cs-cli's
+shims; needs uv and a uv-managed interpreter of the pinned version, else SKIP with the reason. The real
+director-rs (target/release/cs-director) is started from its plist's own command when built; else that part SKIPs.
+Temp dirs only; never the real launchd, ~/.local/bin or ~/Library/LaunchAgents (asserted); HOME is always fake.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import shutil
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "node-install-layout"))
+import _bundle  # noqa: E402
+
+LAB = _bundle.LAB
+sys.path.insert(0, str(LAB / "scripts"))
+from check_timeout import timeout as check_timeout
+INSTALL = LAB / "scripts/node-install"
+A, B, C = "20990101-aaaaaaaaa", "20990102-bbbbbbbbb", "20990103-ccccccccc"
+LABEL = "com.contextstack.director-rs"
+TOKEN = "csn_FAKEnodetoken0123456789abcdef"  # a stand-in: never a real token
+LOCAL_SECRET = "csl_FAKElocalcredential99"
+INST = "inst_01TESTINSTALLATION0000000"
+problems = []
+
+
+def fail(msg):
+    problems.append(msg)
+    print("FAIL " + msg)
+
+
+def expect(cond, msg):
+    (print("ok   " + msg) if cond else fail(msg))
+
+
+def cs_cli():
+    """cs-cli's shims (launchctl, curl, ssh, fdesetup), loaded from its check without running it."""
+    loader = importlib.machinery.SourceFileLoader("cs_cli_check", str(HERE.parent / "cs-cli/check"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("cs_cli_check", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def node_install(home, *args, stdin=None, **env_more):
+    env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home, **env_more)
+    r = subprocess.run(["sh", str(INSTALL), *args], capture_output=True, text=True, env=env, cwd="/", input=stdin)
+    return r, _bundle.report(r.stdout)
+
+
+def tree(root):
+    out = {}
+    for p in sorted(root.rglob("*")) if root.exists() else []:
+        st = p.lstat()
+        out[str(p.relative_to(root))] = os.readlink(p) if p.is_symlink() else (st.st_size, st.st_mtime_ns, st.st_mode)
+    return out
+
+
+def bins_with_director(tmp, name):
+    bins = _bundle.fake_bins(tmp / name)
+    real = LAB.parent / "target/release/cs-director"
+    if os.access(real, os.X_OK):
+        bins["cs-director"] = real
+    else:
+        (tmp / name / "director-rs").write_text("#!/bin/sh\necho director-rs \"$@\"\n")
+        (tmp / name / "director-rs").chmod(0o755)
+        bins["cs-director"] = tmp / name / "director-rs"
+    return bins, bins["cs-director"] == real
+
+
+def part_bundle(tmp, uv):
+    nb = _bundle.node_bundle()
+    expect("cs-director" in nb.cargo_argv(["director-rs"]) and "cs-director" not in nb.cargo_argv(),
+           "node-bundle: cargo builds -p cs-director only when asked (--director-rs)")
+    bins, _ = bins_with_director(tmp, "fakebin-bundle")
+    _bundle.bundle(tmp / "b-rs", uv, A, bins)
+    meta = json.loads((tmp / "b-rs/bundle.json").read_text())
+    entry = [b for b in meta["binaries"] if b["name"] == "cs-director"]
+    expect(entry == [{"name": "cs-director", "path": "bin/cs-director", "bundled": True}]
+           and os.access(tmp / "b-rs/release/bin/cs-director", os.X_OK) and "release/bin/cs-director" in meta["files"],
+           "a bundle with director-rs ships bin/cs-director and bin/director-rs -> cs-director, listed bundled and hashed")
+    plain = {k: v for k, v in _bundle.fake_bins(tmp / "fakebin-plain").items()}
+    _bundle.bundle(tmp / "b-plain", uv, B, plain)
+    meta = json.loads((tmp / "b-plain/bundle.json").read_text())
+    expect(not any(b["name"] == "director-rs" for b in meta["binaries"]) and not (tmp / "b-plain/release/bin/director-rs").exists(),
+           "a bundle without it names no director-rs (never 'required, not bundled' on a node)")
+    other = "linux-x86_64" if nb.host_target() != "linux-x86_64" else "linux-aarch64"
+    r = subprocess.run([sys.executable, str(LAB / "scripts/node-bundle"), "build", "--director-rs", "--target", other,
+                        str(tmp / "b-other")], capture_output=True, text=True, env=_bundle.dead_network_env(tmp / "nohome"))
+    expect(r.returncode != 0 and "--director-rs" in r.stderr and not (tmp / "b-other").exists(),
+           "build --director-rs for another target: refused before writing: %s" % r.stderr[-200:])
+
+
+def check_plist(home, root, listen=("127.0.0.1:8780",)):
+    p = plistlib.loads((home / "Library/LaunchAgents" / (LABEL + ".plist")).read_bytes())
+    data = str(root / "state/director")
+    want = [str(root / "current/bin/cs-director"), "serve", "--data-dir", data]
+    for addr in listen:
+        want += ["--listen", addr]
+    want += ["--gateway-owner-token", str(root / "config/gateway/owner-token")]
+    env = p["EnvironmentVariables"]
+    text = json.dumps(p)
+    expect(p["ProgramArguments"] == want and p["WorkingDirectory"] == data and p.get("KeepAlive") is True
+           and p.get("RunAtLoad") is True, "director-rs plist: serve from current/bin, data in state/director, %s: %s"
+           % (", ".join(listen), p["ProgramArguments"]))
+    expect(env.get("PATH", "").startswith("/") and "/opt/homebrew/bin" in env["PATH"].split(":") and "~" not in text
+           and "$HOME" not in text and str(home / ".local/bin") not in text,
+           "director-rs plist: explicit PATH, absolute paths only, no PATH link")
+    expect(p["StandardOutPath"] == str(root / "logs/director-rs.out.log")
+           and p["StandardErrorPath"] == str(root / "logs/director-rs.err.log"), "director-rs plist: logs under logs/")
+    return p
+
+
+def run_director(home, p):
+    """Run the plist command on a kernel-assigned port and require its unauthenticated 401."""
+    args = [a if a != "127.0.0.1:8780" else "127.0.0.1:0" for a in p["ProgramArguments"]]
+    env = dict(p["EnvironmentVariables"], HOME=str(home))
+    code = None
+    with tempfile.NamedTemporaryFile(mode="w+") as stderr:
+        proc = subprocess.Popen(args, cwd=p["WorkingDirectory"], env=env,
+                                stdout=subprocess.DEVNULL, stderr=stderr, text=True)
+        try:
+            deadline = time.monotonic() + check_timeout(60)
+            while time.monotonic() < deadline:
+                err = Path(stderr.name).read_text()
+                bound = re.search(r"listening on http://(127\.0\.0\.1:\d+)", err)
+                if bound:
+                    try:
+                        with urllib.request.urlopen("http://%s/api/v1/client/me" % bound[1], timeout=check_timeout(10)) as answer:
+                            code = answer.status
+                    except urllib.error.HTTPError as e:
+                        code = e.code
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=check_timeout(10))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        err = Path(stderr.name).read_text()[-400:]
+    expect(code == 401, "the plist's command serves (401 without a credential): %s %s" % (code, err))
+    return err
+
+
+def part_serve(tmp, uv, managed):
+    home, shim = tmp / "home", tmp / "shim"
+    root = home / ".contextstack"
+    data = root / "state/director"
+    bins, real = bins_with_director(tmp, "fakebin-serve")
+    _bundle.bundle(tmp / "bundle-a", uv, A, bins)
+    _bundle.bundle(tmp / "bundle-b", uv, B, bins, extra={"RELEASE-B": "b\n"})
+    _bundle.bundle(tmp / "bundle-c", uv, C, _bundle.fake_bins(tmp / "fakebin-c"))  # no director-rs
+    for rid in (A, B, C):
+        _bundle.seed_python(home, rid, managed)
+
+    r, rep = node_install(home, "install", str(tmp / "bundle-a"), "--estate", "workstation", "--serve-director-rs",
+                          "--serve-director", "127.0.0.1:8790", "--no-load")
+    expect(r.returncode == 1 and "retired" in rep.get("refused", "") and "--serve-director-rs" in rep.get("refused", "")
+           and not os.path.lexists(root / "current") and not (home / "Library").exists(),
+           "--serve-director (the retired Laravel director) beside --serve-director-rs: refused clearly, nothing activated: %s"
+           % rep.get("refused"))
+    r, rep = node_install(home, "install", str(tmp / "bundle-c"), "--estate", "workstation", "--serve-director-rs", "--no-load")
+    expect(r.returncode == 1 and "no bin/cs-director" in rep.get("refused", "") and "--director-rs" in rep.get("refused", ""),
+           "--serve-director-rs on a release without bin/director-rs: refused, naming the bundle flag: %s" % rep.get("refused"))
+    for bad in ("0.0.0.0:8780", "192.0.2.5:8780", "127.0.0.1", "localhost:8780"):
+        r, rep = node_install(home, "install", str(tmp / "bundle-a"), "--estate", "workstation", "--serve-director-rs",
+                              "--director-rs-listen", bad, "--no-load")
+        expect(r.returncode == 1 and "Tailscale" in rep.get("refused", "") and not os.path.lexists(root / "current"),
+               "--director-rs-listen %s: refused (loopback or Tailscale only), nothing activated" % bad)
+    data.mkdir(parents=True)
+    data.chmod(0o755)
+    r, rep = node_install(home, "install", str(tmp / "bundle-a"), "--estate", "workstation", "--serve-director-rs", "--no-load")
+    expect(r.returncode == 1 and "chmod 700" in rep.get("refused", "") and data.stat().st_mode & 0o777 == 0o755,
+           "a data dir open to other users: refused, never re-moded: %s" % rep.get("refused"))
+    data.rmdir()
+
+    # This Mac: the Director host is also a node of its own Director.
+    r, rep = node_install(home, "install", str(tmp / "bundle-a"), "--node", "workstation", "--director", "http://127.0.0.1:8780",
+                          "--serve-director-rs", "--no-load")
+    if r.returncode != 0:
+        return fail("install with --serve-director-rs: %s %s" % (rep, r.stderr[-800:]))
+    agents = home / "Library/LaunchAgents"
+    expect(data.is_dir() and data.stat().st_mode & 0o777 == 0o700 and rep.get("director_rs", {}).get("url") == "http://127.0.0.1:8780"
+           and (agents / "com.contextstack.node.plist").is_file() and not (agents / "com.contextstack.director.plist").exists(),
+           "install: state/director created 0700; the host is a node too; no Laravel director plist: %s" % rep.get("director_rs"))
+    p = check_plist(home, root)
+    if real:
+        run_director(home, p)
+        expect((data / "director.sqlite").stat().st_mode & 0o777 == 0o600 and (data / "local-credential").stat().st_mode & 0o777 == 0o600,
+               "the Director's own files in its data dir: director.sqlite and local-credential 0600")
+    else:
+        print("SKIP serving: target/release/cs-director is not built (cargo build --release -p cs-director)")
+        db = sqlite3.connect(str(data / "director.sqlite"))
+        db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execute("INSERT INTO meta VALUES ('installation', ?)", (INST,))
+        db.commit()
+        db.close()
+        (data / "director.sqlite").chmod(0o600)
+        (data / "local-credential").write_text(LOCAL_SECRET + "\n")
+        (data / "local-credential").chmod(0o600)
+    (data / "objects").mkdir(mode=0o700, exist_ok=True)  # the Director makes it 0700; the fallback's stand-in too
+    (data / "objects").chmod(0o700)
+    (data / "objects/ab").mkdir(exist_ok=True)
+    (data / "objects/ab/abcd").write_text("evidence\n")
+    kept = tree(data)
+
+    r, rep = node_install(home, "install", str(tmp / "bundle-b"), "--director-rs-listen", "127.0.0.1:8780",
+                          "--director-rs-listen", "127.0.0.2:8780", "--no-load")
+    expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + B and tree(data) == kept,
+           "install B: current -> B, the Director's data dir unchanged (bytes, mtime, mode)")
+    check_plist(home, root, ("127.0.0.1:8780", "127.0.0.2:8780"))
+    r, rep = node_install(home, "rollback", "--no-load")
+    expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + A and tree(data) == kept,
+           "rollback: current -> A, data dir unchanged; the listen choice is recorded")
+    check_plist(home, root, ("127.0.0.1:8780", "127.0.0.2:8780"))
+    r, rep = node_install(home, "switch", C, "--no-load")
+    expect(r.returncode == 1 and "no bin/cs-director" in rep.get("refused", "") and os.readlink(root / "current") == "releases/" + A,
+           "switch to a release without director-rs while it is served: refused, current unchanged")
+    r, rep = node_install(home, "install", str(tmp / "bundle-a"), "--serve-director", "127.0.0.1:8790", "--no-load")
+    expect(r.returncode == 1 and "retired" in rep.get("refused", "") and not (agents / "com.contextstack.director.plist").exists(),
+           "--serve-director on a host serving director-rs: refused (retired), no Laravel plist")
+    r, rep = node_install(home, "install", str(tmp / "bundle-b"), "--director-rs-listen", "127.0.0.1:8780", "--no-load")
+    r, rep = node_install(home, "switch", A, LAUNCHCTL_SHIM_LOG=str(tmp / "launchctl.log"))
+    states = {k: v["launchd"] for k, v in rep.get("plists", {}).items()}
+    log = (tmp / "launchctl.log").read_text() if (tmp / "launchctl.log").exists() else ""
+    expect(r.returncode == 0 and states.get(LABEL) == "bootstrapped" and str(agents / (LABEL + ".plist")) in log,
+           "loading (shimmed launchctl): the Director agent is bootstrapped: %s" % states)
+    part_cs(home, shim, root, data)
+    r, rep = node_install(home, "uninstall", "--purge", "--no-load")
+    expect(r.returncode == 0 and not (agents / (LABEL + ".plist")).exists() and tree(data) == kept
+           and not (root / "state/dispatch.jsonl").exists() and not (root / "config").exists(),
+           "uninstall --purge: the plist and the rest of state/ go; state/director (the database) stays: %s %s"
+           % (rep.get("refused"), sorted(set(tree(data)) ^ set(kept))[:5]))
+
+
+def part_cs(home, shim, root, data):
+    mod = cs_cli()
+    mod.write_shims(shim)
+    (shim / "http.json").write_text(json.dumps([[":8780/api/v1/client/me", [401, {"error": "unauthenticated"}]]]))
+    installation = sqlite3.connect("file:%s?immutable=1" % (data / "director.sqlite"), uri=True).execute(
+        "SELECT value FROM meta WHERE key = 'installation'").fetchone()[0]
+    secret = (data / "local-credential").read_text().strip()
+
+    def cs(*args):
+        env = _bundle.dead_network_env(home, PATH="%s:%s" % (shim / "bin", os.environ.get("PATH", "/usr/bin:/bin")))
+        env.pop("CS_PLATFORM", None)
+        r = subprocess.run([str(root / "current/cs/scripts/cs"), *args], capture_output=True, text=True, env=env,
+                           cwd="/", timeout=120)
+        expect(secret not in r.stdout + r.stderr and TOKEN not in r.stdout + r.stderr, "cs %s prints no credential" % " ".join(args))
+        return r
+
+    r = cs("start", "director")
+    calls = (shim / "calls.log").read_text() if (shim / "calls.log").exists() else ""
+    expect(r.returncode == 0 and "launchctl bootstrap" in calls and str(home / "Library/LaunchAgents" / (LABEL + ".plist")) in calls
+           and "now up" in r.stdout, "cs start director: bootstraps com.contextstack.director-rs: %r" % r.stdout[-300:])
+    r = cs("status", "--json")
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return fail("cs status --json: %r %r" % (r.stdout[-400:], r.stderr[-400:]))
+    dr = d.get("director") or {}
+    expect(dr.get("url") == "http://127.0.0.1:8780" and dr.get("answers") is True and dr.get("http") == 401
+           and dr.get("installation") == installation and dr.get("data_dir") == str(data)
+           and dr.get("modes") == {"data_dir": "700", "objects": "700", "director.sqlite": "600", "local-credential": "600"},
+           "cs status --json: the Director's URL, answer, installation and data dir modes: %s" % dr)
+    expect([v["up"] for v in d["services"]["director"]] == [True], "cs status: the director service is up")
+    r = cs("status")
+    expect("director  http://127.0.0.1:8780 answers HTTP 401, installation %s; data %s (data_dir 700" % (installation, data) in r.stdout,
+           "cs status: one director line: %r" % [l for l in r.stdout.splitlines() if l.startswith("director")])
+    r = cs("doctor", "--json")
+    found = {f["check"]: f for f in json.loads(r.stdout or "[]")}
+    expect(found.get("director http://127.0.0.1:8780 (installation %s)" % installation, {}).get("ok") is True
+           and all(found.get("director mode %s" % n, {}).get("ok") for n in ("data dir", "objects", "director.sqlite", "local-credential"))
+           and found.get("plist paths %s" % LABEL, {}).get("ok") is True and found.get("agent PATH %s" % LABEL, {}).get("ok") is True,
+           "cs doctor: the Director answers, its data dir modes and plist are fine")
+    (data / "local-credential").chmod(0o644)
+    r = cs("doctor")
+    expect(r.returncode == 1 and "FAIL  director mode local-credential" in r.stdout and "chmod 600 %s" % (data / "local-credential") in r.stdout,
+           "cs doctor: a local-credential readable by others fails, with its fix")
+    (data / "local-credential").chmod(0o600)
+    r = cs("restart", "director")
+    expect(r.returncode == 0 and "launchctl kickstart -k gui/%d/%s" % (os.getuid(), LABEL) in (shim / "calls.log").read_text(),
+           "cs restart director: kickstart -k")
+    r = cs("stop", "director")
+    expect(r.returncode == 0 and "launchctl bootout gui/%d/%s" % (os.getuid(), LABEL) in (shim / "calls.log").read_text(),
+           "cs stop director: bootout")
+    (shim / "http.json").write_text("[]")
+    r = cs("doctor", "--json")
+    found = {f["check"]: f for f in json.loads(r.stdout or "[]")}
+    expect(r.returncode == 1 and found.get("director http://127.0.0.1:8780 (installation %s)" % installation, {}).get("ok") is False,
+           "cs doctor: a Director that does not answer is a failure, with cs start director as the fix")
+
+
+def part_node(tmp, uv, managed):
+    """The node side of registration: node register's JSON line (or a bare token on stdin) into node.env and spool.json."""
+    home = tmp / "home-node"
+    root = home / ".contextstack"
+    _bundle.bundle(tmp / "bundle-n", uv, A, _bundle.fake_bins(tmp / "fakebin-n"))
+    _bundle.seed_python(home, A, managed)
+    reg = tmp / "laptop.json"
+    reg.write_text(json.dumps({"node": "laptop", "token": TOKEN, "installation": INST}) + "\n")
+    url = "http://127.0.0.2:8780"
+    r, rep = node_install(home, "install", str(tmp / "bundle-n"), "--estate", "laptop", "--director-token-from", str(reg), "--no-load")
+    expect(r.returncode == 1 and "is for a node" in rep.get("refused", "") and not (root / "config/node.env").exists(),
+           "--director-token-from without --node/--director: refused, nothing written")
+    wrong = tmp / "other.json"
+    wrong.write_text(json.dumps({"node": "m3", "token": TOKEN, "installation": INST}))
+    r, rep = node_install(home, "install", str(tmp / "bundle-n"), "--node", "laptop", "--director", url, "--director-token-from", str(wrong), "--no-load")
+    expect(r.returncode == 1 and "'m3'" in rep.get("refused", "") and TOKEN not in r.stdout + r.stderr
+           and not (root / "config/node.env").exists(), "a token registered for another node: refused, never printed")
+    r, rep = node_install(home, "install", str(tmp / "bundle-n"), "--node", "laptop", "--director", url, "--director-token-from",
+                          str(reg), "--installation", "inst_OTHER", "--no-load")
+    expect(r.returncode == 1 and "differs" in rep.get("refused", ""), "--installation that differs from the token's: refused")
+    (root / "config").mkdir(parents=True, exist_ok=True)
+    (root / "config/node.env").write_text("export OTHER_SETTING=1\nexport CONTEXTSTACK_NODE_TOKEN=csn_OLDtoken000000\n")
+    (root / "config/node.env").chmod(0o600)
+    r, rep = node_install(home, "install", str(tmp / "bundle-n"), "--node", "laptop", "--director", url, "--director-token-from", str(reg), "--no-load")
+    envf = root / "config/node.env"
+    receiver = json.loads((root / "config/policy/spool.json").read_text()).get("receiver", {})
+    expect(r.returncode == 0 and receiver == {"kind": "director", "url": url, "node": "laptop", "token_env": "CONTEXTSTACK_NODE_TOKEN",
+                                              "installation": INST},
+           "node: spool.json's receiver takes the Director URL, node and installation: %s %s" % (receiver, rep.get("refused")))
+    expect(envf.read_text() == "export OTHER_SETTING=1\nexport CONTEXTSTACK_NODE_TOKEN=%s\n" % TOKEN and envf.stat().st_mode & 0o777 == 0o600
+           and rep.get("node_token", "").startswith("written to"), "node.env: the token replaces the old line, others kept, 0600")
+    expect(TOKEN not in r.stdout + r.stderr + (root / "config/install.json").read_text() + (root / "config/policy/spool.json").read_text(),
+           "the token is never printed, recorded in install.json or spool.json")
+    r, rep = node_install(home, "switch", A, "--no-load")
+    expect(json.loads((root / "config/policy/spool.json").read_text())["receiver"].get("installation") == INST,
+           "a later switch keeps the recorded installation")
+    r, rep = node_install(home, "install", str(tmp / "bundle-n"), "--director-token-from", "-", "--installation", INST,
+                          "--no-load", stdin="csn_BAREtoken987654321\n")
+    expect(r.returncode == 0 and "export CONTEXTSTACK_NODE_TOKEN=csn_BAREtoken987654321\n" in envf.read_text()
+           and "csn_BAREtoken987654321" not in r.stdout + r.stderr, "a bare token on stdin (-) works the same")
+    r, rep = node_install(home, "install", str(tmp / "bundle-n"), "--installation", "bad id!", "--no-load")
+    expect(r.returncode == 1 and "not an installation ID" in rep.get("refused", ""), "a malformed --installation: refused")
+    node_install(home, "uninstall", "--no-load")
+
+
+def main():
+    uv, managed = _bundle.host_python()
+    if uv is None:
+        print("SKIP director-rs-install: %s" % managed)
+        return 0
+    real = Path.home()
+    watched = [real / ".local/bin", real / "Library/LaunchAgents"]
+    before = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    agents = _bundle.real_agents()
+    tmp = Path(tempfile.mkdtemp(prefix="director-rs-install-", suffix=".noindex"))
+    try:
+        part_bundle(tmp, uv)
+        part_serve(tmp, uv, managed)
+        part_node(tmp, uv, managed)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    after = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    expect(before == after, "the real ~/.local/bin and ~/Library/LaunchAgents are unchanged")
+    leak = _bundle.launchd_untouched(agents)
+    expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")
+    print("check: director-rs-install %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

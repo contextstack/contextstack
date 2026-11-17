@@ -1,0 +1,20 @@
+*.gone
+# Setup clones, dest snapshots, and cache links. Symlink `setup` is a
+# file to git, so keep the slash-less form; tracked fixture files stay
+# in the index until explicitly removed.
+tasks/**/setup
+tasks/**/setup/
+tasks/work/*/want/
+.lab-out/
+.lab-tmp/
+.lab-calls.jsonl
+.lab-doom-mark
+.lab-session
+_evidence/
+__pycache__/
+tools/defuddle/node_modules/
+
+ledger/
+
+# Host-owned harvest repos (_harvest_git) sit beside a workspace; never track one.
+harvest-*.git/

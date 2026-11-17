@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""tool-escapes-workspace: observed reproduction (phase 3 demand) and the cs-sandbox acceptance.
+
+A manifest tool runs with cwd = workspace and no OS confinement except what `exec`
+applies to its own child. Each tool's path check is a string test (`isabs`, `..`);
+nothing resolves symlinks or confines the process, so a symlink planted in the
+workspace (or `sh -c` under exec) reaches any path the user can read, HOME included.
+
+Layout, built fresh in temp dirs and removed afterwards:
+  <tmp>/outside/sentinel.txt   a random sentinel string, outside every workspace
+  <tmp>/outside/doc.md         a Markdown file holding the sentinel
+  $HOME/.lab-escape-probe-<r>/sentinel.txt   the same sentinel, created here, removed in finally
+  <ws>/link.txt -> outside/sentinel.txt   <ws>/linkdir -> outside/   <ws>/link.md -> outside/doc.md
+Never reads, prints or copies anything under ~/.ssh, ~/.aws or any real dotfile.
+
+Each tool is exec'd exactly as scripts/tool-fixtures and the Go runner do: argv the tool
+path alone (a runtime exe tool: its bin + args, _sandbox_policy.tool_argv), cwd the workspace, JSON args on stdin, env the policy/env.json "always" names.
+CS_TOOL_PREFIX (shell words) is prepended to argv so the wrapper can be put under test.
+
+One line per probe:
+  FAIL  the tool read or wrote outside the workspace (the escape, observed with the sentinel)
+  ok    the tool refused, or the OS denied it
+  ERR   inconclusive: the tool failed for another reason (missing runtime, bad fixture)
+Verdict, two-sided. CS_TOOL_PREFIX set (non-empty): exit 0 only when every probe is ok
+(no FAIL, no ERR). Unset: the tools run unconfined, the escapes are expected, exit 1 (red by
+design). notes.md holds the full table including the tools that refuse on their own.
+"""
+import hashlib
+import json
+import os
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+BIN = LAB / "tools/bin"
+sys.path.insert(0, str(LAB / "ops/bin"))
+import _env_policy  # noqa: E402
+import _sandbox_policy  # noqa: E402
+
+SENT = "SENTINEL-" + secrets.token_hex(12)
+PREFIX = shlex.split(os.environ.get("CS_TOOL_PREFIX", ""))
+failed, errors = [], []
+# Linux (phase 3b): cs-sandbox's bwrap root holds only the policy's paths, so an outside path is not
+# denied but absent (a planted link dangles); under a prefix, the tool reporting the path missing is the OS
+# refusal (never the wrapper's own failure or a missing interpreter). An escape is still judged by the sentinel and the outside files
+# alone, so this cannot hide one.
+ABSENT_IS_DENIAL = bool(PREFIX) and sys.platform.startswith("linux")
+ABSENT = ("No such file or directory", "Directory nonexistent", "not a file", "does not exist", "FileNotFoundError",
+          "FileExistsError")
+RAN_NOTHING = ("cs-sandbox:", "env: '")  # the wrapper refused (101), or the host lacks the tool's interpreter
+
+
+def child_env(extra=None):
+    env = {n: os.environ[n] for n in _env_policy.load_policy(LAB)["always"] if n in os.environ}
+    env.setdefault("LAB_TRIAL", "1")
+    env.update(extra or {})
+    return env
+
+
+def run(tool, args, ws, extra=None):
+    r = subprocess.run(PREFIX + _sandbox_policy.tool_argv(LAB, tool), cwd=str(ws), input=json.dumps(args).encode(),
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=child_env(extra), timeout=90)
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def workspace(tmp, outside, name):
+    ws = tmp / name
+    ws.mkdir()
+    (ws / "link.txt").symlink_to(outside / "sentinel.txt")
+    (ws / "linkdir").symlink_to(outside)
+    (ws / "link.md").symlink_to(outside / "doc.md")
+    (ws / "inside.txt").write_text("inside\n")
+    return ws
+
+
+def probe(tool, what, escaped, refused, detail=""):
+    """escaped: the sentinel crossed the boundary. refused: the tool or OS said no. Neither: inconclusive."""
+    detail = " ".join(detail.split())[:140]
+    if escaped:
+        failed.append("%s %s" % (tool, what))
+        print("FAIL %-22s %-38s %s" % (tool, what, detail))
+    elif refused:
+        print("ok   %-22s %-38s %s" % (tool, what, detail))
+    else:
+        errors.append("%s %s" % (tool, what))
+        print("ERR  %-22s %-38s %s" % (tool, what, detail))
+
+
+def reset(outside):
+    (outside / "sentinel.txt").write_text(SENT + "\n")
+    (outside / "doc.md").write_text("# doc\n\n" + SENT + "\n")
+
+
+def main():
+    tmp = Path(tempfile.mkdtemp(prefix="tool-escapes-workspace-", suffix=".noindex"))
+    outside = tmp / "outside"
+    outside.mkdir()
+    home_probe = Path(os.environ["HOME"]) / (".lab-escape-probe-" + secrets.token_hex(6))
+    try:
+        reset(outside)
+        home_probe.mkdir(mode=0o700)
+        (home_probe / "sentinel.txt").write_text(SENT + "\n")
+        abs_sent = str(outside / "sentinel.txt")
+        sent = lambda o: SENT in o  # noqa: E731
+        esc = lambda o: ("escapes workspace" in o or "not permitted" in o.lower() or "Read-only" in o  # noqa: E731
+                         or (ABSENT_IS_DENIAL and not any(s in o for s in RAN_NOTHING) and any(s in o for s in ABSENT)))
+
+        print("--- fs_read")
+        ws = workspace(tmp, outside, "fs_read")
+        c, o = run("fs_read", {"path": abs_sent}, ws)
+        probe("fs_read", "absolute path", sent(o), esc(o), o)
+        c, o = run("fs_read", {"path": "link.txt"}, ws)
+        probe("fs_read", "read through file symlink", sent(o), esc(o), o)
+        c, o = run("fs_read", {"path": "linkdir/sentinel.txt"}, ws)
+        probe("fs_read", "read through dir symlink", sent(o), esc(o), o)
+        c, o = run("fs_read", {"path": "linkdir"}, ws)
+        probe("fs_read", "list through dir symlink", "sentinel.txt" in o, esc(o), o)
+
+        print("--- fs_write")
+        ws = workspace(tmp, outside, "fs_write")
+        c, o = run("fs_write", {"path": str(outside / "abs.txt"), "content": "x"}, ws)
+        probe("fs_write", "absolute path", (outside / "abs.txt").exists(), esc(o), o)
+        c, o = run("fs_write", {"path": "linkdir/w.txt", "content": SENT}, ws)
+        probe("fs_write", "write through dir symlink", (outside / "w.txt").is_file(), esc(o),
+              o + " outside/w.txt=%s" % (outside / "w.txt").is_file())
+        c, o = run("fs_write", {"path": "link.txt", "content": "clobbered\n"}, ws)
+        got = (outside / "sentinel.txt").read_text()
+        probe("fs_write", "write onto file symlink", got == "clobbered\n", esc(o), o + " sentinel=%r" % got)
+        reset(outside)
+
+        print("--- fs_edit")
+        ws = workspace(tmp, outside, "fs_edit")
+        c, o = run("fs_edit", {"path": abs_sent, "edits": [{"oldText": SENT, "newText": "e"}]}, ws)
+        probe("fs_edit", "absolute path", not c, esc(o), o)
+        c, o = run("fs_edit", {"path": "link.txt", "edits": [{"oldText": SENT, "newText": "edited-" + SENT}]}, ws)
+        got = (outside / "sentinel.txt").read_text()
+        probe("fs_edit", "edit through file symlink", got.startswith("edited-"), esc(o), "sentinel=%r" % got)
+        reset(outside)
+
+        print("--- search")
+        ws = workspace(tmp, outside, "search")
+        c, o = run("search", {"pattern": SENT[:20]}, ws)
+        probe("search", "regex hit through file symlink", "./link.txt:1:" in o, c == 0 and "./link.txt:" not in o, o)
+
+        print("--- exec (macOS: sandbox-exec, deny file-write* outside cwd; reads unconfined)")
+        ws = workspace(tmp, outside, "exec")
+        c, o = run("exec", {"cmd": ["cat", abs_sent]}, ws)
+        probe("exec", "argv absolute path", sent(o), esc(o), o)
+        c, o = run("exec", {"cmd": ["sh", "-c", "cat " + abs_sent]}, ws)
+        probe("exec", "sh -c cat <absolute>", sent(o), esc(o), o)
+        c, o = run("exec", {"cmd": ["sh", "-c", "cat ../outside/sentinel.txt"]}, ws)
+        probe("exec", "sh -c cat ../ (dotdot)", sent(o), esc(o), o)
+        c, o = run("exec", {"cmd": ["cat", "link.txt"]}, ws)
+        probe("exec", "cat file symlink", sent(o), esc(o), o)
+        c, o = run("exec", {"cmd": ["sh", "-c", 'cat "$HOME"/%s/sentinel.txt' % home_probe.name]}, ws)
+        probe("exec", "sh -c cat $HOME/<probe>", sent(o), esc(o), o)
+        c, o = run("exec", {"cmd": ["sh", "-c", "echo x > %s/w && echo wrote" % outside]}, ws)
+        probe("exec", "sh -c write <outside>/w", (outside / "w").exists(), esc(o), o)
+        c, o = run("exec", {"cmd": ["sh", "-c", "echo x > linkdir/wl && echo wrote"]}, ws)
+        probe("exec", "write through dir symlink", (outside / "wl").exists(), esc(o), o)
+        c, o = run("exec", {"cmd": ["sh", "-c", 'echo x > "$HOME"/%s/w && echo wrote' % home_probe.name]}, ws)
+        probe("exec", "sh -c write $HOME/<probe>/w", (home_probe / "w").exists(), esc(o), o)
+        ws2 = tmp / "exec-labout"
+        ws2.mkdir()
+        (outside / "labout").mkdir()
+        (ws2 / ".lab-out").symlink_to(outside / "labout")
+        c, o = run("exec", {"cmd": ["sh", "-c", "seq 1 3000"]}, ws2)
+        spilled = [p.name for p in (outside / "labout").iterdir()]
+        probe("exec", ".lab-out spill via dir symlink", bool(spilled), not spilled and esc(o),
+              o.split("\n", 1)[0] + " outside/labout=%s" % spilled)
+
+        # fs_read was the carrier before moving to cs-tools, whose call log refuses a link out of the
+        # workspace; the Python helper is now shown with fs_write, and the Rust log gets its own probe.
+        for tool, label, args, refusal in (
+                ("fs_write", "_calllog", {"path": "/nope", "content": ""}, "escapes workspace"),
+                ("fs_read", "fs_read", {"path": "nope"}, "not a file")):
+            print("--- " + ("_calllog (shared by every python tool; shown with fs_write)" if label == "_calllog"
+                            else "fs_read call log (cs-tools, Rust)"))
+            ws3 = tmp / ("calllog-" + tool)
+            ws3.mkdir()
+            (ws3 / ".lab-calls.jsonl").symlink_to(outside / ("calls-%s.jsonl" % tool))
+            c, o = run(tool, args, ws3)
+            log = outside / ("calls-%s.jsonl" % tool)
+            wrote = log.is_file()
+            probe(label, ".lab-calls.jsonl file symlink", wrote, not wrote and refusal in o,
+                  "outside/%s=%r" % (log.name, log.read_text() if wrote else None))
+
+        print("--- okf (cs-tools: root realpath-checked, a corpus file linking out refused)")
+        ws = workspace(tmp, outside, "okf")
+        c, o = run("okf", {"action": "lint", "root": "linkdir"}, ws)
+        probe("okf", "root through dir symlink", not c, esc(o), o)
+        c, o = run("okf", {"action": "stamp", "root": ".", "version": "0.1"}, ws)
+        got = (outside / "doc.md").read_text()
+        probe("okf", "stamp through file symlink link.md", got.startswith("---"), "ok" in o and not got.startswith("---"),
+              o + " doc.md=%r" % got[:30])
+        reset(outside)
+
+        print("--- evidence_assert (records read through a symlinked _evidence/fetches; bodies refused)")
+        ws = tmp / "evassert"
+        (ws / "_evidence").mkdir(parents=True)
+        (outside / "fetches").mkdir()
+        url = "https://93.184.216.34/p"
+        (outside / "fetches/r.json").write_text(json.dumps({
+            "status": 200, "requested_url": url, "final_url": url, "body_path": "_evidence/bodies/x.html",
+            "sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0, "retrieved_at": "2026-01-01T00:00:00Z"}))
+        (ws / "_evidence/fetches").symlink_to(outside / "fetches")
+        c, o = run("evidence_assert", {"source_url": url, "quote": "q"}, ws)
+        probe("evidence_assert", "records via _evidence/fetches symlink", "unsafe body_path" in o,
+              "no successful fetch evidence" in o, o)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(home_probe, ignore_errors=True)
+    print()
+    tail = "; inconclusive: " + ", ".join(errors) if errors else ""
+    if not PREFIX:
+        print("check: tool-escapes-workspace unconfined: %d escapes (expected until CS_TOOL_PREFIX is set)%s"
+              % (len(failed), tail))
+        return 1
+    print("check: tool-escapes-workspace confined: %d escapes, %d inconclusive (prefix: %s)"
+          % (len(failed), len(errors), " ".join(PREFIX)) + tail)
+    return 1 if failed or errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

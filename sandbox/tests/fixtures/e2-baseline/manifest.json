@@ -1,0 +1,6206 @@
+{
+  "routes": [
+    "native-task",
+    "frozen-check",
+    "auth-refresh",
+    "muse",
+    "muse-check",
+    "cli-adapter",
+    "lead-host"
+  ],
+  "templates": [
+    "antigravity",
+    "antigravity-hydrogen",
+    "claude-auth-context-probe",
+    "claude-code",
+    "claude-code-opus",
+    "claude-code-opus-judge",
+    "claude-code-sonnet",
+    "claude-code-sonnet-patch",
+    "claude-code-sonnet-planner",
+    "codex",
+    "cursor-agent",
+    "cursor-codex",
+    "cursor-composer",
+    "cursor-grok",
+    "cursor-sol",
+    "cursor-sonnet",
+    "gemini-cli",
+    "goose",
+    "grok",
+    "muse-code",
+    "opencode",
+    "opencode-go",
+    "pi",
+    "test-echo"
+  ],
+  "adapters": [
+    "opencode",
+    "opencode-go"
+  ],
+  "states": [
+    "unconfigured",
+    "cargo",
+    "php",
+    "uv",
+    "ssh-agent",
+    "repo-lane"
+  ],
+  "environment": {
+    "home": "/e2-baseline/owner +[test]",
+    "workspace": "/e2-baseline/owner +[test]/workspace",
+    "tmpdir": "/e2-baseline/owner +[test]/private",
+    "path": "/e2-baseline/owner +[test]/.local/bin",
+    "ssh_auth_sock": "unset except /e2-baseline/agent.sock in ssh-agent"
+  },
+  "dispatch_inventory": [
+    "_cli_adapter.py:command:sandbox_command",
+    "_executor.py:main:sandbox_cmd",
+    "_executor.py:main:sandbox_cmd",
+    "_executor.py:refresh_sandbox:sandbox_cmd",
+    "_executor.py:run_check_sandboxed:sandbox_cmd",
+    "_executor.py:sandbox_cmd:sandbox-exec",
+    "_lead_host.py:build:sandbox_cmd",
+    "_lead_host.py:make_session:sandbox_builder",
+    "_muse.py:sandbox_command:sandbox-exec",
+    "_muse.py:sandbox_command:sandbox-exec",
+    "_muse_adapter.py:check_command:sandbox_command",
+    "_muse_adapter.py:execute:sandbox_command",
+    "_muse_adapter.py:probe:sandbox_command",
+    "_muse_adapter.py:run:check_command"
+  ],
+  "cases": [
+    {
+      "id": "native-task/antigravity/unconfigured",
+      "route": "native-task",
+      "template": "antigravity",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity/cargo",
+      "route": "native-task",
+      "template": "antigravity",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity/php",
+      "route": "native-task",
+      "template": "antigravity",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity/uv",
+      "route": "native-task",
+      "template": "antigravity",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity/ssh-agent",
+      "route": "native-task",
+      "template": "antigravity",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity/repo-lane",
+      "route": "native-task",
+      "template": "antigravity",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity-hydrogen/unconfigured",
+      "route": "native-task",
+      "template": "antigravity-hydrogen",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity-hydrogen/cargo",
+      "route": "native-task",
+      "template": "antigravity-hydrogen",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity-hydrogen/php",
+      "route": "native-task",
+      "template": "antigravity-hydrogen",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity-hydrogen/uv",
+      "route": "native-task",
+      "template": "antigravity-hydrogen",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity-hydrogen/ssh-agent",
+      "route": "native-task",
+      "template": "antigravity-hydrogen",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/antigravity-hydrogen/repo-lane",
+      "route": "native-task",
+      "template": "antigravity-hydrogen",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-auth-context-probe/unconfigured",
+      "route": "native-task",
+      "template": "claude-auth-context-probe",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-auth-context-probe/cargo",
+      "route": "native-task",
+      "template": "claude-auth-context-probe",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-auth-context-probe/php",
+      "route": "native-task",
+      "template": "claude-auth-context-probe",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-auth-context-probe/uv",
+      "route": "native-task",
+      "template": "claude-auth-context-probe",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-auth-context-probe/ssh-agent",
+      "route": "native-task",
+      "template": "claude-auth-context-probe",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-auth-context-probe/repo-lane",
+      "route": "native-task",
+      "template": "claude-auth-context-probe",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code/unconfigured",
+      "route": "native-task",
+      "template": "claude-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code/cargo",
+      "route": "native-task",
+      "template": "claude-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code/php",
+      "route": "native-task",
+      "template": "claude-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code/uv",
+      "route": "native-task",
+      "template": "claude-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code/ssh-agent",
+      "route": "native-task",
+      "template": "claude-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code/repo-lane",
+      "route": "native-task",
+      "template": "claude-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus/unconfigured",
+      "route": "native-task",
+      "template": "claude-code-opus",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus/cargo",
+      "route": "native-task",
+      "template": "claude-code-opus",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus/php",
+      "route": "native-task",
+      "template": "claude-code-opus",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus/uv",
+      "route": "native-task",
+      "template": "claude-code-opus",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus/ssh-agent",
+      "route": "native-task",
+      "template": "claude-code-opus",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus/repo-lane",
+      "route": "native-task",
+      "template": "claude-code-opus",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus-judge/unconfigured",
+      "route": "native-task",
+      "template": "claude-code-opus-judge",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus-judge/cargo",
+      "route": "native-task",
+      "template": "claude-code-opus-judge",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus-judge/php",
+      "route": "native-task",
+      "template": "claude-code-opus-judge",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus-judge/uv",
+      "route": "native-task",
+      "template": "claude-code-opus-judge",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus-judge/ssh-agent",
+      "route": "native-task",
+      "template": "claude-code-opus-judge",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-opus-judge/repo-lane",
+      "route": "native-task",
+      "template": "claude-code-opus-judge",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet/unconfigured",
+      "route": "native-task",
+      "template": "claude-code-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet/cargo",
+      "route": "native-task",
+      "template": "claude-code-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet/php",
+      "route": "native-task",
+      "template": "claude-code-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet/uv",
+      "route": "native-task",
+      "template": "claude-code-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet/ssh-agent",
+      "route": "native-task",
+      "template": "claude-code-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet/repo-lane",
+      "route": "native-task",
+      "template": "claude-code-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-patch/unconfigured",
+      "route": "native-task",
+      "template": "claude-code-sonnet-patch",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-patch/cargo",
+      "route": "native-task",
+      "template": "claude-code-sonnet-patch",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-patch/php",
+      "route": "native-task",
+      "template": "claude-code-sonnet-patch",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-patch/uv",
+      "route": "native-task",
+      "template": "claude-code-sonnet-patch",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-patch/ssh-agent",
+      "route": "native-task",
+      "template": "claude-code-sonnet-patch",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-patch/repo-lane",
+      "route": "native-task",
+      "template": "claude-code-sonnet-patch",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-planner/unconfigured",
+      "route": "native-task",
+      "template": "claude-code-sonnet-planner",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-planner/cargo",
+      "route": "native-task",
+      "template": "claude-code-sonnet-planner",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-planner/php",
+      "route": "native-task",
+      "template": "claude-code-sonnet-planner",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-planner/uv",
+      "route": "native-task",
+      "template": "claude-code-sonnet-planner",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-planner/ssh-agent",
+      "route": "native-task",
+      "template": "claude-code-sonnet-planner",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/claude-code-sonnet-planner/repo-lane",
+      "route": "native-task",
+      "template": "claude-code-sonnet-planner",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/codex/unconfigured",
+      "route": "native-task",
+      "template": "codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/codex/cargo",
+      "route": "native-task",
+      "template": "codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/codex/php",
+      "route": "native-task",
+      "template": "codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/codex/uv",
+      "route": "native-task",
+      "template": "codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/codex/ssh-agent",
+      "route": "native-task",
+      "template": "codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/codex/repo-lane",
+      "route": "native-task",
+      "template": "codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-agent/unconfigured",
+      "route": "native-task",
+      "template": "cursor-agent",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-agent/cargo",
+      "route": "native-task",
+      "template": "cursor-agent",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-agent/php",
+      "route": "native-task",
+      "template": "cursor-agent",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-agent/uv",
+      "route": "native-task",
+      "template": "cursor-agent",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-agent/ssh-agent",
+      "route": "native-task",
+      "template": "cursor-agent",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-agent/repo-lane",
+      "route": "native-task",
+      "template": "cursor-agent",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-codex/unconfigured",
+      "route": "native-task",
+      "template": "cursor-codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-codex/cargo",
+      "route": "native-task",
+      "template": "cursor-codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-codex/php",
+      "route": "native-task",
+      "template": "cursor-codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-codex/uv",
+      "route": "native-task",
+      "template": "cursor-codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-codex/ssh-agent",
+      "route": "native-task",
+      "template": "cursor-codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-codex/repo-lane",
+      "route": "native-task",
+      "template": "cursor-codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-composer/unconfigured",
+      "route": "native-task",
+      "template": "cursor-composer",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-composer/cargo",
+      "route": "native-task",
+      "template": "cursor-composer",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-composer/php",
+      "route": "native-task",
+      "template": "cursor-composer",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-composer/uv",
+      "route": "native-task",
+      "template": "cursor-composer",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-composer/ssh-agent",
+      "route": "native-task",
+      "template": "cursor-composer",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-composer/repo-lane",
+      "route": "native-task",
+      "template": "cursor-composer",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-grok/unconfigured",
+      "route": "native-task",
+      "template": "cursor-grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-grok/cargo",
+      "route": "native-task",
+      "template": "cursor-grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-grok/php",
+      "route": "native-task",
+      "template": "cursor-grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-grok/uv",
+      "route": "native-task",
+      "template": "cursor-grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-grok/ssh-agent",
+      "route": "native-task",
+      "template": "cursor-grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-grok/repo-lane",
+      "route": "native-task",
+      "template": "cursor-grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sol/unconfigured",
+      "route": "native-task",
+      "template": "cursor-sol",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sol/cargo",
+      "route": "native-task",
+      "template": "cursor-sol",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sol/php",
+      "route": "native-task",
+      "template": "cursor-sol",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sol/uv",
+      "route": "native-task",
+      "template": "cursor-sol",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sol/ssh-agent",
+      "route": "native-task",
+      "template": "cursor-sol",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sol/repo-lane",
+      "route": "native-task",
+      "template": "cursor-sol",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sonnet/unconfigured",
+      "route": "native-task",
+      "template": "cursor-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sonnet/cargo",
+      "route": "native-task",
+      "template": "cursor-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sonnet/php",
+      "route": "native-task",
+      "template": "cursor-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sonnet/uv",
+      "route": "native-task",
+      "template": "cursor-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sonnet/ssh-agent",
+      "route": "native-task",
+      "template": "cursor-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/cursor-sonnet/repo-lane",
+      "route": "native-task",
+      "template": "cursor-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/gemini-cli/unconfigured",
+      "route": "native-task",
+      "template": "gemini-cli",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/gemini-cli/cargo",
+      "route": "native-task",
+      "template": "gemini-cli",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/gemini-cli/php",
+      "route": "native-task",
+      "template": "gemini-cli",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/gemini-cli/uv",
+      "route": "native-task",
+      "template": "gemini-cli",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/gemini-cli/ssh-agent",
+      "route": "native-task",
+      "template": "gemini-cli",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/gemini-cli/repo-lane",
+      "route": "native-task",
+      "template": "gemini-cli",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/goose/unconfigured",
+      "route": "native-task",
+      "template": "goose",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/goose/cargo",
+      "route": "native-task",
+      "template": "goose",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/goose/php",
+      "route": "native-task",
+      "template": "goose",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/goose/uv",
+      "route": "native-task",
+      "template": "goose",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/goose/ssh-agent",
+      "route": "native-task",
+      "template": "goose",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/goose/repo-lane",
+      "route": "native-task",
+      "template": "goose",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/grok/unconfigured",
+      "route": "native-task",
+      "template": "grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/grok/cargo",
+      "route": "native-task",
+      "template": "grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/grok/php",
+      "route": "native-task",
+      "template": "grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/grok/uv",
+      "route": "native-task",
+      "template": "grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/grok/ssh-agent",
+      "route": "native-task",
+      "template": "grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/grok/repo-lane",
+      "route": "native-task",
+      "template": "grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/muse-code/unconfigured",
+      "route": "native-task",
+      "template": "muse-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/muse-code/cargo",
+      "route": "native-task",
+      "template": "muse-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/muse-code/php",
+      "route": "native-task",
+      "template": "muse-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/muse-code/uv",
+      "route": "native-task",
+      "template": "muse-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/muse-code/ssh-agent",
+      "route": "native-task",
+      "template": "muse-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/muse-code/repo-lane",
+      "route": "native-task",
+      "template": "muse-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode/unconfigured",
+      "route": "native-task",
+      "template": "opencode",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode/cargo",
+      "route": "native-task",
+      "template": "opencode",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode/php",
+      "route": "native-task",
+      "template": "opencode",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode/uv",
+      "route": "native-task",
+      "template": "opencode",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode/ssh-agent",
+      "route": "native-task",
+      "template": "opencode",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode/repo-lane",
+      "route": "native-task",
+      "template": "opencode",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode-go/unconfigured",
+      "route": "native-task",
+      "template": "opencode-go",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode-go/cargo",
+      "route": "native-task",
+      "template": "opencode-go",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode-go/php",
+      "route": "native-task",
+      "template": "opencode-go",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode-go/uv",
+      "route": "native-task",
+      "template": "opencode-go",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode-go/ssh-agent",
+      "route": "native-task",
+      "template": "opencode-go",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/opencode-go/repo-lane",
+      "route": "native-task",
+      "template": "opencode-go",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/pi/unconfigured",
+      "route": "native-task",
+      "template": "pi",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/pi/cargo",
+      "route": "native-task",
+      "template": "pi",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/pi/php",
+      "route": "native-task",
+      "template": "pi",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/pi/uv",
+      "route": "native-task",
+      "template": "pi",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/pi/ssh-agent",
+      "route": "native-task",
+      "template": "pi",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/pi/repo-lane",
+      "route": "native-task",
+      "template": "pi",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "native-task/test-echo/unconfigured",
+      "route": "native-task",
+      "template": "test-echo",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "native-task/test-echo/cargo",
+      "route": "native-task",
+      "template": "test-echo",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "native-task/test-echo/php",
+      "route": "native-task",
+      "template": "test-echo",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "native-task/test-echo/uv",
+      "route": "native-task",
+      "template": "test-echo",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "native-task/test-echo/ssh-agent",
+      "route": "native-task",
+      "template": "test-echo",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "native-task/test-echo/repo-lane",
+      "route": "native-task",
+      "template": "test-echo",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity/unconfigured",
+      "route": "frozen-check",
+      "template": "antigravity",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity/cargo",
+      "route": "frozen-check",
+      "template": "antigravity",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity/php",
+      "route": "frozen-check",
+      "template": "antigravity",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity/uv",
+      "route": "frozen-check",
+      "template": "antigravity",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity/ssh-agent",
+      "route": "frozen-check",
+      "template": "antigravity",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity/repo-lane",
+      "route": "frozen-check",
+      "template": "antigravity",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity-hydrogen/unconfigured",
+      "route": "frozen-check",
+      "template": "antigravity-hydrogen",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity-hydrogen/cargo",
+      "route": "frozen-check",
+      "template": "antigravity-hydrogen",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity-hydrogen/php",
+      "route": "frozen-check",
+      "template": "antigravity-hydrogen",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity-hydrogen/uv",
+      "route": "frozen-check",
+      "template": "antigravity-hydrogen",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity-hydrogen/ssh-agent",
+      "route": "frozen-check",
+      "template": "antigravity-hydrogen",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/antigravity-hydrogen/repo-lane",
+      "route": "frozen-check",
+      "template": "antigravity-hydrogen",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-auth-context-probe/unconfigured",
+      "route": "frozen-check",
+      "template": "claude-auth-context-probe",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-auth-context-probe/cargo",
+      "route": "frozen-check",
+      "template": "claude-auth-context-probe",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-auth-context-probe/php",
+      "route": "frozen-check",
+      "template": "claude-auth-context-probe",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-auth-context-probe/uv",
+      "route": "frozen-check",
+      "template": "claude-auth-context-probe",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-auth-context-probe/ssh-agent",
+      "route": "frozen-check",
+      "template": "claude-auth-context-probe",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-auth-context-probe/repo-lane",
+      "route": "frozen-check",
+      "template": "claude-auth-context-probe",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code/unconfigured",
+      "route": "frozen-check",
+      "template": "claude-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code/cargo",
+      "route": "frozen-check",
+      "template": "claude-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code/php",
+      "route": "frozen-check",
+      "template": "claude-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code/uv",
+      "route": "frozen-check",
+      "template": "claude-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code/ssh-agent",
+      "route": "frozen-check",
+      "template": "claude-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code/repo-lane",
+      "route": "frozen-check",
+      "template": "claude-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus/unconfigured",
+      "route": "frozen-check",
+      "template": "claude-code-opus",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus/cargo",
+      "route": "frozen-check",
+      "template": "claude-code-opus",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus/php",
+      "route": "frozen-check",
+      "template": "claude-code-opus",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus/uv",
+      "route": "frozen-check",
+      "template": "claude-code-opus",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus/ssh-agent",
+      "route": "frozen-check",
+      "template": "claude-code-opus",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus/repo-lane",
+      "route": "frozen-check",
+      "template": "claude-code-opus",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus-judge/unconfigured",
+      "route": "frozen-check",
+      "template": "claude-code-opus-judge",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus-judge/cargo",
+      "route": "frozen-check",
+      "template": "claude-code-opus-judge",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus-judge/php",
+      "route": "frozen-check",
+      "template": "claude-code-opus-judge",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus-judge/uv",
+      "route": "frozen-check",
+      "template": "claude-code-opus-judge",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus-judge/ssh-agent",
+      "route": "frozen-check",
+      "template": "claude-code-opus-judge",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-opus-judge/repo-lane",
+      "route": "frozen-check",
+      "template": "claude-code-opus-judge",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet/unconfigured",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet/cargo",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet/php",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet/uv",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet/ssh-agent",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet/repo-lane",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-patch/unconfigured",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-patch/cargo",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-patch/php",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-patch/uv",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-patch/ssh-agent",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-patch/repo-lane",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-planner/unconfigured",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-planner/cargo",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-planner/php",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-planner/uv",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-planner/ssh-agent",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/claude-code-sonnet-planner/repo-lane",
+      "route": "frozen-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/codex/unconfigured",
+      "route": "frozen-check",
+      "template": "codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/codex/cargo",
+      "route": "frozen-check",
+      "template": "codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/codex/php",
+      "route": "frozen-check",
+      "template": "codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/codex/uv",
+      "route": "frozen-check",
+      "template": "codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/codex/ssh-agent",
+      "route": "frozen-check",
+      "template": "codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/codex/repo-lane",
+      "route": "frozen-check",
+      "template": "codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-agent/unconfigured",
+      "route": "frozen-check",
+      "template": "cursor-agent",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-agent/cargo",
+      "route": "frozen-check",
+      "template": "cursor-agent",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-agent/php",
+      "route": "frozen-check",
+      "template": "cursor-agent",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-agent/uv",
+      "route": "frozen-check",
+      "template": "cursor-agent",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-agent/ssh-agent",
+      "route": "frozen-check",
+      "template": "cursor-agent",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-agent/repo-lane",
+      "route": "frozen-check",
+      "template": "cursor-agent",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-codex/unconfigured",
+      "route": "frozen-check",
+      "template": "cursor-codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-codex/cargo",
+      "route": "frozen-check",
+      "template": "cursor-codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-codex/php",
+      "route": "frozen-check",
+      "template": "cursor-codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-codex/uv",
+      "route": "frozen-check",
+      "template": "cursor-codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-codex/ssh-agent",
+      "route": "frozen-check",
+      "template": "cursor-codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-codex/repo-lane",
+      "route": "frozen-check",
+      "template": "cursor-codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-composer/unconfigured",
+      "route": "frozen-check",
+      "template": "cursor-composer",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-composer/cargo",
+      "route": "frozen-check",
+      "template": "cursor-composer",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-composer/php",
+      "route": "frozen-check",
+      "template": "cursor-composer",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-composer/uv",
+      "route": "frozen-check",
+      "template": "cursor-composer",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-composer/ssh-agent",
+      "route": "frozen-check",
+      "template": "cursor-composer",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-composer/repo-lane",
+      "route": "frozen-check",
+      "template": "cursor-composer",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-grok/unconfigured",
+      "route": "frozen-check",
+      "template": "cursor-grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-grok/cargo",
+      "route": "frozen-check",
+      "template": "cursor-grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-grok/php",
+      "route": "frozen-check",
+      "template": "cursor-grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-grok/uv",
+      "route": "frozen-check",
+      "template": "cursor-grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-grok/ssh-agent",
+      "route": "frozen-check",
+      "template": "cursor-grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-grok/repo-lane",
+      "route": "frozen-check",
+      "template": "cursor-grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sol/unconfigured",
+      "route": "frozen-check",
+      "template": "cursor-sol",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sol/cargo",
+      "route": "frozen-check",
+      "template": "cursor-sol",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sol/php",
+      "route": "frozen-check",
+      "template": "cursor-sol",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sol/uv",
+      "route": "frozen-check",
+      "template": "cursor-sol",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sol/ssh-agent",
+      "route": "frozen-check",
+      "template": "cursor-sol",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sol/repo-lane",
+      "route": "frozen-check",
+      "template": "cursor-sol",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sonnet/unconfigured",
+      "route": "frozen-check",
+      "template": "cursor-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sonnet/cargo",
+      "route": "frozen-check",
+      "template": "cursor-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sonnet/php",
+      "route": "frozen-check",
+      "template": "cursor-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sonnet/uv",
+      "route": "frozen-check",
+      "template": "cursor-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sonnet/ssh-agent",
+      "route": "frozen-check",
+      "template": "cursor-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/cursor-sonnet/repo-lane",
+      "route": "frozen-check",
+      "template": "cursor-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/gemini-cli/unconfigured",
+      "route": "frozen-check",
+      "template": "gemini-cli",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/gemini-cli/cargo",
+      "route": "frozen-check",
+      "template": "gemini-cli",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/gemini-cli/php",
+      "route": "frozen-check",
+      "template": "gemini-cli",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/gemini-cli/uv",
+      "route": "frozen-check",
+      "template": "gemini-cli",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/gemini-cli/ssh-agent",
+      "route": "frozen-check",
+      "template": "gemini-cli",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/gemini-cli/repo-lane",
+      "route": "frozen-check",
+      "template": "gemini-cli",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/goose/unconfigured",
+      "route": "frozen-check",
+      "template": "goose",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/goose/cargo",
+      "route": "frozen-check",
+      "template": "goose",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/goose/php",
+      "route": "frozen-check",
+      "template": "goose",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/goose/uv",
+      "route": "frozen-check",
+      "template": "goose",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/goose/ssh-agent",
+      "route": "frozen-check",
+      "template": "goose",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/goose/repo-lane",
+      "route": "frozen-check",
+      "template": "goose",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/grok/unconfigured",
+      "route": "frozen-check",
+      "template": "grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/grok/cargo",
+      "route": "frozen-check",
+      "template": "grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/grok/php",
+      "route": "frozen-check",
+      "template": "grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/grok/uv",
+      "route": "frozen-check",
+      "template": "grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/grok/ssh-agent",
+      "route": "frozen-check",
+      "template": "grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/grok/repo-lane",
+      "route": "frozen-check",
+      "template": "grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/muse-code/unconfigured",
+      "route": "frozen-check",
+      "template": "muse-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/muse-code/cargo",
+      "route": "frozen-check",
+      "template": "muse-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/muse-code/php",
+      "route": "frozen-check",
+      "template": "muse-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/muse-code/uv",
+      "route": "frozen-check",
+      "template": "muse-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/muse-code/ssh-agent",
+      "route": "frozen-check",
+      "template": "muse-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/muse-code/repo-lane",
+      "route": "frozen-check",
+      "template": "muse-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode/unconfigured",
+      "route": "frozen-check",
+      "template": "opencode",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode/cargo",
+      "route": "frozen-check",
+      "template": "opencode",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode/php",
+      "route": "frozen-check",
+      "template": "opencode",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode/uv",
+      "route": "frozen-check",
+      "template": "opencode",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode/ssh-agent",
+      "route": "frozen-check",
+      "template": "opencode",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode/repo-lane",
+      "route": "frozen-check",
+      "template": "opencode",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode-go/unconfigured",
+      "route": "frozen-check",
+      "template": "opencode-go",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode-go/cargo",
+      "route": "frozen-check",
+      "template": "opencode-go",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode-go/php",
+      "route": "frozen-check",
+      "template": "opencode-go",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode-go/uv",
+      "route": "frozen-check",
+      "template": "opencode-go",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode-go/ssh-agent",
+      "route": "frozen-check",
+      "template": "opencode-go",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/opencode-go/repo-lane",
+      "route": "frozen-check",
+      "template": "opencode-go",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/pi/unconfigured",
+      "route": "frozen-check",
+      "template": "pi",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/pi/cargo",
+      "route": "frozen-check",
+      "template": "pi",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/pi/php",
+      "route": "frozen-check",
+      "template": "pi",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/pi/uv",
+      "route": "frozen-check",
+      "template": "pi",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/pi/ssh-agent",
+      "route": "frozen-check",
+      "template": "pi",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/pi/repo-lane",
+      "route": "frozen-check",
+      "template": "pi",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/test-echo/unconfigured",
+      "route": "frozen-check",
+      "template": "test-echo",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/test-echo/cargo",
+      "route": "frozen-check",
+      "template": "test-echo",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/test-echo/php",
+      "route": "frozen-check",
+      "template": "test-echo",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/test-echo/uv",
+      "route": "frozen-check",
+      "template": "test-echo",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/test-echo/ssh-agent",
+      "route": "frozen-check",
+      "template": "test-echo",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "frozen-check/test-echo/repo-lane",
+      "route": "frozen-check",
+      "template": "test-echo",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity/unconfigured",
+      "route": "auth-refresh",
+      "template": "antigravity",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity/cargo",
+      "route": "auth-refresh",
+      "template": "antigravity",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity/php",
+      "route": "auth-refresh",
+      "template": "antigravity",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity/uv",
+      "route": "auth-refresh",
+      "template": "antigravity",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity/ssh-agent",
+      "route": "auth-refresh",
+      "template": "antigravity",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity/repo-lane",
+      "route": "auth-refresh",
+      "template": "antigravity",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity-hydrogen/unconfigured",
+      "route": "auth-refresh",
+      "template": "antigravity-hydrogen",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity-hydrogen/cargo",
+      "route": "auth-refresh",
+      "template": "antigravity-hydrogen",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity-hydrogen/php",
+      "route": "auth-refresh",
+      "template": "antigravity-hydrogen",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity-hydrogen/uv",
+      "route": "auth-refresh",
+      "template": "antigravity-hydrogen",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity-hydrogen/ssh-agent",
+      "route": "auth-refresh",
+      "template": "antigravity-hydrogen",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/antigravity-hydrogen/repo-lane",
+      "route": "auth-refresh",
+      "template": "antigravity-hydrogen",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-auth-context-probe/unconfigured",
+      "route": "auth-refresh",
+      "template": "claude-auth-context-probe",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-auth-context-probe/cargo",
+      "route": "auth-refresh",
+      "template": "claude-auth-context-probe",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-auth-context-probe/php",
+      "route": "auth-refresh",
+      "template": "claude-auth-context-probe",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-auth-context-probe/uv",
+      "route": "auth-refresh",
+      "template": "claude-auth-context-probe",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-auth-context-probe/ssh-agent",
+      "route": "auth-refresh",
+      "template": "claude-auth-context-probe",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-auth-context-probe/repo-lane",
+      "route": "auth-refresh",
+      "template": "claude-auth-context-probe",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code/unconfigured",
+      "route": "auth-refresh",
+      "template": "claude-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code/cargo",
+      "route": "auth-refresh",
+      "template": "claude-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code/php",
+      "route": "auth-refresh",
+      "template": "claude-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code/uv",
+      "route": "auth-refresh",
+      "template": "claude-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code/ssh-agent",
+      "route": "auth-refresh",
+      "template": "claude-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code/repo-lane",
+      "route": "auth-refresh",
+      "template": "claude-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus/unconfigured",
+      "route": "auth-refresh",
+      "template": "claude-code-opus",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus/cargo",
+      "route": "auth-refresh",
+      "template": "claude-code-opus",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus/php",
+      "route": "auth-refresh",
+      "template": "claude-code-opus",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus/uv",
+      "route": "auth-refresh",
+      "template": "claude-code-opus",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus/ssh-agent",
+      "route": "auth-refresh",
+      "template": "claude-code-opus",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus/repo-lane",
+      "route": "auth-refresh",
+      "template": "claude-code-opus",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus-judge/unconfigured",
+      "route": "auth-refresh",
+      "template": "claude-code-opus-judge",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus-judge/cargo",
+      "route": "auth-refresh",
+      "template": "claude-code-opus-judge",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus-judge/php",
+      "route": "auth-refresh",
+      "template": "claude-code-opus-judge",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus-judge/uv",
+      "route": "auth-refresh",
+      "template": "claude-code-opus-judge",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus-judge/ssh-agent",
+      "route": "auth-refresh",
+      "template": "claude-code-opus-judge",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-opus-judge/repo-lane",
+      "route": "auth-refresh",
+      "template": "claude-code-opus-judge",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet/unconfigured",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet/cargo",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet/php",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet/uv",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet/ssh-agent",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet/repo-lane",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-patch/unconfigured",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-patch",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-patch/cargo",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-patch",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-patch/php",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-patch",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-patch/uv",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-patch",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-patch/ssh-agent",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-patch",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-patch/repo-lane",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-patch",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-planner/unconfigured",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-planner",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-planner/cargo",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-planner",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-planner/php",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-planner",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-planner/uv",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-planner",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-planner/ssh-agent",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-planner",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/claude-code-sonnet-planner/repo-lane",
+      "route": "auth-refresh",
+      "template": "claude-code-sonnet-planner",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/codex/unconfigured",
+      "route": "auth-refresh",
+      "template": "codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/codex/cargo",
+      "route": "auth-refresh",
+      "template": "codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/codex/php",
+      "route": "auth-refresh",
+      "template": "codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/codex/uv",
+      "route": "auth-refresh",
+      "template": "codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/codex/ssh-agent",
+      "route": "auth-refresh",
+      "template": "codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/codex/repo-lane",
+      "route": "auth-refresh",
+      "template": "codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-agent/unconfigured",
+      "route": "auth-refresh",
+      "template": "cursor-agent",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-agent/cargo",
+      "route": "auth-refresh",
+      "template": "cursor-agent",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-agent/php",
+      "route": "auth-refresh",
+      "template": "cursor-agent",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-agent/uv",
+      "route": "auth-refresh",
+      "template": "cursor-agent",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-agent/ssh-agent",
+      "route": "auth-refresh",
+      "template": "cursor-agent",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-agent/repo-lane",
+      "route": "auth-refresh",
+      "template": "cursor-agent",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-codex/unconfigured",
+      "route": "auth-refresh",
+      "template": "cursor-codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-codex/cargo",
+      "route": "auth-refresh",
+      "template": "cursor-codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-codex/php",
+      "route": "auth-refresh",
+      "template": "cursor-codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-codex/uv",
+      "route": "auth-refresh",
+      "template": "cursor-codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-codex/ssh-agent",
+      "route": "auth-refresh",
+      "template": "cursor-codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-codex/repo-lane",
+      "route": "auth-refresh",
+      "template": "cursor-codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-composer/unconfigured",
+      "route": "auth-refresh",
+      "template": "cursor-composer",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-composer/cargo",
+      "route": "auth-refresh",
+      "template": "cursor-composer",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-composer/php",
+      "route": "auth-refresh",
+      "template": "cursor-composer",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-composer/uv",
+      "route": "auth-refresh",
+      "template": "cursor-composer",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-composer/ssh-agent",
+      "route": "auth-refresh",
+      "template": "cursor-composer",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-composer/repo-lane",
+      "route": "auth-refresh",
+      "template": "cursor-composer",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-grok/unconfigured",
+      "route": "auth-refresh",
+      "template": "cursor-grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-grok/cargo",
+      "route": "auth-refresh",
+      "template": "cursor-grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-grok/php",
+      "route": "auth-refresh",
+      "template": "cursor-grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-grok/uv",
+      "route": "auth-refresh",
+      "template": "cursor-grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-grok/ssh-agent",
+      "route": "auth-refresh",
+      "template": "cursor-grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-grok/repo-lane",
+      "route": "auth-refresh",
+      "template": "cursor-grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sol/unconfigured",
+      "route": "auth-refresh",
+      "template": "cursor-sol",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sol/cargo",
+      "route": "auth-refresh",
+      "template": "cursor-sol",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sol/php",
+      "route": "auth-refresh",
+      "template": "cursor-sol",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sol/uv",
+      "route": "auth-refresh",
+      "template": "cursor-sol",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sol/ssh-agent",
+      "route": "auth-refresh",
+      "template": "cursor-sol",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sol/repo-lane",
+      "route": "auth-refresh",
+      "template": "cursor-sol",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sonnet/unconfigured",
+      "route": "auth-refresh",
+      "template": "cursor-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sonnet/cargo",
+      "route": "auth-refresh",
+      "template": "cursor-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sonnet/php",
+      "route": "auth-refresh",
+      "template": "cursor-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sonnet/uv",
+      "route": "auth-refresh",
+      "template": "cursor-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sonnet/ssh-agent",
+      "route": "auth-refresh",
+      "template": "cursor-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/cursor-sonnet/repo-lane",
+      "route": "auth-refresh",
+      "template": "cursor-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/gemini-cli/unconfigured",
+      "route": "auth-refresh",
+      "template": "gemini-cli",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/gemini-cli/cargo",
+      "route": "auth-refresh",
+      "template": "gemini-cli",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/gemini-cli/php",
+      "route": "auth-refresh",
+      "template": "gemini-cli",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/gemini-cli/uv",
+      "route": "auth-refresh",
+      "template": "gemini-cli",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/gemini-cli/ssh-agent",
+      "route": "auth-refresh",
+      "template": "gemini-cli",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/gemini-cli/repo-lane",
+      "route": "auth-refresh",
+      "template": "gemini-cli",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/goose/unconfigured",
+      "route": "auth-refresh",
+      "template": "goose",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/goose/cargo",
+      "route": "auth-refresh",
+      "template": "goose",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/goose/php",
+      "route": "auth-refresh",
+      "template": "goose",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/goose/uv",
+      "route": "auth-refresh",
+      "template": "goose",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/goose/ssh-agent",
+      "route": "auth-refresh",
+      "template": "goose",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/goose/repo-lane",
+      "route": "auth-refresh",
+      "template": "goose",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/grok/unconfigured",
+      "route": "auth-refresh",
+      "template": "grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/grok/cargo",
+      "route": "auth-refresh",
+      "template": "grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/grok/php",
+      "route": "auth-refresh",
+      "template": "grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/grok/uv",
+      "route": "auth-refresh",
+      "template": "grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/grok/ssh-agent",
+      "route": "auth-refresh",
+      "template": "grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/grok/repo-lane",
+      "route": "auth-refresh",
+      "template": "grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/muse-code/unconfigured",
+      "route": "auth-refresh",
+      "template": "muse-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/muse-code/cargo",
+      "route": "auth-refresh",
+      "template": "muse-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/muse-code/php",
+      "route": "auth-refresh",
+      "template": "muse-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/muse-code/uv",
+      "route": "auth-refresh",
+      "template": "muse-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/muse-code/ssh-agent",
+      "route": "auth-refresh",
+      "template": "muse-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/muse-code/repo-lane",
+      "route": "auth-refresh",
+      "template": "muse-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode/unconfigured",
+      "route": "auth-refresh",
+      "template": "opencode",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode/cargo",
+      "route": "auth-refresh",
+      "template": "opencode",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode/php",
+      "route": "auth-refresh",
+      "template": "opencode",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode/uv",
+      "route": "auth-refresh",
+      "template": "opencode",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode/ssh-agent",
+      "route": "auth-refresh",
+      "template": "opencode",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode/repo-lane",
+      "route": "auth-refresh",
+      "template": "opencode",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode-go/unconfigured",
+      "route": "auth-refresh",
+      "template": "opencode-go",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode-go/cargo",
+      "route": "auth-refresh",
+      "template": "opencode-go",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode-go/php",
+      "route": "auth-refresh",
+      "template": "opencode-go",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode-go/uv",
+      "route": "auth-refresh",
+      "template": "opencode-go",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode-go/ssh-agent",
+      "route": "auth-refresh",
+      "template": "opencode-go",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/opencode-go/repo-lane",
+      "route": "auth-refresh",
+      "template": "opencode-go",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/pi/unconfigured",
+      "route": "auth-refresh",
+      "template": "pi",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/pi/cargo",
+      "route": "auth-refresh",
+      "template": "pi",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/pi/php",
+      "route": "auth-refresh",
+      "template": "pi",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/pi/uv",
+      "route": "auth-refresh",
+      "template": "pi",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/pi/ssh-agent",
+      "route": "auth-refresh",
+      "template": "pi",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/pi/repo-lane",
+      "route": "auth-refresh",
+      "template": "pi",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/test-echo/unconfigured",
+      "route": "auth-refresh",
+      "template": "test-echo",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/test-echo/cargo",
+      "route": "auth-refresh",
+      "template": "test-echo",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/test-echo/php",
+      "route": "auth-refresh",
+      "template": "test-echo",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/test-echo/uv",
+      "route": "auth-refresh",
+      "template": "test-echo",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/test-echo/ssh-agent",
+      "route": "auth-refresh",
+      "template": "test-echo",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "auth-refresh/test-echo/repo-lane",
+      "route": "auth-refresh",
+      "template": "test-echo",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity/unconfigured",
+      "route": "muse",
+      "template": "antigravity",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity/cargo",
+      "route": "muse",
+      "template": "antigravity",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity/php",
+      "route": "muse",
+      "template": "antigravity",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity/uv",
+      "route": "muse",
+      "template": "antigravity",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity/ssh-agent",
+      "route": "muse",
+      "template": "antigravity",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity/repo-lane",
+      "route": "muse",
+      "template": "antigravity",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity-hydrogen/unconfigured",
+      "route": "muse",
+      "template": "antigravity-hydrogen",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity-hydrogen/cargo",
+      "route": "muse",
+      "template": "antigravity-hydrogen",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity-hydrogen/php",
+      "route": "muse",
+      "template": "antigravity-hydrogen",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity-hydrogen/uv",
+      "route": "muse",
+      "template": "antigravity-hydrogen",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity-hydrogen/ssh-agent",
+      "route": "muse",
+      "template": "antigravity-hydrogen",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/antigravity-hydrogen/repo-lane",
+      "route": "muse",
+      "template": "antigravity-hydrogen",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-auth-context-probe/unconfigured",
+      "route": "muse",
+      "template": "claude-auth-context-probe",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-auth-context-probe/cargo",
+      "route": "muse",
+      "template": "claude-auth-context-probe",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-auth-context-probe/php",
+      "route": "muse",
+      "template": "claude-auth-context-probe",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-auth-context-probe/uv",
+      "route": "muse",
+      "template": "claude-auth-context-probe",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-auth-context-probe/ssh-agent",
+      "route": "muse",
+      "template": "claude-auth-context-probe",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-auth-context-probe/repo-lane",
+      "route": "muse",
+      "template": "claude-auth-context-probe",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code/unconfigured",
+      "route": "muse",
+      "template": "claude-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code/cargo",
+      "route": "muse",
+      "template": "claude-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code/php",
+      "route": "muse",
+      "template": "claude-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code/uv",
+      "route": "muse",
+      "template": "claude-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code/ssh-agent",
+      "route": "muse",
+      "template": "claude-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code/repo-lane",
+      "route": "muse",
+      "template": "claude-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus/unconfigured",
+      "route": "muse",
+      "template": "claude-code-opus",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus/cargo",
+      "route": "muse",
+      "template": "claude-code-opus",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus/php",
+      "route": "muse",
+      "template": "claude-code-opus",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus/uv",
+      "route": "muse",
+      "template": "claude-code-opus",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus/ssh-agent",
+      "route": "muse",
+      "template": "claude-code-opus",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus/repo-lane",
+      "route": "muse",
+      "template": "claude-code-opus",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus-judge/unconfigured",
+      "route": "muse",
+      "template": "claude-code-opus-judge",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus-judge/cargo",
+      "route": "muse",
+      "template": "claude-code-opus-judge",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus-judge/php",
+      "route": "muse",
+      "template": "claude-code-opus-judge",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus-judge/uv",
+      "route": "muse",
+      "template": "claude-code-opus-judge",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus-judge/ssh-agent",
+      "route": "muse",
+      "template": "claude-code-opus-judge",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-opus-judge/repo-lane",
+      "route": "muse",
+      "template": "claude-code-opus-judge",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet/unconfigured",
+      "route": "muse",
+      "template": "claude-code-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet/cargo",
+      "route": "muse",
+      "template": "claude-code-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet/php",
+      "route": "muse",
+      "template": "claude-code-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet/uv",
+      "route": "muse",
+      "template": "claude-code-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet/ssh-agent",
+      "route": "muse",
+      "template": "claude-code-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet/repo-lane",
+      "route": "muse",
+      "template": "claude-code-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-patch/unconfigured",
+      "route": "muse",
+      "template": "claude-code-sonnet-patch",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-patch/cargo",
+      "route": "muse",
+      "template": "claude-code-sonnet-patch",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-patch/php",
+      "route": "muse",
+      "template": "claude-code-sonnet-patch",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-patch/uv",
+      "route": "muse",
+      "template": "claude-code-sonnet-patch",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-patch/ssh-agent",
+      "route": "muse",
+      "template": "claude-code-sonnet-patch",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-patch/repo-lane",
+      "route": "muse",
+      "template": "claude-code-sonnet-patch",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-planner/unconfigured",
+      "route": "muse",
+      "template": "claude-code-sonnet-planner",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-planner/cargo",
+      "route": "muse",
+      "template": "claude-code-sonnet-planner",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-planner/php",
+      "route": "muse",
+      "template": "claude-code-sonnet-planner",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-planner/uv",
+      "route": "muse",
+      "template": "claude-code-sonnet-planner",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-planner/ssh-agent",
+      "route": "muse",
+      "template": "claude-code-sonnet-planner",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/claude-code-sonnet-planner/repo-lane",
+      "route": "muse",
+      "template": "claude-code-sonnet-planner",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/codex/unconfigured",
+      "route": "muse",
+      "template": "codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/codex/cargo",
+      "route": "muse",
+      "template": "codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/codex/php",
+      "route": "muse",
+      "template": "codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/codex/uv",
+      "route": "muse",
+      "template": "codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/codex/ssh-agent",
+      "route": "muse",
+      "template": "codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/codex/repo-lane",
+      "route": "muse",
+      "template": "codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-agent/unconfigured",
+      "route": "muse",
+      "template": "cursor-agent",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-agent/cargo",
+      "route": "muse",
+      "template": "cursor-agent",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-agent/php",
+      "route": "muse",
+      "template": "cursor-agent",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-agent/uv",
+      "route": "muse",
+      "template": "cursor-agent",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-agent/ssh-agent",
+      "route": "muse",
+      "template": "cursor-agent",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-agent/repo-lane",
+      "route": "muse",
+      "template": "cursor-agent",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-codex/unconfigured",
+      "route": "muse",
+      "template": "cursor-codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-codex/cargo",
+      "route": "muse",
+      "template": "cursor-codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-codex/php",
+      "route": "muse",
+      "template": "cursor-codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-codex/uv",
+      "route": "muse",
+      "template": "cursor-codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-codex/ssh-agent",
+      "route": "muse",
+      "template": "cursor-codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-codex/repo-lane",
+      "route": "muse",
+      "template": "cursor-codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-composer/unconfigured",
+      "route": "muse",
+      "template": "cursor-composer",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-composer/cargo",
+      "route": "muse",
+      "template": "cursor-composer",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-composer/php",
+      "route": "muse",
+      "template": "cursor-composer",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-composer/uv",
+      "route": "muse",
+      "template": "cursor-composer",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-composer/ssh-agent",
+      "route": "muse",
+      "template": "cursor-composer",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-composer/repo-lane",
+      "route": "muse",
+      "template": "cursor-composer",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-grok/unconfigured",
+      "route": "muse",
+      "template": "cursor-grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-grok/cargo",
+      "route": "muse",
+      "template": "cursor-grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-grok/php",
+      "route": "muse",
+      "template": "cursor-grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-grok/uv",
+      "route": "muse",
+      "template": "cursor-grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-grok/ssh-agent",
+      "route": "muse",
+      "template": "cursor-grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-grok/repo-lane",
+      "route": "muse",
+      "template": "cursor-grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sol/unconfigured",
+      "route": "muse",
+      "template": "cursor-sol",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sol/cargo",
+      "route": "muse",
+      "template": "cursor-sol",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sol/php",
+      "route": "muse",
+      "template": "cursor-sol",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sol/uv",
+      "route": "muse",
+      "template": "cursor-sol",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sol/ssh-agent",
+      "route": "muse",
+      "template": "cursor-sol",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sol/repo-lane",
+      "route": "muse",
+      "template": "cursor-sol",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sonnet/unconfigured",
+      "route": "muse",
+      "template": "cursor-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sonnet/cargo",
+      "route": "muse",
+      "template": "cursor-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sonnet/php",
+      "route": "muse",
+      "template": "cursor-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sonnet/uv",
+      "route": "muse",
+      "template": "cursor-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sonnet/ssh-agent",
+      "route": "muse",
+      "template": "cursor-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/cursor-sonnet/repo-lane",
+      "route": "muse",
+      "template": "cursor-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/gemini-cli/unconfigured",
+      "route": "muse",
+      "template": "gemini-cli",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/gemini-cli/cargo",
+      "route": "muse",
+      "template": "gemini-cli",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/gemini-cli/php",
+      "route": "muse",
+      "template": "gemini-cli",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/gemini-cli/uv",
+      "route": "muse",
+      "template": "gemini-cli",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/gemini-cli/ssh-agent",
+      "route": "muse",
+      "template": "gemini-cli",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/gemini-cli/repo-lane",
+      "route": "muse",
+      "template": "gemini-cli",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/goose/unconfigured",
+      "route": "muse",
+      "template": "goose",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/goose/cargo",
+      "route": "muse",
+      "template": "goose",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/goose/php",
+      "route": "muse",
+      "template": "goose",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/goose/uv",
+      "route": "muse",
+      "template": "goose",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/goose/ssh-agent",
+      "route": "muse",
+      "template": "goose",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/goose/repo-lane",
+      "route": "muse",
+      "template": "goose",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/grok/unconfigured",
+      "route": "muse",
+      "template": "grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/grok/cargo",
+      "route": "muse",
+      "template": "grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/grok/php",
+      "route": "muse",
+      "template": "grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/grok/uv",
+      "route": "muse",
+      "template": "grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/grok/ssh-agent",
+      "route": "muse",
+      "template": "grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/grok/repo-lane",
+      "route": "muse",
+      "template": "grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/muse-code/unconfigured",
+      "route": "muse",
+      "template": "muse-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/muse-code/cargo",
+      "route": "muse",
+      "template": "muse-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/muse-code/php",
+      "route": "muse",
+      "template": "muse-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/muse-code/uv",
+      "route": "muse",
+      "template": "muse-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/muse-code/ssh-agent",
+      "route": "muse",
+      "template": "muse-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/muse-code/repo-lane",
+      "route": "muse",
+      "template": "muse-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode/unconfigured",
+      "route": "muse",
+      "template": "opencode",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode/cargo",
+      "route": "muse",
+      "template": "opencode",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode/php",
+      "route": "muse",
+      "template": "opencode",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode/uv",
+      "route": "muse",
+      "template": "opencode",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode/ssh-agent",
+      "route": "muse",
+      "template": "opencode",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode/repo-lane",
+      "route": "muse",
+      "template": "opencode",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode-go/unconfigured",
+      "route": "muse",
+      "template": "opencode-go",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode-go/cargo",
+      "route": "muse",
+      "template": "opencode-go",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode-go/php",
+      "route": "muse",
+      "template": "opencode-go",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode-go/uv",
+      "route": "muse",
+      "template": "opencode-go",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode-go/ssh-agent",
+      "route": "muse",
+      "template": "opencode-go",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/opencode-go/repo-lane",
+      "route": "muse",
+      "template": "opencode-go",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/pi/unconfigured",
+      "route": "muse",
+      "template": "pi",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/pi/cargo",
+      "route": "muse",
+      "template": "pi",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/pi/php",
+      "route": "muse",
+      "template": "pi",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/pi/uv",
+      "route": "muse",
+      "template": "pi",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/pi/ssh-agent",
+      "route": "muse",
+      "template": "pi",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/pi/repo-lane",
+      "route": "muse",
+      "template": "pi",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse/test-echo/unconfigured",
+      "route": "muse",
+      "template": "test-echo",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse/test-echo/cargo",
+      "route": "muse",
+      "template": "test-echo",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse/test-echo/php",
+      "route": "muse",
+      "template": "test-echo",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse/test-echo/uv",
+      "route": "muse",
+      "template": "test-echo",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse/test-echo/ssh-agent",
+      "route": "muse",
+      "template": "test-echo",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse/test-echo/repo-lane",
+      "route": "muse",
+      "template": "test-echo",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity/unconfigured",
+      "route": "muse-check",
+      "template": "antigravity",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity/cargo",
+      "route": "muse-check",
+      "template": "antigravity",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity/php",
+      "route": "muse-check",
+      "template": "antigravity",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity/uv",
+      "route": "muse-check",
+      "template": "antigravity",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity/ssh-agent",
+      "route": "muse-check",
+      "template": "antigravity",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity/repo-lane",
+      "route": "muse-check",
+      "template": "antigravity",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity-hydrogen/unconfigured",
+      "route": "muse-check",
+      "template": "antigravity-hydrogen",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity-hydrogen/cargo",
+      "route": "muse-check",
+      "template": "antigravity-hydrogen",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity-hydrogen/php",
+      "route": "muse-check",
+      "template": "antigravity-hydrogen",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity-hydrogen/uv",
+      "route": "muse-check",
+      "template": "antigravity-hydrogen",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity-hydrogen/ssh-agent",
+      "route": "muse-check",
+      "template": "antigravity-hydrogen",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/antigravity-hydrogen/repo-lane",
+      "route": "muse-check",
+      "template": "antigravity-hydrogen",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-auth-context-probe/unconfigured",
+      "route": "muse-check",
+      "template": "claude-auth-context-probe",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-auth-context-probe/cargo",
+      "route": "muse-check",
+      "template": "claude-auth-context-probe",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-auth-context-probe/php",
+      "route": "muse-check",
+      "template": "claude-auth-context-probe",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-auth-context-probe/uv",
+      "route": "muse-check",
+      "template": "claude-auth-context-probe",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-auth-context-probe/ssh-agent",
+      "route": "muse-check",
+      "template": "claude-auth-context-probe",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-auth-context-probe/repo-lane",
+      "route": "muse-check",
+      "template": "claude-auth-context-probe",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code/unconfigured",
+      "route": "muse-check",
+      "template": "claude-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code/cargo",
+      "route": "muse-check",
+      "template": "claude-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code/php",
+      "route": "muse-check",
+      "template": "claude-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code/uv",
+      "route": "muse-check",
+      "template": "claude-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code/ssh-agent",
+      "route": "muse-check",
+      "template": "claude-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code/repo-lane",
+      "route": "muse-check",
+      "template": "claude-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus/unconfigured",
+      "route": "muse-check",
+      "template": "claude-code-opus",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus/cargo",
+      "route": "muse-check",
+      "template": "claude-code-opus",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus/php",
+      "route": "muse-check",
+      "template": "claude-code-opus",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus/uv",
+      "route": "muse-check",
+      "template": "claude-code-opus",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus/ssh-agent",
+      "route": "muse-check",
+      "template": "claude-code-opus",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus/repo-lane",
+      "route": "muse-check",
+      "template": "claude-code-opus",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus-judge/unconfigured",
+      "route": "muse-check",
+      "template": "claude-code-opus-judge",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus-judge/cargo",
+      "route": "muse-check",
+      "template": "claude-code-opus-judge",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus-judge/php",
+      "route": "muse-check",
+      "template": "claude-code-opus-judge",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus-judge/uv",
+      "route": "muse-check",
+      "template": "claude-code-opus-judge",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus-judge/ssh-agent",
+      "route": "muse-check",
+      "template": "claude-code-opus-judge",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-opus-judge/repo-lane",
+      "route": "muse-check",
+      "template": "claude-code-opus-judge",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet/unconfigured",
+      "route": "muse-check",
+      "template": "claude-code-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet/cargo",
+      "route": "muse-check",
+      "template": "claude-code-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet/php",
+      "route": "muse-check",
+      "template": "claude-code-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet/uv",
+      "route": "muse-check",
+      "template": "claude-code-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet/ssh-agent",
+      "route": "muse-check",
+      "template": "claude-code-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet/repo-lane",
+      "route": "muse-check",
+      "template": "claude-code-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-patch/unconfigured",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-patch/cargo",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-patch/php",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-patch/uv",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-patch/ssh-agent",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-patch/repo-lane",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-patch",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-planner/unconfigured",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-planner/cargo",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-planner/php",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-planner/uv",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-planner/ssh-agent",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/claude-code-sonnet-planner/repo-lane",
+      "route": "muse-check",
+      "template": "claude-code-sonnet-planner",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/codex/unconfigured",
+      "route": "muse-check",
+      "template": "codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/codex/cargo",
+      "route": "muse-check",
+      "template": "codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/codex/php",
+      "route": "muse-check",
+      "template": "codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/codex/uv",
+      "route": "muse-check",
+      "template": "codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/codex/ssh-agent",
+      "route": "muse-check",
+      "template": "codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/codex/repo-lane",
+      "route": "muse-check",
+      "template": "codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-agent/unconfigured",
+      "route": "muse-check",
+      "template": "cursor-agent",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-agent/cargo",
+      "route": "muse-check",
+      "template": "cursor-agent",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-agent/php",
+      "route": "muse-check",
+      "template": "cursor-agent",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-agent/uv",
+      "route": "muse-check",
+      "template": "cursor-agent",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-agent/ssh-agent",
+      "route": "muse-check",
+      "template": "cursor-agent",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-agent/repo-lane",
+      "route": "muse-check",
+      "template": "cursor-agent",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-codex/unconfigured",
+      "route": "muse-check",
+      "template": "cursor-codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-codex/cargo",
+      "route": "muse-check",
+      "template": "cursor-codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-codex/php",
+      "route": "muse-check",
+      "template": "cursor-codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-codex/uv",
+      "route": "muse-check",
+      "template": "cursor-codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-codex/ssh-agent",
+      "route": "muse-check",
+      "template": "cursor-codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-codex/repo-lane",
+      "route": "muse-check",
+      "template": "cursor-codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-composer/unconfigured",
+      "route": "muse-check",
+      "template": "cursor-composer",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-composer/cargo",
+      "route": "muse-check",
+      "template": "cursor-composer",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-composer/php",
+      "route": "muse-check",
+      "template": "cursor-composer",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-composer/uv",
+      "route": "muse-check",
+      "template": "cursor-composer",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-composer/ssh-agent",
+      "route": "muse-check",
+      "template": "cursor-composer",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-composer/repo-lane",
+      "route": "muse-check",
+      "template": "cursor-composer",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-grok/unconfigured",
+      "route": "muse-check",
+      "template": "cursor-grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-grok/cargo",
+      "route": "muse-check",
+      "template": "cursor-grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-grok/php",
+      "route": "muse-check",
+      "template": "cursor-grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-grok/uv",
+      "route": "muse-check",
+      "template": "cursor-grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-grok/ssh-agent",
+      "route": "muse-check",
+      "template": "cursor-grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-grok/repo-lane",
+      "route": "muse-check",
+      "template": "cursor-grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sol/unconfigured",
+      "route": "muse-check",
+      "template": "cursor-sol",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sol/cargo",
+      "route": "muse-check",
+      "template": "cursor-sol",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sol/php",
+      "route": "muse-check",
+      "template": "cursor-sol",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sol/uv",
+      "route": "muse-check",
+      "template": "cursor-sol",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sol/ssh-agent",
+      "route": "muse-check",
+      "template": "cursor-sol",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sol/repo-lane",
+      "route": "muse-check",
+      "template": "cursor-sol",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sonnet/unconfigured",
+      "route": "muse-check",
+      "template": "cursor-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sonnet/cargo",
+      "route": "muse-check",
+      "template": "cursor-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sonnet/php",
+      "route": "muse-check",
+      "template": "cursor-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sonnet/uv",
+      "route": "muse-check",
+      "template": "cursor-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sonnet/ssh-agent",
+      "route": "muse-check",
+      "template": "cursor-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/cursor-sonnet/repo-lane",
+      "route": "muse-check",
+      "template": "cursor-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/gemini-cli/unconfigured",
+      "route": "muse-check",
+      "template": "gemini-cli",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/gemini-cli/cargo",
+      "route": "muse-check",
+      "template": "gemini-cli",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/gemini-cli/php",
+      "route": "muse-check",
+      "template": "gemini-cli",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/gemini-cli/uv",
+      "route": "muse-check",
+      "template": "gemini-cli",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/gemini-cli/ssh-agent",
+      "route": "muse-check",
+      "template": "gemini-cli",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/gemini-cli/repo-lane",
+      "route": "muse-check",
+      "template": "gemini-cli",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/goose/unconfigured",
+      "route": "muse-check",
+      "template": "goose",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/goose/cargo",
+      "route": "muse-check",
+      "template": "goose",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/goose/php",
+      "route": "muse-check",
+      "template": "goose",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/goose/uv",
+      "route": "muse-check",
+      "template": "goose",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/goose/ssh-agent",
+      "route": "muse-check",
+      "template": "goose",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/goose/repo-lane",
+      "route": "muse-check",
+      "template": "goose",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/grok/unconfigured",
+      "route": "muse-check",
+      "template": "grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/grok/cargo",
+      "route": "muse-check",
+      "template": "grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/grok/php",
+      "route": "muse-check",
+      "template": "grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/grok/uv",
+      "route": "muse-check",
+      "template": "grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/grok/ssh-agent",
+      "route": "muse-check",
+      "template": "grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/grok/repo-lane",
+      "route": "muse-check",
+      "template": "grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/muse-code/unconfigured",
+      "route": "muse-check",
+      "template": "muse-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/muse-code/cargo",
+      "route": "muse-check",
+      "template": "muse-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/muse-code/php",
+      "route": "muse-check",
+      "template": "muse-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/muse-code/uv",
+      "route": "muse-check",
+      "template": "muse-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/muse-code/ssh-agent",
+      "route": "muse-check",
+      "template": "muse-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/muse-code/repo-lane",
+      "route": "muse-check",
+      "template": "muse-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode/unconfigured",
+      "route": "muse-check",
+      "template": "opencode",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode/cargo",
+      "route": "muse-check",
+      "template": "opencode",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode/php",
+      "route": "muse-check",
+      "template": "opencode",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode/uv",
+      "route": "muse-check",
+      "template": "opencode",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode/ssh-agent",
+      "route": "muse-check",
+      "template": "opencode",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode/repo-lane",
+      "route": "muse-check",
+      "template": "opencode",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode-go/unconfigured",
+      "route": "muse-check",
+      "template": "opencode-go",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode-go/cargo",
+      "route": "muse-check",
+      "template": "opencode-go",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode-go/php",
+      "route": "muse-check",
+      "template": "opencode-go",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode-go/uv",
+      "route": "muse-check",
+      "template": "opencode-go",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode-go/ssh-agent",
+      "route": "muse-check",
+      "template": "opencode-go",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/opencode-go/repo-lane",
+      "route": "muse-check",
+      "template": "opencode-go",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/pi/unconfigured",
+      "route": "muse-check",
+      "template": "pi",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/pi/cargo",
+      "route": "muse-check",
+      "template": "pi",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/pi/php",
+      "route": "muse-check",
+      "template": "pi",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/pi/uv",
+      "route": "muse-check",
+      "template": "pi",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/pi/ssh-agent",
+      "route": "muse-check",
+      "template": "pi",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/pi/repo-lane",
+      "route": "muse-check",
+      "template": "pi",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "muse-check/test-echo/unconfigured",
+      "route": "muse-check",
+      "template": "test-echo",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "muse-check/test-echo/cargo",
+      "route": "muse-check",
+      "template": "test-echo",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "muse-check/test-echo/php",
+      "route": "muse-check",
+      "template": "test-echo",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "muse-check/test-echo/uv",
+      "route": "muse-check",
+      "template": "test-echo",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "muse-check/test-echo/ssh-agent",
+      "route": "muse-check",
+      "template": "test-echo",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "muse-check/test-echo/repo-lane",
+      "route": "muse-check",
+      "template": "test-echo",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode/unconfigured",
+      "route": "cli-adapter",
+      "template": "opencode",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode/cargo",
+      "route": "cli-adapter",
+      "template": "opencode",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode/php",
+      "route": "cli-adapter",
+      "template": "opencode",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode/uv",
+      "route": "cli-adapter",
+      "template": "opencode",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode/ssh-agent",
+      "route": "cli-adapter",
+      "template": "opencode",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode/repo-lane",
+      "route": "cli-adapter",
+      "template": "opencode",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode-go/unconfigured",
+      "route": "cli-adapter",
+      "template": "opencode-go",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode-go/cargo",
+      "route": "cli-adapter",
+      "template": "opencode-go",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode-go/php",
+      "route": "cli-adapter",
+      "template": "opencode-go",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode-go/uv",
+      "route": "cli-adapter",
+      "template": "opencode-go",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode-go/ssh-agent",
+      "route": "cli-adapter",
+      "template": "opencode-go",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "cli-adapter/opencode-go/repo-lane",
+      "route": "cli-adapter",
+      "template": "opencode-go",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity/unconfigured",
+      "route": "lead-host",
+      "template": "antigravity",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity/cargo",
+      "route": "lead-host",
+      "template": "antigravity",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity/php",
+      "route": "lead-host",
+      "template": "antigravity",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity/uv",
+      "route": "lead-host",
+      "template": "antigravity",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity/ssh-agent",
+      "route": "lead-host",
+      "template": "antigravity",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity/repo-lane",
+      "route": "lead-host",
+      "template": "antigravity",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity-hydrogen/unconfigured",
+      "route": "lead-host",
+      "template": "antigravity-hydrogen",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity-hydrogen/cargo",
+      "route": "lead-host",
+      "template": "antigravity-hydrogen",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity-hydrogen/php",
+      "route": "lead-host",
+      "template": "antigravity-hydrogen",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity-hydrogen/uv",
+      "route": "lead-host",
+      "template": "antigravity-hydrogen",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity-hydrogen/ssh-agent",
+      "route": "lead-host",
+      "template": "antigravity-hydrogen",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/antigravity-hydrogen/repo-lane",
+      "route": "lead-host",
+      "template": "antigravity-hydrogen",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-auth-context-probe/unconfigured",
+      "route": "lead-host",
+      "template": "claude-auth-context-probe",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-auth-context-probe/cargo",
+      "route": "lead-host",
+      "template": "claude-auth-context-probe",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-auth-context-probe/php",
+      "route": "lead-host",
+      "template": "claude-auth-context-probe",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-auth-context-probe/uv",
+      "route": "lead-host",
+      "template": "claude-auth-context-probe",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-auth-context-probe/ssh-agent",
+      "route": "lead-host",
+      "template": "claude-auth-context-probe",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-auth-context-probe/repo-lane",
+      "route": "lead-host",
+      "template": "claude-auth-context-probe",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code/unconfigured",
+      "route": "lead-host",
+      "template": "claude-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code/cargo",
+      "route": "lead-host",
+      "template": "claude-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code/php",
+      "route": "lead-host",
+      "template": "claude-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code/uv",
+      "route": "lead-host",
+      "template": "claude-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code/ssh-agent",
+      "route": "lead-host",
+      "template": "claude-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code/repo-lane",
+      "route": "lead-host",
+      "template": "claude-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus/unconfigured",
+      "route": "lead-host",
+      "template": "claude-code-opus",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus/cargo",
+      "route": "lead-host",
+      "template": "claude-code-opus",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus/php",
+      "route": "lead-host",
+      "template": "claude-code-opus",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus/uv",
+      "route": "lead-host",
+      "template": "claude-code-opus",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus/ssh-agent",
+      "route": "lead-host",
+      "template": "claude-code-opus",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus/repo-lane",
+      "route": "lead-host",
+      "template": "claude-code-opus",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus-judge/unconfigured",
+      "route": "lead-host",
+      "template": "claude-code-opus-judge",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus-judge/cargo",
+      "route": "lead-host",
+      "template": "claude-code-opus-judge",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus-judge/php",
+      "route": "lead-host",
+      "template": "claude-code-opus-judge",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus-judge/uv",
+      "route": "lead-host",
+      "template": "claude-code-opus-judge",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus-judge/ssh-agent",
+      "route": "lead-host",
+      "template": "claude-code-opus-judge",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-opus-judge/repo-lane",
+      "route": "lead-host",
+      "template": "claude-code-opus-judge",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet/unconfigured",
+      "route": "lead-host",
+      "template": "claude-code-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet/cargo",
+      "route": "lead-host",
+      "template": "claude-code-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet/php",
+      "route": "lead-host",
+      "template": "claude-code-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet/uv",
+      "route": "lead-host",
+      "template": "claude-code-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet/ssh-agent",
+      "route": "lead-host",
+      "template": "claude-code-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet/repo-lane",
+      "route": "lead-host",
+      "template": "claude-code-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-patch/unconfigured",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-patch",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-patch/cargo",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-patch",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-patch/php",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-patch",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-patch/uv",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-patch",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-patch/ssh-agent",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-patch",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-patch/repo-lane",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-patch",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-planner/unconfigured",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-planner",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-planner/cargo",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-planner",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-planner/php",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-planner",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-planner/uv",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-planner",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-planner/ssh-agent",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-planner",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/claude-code-sonnet-planner/repo-lane",
+      "route": "lead-host",
+      "template": "claude-code-sonnet-planner",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/codex/unconfigured",
+      "route": "lead-host",
+      "template": "codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/codex/cargo",
+      "route": "lead-host",
+      "template": "codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/codex/php",
+      "route": "lead-host",
+      "template": "codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/codex/uv",
+      "route": "lead-host",
+      "template": "codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/codex/ssh-agent",
+      "route": "lead-host",
+      "template": "codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/codex/repo-lane",
+      "route": "lead-host",
+      "template": "codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-agent/unconfigured",
+      "route": "lead-host",
+      "template": "cursor-agent",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-agent/cargo",
+      "route": "lead-host",
+      "template": "cursor-agent",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-agent/php",
+      "route": "lead-host",
+      "template": "cursor-agent",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-agent/uv",
+      "route": "lead-host",
+      "template": "cursor-agent",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-agent/ssh-agent",
+      "route": "lead-host",
+      "template": "cursor-agent",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-agent/repo-lane",
+      "route": "lead-host",
+      "template": "cursor-agent",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-codex/unconfigured",
+      "route": "lead-host",
+      "template": "cursor-codex",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-codex/cargo",
+      "route": "lead-host",
+      "template": "cursor-codex",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-codex/php",
+      "route": "lead-host",
+      "template": "cursor-codex",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-codex/uv",
+      "route": "lead-host",
+      "template": "cursor-codex",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-codex/ssh-agent",
+      "route": "lead-host",
+      "template": "cursor-codex",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-codex/repo-lane",
+      "route": "lead-host",
+      "template": "cursor-codex",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-composer/unconfigured",
+      "route": "lead-host",
+      "template": "cursor-composer",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-composer/cargo",
+      "route": "lead-host",
+      "template": "cursor-composer",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-composer/php",
+      "route": "lead-host",
+      "template": "cursor-composer",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-composer/uv",
+      "route": "lead-host",
+      "template": "cursor-composer",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-composer/ssh-agent",
+      "route": "lead-host",
+      "template": "cursor-composer",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-composer/repo-lane",
+      "route": "lead-host",
+      "template": "cursor-composer",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-grok/unconfigured",
+      "route": "lead-host",
+      "template": "cursor-grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-grok/cargo",
+      "route": "lead-host",
+      "template": "cursor-grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-grok/php",
+      "route": "lead-host",
+      "template": "cursor-grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-grok/uv",
+      "route": "lead-host",
+      "template": "cursor-grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-grok/ssh-agent",
+      "route": "lead-host",
+      "template": "cursor-grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-grok/repo-lane",
+      "route": "lead-host",
+      "template": "cursor-grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sol/unconfigured",
+      "route": "lead-host",
+      "template": "cursor-sol",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sol/cargo",
+      "route": "lead-host",
+      "template": "cursor-sol",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sol/php",
+      "route": "lead-host",
+      "template": "cursor-sol",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sol/uv",
+      "route": "lead-host",
+      "template": "cursor-sol",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sol/ssh-agent",
+      "route": "lead-host",
+      "template": "cursor-sol",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sol/repo-lane",
+      "route": "lead-host",
+      "template": "cursor-sol",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sonnet/unconfigured",
+      "route": "lead-host",
+      "template": "cursor-sonnet",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sonnet/cargo",
+      "route": "lead-host",
+      "template": "cursor-sonnet",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sonnet/php",
+      "route": "lead-host",
+      "template": "cursor-sonnet",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sonnet/uv",
+      "route": "lead-host",
+      "template": "cursor-sonnet",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sonnet/ssh-agent",
+      "route": "lead-host",
+      "template": "cursor-sonnet",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/cursor-sonnet/repo-lane",
+      "route": "lead-host",
+      "template": "cursor-sonnet",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/gemini-cli/unconfigured",
+      "route": "lead-host",
+      "template": "gemini-cli",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/gemini-cli/cargo",
+      "route": "lead-host",
+      "template": "gemini-cli",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/gemini-cli/php",
+      "route": "lead-host",
+      "template": "gemini-cli",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/gemini-cli/uv",
+      "route": "lead-host",
+      "template": "gemini-cli",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/gemini-cli/ssh-agent",
+      "route": "lead-host",
+      "template": "gemini-cli",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/gemini-cli/repo-lane",
+      "route": "lead-host",
+      "template": "gemini-cli",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/goose/unconfigured",
+      "route": "lead-host",
+      "template": "goose",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/goose/cargo",
+      "route": "lead-host",
+      "template": "goose",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/goose/php",
+      "route": "lead-host",
+      "template": "goose",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/goose/uv",
+      "route": "lead-host",
+      "template": "goose",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/goose/ssh-agent",
+      "route": "lead-host",
+      "template": "goose",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/goose/repo-lane",
+      "route": "lead-host",
+      "template": "goose",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/grok/unconfigured",
+      "route": "lead-host",
+      "template": "grok",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/grok/cargo",
+      "route": "lead-host",
+      "template": "grok",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/grok/php",
+      "route": "lead-host",
+      "template": "grok",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/grok/uv",
+      "route": "lead-host",
+      "template": "grok",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/grok/ssh-agent",
+      "route": "lead-host",
+      "template": "grok",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/grok/repo-lane",
+      "route": "lead-host",
+      "template": "grok",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/muse-code/unconfigured",
+      "route": "lead-host",
+      "template": "muse-code",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/muse-code/cargo",
+      "route": "lead-host",
+      "template": "muse-code",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/muse-code/php",
+      "route": "lead-host",
+      "template": "muse-code",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/muse-code/uv",
+      "route": "lead-host",
+      "template": "muse-code",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/muse-code/ssh-agent",
+      "route": "lead-host",
+      "template": "muse-code",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/muse-code/repo-lane",
+      "route": "lead-host",
+      "template": "muse-code",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode/unconfigured",
+      "route": "lead-host",
+      "template": "opencode",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode/cargo",
+      "route": "lead-host",
+      "template": "opencode",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode/php",
+      "route": "lead-host",
+      "template": "opencode",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode/uv",
+      "route": "lead-host",
+      "template": "opencode",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode/ssh-agent",
+      "route": "lead-host",
+      "template": "opencode",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode/repo-lane",
+      "route": "lead-host",
+      "template": "opencode",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode-go/unconfigured",
+      "route": "lead-host",
+      "template": "opencode-go",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode-go/cargo",
+      "route": "lead-host",
+      "template": "opencode-go",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode-go/php",
+      "route": "lead-host",
+      "template": "opencode-go",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode-go/uv",
+      "route": "lead-host",
+      "template": "opencode-go",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode-go/ssh-agent",
+      "route": "lead-host",
+      "template": "opencode-go",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/opencode-go/repo-lane",
+      "route": "lead-host",
+      "template": "opencode-go",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/pi/unconfigured",
+      "route": "lead-host",
+      "template": "pi",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/pi/cargo",
+      "route": "lead-host",
+      "template": "pi",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/pi/php",
+      "route": "lead-host",
+      "template": "pi",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/pi/uv",
+      "route": "lead-host",
+      "template": "pi",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/pi/ssh-agent",
+      "route": "lead-host",
+      "template": "pi",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/pi/repo-lane",
+      "route": "lead-host",
+      "template": "pi",
+      "state": "repo-lane",
+      "rust": true
+    },
+    {
+      "id": "lead-host/test-echo/unconfigured",
+      "route": "lead-host",
+      "template": "test-echo",
+      "state": "unconfigured",
+      "rust": true
+    },
+    {
+      "id": "lead-host/test-echo/cargo",
+      "route": "lead-host",
+      "template": "test-echo",
+      "state": "cargo",
+      "rust": true
+    },
+    {
+      "id": "lead-host/test-echo/php",
+      "route": "lead-host",
+      "template": "test-echo",
+      "state": "php",
+      "rust": true
+    },
+    {
+      "id": "lead-host/test-echo/uv",
+      "route": "lead-host",
+      "template": "test-echo",
+      "state": "uv",
+      "rust": true
+    },
+    {
+      "id": "lead-host/test-echo/ssh-agent",
+      "route": "lead-host",
+      "template": "test-echo",
+      "state": "ssh-agent",
+      "rust": true
+    },
+    {
+      "id": "lead-host/test-echo/repo-lane",
+      "route": "lead-host",
+      "template": "test-echo",
+      "state": "repo-lane",
+      "rust": true
+    }
+  ]
+}

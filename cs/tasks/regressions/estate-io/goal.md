@@ -1,0 +1,1 @@
+Preserve strict/tolerant shelf reads, UTC parsing, Git environment and decoding, and op transport outcomes while replacing duplicated helpers inside ops/bin. Source contracts: docs/dev/artifacts/decision-workflow/estate-dedup.json at f726576.

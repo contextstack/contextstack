@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Synthetic credential shapes are removed from transcripts, events, and task_output."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import importlib.util
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+KIT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(KIT / "ops/bin"))
+import _agent_stream  # noqa: E402
+import _job_reason  # noqa: E402
+import _lead_session  # noqa: E402
+import _node_events  # noqa: E402
+import _run_record  # noqa: E402
+
+spec = importlib.util.spec_from_file_location("cs_mcp", KIT / "scripts/cs_mcp.py")
+mcp = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mcp)
+
+FAILED = []
+HEX = "0123456789abcdef"
+DIRECTOR = {
+    "csl_": "csl_" + (HEX * 4),
+    "csn_": "csn_" + (HEX * 4)[:64],
+    "csd_": "csd_" + ("ab" * 32),
+}
+PEM_BODY = "MIIBFAKEKEYMATERIALONLY"
+PEM = "-----BEGIN RSA PRIVATE KEY-----\n%s\n-----END RSA PRIVATE KEY-----\n" % PEM_BODY
+PEM_OPENSSH = "-----BEGIN OPENSSH PRIVATE KEY-----\n%s\n-----END OPENSSH PRIVATE KEY-----\n" % PEM_BODY
+BASIC = "eHh4Onl5eQ=="
+BEARER = "synthetic-bearer-token-0123456789"
+URL_USER, URL_PASS = "synthetic-user", "synthetic-pass"
+URL = "https://%s:%s@example.test/resource" % (URL_USER, URL_PASS)
+TOKENS = {
+    **DIRECTOR,
+    "pem": PEM_BODY,
+    "basic": BASIC,
+    "bearer": BEARER,
+    "url-user": URL_USER,
+    "url-pass": URL_PASS,
+    "aws": "AKIA" + "EXAMPLEKEY123456",
+    "github-pat": "ghp_" + ("A" * 36),
+    "github-oauth": "gho_" + ("B" * 36),
+    "github-fine": "github_pat_" + ("C" * 22) + "_" + ("D" * 59),
+    "slack": "xoxb-" + ("1" * 12) + "-" + ("T" * 24),
+    "openai": "sk-" + ("P" * 20),
+    "anthropic": "sk-ant-api03-" + ("N" * 32),
+    "google": "AIza" + ("S" * 35),
+}
+
+
+def expect(ok, what, detail=None):
+    print(("ok   " if ok else "FAIL ") + what + ("" if ok or detail is None else " : %s" % str(detail)[:400]))
+    if not ok:
+        FAILED.append(what)
+
+
+def gone(text, *secrets):
+    return all(secret not in text for secret in secrets)
+
+
+def main():
+    expect(len(DIRECTOR["csl_"]) == 4 + 64 and len(DIRECTOR["csn_"]) == 4 + 64, "director tokens are prefix plus 64 hex")
+    samples = {
+        "csl_": "local %s credential" % DIRECTOR["csl_"],
+        "csn_": "node %s credential" % DIRECTOR["csn_"],
+        "csd_": "device %s credential" % DIRECTOR["csd_"],
+        "pem": "key\n%s\n%s" % (PEM, PEM_OPENSSH),
+        "basic": "Authorization: Basic %s" % BASIC,
+        "bearer": "Authorization: Bearer %s" % BEARER,
+        "url": "fetch %s now" % URL,
+        "aws": "key %s id" % TOKENS["aws"],
+        "github-pat": "gh %s" % TOKENS["github-pat"],
+        "github-oauth": "gh %s" % TOKENS["github-oauth"],
+        "github-fine": "gh %s" % TOKENS["github-fine"],
+        "slack": "sl %s" % TOKENS["slack"],
+        "openai": "oa %s" % TOKENS["openai"],
+        "anthropic": "an %s" % TOKENS["anthropic"],
+        "google": "g %s" % TOKENS["google"],
+    }
+    for name, sample in samples.items():
+        red = _job_reason.redact(sample)
+        secrets = (PEM_BODY,) if name == "pem" else ((URL_USER, URL_PASS) if name == "url" else (TOKENS[name],))
+        expect(all(secret not in red for secret in secrets) and "<redacted>" in red, "redacts %s" % name, red)
+    benign = "Build the lane. See https://example.test/a and a short sk-short csl_%s AKIAEXAMPLE." % ("a" * 63)
+    expect(_job_reason.redact(benign) == benign, "benign text is unchanged", _job_reason.redact(benign))
+    url = _job_reason.redact(URL)
+    expect(url == "https://<redacted>@example.test/resource", "url keeps the host", url)
+    basic = _job_reason.redact("Authorization: Basic %s" % BASIC)
+    expect(basic == "Authorization: Basic <redacted>", "basic header keeps the scheme", basic)
+    bearer = _job_reason.redact("Authorization: Bearer %s" % BEARER)
+    expect(bearer == "Authorization: Bearer <redacted>", "bearer header keeps the scheme", bearer)
+    combined = "\n".join(samples.values())
+    red_all = _job_reason.redact(combined)
+    expect(gone(red_all, *TOKENS.values(), "BEGIN RSA", "BEGIN OPENSSH"), "one pass clears every shape", red_all)
+
+    with scratch_dir(prefix="transcript-redaction-") as raw:
+        run = Path(raw)
+        body = _job_reason.persist_output(run / "transcript.md", "stdout:\n%s\n" % combined)
+        stored = (run / "transcript.md").read_text(encoding="utf-8")
+        expect(stored == body and gone(stored, *TOKENS.values()), "persist_output writes a redacted transcript")
+        _agent_stream.Events(run).write(1, "delta " + DIRECTOR["csl_"])
+        events = (run / "events.jsonl").read_text(encoding="utf-8")
+        expect(DIRECTOR["csl_"] not in events and "<redacted>" in events, "events.jsonl deltas are redacted", events)
+        posted = _node_events.protocol_event({
+            "seq": 1, "kind": "model.output",
+            "payload": {"partial": True, "turn": 1, "delta": "posted " + DIRECTOR["csn_"]},
+        })
+        expect(DIRECTOR["csn_"] not in json.dumps(posted), "events posted to the Director are redacted", posted)
+        _run_record.check_json(run, "sha", 60, 1, "check " + DIRECTOR["csd_"] + " " + TOKENS["slack"])
+        check = (run / "check.json").read_text(encoding="utf-8")
+        expect(gone(check, DIRECTOR["csd_"], TOKENS["slack"]), "check.json output is redacted", check)
+        logged = _lead_session.redact_msg({"msg": {"text": DIRECTOR["csl_"], "n": 1}})
+        expect(DIRECTOR["csl_"] not in json.dumps(logged) and logged["msg"]["n"] == 1, "lead transcript rows are redacted")
+
+        token = DIRECTOR["csl_"]
+        live = mcp.Tools(Director(live=token), "fixture").task_output("live")
+        expect(token not in json.dumps(live) and "<redacted>" in live["partial_output"],
+               "task_output redacts live event text", live)
+        done = mcp.Tools(Director(done=combined), "fixture").task_output("done")
+        dumped = json.dumps(done)
+        expect(gone(dumped, *TOKENS.values(), "BEGIN RSA"), "task_output redacts transcript, check output, and error", dumped)
+        expect("<redacted>" in done["transcript_tail"] and "<redacted>" in done["check"]["output"],
+               "task_output keeps redacted tails", done)
+    for path, needle in (
+        ("ops/bin/_executor.py", "persist_output(run_dir / \"transcript.md\""),
+        ("ops/bin/_executor.py", "persist_output(run_dir / \"cli.log\""),
+        ("ops/bin/_executor.py", "redact(mapper.reply())"),
+        ("ops/bin/_muse_adapter.py", "persist_output(run_dir / \"transcript.md\""),
+        ("ops/bin/_lead_host.py", "persist_output(run_dir / \"transcript.md\""),
+        ("ops/bin/_node_events.py", "redact_obj("),
+        ("ops/bin/_agent_stream.py", "redact(delta)"),
+        ("ops/bin/_run_record.py", "redact(output)"),
+        ("scripts/cs_mcp.py", "redact_obj("),
+    ):
+        text = (KIT / path).read_text(encoding="utf-8")
+        expect(needle in text and "transcript.md\").write_text" not in text, "%s stores redacted output" % path, needle)
+    if FAILED:
+        print("%d failed" % len(FAILED))
+        return 1
+    print("ok   transcript redaction")
+    return 0
+
+
+class Director:
+    def __init__(self, live="", done=""):
+        self.live, self.done = live, done
+
+    def get(self, path):
+        status, body = self.request("GET", path)
+        if status != 200:
+            raise mcp.Refused("%s %s" % (status, path))
+        return body
+
+    def request(self, method, path, **_kwargs):
+        assert method == "GET", method
+        if path == "jobs/live":
+            return 200, {"job": {"job_id": "live", "state": "running", "live_run_ids": ["run-live"]}}
+        if path == "runs/run-live/events?after=0":
+            return 200, {"confirmed": 1, "events": [
+                {"kind": "delta", "payload": {"text": "live " + self.live}}]}
+        if path == "jobs/done":
+            return 200, {"job": {"job_id": "done", "state": "done", "run_id": "run-done",
+                                  "error": "failed " + DIRECTOR["csd_"]}}
+        if path == "runs/run-done":
+            return 200, {"run": {"run_id": "run-done", "files": [
+                {"path": "transcript.md"}, {"path": "check.json"}, {"path": "stuck.md"}]}}
+        if path == "runs/run-done/files/transcript.md":
+            return 200, ("stdout:\n%s\n" % self.done).encode()
+        if path == "runs/run-done/files/check.json":
+            return 200, json.dumps({"verdict": "fail", "exit_code": 1, "output": "out " + TOKENS["aws"],
+                                     "skipped": False}).encode()
+        if path == "runs/run-done/files/stuck.md":
+            return 200, ("stuck " + TOKENS["openai"]).encode()
+        raise AssertionError(path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

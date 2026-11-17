@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""error-classes: the error-v1 vocabulary as built (ops/bin/_errors.py) and where it lands.
+
+  history    every `error:` stop in a fixed extract of the ledger (historical-stops.json: 131 distinct
+             stops, 7,577 rows, 2026-11-09) classifies to a class other than unclassified; every other
+             stop to none, except interrupted and aborted; the per-class row counts are pinned
+  shape      every object is {class, code, source, retryable, detail}, detail <= 512 bytes
+  calls      tool events: a pre_tool veto, a sandbox exit 101, a kill (timeout or external), a kill by
+             the run's own deadline, a plain non-zero exit; a successful call counts nothing
+  sandbox    sandbox_denied over cs-sandbox reports (finalize-run groups them per tool): a denial text plus a
+             path the effective policy withholds, or a narrowing the failure names; each limit has a control
+  readers    row_error classifies a version 1 row on read and returns a version 2 row's own object;
+             _void's CONFIG_VOID and repeated_failure answer the same for a v1 row and its v2 twin
+  dispatch   tick: an orphaned running job closes with class node_restart; a launcher refusal
+             (env_policy) closes with class node_config, code env_policy; stop strings unchanged
+Isolated estates only; lab/ledger is never read or written.
+"""
+import json
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+# Direct ops imports and calls must not resolve the caller's estate either.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+sys.path.insert(0, str(LAB / "ops/bin"))
+sys.path.insert(0, str(LAB / "tasks/regressions/spool-delivery"))
+import _errors  # noqa: E402
+import _void  # noqa: E402
+import _tick_estate as te  # noqa: E402
+
+FAILED = []
+PINNED_COUNTS = {"gateway_config": 337, "provider_fault": 42, "gateway_unreachable": 16, "gateway_protocol": 9,
+                 "node_config": 5, "interrupted": 4}
+KEYS = {"class", "code", "source", "retryable", "detail"}
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:600]) if detail else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def test_history():
+    stops = json.loads((HERE / "historical-stops.json").read_text(encoding="utf-8"))
+    counts, wrong = {}, []
+    for item in stops:
+        stop, err = item["stop"], _errors.classify_stop(item["stop"])
+        if err:
+            counts[err["class"]] = counts.get(err["class"], 0) + item["rows"]
+            if set(err) != KEYS or len(err["detail"].encode()) > 512 or err["class"] not in _errors.CLASSES:
+                wrong.append(("shape", stop, err))
+        if str(stop or "").startswith("error: ") and (not err or err["class"] == "unclassified"):
+            wrong.append(("unclassified", stop))
+        elif not str(stop or "").startswith("error: ") and err and stop not in ("interrupted", "aborted"):
+            wrong.append(("not an error", stop, err))
+    expect(len(stops) == 131 and sum(i["rows"] for i in stops) == 7577, "history: the fixed extract", len(stops))
+    expect(not wrong, "history: every error: stop classifies, no other stop does, every object has the shape", wrong[:5])
+    expect(counts == PINNED_COUNTS, "history: rows per class as pinned", counts)
+    long = _errors.classify_stop("error: gateway unreachable: " + "é" * 600)
+    expect(len(long["detail"].encode()) <= 512 and long["detail"] == "é" * 256, "shape: detail clipped to 512 bytes on a "
+           "character boundary", len(long["detail"].encode()))
+    expect(_errors.classify_stop("error: something new") == {"class": "unclassified", "code": None, "source": None,
+                                                             "retryable": False, "detail": "something new"},
+           "history: a new runner message is unclassified, never an exception")
+    expect(_errors.classify_stop("aborted", [{"event": "pre_tool", "output": "refused by h\n"}])["detail"]
+           == "refused by h\n", "history: aborted carries the pre_tool event's output as detail")
+
+
+def test_calls():
+    ev = lambda content, turn=1, error=True: {"event": "tool", "turn": turn, "error": error, "content": content}  # noqa: E731
+    events = [ev("pre_tool fx_gate refused: no\n"),
+              ev("cs-sandbox: cannot enforce\n\nexit: exit status 101"),
+              ev("partial\nexit: signal: killed"),
+              ev("plain\n\nexit: exit status 3"),
+              ev("ok", error=False),
+              {"event": "turn", "turn": 2, "text": "x"},
+              ev("\nexit: signal: killed", turn=2)]
+    expect(_errors.call_errors(events, "budget:seconds", 2) == {"hook_rejected": 1, "sandbox_unenforceable": 1,
+                                                               "tool_timeout": 1, "tool_exit": 2},
+           "calls: veto, sandbox 101, kill, plain exit; a kill in the deadline's own turn is not a timeout",
+           _errors.call_errors(events, "budget:seconds", 2))
+    expect(_errors.call_errors(events, "done", 2)["tool_timeout"] == 2, "calls: the same kill after a done run is a timeout")
+    expect(_errors.call_errors([ev("ok", error=False)]) == {}, "calls: a clean run counts nothing")
+
+
+def test_sandbox(scratch):
+    ws, ro, outside = scratch / "ws", scratch / "code", scratch / "outside.txt"
+    ws.mkdir()
+    ro.mkdir()
+    outside.write_text("secret\n")
+    os.symlink(str(outside), str(ws / "link.txt"))
+    w, r, o = (os.path.realpath(str(p)) for p in (ws, ro, outside))
+    report = {"tool": "/x/fx", "cwd": w, "narrowed": [],
+              "effective_policy": {"read": [w, r], "write": [w], "tmp": "/t/cs-sandbox-1", "write_env": {}}}
+    narrowed = dict(report, narrowed=[{"capability": "net", "requested": "all", "granted": "none", "reason": "x"},
+                                      {"capability": "write_env", "requested": "LAB_STATE_X", "granted": "none", "reason": "y"}])
+    ev = lambda content, args=None, name="fx": {"event": "tool", "turn": 1, "error": True, "name": name,  # noqa: E731
+                                                "args": args or {}, "content": content + "\n\nexit: exit status 1"}
+    cases = [
+        ("EPERM on a path outside every readable root", ev("cat: %s: Operation not permitted" % o), report, "sandbox_denied"),
+        ("ENOENT through a planted symlink to a host file (bwrap: absent, not denied)",
+         ev("cat: link.txt: No such file or directory", {"cmd": ["cat", "link.txt"]}), report, "sandbox_denied"),
+        ("EROFS writing a readable, unwritable root", ev("fx: %s/a: Read-only file system" % r), report, "sandbox_denied"),
+        ("EPERM writing a readable, unwritable root (Seatbelt)", ev("fx: %s/a: Operation not permitted" % r), report, "sandbox_denied"),
+        ("a narrowed net and a network error", ev("curl: (6) Could not resolve host: example.com"), narrowed, "sandbox_denied"),
+        ("a narrowed write_env the failure names", ev("fx: LAB_STATE_X: Operation not permitted"), narrowed, "sandbox_denied"),
+        ("control: ENOENT outside the policy for a path the host lacks", ev("fx: /nonexistent-cs-x/y: No such file or directory"),
+         report, "tool_exit"),
+        ("control: ENOENT inside the workspace", ev("fx: missing.txt: No such file or directory", {"path": "missing.txt"}),
+         report, "tool_exit"),
+        ("control: EACCES inside a readable root (file modes)", ev("fx: %s/a: Permission denied" % r), report, "tool_exit"),
+        ("control: a network error with no net narrowing", ev("curl: (6) Could not resolve host: example.com"), report, "tool_exit"),
+        ("control: the tmp dir is writable", ev("fx: /t/cs-sandbox-1/f: Operation not permitted"), report, "tool_exit"),
+        ("control: no reports for the tool (unwrapped)", ev("cat: %s: Operation not permitted" % o), None, "tool_exit"),
+        ("control: no denial text", ev("fx: %s: bad format" % o), report, "tool_exit"),
+    ]
+    for label, event, rep_, want in cases:
+        got = _errors.classify_event(event, "done", 1, {"fx": [rep_]} if rep_ else None)
+        expect(got == want, "sandbox: %s -> %s" % (label, want), got)
+    unenforceable = {"event": "tool", "turn": 1, "error": True, "name": "gy", "content": "cs-sandbox: no\n\nexit: exit status 101"}
+    events = [cases[0][1], unenforceable, cases[6][1]]
+    by_tool = {"fx": [report]}
+    expect(_errors.call_errors(events, "done", 1, by_tool) == {"sandbox_denied": 1, "sandbox_unenforceable": 1, "tool_exit": 1}
+           and _errors.sandbox_tools(events, "done", 1, by_tool) == {"sandbox_denied": ["fx"], "sandbox_unenforceable": ["gy"]},
+           "sandbox: call_errors counts the classes and sandbox_tools names each tool once",
+           (_errors.call_errors(events, "done", 1, by_tool), _errors.sandbox_tools(events, "done", 1, by_tool)))
+
+
+def test_readers():
+    v1 = {"verdict": "void", "stop": "error: gateway fatal_session [gateway.no_provider_credential]: none"}
+    v2 = dict(v1, row_version=2, error=_errors.classify_stop(v1["stop"]))
+    expect(_errors.row_error(v1) == v2["error"] and _errors.row_error(v2) is v2["error"]
+           and _errors.row_error({"stop": "done", "row_version": 2}) is None,
+           "readers: v1 classified on read, v2 returns its own object, a clean v2 row none")
+    expect(_void.is_config_void(v1) and _void.is_config_void(v2)
+           and _void.config_void_reason(v1) == _void.config_void_reason(v2) == "no_provider_credential",
+           "readers: CONFIG_VOID holds the same schedule for a v1 row and its v2 twin")
+    sched = {"id": "s", "failure_hold_after": 2}
+    rows = [dict(r, id=str(i), state="error", schedule_id="s") for i, r in enumerate([v1, v2])]
+    expect(_void.repeated_failure(sched, rows) == "repeated_terminal_failure:" + v1["stop"],
+           "readers: repeated_failure's (verdict, stop) signature is unchanged by the v2 fields")
+
+
+def test_dispatch(scratch):
+    root = te.build(scratch / "lab")
+    (root / "ledger/dispatch.jsonl").write_text(json.dumps(
+        {"ts": "2026-11-09T00:00:00Z", "id": "orphan-1", "job": "orphan-1", "spec": "specs/x.yaml",
+         "state": "running", "pid": 999999, "origin": "dispatch"}) + "\n", encoding="utf-8")
+    rel = te.spec(root, "fx-env-refused", env_request=["CS_FIXTURE_NOT_ALLOWED"])
+    rc, out, _ = te.op(root, "enqueue", {"spec": rel, "lane": "probe", "task": "tasks/fx", "note": "refusal"})
+    expect(rc == 0, "dispatch: job enqueued", out)
+    rc, out, err = te.op(root, "tick")
+    rows = te.dispatch(root)
+    orphan = [r for r in rows if r.get("id") == "orphan-1" and r.get("state") == "error"]
+    expect(len(orphan) == 1 and orphan[0]["stop"] == "error: scheduler orphaned_running after restart"
+           and orphan[0].get("error") == {"class": "node_restart", "code": "orphaned_running", "source": "launcher",
+                                          "retryable": True, "detail": "scheduler orphaned_running after restart"},
+           "dispatch: an orphaned running job closes with class node_restart, stop unchanged", orphan)
+    refused = [r for r in rows if r.get("spec") == rel and r.get("state") == "error"]
+    expect(len(refused) == 1 and refused[0]["stop"].startswith('env_policy: env "CS_FIXTURE_NOT_ALLOWED"')
+           and refused[0].get("error", {}).get("class") == "node_config"
+           and refused[0]["error"]["code"] == "env_policy" and refused[0]["error"]["source"] == "launcher"
+           and refused[0]["error"]["detail"] == refused[0]["stop"][len("env_policy: "):]
+           and refused[0]["error"] == _errors.classify_stop(refused[0]["stop"]),
+           "dispatch: a launcher refusal closes with class node_config, code env_policy, the same object "
+           "_errors gives its stop", (refused, err[-300:]))
+
+
+def main():
+    scratch = Path(tempfile.mkdtemp(prefix="error-classes-", suffix=".noindex"))
+    try:
+        test_history()
+        test_calls()
+        test_sandbox(scratch)
+        test_readers()
+        test_dispatch(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("\ncheck: error-classes %d assertion(s) failed%s" % (len(FAILED), (": " + "; ".join(FAILED)) if FAILED else ""))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

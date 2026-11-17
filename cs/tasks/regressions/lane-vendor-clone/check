@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""New lane worktrees receive private copies of existing ignored dependencies."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+sys.path.insert(0, str(HERE.parents[2] / "ops/bin"))
+import _lanes
+
+with scratch_dir(dir="/tmp", prefix="lane-vendor-clone-") as raw:
+    root = Path(raw).resolve()
+    home = root / "home"
+    home.mkdir()
+    env = {**hermetic_env(), **{"HOME": str(home), "PATH": "/usr/bin:/bin",
+                        "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.test",
+                        "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.test"}}
+    main = root / "main"
+    main.mkdir()
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(main), *args], env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (main / ".gitignore").write_text("clients/web/vendor/\nclients/web/node_modules/\nclients/web/public/build/\n")
+    git("add", ".gitignore")
+    git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture")
+    cfg = dict(_lanes.DEFAULTS, name="fixture", path=main)
+    folders = ("vendor", "node_modules", "public/build")
+    for name in folders:
+        source = main / "clients/web" / name
+        source.mkdir(parents=True)
+        (source / "package").write_text("main")
+        (source / "alias").symlink_to("package")
+    with patch.dict(os.environ, env, clear=True):
+        lane = Path(_lanes.ensure_lane(cfg, "with-deps")["path"])
+        for name in folders:
+            copied = lane / "clients/web" / name
+            assert copied.is_dir() and not copied.is_symlink()
+            assert (copied / "package").read_text() == "main"
+            assert not (copied / "alias").is_symlink(), "dependency links must be private copies"
+            (copied / "package").write_text("lane")
+            assert (main / "clients/web" / name / "package").read_text() == "main"
+        # Reusing a lane does not overwrite its dependencies.
+        _lanes.ensure_lane(cfg, "with-deps")
+        assert (lane / "clients/web/vendor/package").read_text() == "lane"
+        import shutil
+        shutil.rmtree(main / "clients/web")
+        empty = Path(_lanes.ensure_lane(cfg, "without-deps")["path"])
+        for name in folders:
+            assert not (empty / "clients/web" / name).exists()
+print("lane-vendor-clone: PASS (private dependencies; no absent dependencies created)")

@@ -1,0 +1,16 @@
+{
+  "description": "Runner/operator: finalize one finished run dir under ledger/runs (terminal.json present): run the frozen check into check.json, append the transcript footer, publish-evidence, append the ledger row once (ledger.jsonl scanned for this run's transcript first), then the outbox envelope (<state>/outbox/<run_id>.json), then finalized.json last. terminal.json and the run dir are fsync'd on entry. Rows are row_version 2: error and call_errors from ops/bin/_errors.py when present, stop and verdict unchanged; finalize.error carries class (spool_full on ENOSPC). One exclusive flock on finalize.lock per run; a second finalizer exits 3 with state pending. Publish failure is recorded in finalize.error, lets the row through, and keeps finalized.json absent so tick's sweep retries and tick retries publication. Env FINALIZE_RUN_CRASH_AFTER=check|transcript|publish|row|envelope and FINALIZE_RUN_ENOSPC_BEFORE=row|envelope are TEST-ONLY fault injection. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "run_dir": {
+        "type": "string",
+        "description": "Run directory: an absolute path, or the run's identifier (the row's ledger/runs/<id>, or <id>) resolved under the state root (_roots); must resolve directly under <state>/runs."
+      }
+    },
+    "required": [
+      "run_dir"
+    ],
+    "additionalProperties": false
+  }
+}

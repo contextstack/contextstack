@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""schedule-firing-identity (goal.md): firing identity before the job, uncertain after a crash, missed."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+FAILED = []
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:600]) if detail and not cond else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def host(root):
+    """A director host whose schedule fires through a stand-in LAB_DIRECTOR_DISPATCH (no enqueue, no setup)."""
+    for d in ("ops/bin", "grants", "ledger", "home"):
+        (root / d).mkdir(parents=True)
+    for p in (LAB / "ops/bin").iterdir():
+        if p.is_file():
+            shutil.copy2(p, root / "ops/bin" / p.name)
+    shutil.copy2(LAB / "INVARIANTS.md", root / "INVARIANTS.md")
+    (root / "ESTATE").write_text("dev\n")
+    (root / "grants/g-n.yaml").write_text('id: g-n\nestate: node-n\nrepo: /nonexistent\npaths: ["src/"]\ngates: ["true"]\n'
+                                          'commit: false\nstatus: active\nexpiry: "2099-01-01T00:00:00Z"\n')
+    fake = root / "dispatch"
+    fake.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\necho '{\"job_id\": \"job-'\"$$\"'\"}'\n" % (root / "calls"))
+    fake.chmod(0o755)
+    return root
+
+
+def schedule(root, **more):
+    row = {"event": "schedule_updated", "id": "s", "enabled": True, "cron": "0 * * * *", "timezone": "UTC",
+           "spec": "specs/x.yaml", "task": "tasks/x", "lane": "production", "grant": "g-n", "node": "node-n",
+           "ts": "2026-11-10T00:00:00Z", **more}
+    (root / "ledger/schedules.jsonl").write_text(json.dumps(row) + "\n")
+
+
+def tick(root, now, **extra):
+    args = {"now": now, "schedules": str(root / "ledger/schedules.jsonl"), "fires": str(root / "ledger/fires.jsonl"),
+            "dispatch": str(root / "ledger/dispatch.jsonl"), "lock": str(root / "ledger/schedule.lock"), "scan_stale": False, **extra}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(root / "home"),
+           "LAB_DIRECTOR_DISPATCH": json.dumps([str(root / "dispatch")]), "LAB_DIRECTOR_ESTATE_ROOT": str(root / "estate")}
+    r = subprocess.run([sys.executable, str(root / "ops/bin/schedule-tick")], input=json.dumps(args), text=True,
+                       capture_output=True, cwd=str(root), env=env, timeout=60)
+    out = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+    return r.returncode, out, r.stderr[-400:]
+
+
+def fires(root):
+    path = root / "ledger/fires.jsonl"
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.is_file() else []
+
+
+def calls(root):
+    return (root / "calls").read_text().splitlines() if (root / "calls").is_file() else []
+
+
+def main():
+    scratch = Path(tempfile.mkdtemp(prefix="schedule-firing-identity-", suffix=".noindex"))
+    try:
+        a = host(scratch / "a")
+        schedule(a)
+        rc, out, err = tick(a, "2026-11-10T03:05:00+00:00")
+        rows = fires(a)
+        expect(rc == 0 and len(calls(a)) == 1 and [r.get("event") for r in rows] == ["firing_recorded", None]
+               and rows[0]["firing_id"] == "s@2026-11-10T03:00:00Z" and rows[0]["schedule_revision"] == 1
+               and rows[1]["job"].startswith("job-") and not rows[1].get("catch_up"),
+               "the identity is recorded before the job is dispatched; on time is not catch_up", (rc, rows, err))
+
+        b = host(scratch / "b")
+        schedule(b)
+        (b / "ledger/fires.jsonl").write_text(json.dumps({"event": "firing_recorded", "id": "s", "slot": "2026-11-10T03:00:00Z",
+                                                          "firing_id": "s@2026-11-10T03:00:00Z", "ts": "2026-11-10T03:00:01Z"}) + "\n")
+        rc, out, err = tick(b, "2026-11-10T03:05:00+00:00")
+        expect(rc == 0 and not calls(b) and any(d.get("reason") == "firing_uncertain" for d in out.get("deferred", [])),
+               "recorded but never fired (a crash): uncertain, not fired again", (rc, out, err))
+        rc, out, err = tick(b, "2026-11-10T03:06:00+00:00", retry_failed=["s"])
+        expect(rc == 0 and len(calls(b)) == 1, "an operator's retry_failed fires it", (rc, out, err))
+
+        c = host(scratch / "c")
+        schedule(c)
+        rc, out, err = tick(c, "2026-11-10T04:59:00+00:00")  # the 04:00 slot, first seen 59 min late: within grace
+        expect(rc == 0 and len(calls(c)) == 1, "within missed_grace_minutes it fires", (rc, out, err))
+        d = host(scratch / "d")
+        schedule(d)
+        rc, out, err = tick(d, "2026-11-10T03:30:00+00:00", local_model_ready=True)
+        expect(len(calls(d)) == 1, "d: the 03:00 slot fires on time", (rc, out, err))
+        rc, out, err = tick(d, "2026-11-10T06:10:00+00:00")  # off from 03:30 to 06:10: 04:00 and 05:00 never seen; 06:00 is due
+        expect(rc == 0 and len(calls(d)) == 2, "back on time for the latest slot: it fires (latest slot only, as before)", (rc, out, err))
+
+        e = host(scratch / "e")
+        schedule(e, cron="0 2 * * *")
+        rc, out, err = tick(e, "2026-11-10T07:00:00+00:00", missed_default="skip")
+        expect(rc == 0 and not calls(e) and any(x.get("reason") == "missed" and x.get("slot") == "2026-11-10T02:00:00Z"
+                                                  for x in out.get("deferred", [])),
+               "missed: skip (node-listen's default): the 02:00 slot first seen at 07:00 is recorded missed, nothing runs",
+               (rc, out, err))
+        rc, out, err = tick(e, "2026-11-10T07:01:00+00:00", missed_default="skip")
+        expect(rc == 0 and not calls(e) and not out.get("deferred"), "a missed slot stays settled, quietly", (rc, out, err))
+
+        legacy = host(scratch / "legacy")
+        schedule(legacy, cron="0 2 * * *")
+        rc, out, err = tick(legacy, "2026-11-10T07:00:00+00:00")
+        fired = [r for r in fires(legacy) if r.get("job")]
+        expect(rc == 0 and len(calls(legacy)) == 1 and fired and "catch_up" not in fired[-1],
+               "neither the row nor the caller names `missed` (a director host's tick): it fires as before", (rc, out, err))
+
+        f = host(scratch / "f")
+        schedule(f, cron="0 2 * * *", missed="catch_up")
+        rc, out, err = tick(f, "2026-11-10T07:00:00+00:00")
+        fired = [r for r in fires(f) if r.get("job")]
+        expect(rc == 0 and len(calls(f)) == 1 and fired and fired[-1].get("catch_up") is True,
+               "missed: catch_up fires it late and says so", (rc, out, err, fired))
+
+        g = host(scratch / "g")
+        schedule(g, cron="0 2 * * *")
+        (g / "ledger/fires.jsonl").write_text(json.dumps({"event": "schedule_deferred", "id": "s", "slot": "2026-11-10T02:00:00Z",
+                                                          "reason": "dependency_not_ready", "ts": "2026-11-10T02:01:00Z"}) + "\n")
+        rc, out, err = tick(g, "2026-11-10T07:00:00+00:00")
+        expect(rc == 0 and len(calls(g)) == 1, "a slot deferred while the node was up was seen, not missed: it fires", (rc, out, err))
+
+        h = host(scratch / "h")
+        schedule(h, missed="sometimes")
+        rc, out, err = tick(h, "2026-11-10T07:00:00+00:00")
+        expect(rc != 0 and "missed" in err, "an unknown missed value is refused", (rc, err))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("check: schedule-firing-identity %d problem(s)" % len(FAILED))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

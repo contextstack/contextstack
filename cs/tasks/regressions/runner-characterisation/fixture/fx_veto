@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fixture-only post_turn hook: always vetoes with a message.
+echo "fx_veto: not yet"
+exit 1

@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""`model:` is required in every spec. PINNED.md's `pinned:` line is the default
+an author copies, never a fallback resolved for them: the runner, `enqueue`
+and `scripts/check` rule 3 each refuse a model-less spec and name the pin."""
+import json
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+PIN = (LAB / "PINNED.md").read_text()
+# (1) The pin itself and the cost ladder it sits on.
+assert PIN.splitlines()[2].strip() == "pinned: claude-code-sonnet"
+ladder = PIN.find("subscription CLIs first"), PIN.find("claude-code-sonnet is the default to copy"), PIN.find("local free"), PIN.find("API last resort")
+assert -1 not in ladder and ladder == tuple(sorted(ladder))
+# (2) SCHEMA says required, with PINNED as the default to copy.
+schema = (LAB / "SCHEMA.md").read_text()
+assert "`model` — gateway name or executor template; required (PINNED `pinned:` is the default to copy" in schema
+# (3) The runner (the default Rust one) refuses a model-less spec whether or not PINNED.md is present.
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _runner import built_runner
+for pinned in (True, False):
+    with scratch_dir(prefix="pin-default-runner-") as raw:
+        root = Path(raw)
+        (root / "INVARIANTS.md").write_text("Isolated fixture.\n")
+        if pinned:
+            shutil.copy2(LAB / "PINNED.md", root / "PINNED.md")
+        (root / "spec.yaml").write_text("id: fixture\ntools: []\nbudget: {turns: 1}\ntasks: [fixture]\ntrials: 1\nhypothesis: fixture-1972\n")
+        result = subprocess.run([str(built_runner(LAB)), "run", "spec.yaml"], cwd=root, capture_output=True, text=True,
+                                env={"PATH": "/usr/bin:/bin", "HOME": raw})
+        assert result.returncode != 0 and "model (required; PINNED.md pinned: is the default to copy)" in result.stderr, (
+            pinned, result.returncode, result.stdout, result.stderr)
+        assert not (root / "ledger").exists(), "a refused spec wrote a ledger"
+# (4) Exercise the actual required-key rule, not a second implementation of it.
+check_source = (LAB / "scripts/check").read_text()
+rule = check_source.split("# 3. Specs: required keys.\n", 1)[1].split("# 4. Archived", 1)[0]
+base = "id: fixture\ntools: []\nbudget: {}\ntasks: [fixture]\ntrials: 1\nhypothesis: fixture-1972\n"
+with scratch_dir(prefix="pin-default-rule-") as raw:
+    root = Path(raw)
+    (root / "specs").mkdir()
+    (root / "ops/bin").mkdir(parents=True)
+    for spec, default, expected in [(base, "pinned: claude-code-sonnet\n", 1),  # a pin is not a fallback
+                                    (base, "", 1),
+                                    (base + "model: explicit\n", "", 0),
+                                    (base + "model: claude-code-sonnet\n", "pinned: claude-code-sonnet\n", 0),
+                                    (base.replace("tasks: [fixture]\n", "") + "model: explicit\n", "pinned: claude-code-sonnet\n", 1)]:
+        (root / "specs/fixture.yaml").write_text(spec)
+        (root / "PINNED.md").write_text(default)
+        checked = subprocess.run(["bash", "-c", "fail=0; say() { fail=1; echo \"$1\"; };\n" + rule + "\nexit $fail"],
+                                 cwd=root, capture_output=True, text=True)
+        assert checked.returncode == expected, (spec, default, expected, checked.stdout)
+        if default and expected and "model:" not in spec:
+            assert "has no model: (PINNED.md pins claude-code-sonnet)" in checked.stdout, checked.stdout
+# (5) The real enqueue refuses a model-less spec, names the pin, fills nothing in.
+with scratch_dir(prefix="pin-default-enqueue-") as raw:
+    root = Path(raw)
+    (root / "ops/bin").mkdir(parents=True)
+    (root / "specs").mkdir()
+    (root / "ledger").mkdir()
+    for name in ("_dispatch.py", "_estate_io.py", "_roots.py", "enqueue", "_grant.py", "_corpus_contract.py", "_workspace_setup.py"):
+        shutil.copy2(LAB / "ops/bin" / name, root / "ops/bin" / name)
+    shutil.copy2(LAB / "PINNED.md", root / "PINNED.md")
+    (root / "specs/fixture.yaml").write_text(base, encoding="utf-8")
+    enqueue = root / "ops/bin/enqueue"
+    refused = subprocess.run([str(enqueue)], input=json.dumps({"spec": "specs/fixture.yaml"}),
+                             text=True, capture_output=True, cwd=root, env={**hermetic_env()})
+    assert refused.returncode != 0, refused.stdout
+    assert "specs/fixture.yaml has no model: ; PINNED.md pins claude-code-sonnet" in refused.stderr, refused.stderr
+    assert "add model: claude-code-sonnet" in refused.stderr, refused.stderr
+    assert not (root / "ledger/dispatch.jsonl").exists()
+    (root / "specs/fixture.yaml").write_text(base + "model: claude-code-sonnet\n", encoding="utf-8")
+    accepted = subprocess.run([str(enqueue)], input=json.dumps({"spec": "specs/fixture.yaml"}),
+                              text=True, capture_output=True, cwd=root, env={**hermetic_env()})
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads((root / "ledger/dispatch.jsonl").read_text(encoding="utf-8"))["spec"] == "specs/fixture.yaml"
+print("check: model: is required; runner, enqueue and rule 3 refuse its absence naming pinned claude-code-sonnet")

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""run-spec — run every cell of a spec (tasks x trials) and print the summary.
+
+Operator-called, never palette. `lab run` executes one
+cell; this op is the whole-spec iteration that left the runner, with the
+banner and TOTAL lines the runner used to print. Input JSON on stdin
+{"spec": "specs/x.yaml", "task"?: dir, "trials"?: n}, or for a human at a
+terminal: run-spec <spec.yaml> [-task dir]. Each cell is `<runner> run -task T
+-trial n <spec>` (runner: $CS_RUNNER_BIN or $LAB_RUNNER_BIN, else ../target/release/cs-harness; cwd
+the lab root) with LAB_CHILD_ENV = the spec's `env:` request resolved against
+policy/env.json (_env_policy); the node's LAB_*_ROOT are validated first
+(_roots), and CS_TOOL_PREFIX is set from policy/sandbox.json (_sandbox_policy), with
+one sandbox report dir per cell (cell_prefix).
+A refused root, request or sandbox policy exits 2 naming it, before any cell runs;
+the runner reads the roots without validating. Stdout and stderr pass through. To step through tool calls
+by hand, put `pre_tool: [step-confirm]` in the spec (SCHEMA: Hook); there is
+no runner flag. Exit 3 if any cell exited 3 (finalization pending), else 1 if
+pass < want, else 0.
+"""
+import json, os, re, subprocess, sys
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _runner import runner_path
+from _env_policy import EnvPolicyError, child_env_value, resolve  # noqa: E402
+from _roots import RootsError, roots, sandbox_reports_dir  # noqa: E402
+from _sandbox_policy import SandboxPolicyError, browser_state_value, cell_prefix, tool_prefix_value  # noqa: E402
+
+
+def spec_value(text, key):
+    for line in text.splitlines():
+        if line.startswith(key + ":"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def spec_tasks(text):
+    raw = spec_value(text, "tasks")
+    try:
+        tasks = json.loads(raw)
+    except json.JSONDecodeError:
+        tasks = [part.strip().strip("\"'") for part in raw.strip("[]").split(",") if part.strip()]
+    if not isinstance(tasks, list) or not all(isinstance(task, str) for task in tasks):
+        raise SystemExit("run-spec: tasks must be a list of paths")
+    return tasks
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")  # the TOTAL line has an em dash; launchd/cron may set no LANG
+    if len(sys.argv) > 1:
+        args, req = sys.argv[1:], {}
+        while args:
+            arg = args.pop(0)
+            if arg == "-task" and args:
+                req["task"] = args.pop(0)
+            else:
+                req["spec"] = arg
+    else:
+        req = json.loads(sys.stdin.read() or "{}")
+    spec = str(req.get("spec") or "")
+    if not spec:
+        raise SystemExit("run-spec: usage: run-spec <spec.yaml> [-task dir], or JSON {spec, task?, trials?} on stdin")
+    text = (LAB / spec).read_text(encoding="utf-8")
+    tasks = [req["task"]] if req.get("task") else spec_tasks(text)
+    trials = int(req.get("trials") or spec_value(text, "trials") or 1)
+    runner = str(runner_path(LAB))  # _runner: CS_RUNNER_BIN, then LAB_RUNNER_BIN, else the Rust runner
+    try:  # the node's roots (_roots) and the spec's env: request, both validated here, before anything launches
+        roots()
+        allowed = child_env_value(resolve(LAB, text))
+        env = dict(os.environ, LAB_CHILD_ENV=allowed, CS_CHILD_ENV=allowed)
+        state = browser_state_value(LAB, env)  # policy write_env lists it: the state root's default unless set
+        if state is not None:
+            env["LAB_BROWSER_STATE"] = state
+        prefix = tool_prefix_value(LAB)  # None: unconfined (no policy); missing wrapper is SandboxPolicyError
+        if prefix is not None:
+            env["CS_TOOL_PREFIX"] = prefix
+        reports = str(sandbox_reports_dir())
+        cell_prefix(prefix, os.environ, reports)  # refuses a report root holding whitespace, before any cell
+    except (RootsError, EnvPolicyError, SandboxPolicyError) as error:
+        print("run-spec: %s" % error, file=sys.stderr, flush=True)
+        if len(sys.argv) <= 1:
+            print(json.dumps({"ok": False, "spec": spec, "error": str(error), "code": 2}, sort_keys=True), flush=True)
+        return 2
+    print("%s: %d task(s) x %d trial(s)" % (spec_value(text, "id").strip("\"'"), len(tasks), trials), flush=True)
+    passed, want, pending = 0, len(tasks) * trials, False
+    for task in tasks:
+        for n in range(1, trials + 1):
+            cmd = [runner, "run", "-task", task, "-trial", str(n), spec]
+            cell = dict(env, CS_TOOL_PREFIX=cell_prefix(prefix, os.environ, reports)) if prefix is not None else env
+            rc = subprocess.run(cmd, cwd=str(LAB), env=cell).returncode
+            passed += rc == 0
+            pending = pending or rc == 3
+    print("  TOTAL %d/%d pass — rows in ledger/ledger.jsonl" % (passed, want), flush=True)
+    code = 3 if pending else 1 if passed < want else 0
+    if len(sys.argv) <= 1:  # op contract (SCHEMA): JSON on stdin gets a JSON last line; argv is the human path
+        print(json.dumps({"ok": code == 0, "spec": spec, "pass": passed, "want": want,
+                          "pending": pending, "code": code}, sort_keys=True), flush=True)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

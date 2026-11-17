@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+# ops/bin/setup-refresh — operator-called. Rsync dest HEAD (vendor +
+# private runtime files excluded) into tasks/work/<name>/setup/. Not a model tool.
+import json, os, subprocess, sys
+from pathlib import Path
+
+from _estate_io import hardened_git_env, git, lab_path, state_dir
+
+from _workspace_setup import metadata, seed_installs
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parent.parent
+
+
+a = json.load(sys.stdin)
+task = Path(str(a.get("task", "")))
+if not task.is_absolute():
+    task = LAB / task
+if not (task / "goal.md").is_file():
+    sys.exit("setup-refresh: task missing goal.md")
+raw = str(a.get("dest") or "").strip()
+dest = Path(raw) if raw else None
+meta = metadata(task)
+if dest is None:
+    p = meta.get("repo", "")
+    dest = Path(p) if p else None
+if dest is None or not (dest / ".git").exists():
+    sys.exit("setup-refresh: dest is not a git repo")
+dirty = git(dest, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "diff", "--quiet", env=hardened_git_env(), errors="strict")
+staged = git(dest, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "diff", "--cached", "--quiet", env=hardened_git_env(), errors="strict")
+if dirty.returncode != 0 or staged.returncode != 0:
+    sys.exit("setup-refresh: dest has tracked changes; commit or stash first")
+setup_raw = str(a.get("setup") or meta.get("setup") or "").strip()
+setup = Path(setup_raw) if setup_raw else task / "setup"
+setup = lab_path(LAB, setup)
+setup.mkdir(parents=True, exist_ok=True)
+r = subprocess.run(
+    ["rsync", "-a", "--delete",
+     "--include", ".env.example", "--exclude", ".env*",
+     "--exclude", "vendor", "--exclude", "vendor/**",
+     "--exclude", "node_modules", "--exclude", "node_modules/**",
+     "--exclude", "bootstrap/cache/config.php", "--exclude", "storage/*.key",
+     "--exclude", ".lab-*", "--exclude", ".lab-*/**",
+     "--delete-excluded",
+     str(dest) + "/", str(setup) + "/"],
+    capture_output=True, text=True,
+)
+if r.returncode != 0:
+    sys.exit((r.stderr or r.stdout or "rsync failed").strip())
+head = git(dest, "rev-parse", "HEAD", env=hardened_git_env(), errors="strict").stdout.strip()
+ref = git(setup, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "update-ref", "refs/lab/base", head, env=hardened_git_env(), errors="strict")
+if ref.returncode != 0:
+    sys.exit((ref.stderr or ref.stdout or "failed to stamp setup base").strip())
+seed_installs(dest, LAB)
+# Also remove stale private files left by a pre-contract setup refresh.
+for private in list(setup.glob('.env*')) + list((setup / 'storage').glob('*.key')) + [setup / 'bootstrap/cache/config.php']:
+    if private.name != '.env.example' and private.is_file():
+        private.unlink()
+if meta.get('repair_run'):
+    from _lifecycle_evidence import require, read_gzip
+    run_id = meta['repair_run']
+    if Path(run_id).name != run_id:
+        sys.exit('setup-refresh: repair run must be one ledger run id')
+    run = state_dir(LAB) / 'runs' / run_id
+    evidence, error = require(run)
+    if error or evidence['evidence_sha'] != meta.get('repair_evidence_sha'):
+        sys.exit('setup-refresh: ' + (error or 'repair evidence mismatch'))
+    if evidence.get('base', {}).get('commit') != head:
+        sys.exit('setup-refresh: repair source and destination base differ')
+    from _grant import load, same_repo
+    source_grant, error = load((evidence.get('grant') or {}).get('id'))
+    if error or not same_repo(source_grant['repo'], dest):
+        sys.exit('setup-refresh: repair grant belongs to another destination')
+    diff = evidence['diff']
+    blob = run / 'evidence' / diff['path']
+    content = read_gzip(blob, diff['source_bytes']) if diff.get('compression') == 'gzip' else blob.read_bytes()
+    subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'update-index', '--refresh'], cwd=setup, check=True, capture_output=True, env=hardened_git_env())
+    subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'apply', '--index', '--binary', '-'], input=content, cwd=setup, check=True, capture_output=True, env=hardened_git_env())
+    tree = subprocess.check_output(['git', 'write-tree'], cwd=setup, text=True, env=hardened_git_env()).strip()
+    if tree != evidence['candidate_tree']:
+        sys.exit('setup-refresh: repaired setup does not match the frozen candidate tree')
+print(json.dumps({"ok": True, "setup": str(setup), "head": head}))

@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Real pi, goose and grok templates, each binary a stub that records argv, env and which dirs it
+could write, then prints a canned completion receipt (goal.md)."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+subprocess.run([sys.executable, str(HERE.parent / "cli-agent-runtimes/read-denies")], check=True, env={**hermetic_env()})
+LAB_SRC = HERE.parents[2]
+OPS = LAB_SRC / "ops/bin"
+GW = LAB_SRC.parent / "gateway" / "models.json"
+sys.path.insert(0, str(OPS))
+from _job_reason import reason_of
+
+KEYS = ["HOME", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_TELEMETRY", "GOOSE_MODE",
+        "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "GROK_HOME", "XAI_API_KEY", "GROK_API_KEY"]
+PI = [{"type": "agent_start"},
+      {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "usage": {"input": 1}}},
+      {"type": "agent_end", "messages": [{"role": "assistant", "stopReason": "stop", "usage": {"input": 1}}]}]
+GOOSE = {"messages": [], "metadata": {"status": "completed", "input_tokens": 4, "output_tokens": 2, "cost_usd": 0.02}}
+GOOSE_ZERO = {"messages": [], "metadata": {"status": "completed", "input_tokens": 0, "output_tokens": 0}}
+GROK = {"stopReason": "end_turn", "text": "done", "sessionId": "s", "requestId": "r", "num_turns": 1,
+        "total_cost_usd": 0.01}
+FAKE = """#!%(python)s
+import json, os, time
+from pathlib import Path
+report = {"argv": __import__("sys").argv[1:], "cwd": os.getcwd(),
+          "env": {k: os.environ.get(k) for k in %(keys)r}, "writes": {}, "links": {}}
+def poke(label, path):
+    path = Path(path)
+    report["links"][label] = path.is_symlink() or path.parent.is_symlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text("tampered")
+        report["writes"][label] = True
+    except OSError:
+        report["writes"][label] = False
+for label, root, name in %(probes)r:
+    base = Path(os.environ[root])
+    base.mkdir(parents=True, exist_ok=True)
+    poke(label, base / name)
+report["keychains"] = (Path(os.environ["HOME"]) / "Library/Keychains").exists()
+Path("agent-report.json").write_text(json.dumps(report))
+time.sleep(%(delay)r)
+print(open(%(fixture)r).read(), end="")
+"""
+
+
+def lines(value):
+    if isinstance(value, dict):
+        return json.dumps(value) + "\n"
+    return "".join(json.dumps(e) + "\n" for e in value)
+
+
+def run(root, name, fixture, budget=None, delay=0, timeout_s=60, symlink_auth=False):
+    lab, home = root / name, root / (name + "-home")
+    ops, task, fake = lab / "ops/bin", lab / "tasks/fixture", root / (name + "-bin")
+    for path in (ops, task, lab / "ledger", fake, home / "Library/Keychains",
+                 home / ".pi/agent/sessions", home / ".pi/agent/skills", home / ".pi/agent/install",
+                 home / ".pi/agent/bin", home / ".config/goose/chatgpt_codex",
+                 home / ".config/goose/gemini_oauth", home / ".config/goose/xai_oauth",
+                 home / ".config/goose/tls", home / ".config/goose/skills", home / ".grok"):
+        path.mkdir(parents=True, exist_ok=True)
+    if symlink_auth:
+        (home / ".pi/agent/auth-target.json").write_text("fixture-auth\n")
+        (home / ".pi/agent/auth.json").symlink_to(home / ".pi/agent/auth-target.json")
+    else:
+        (home / ".pi/agent/auth.json").write_text("fixture-auth\n")
+    (home / ".pi/agent/settings.json").write_text("{}\n")
+    (home / ".pi/agent/models.json").write_text("{}\n")
+    (home / ".pi/agent/models-store.json").write_text("{}\n")
+    (home / ".pi/agent/trust.json").write_text("{}\n")
+    (home / ".config/goose/config.yaml").write_text("provider: fixture\n")
+    for oauth in ("chatgpt_codex", "gemini_oauth", "xai_oauth"):
+        (home / ".config/goose" / oauth / "auth.json").write_text("{}\n")
+    (home / ".grok/auth.json").write_text("{}\n")
+    for f in OPS.iterdir():
+        if f.is_file():
+            shutil.copy2(f, ops / f.name)
+    from native_runtime import stage_native_runtime
+    stage_native_runtime(ops)
+    fixture_path = root / (name + ".fixture")
+    fixture_path.write_text(lines(fixture) if fixture is not None else "")
+    probes = {
+        "pi": [("private", "PI_CODING_AGENT_DIR", "probe"),
+               ("session", "PI_CODING_AGENT_SESSION_DIR", "probe"),
+               ("auth", "PI_CODING_AGENT_DIR", "auth.json"),
+               ("settings", "PI_CODING_AGENT_DIR", "settings.json"),
+               ("models", "PI_CODING_AGENT_DIR", "models.json"),
+               ("models-store", "PI_CODING_AGENT_DIR", "models-store.json"),
+               ("trust", "PI_CODING_AGENT_DIR", "trust.json")],
+        "goose": [("state", "XDG_STATE_HOME", "probe"), ("cache", "XDG_CACHE_HOME", "probe"),
+                  ("config", "XDG_CONFIG_HOME", "goose/config.yaml"),
+                  ("chatgpt", "XDG_CONFIG_HOME", "goose/chatgpt_codex/auth.json"),
+                  ("gemini", "XDG_CONFIG_HOME", "goose/gemini_oauth/auth.json"),
+                  ("xai", "XDG_CONFIG_HOME", "goose/xai_oauth/auth.json"),
+                  ("tls", "XDG_CONFIG_HOME", "goose/tls/probe"),
+                  ("skills", "XDG_CONFIG_HOME", "goose/skills/probe")],
+        "grok": [("private", "GROK_HOME", "probe"), ("auth", "GROK_HOME", "auth.json")],
+    }[name.split("-")[0]]
+    exe = fake / name.split("-")[0]
+    exe.write_text(FAKE % {"python": sys.executable, "keys": KEYS, "probes": probes,
+                           "fixture": str(fixture_path), "delay": delay})
+    exe.chmod(0o755)
+    tmpl = json.loads((OPS / "executor-templates.json").read_text())[name.split("-")[0]]
+    (ops / "executor-templates.json").write_text(json.dumps({name.split("-")[0]: dict(tmpl, binary=str(exe))}))
+    (lab / "ESTATE").write_text("dev\n")
+    (task / "goal.md").write_text("Do nothing.\n")
+    (task / "check").write_text("#!/bin/sh\nexit 0\n")
+    (task / "check").chmod(0o755)
+    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_", "CSGATEWAY_"))}
+    env.update(HOME=str(home), XAI_API_KEY="sk-canary", GROK_API_KEY="sk-canary",
+               CS_TOOLS_BIN=str(LAB_SRC.parent / "target/release/cs-tools"))
+    order = {"executor": name.split("-")[0], "task": "tasks/fixture", "exp": "task-fixture", "trial": 1,
+             "timeout_s": timeout_s}
+    if budget is not None:
+        order["budget"] = budget
+    done = subprocess.run([sys.executable, str(ops / "_executor.py")], cwd=lab, env=env,
+                          input=json.dumps(order), text=True, capture_output=True, timeout=120)
+    assert "Traceback" not in done.stderr, done.stderr[-2000:]
+    ledger = lab / "ledger/ledger.jsonl"
+    rows = [json.loads(x) for x in ledger.read_text().splitlines()] if ledger.is_file() else []
+    run_dir = (lab / rows[0]["transcript"]) if rows else None
+    report = None
+    if run_dir and (run_dir / "workspace/agent-report.json").is_file():
+        report = json.loads((run_dir / "workspace/agent-report.json").read_text())
+    return done, (rows[0] if rows else None), report, run_dir, home
+
+
+def assert_boundary(name, rep, run_dir, home, turns=200):
+    assert rep["cwd"] == str(run_dir / "workspace"), (name, rep["cwd"])
+    assert "Do nothing." in " ".join(rep["argv"]), rep["argv"]
+    assert rep["env"]["HOME"].startswith(str(run_dir / "tmp")), rep["env"]
+    assert rep["keychains"] is False, (name, rep["keychains"])
+    assert rep["env"]["XAI_API_KEY"] is None and rep["env"]["GROK_API_KEY"] is None, rep["env"]
+    if name == "pi":
+        for flag in ("--print", "--approve", "--no-session", "--model"):
+            assert flag in rep["argv"], rep["argv"]
+        assert rep["argv"][rep["argv"].index("--mode") + 1] == "json"
+        assert rep["env"]["PI_TELEMETRY"] == "0"
+        assert rep["writes"]["private"] is True and rep["writes"]["session"] is True, rep
+        assert all(rep["links"][key] for key in ("settings", "models")), rep
+        assert rep["links"]["auth"] is False and rep["writes"]["auth"] is True, rep
+        assert all(rep["links"][key] is False and rep["writes"][key] is True
+                   for key in ("models-store", "trust")), rep
+    elif name == "goose":
+        assert rep["argv"][:2] == ["run", "--text"] and "--output-format" in rep["argv"], rep["argv"]
+        assert rep["argv"][rep["argv"].index("--output-format") + 1] == "json"
+        assert rep["argv"][rep["argv"].index("--max-turns") + 1] == str(turns), rep["argv"]
+        assert "developer" in rep["argv"] and rep["env"]["GOOSE_MODE"] == "auto", rep
+        assert rep["writes"]["state"] is True and rep["writes"]["cache"] is True, rep
+        assert all(rep["links"][key] for key in ("config", "chatgpt", "gemini", "xai")), rep
+        assert all(rep["links"][key] is False and rep["writes"][key] is True for key in ("tls", "skills")), rep
+    else:
+        assert "--always-approve" in rep["argv"] and "bypassPermissions" in rep["argv"], rep["argv"]
+        assert rep["argv"][rep["argv"].index("--max-turns") + 1] == str(turns), rep["argv"]
+        assert rep["argv"][rep["argv"].index("--cwd") + 1] == rep["cwd"]
+        assert rep["env"]["GROK_HOME"].startswith(str(run_dir / "tmp")) and rep["writes"]["private"], rep
+        assert rep["links"]["auth"] is False and rep["writes"]["auth"] is True
+    if sys.platform == "darwin":
+        read_only = {"pi": ("settings", "models"),
+                     "goose": ("config", "chatgpt", "gemini", "xai"),
+                     "grok": ()}[name]
+        assert all(rep["writes"][key] is False for key in read_only), rep
+        if name == "pi":
+            assert rep["writes"]["auth"] is True, rep
+        deny = {"pi": ".pi/agent", "goose": ".config/goose", "grok": ".grok"}[name]
+        profile = (run_dir / "sandbox.sb").read_text()
+        assert str(home / deny) in profile, profile
+        assert not any(
+            line.startswith("(allow file-read") and "Library/Keychains" in line
+            for line in profile.splitlines()
+        ), (name, profile)
+        assert '(deny file-read* (subpath %s))' % json.dumps(str(home / ".codex/auth.json")) in profile
+        if name == "pi":
+            assert '(deny file-write* file-link (literal %s))' % json.dumps(str(home / ".pi/agent/auth.json")) in profile
+    leftovers = [str(path.relative_to(run_dir)) for path in run_dir.rglob("*") if path.is_symlink()]
+    assert leftovers == [], (name, "staged links kept in evidence", leftovers)
+
+
+gw = json.loads(GW.read_text())
+named = {m["name"]: m for m in gw["models"]}
+for name, cls in (("pi", "api"), ("goose", "api"), ("grok", "subscription")):
+    assert named[name]["executor"] == "cli" and named[name]["cost_class"] == cls, named[name]
+pools = {d["id"]: d["models"] for d in gw["deployments"]}
+assert pools["cli-pi"] == ["pi"] and pools["cli-goose"] == ["goose"] and pools["cli-grok"] == ["grok"]
+templates = json.loads((OPS / "executor-templates.json").read_text())
+assert templates["pi"]["links"] == {
+    "{{tmp}}/pi-agent/settings.json": "~/.pi/agent/settings.json",
+    "{{tmp}}/pi-agent/models.json": "~/.pi/agent/models.json",
+}, templates["pi"]["links"]
+assert templates["pi"]["copies"] == {"{{tmp}}/pi-agent/auth.json": "~/.pi/agent/auth.json"}
+assert templates["goose"]["links"] == {
+    "{{tmp}}/home/.config/goose/config.yaml": "~/.config/goose/config.yaml",
+    "{{tmp}}/home/.config/goose/chatgpt_codex": "~/.config/goose/chatgpt_codex",
+    "{{tmp}}/home/.config/goose/gemini_oauth": "~/.config/goose/gemini_oauth",
+    "{{tmp}}/home/.config/goose/xai_oauth": "~/.config/goose/xai_oauth",
+}, templates["goose"]["links"]
+
+with scratch_dir(prefix="harness-providers-") as raw:
+    root = Path(raw).resolve()
+    budget = {"turns": 2, "tool_calls": 4, "usd": 1, "seconds": 30}
+    for name in ("pi", "goose", "grok"):
+        done, row, report, run_dir, _home = run(root, name + "-budget", None, budget)
+        assert done.returncode != 0 and row is None and report is None, (name, done.stderr, row)
+        assert "refuse a USD budget rather than count $0" in done.stderr, done.stderr
+
+    done, row, report, _run_dir, _home = run(root, "pi-symlink-auth", PI, symlink_auth=True)
+    assert done.returncode != 0 and row is None and report is None, (done.stderr, row)
+    assert "symlink" in done.stderr, done.stderr
+
+    done, row, rep, run_dir, home = run(root, "pi", PI)
+    log = (run_dir / "cli.log").read_text() if run_dir else ""
+    assert done.returncode == 0 and row["verdict"] == "pass", (row.get("stop"), row.get("cli_exit"), log[-800:])
+    assert_boundary("pi", rep, run_dir, home)
+    # pi runs openai-codex/gpt-6.1-sol through an OAuth subscription login: subscription, $0, never unmetered api.
+    assert row["cost_class"] == "subscription" and row["cost_usd"] == 0.0, row
+    # An unmetered harness (goose may be on a paid key) that times out still finalizes with a null cost.
+    done, row, _, run_dir, _ = run(root, "goose-timeout", GOOSE, delay=2, timeout_s=1)
+    assert done.returncode == 1 and row["verdict"] == "fail" and row["stop"] == "timeout", (done.returncode, row, done.stderr)
+    assert row["cost_usd"] is None and (run_dir / "finalized.json").is_file(), row
+    assert "cost unmetered" in (run_dir / "transcript.md").read_text()
+    done, row, *_ = run(root, "pi-bad", PI[:1])
+    assert (row["verdict"], row["stop"]) == ("fail", "native_terminal_error"), row
+
+    done, row, rep, run_dir, home = run(root, "goose", GOOSE)
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    assert_boundary("goose", rep, run_dir, home)
+    assert (row["cost_usd"], row["est_basis"], row["input_tokens"], row["output_tokens"]) == (0.02, "api_list", 4, 2), row
+    done, row, rep, run_dir, home = run(root, "goose-turns", GOOSE, budget={"turns": 64, "tool_calls": 0, "usd": 0, "seconds": 30})
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    assert_boundary("goose", rep, run_dir, home, turns=64)
+    done, row, *_ = run(root, "goose-zero", GOOSE_ZERO)
+    assert (row["verdict"], row["stop"]) == ("fail", "no_model_call"), row
+    assert reason_of(row) == "no_model_call", row
+    assert row["cost_usd"] is None and row["est_basis"] == "unmetered", row
+    done, row, *_ = run(root, "goose-err", {"messages": [], "metadata": {"status": "error"}})
+    assert (row["verdict"], row["stop"]) == ("fail", "native_terminal_error"), row
+
+    done, row, rep, run_dir, home = run(root, "grok", GROK)
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    assert_boundary("grok", rep, run_dir, home)
+    assert row["cost_class"] == "subscription" and row["cost_usd"] == 0 and row["est_usd"] == 0.01, row
+    assert row["unmetered"] is True
+    done, row, rep, run_dir, home = run(root, "grok-turns", GROK, budget={"turns": 150, "tool_calls": 0, "usd": 0, "seconds": 30})
+    assert done.returncode == 0 and row["verdict"] == "pass", (row, done.stderr)
+    assert_boundary("grok", rep, run_dir, home, turns=150)
+    done, row, *_ = run(root, "grok-bad", {"stopReason": "max_tokens", "text": "x", "sessionId": "s",
+                                           "requestId": "r", "num_turns": 1})
+    assert (row["verdict"], row["stop"]) == ("fail", "native_terminal_error"), row
+
+print("check: pi, goose and grok take headless args in the workspace, stage only provider config/login read-only, "
+      "remove links before evidence, refuse a USD budget, and report goose no-model-call completions")

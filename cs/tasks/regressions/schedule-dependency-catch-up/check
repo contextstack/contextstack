@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+import json
+import importlib.machinery
+import importlib.util
+import subprocess
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+import os
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must use the same isolated roots as fixture subprocesses.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def tick(root, now, **extra):
+    ops = root / "ops/bin"
+    ops.mkdir(parents=True, exist_ok=True)
+    for name in ("schedule-tick", "_grant.py", "_estate_io.py", "_void.py"):
+        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+    (root / "ESTATE").write_text("dev\n")
+    (root / "grants").mkdir(exist_ok=True)
+    (root / "grants/fixture.yaml").write_text(
+        "id: fixture\nestate: dev\nrepo: /tmp/fixture\n"
+        "paths: [tasks, specs]\ngates: [\"true\"]\ncommit: true\n"
+        "status: active\nexpiry: 2999-01-01T00:00:00Z\n")
+    payload = {
+        "now": now,
+        "schedules": str(root / "schedules.jsonl"),
+        "fires": str(root / "fires.jsonl"),
+        "dispatch": str(root / "dispatch.jsonl"),
+        "lock": str(root / "schedule.lock"),
+        "scan_stale": False,
+        "dry_run": True,
+        "local_model_ready": True,
+    }
+    payload.update(extra)
+    result = subprocess.run([str(ops / "schedule-tick")], input=json.dumps(payload),
+                            text=True, capture_output=True, cwd=LAB, env={**hermetic_env()})
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def schedule(schedule_id, hour, requires=None, accept_check_failure_from=None):
+    row = {
+        "id": schedule_id,
+        "enabled": True,
+        "grant": "fixture",
+        "cron": "0 %d * * *" % hour,
+        "timezone": "UTC",
+        "task": "tasks/sweeps/fixture",
+        "spec": "specs/sweeps/fixture.yaml",
+        "root": "/tmp/fixture",
+        "lane": "shadow",
+    }
+    if requires:
+        row["requires"] = requires
+    if accept_check_failure_from:
+        row["accept_check_failure_from"] = accept_check_failure_from
+    return row
+
+
+loader = importlib.machinery.SourceFileLoader("schedule_tick_policy", str(LAB / "ops/bin/schedule-tick"))
+module_spec = importlib.util.spec_from_loader("schedule_tick_policy", loader)
+schedule_tick_policy = importlib.util.module_from_spec(module_spec)
+module_spec.loader.exec_module(schedule_tick_policy)
+try:
+    schedule_tick_policy.validate_dependencies([
+        schedule("judge", 14), schedule("bad-repair", 15, ["judge"], ["other"]),
+    ])
+    raise AssertionError("out-of-scope recovery dependency was accepted")
+except ValueError as error:
+    assert "subset of requires" in str(error)
+
+
+with scratch_dir(prefix="schedule-dependency-") as raw:
+    root = Path(raw)
+    write_jsonl(root / "schedules.jsonl", [
+        schedule("upstream", 14),
+        schedule("downstream", 15, ["upstream"]),
+    ])
+    first = tick(root, "2026-09-02T15:00:00+00:00")
+    assert [row["id"] for row in first["admitted"]] == ["upstream"]
+    assert first["deferred"] == [{
+        "id": "downstream",
+        "slot": "2026-09-02T15:00:00Z",
+        "reason": "dependency_not_ready",
+        "dependency": "upstream",
+        "required_slot": "2026-09-02T14:00:00Z",
+    }]
+    assert [json.loads(line)["id"] for line in (root / "fires.jsonl").read_text().splitlines()
+            if json.loads(line).get("job")] == ["upstream"]
+
+    write_jsonl(root / "dispatch.jsonl", [{
+        "ts": "2026-09-02T15:01:00Z",
+        "id": "dry-run",
+        "state": "done",
+        "schedule_id": "upstream",
+        "slot": "2026-09-02T14:00:00Z",
+    }])
+    second = tick(root, "2026-09-02T15:02:00+00:00")
+    assert [row["id"] for row in second["admitted"]] == ["downstream"]
+
+with scratch_dir(prefix="schedule-later-catch-up-") as raw:
+    root = Path(raw)
+    hourly = schedule("hourly-upstream", 14)
+    hourly["cron"] = "0 * * * *"
+    write_jsonl(root / "schedules.jsonl", [
+        hourly,
+        schedule("waiting-downstream", 15, ["hourly-upstream"]),
+    ])
+    write_jsonl(root / "fires.jsonl", [{
+        "ts": "2026-09-03T16:00:00Z",
+        "id": "hourly-upstream",
+        "slot": "2026-09-03T16:00:00Z",
+        "job": "later-success",
+        "lane": "shadow",
+    }])
+    write_jsonl(root / "dispatch.jsonl", [{
+        "ts": "2026-09-03T16:01:00Z",
+        "id": "later-success",
+        "state": "done",
+    }])
+    caught_up = tick(root, "2026-09-03T16:02:00+00:00")
+    assert [row["id"] for row in caught_up["admitted"]] == ["waiting-downstream"]
+
+with scratch_dir(prefix="schedule-check-recovery-") as raw:
+    root = Path(raw)
+    write_jsonl(root / "schedules.jsonl", [
+        schedule("judge", 14),
+        schedule("repair", 15, ["judge"], ["judge"]),
+    ])
+    write_jsonl(root / "fires.jsonl", [{
+        "ts": "2026-09-03T14:00:00Z", "id": "judge",
+        "slot": "2026-09-03T14:00:00Z", "job": "failed-check", "lane": "probe",
+    }])
+    write_jsonl(root / "dispatch.jsonl", [{
+        "ts": "2026-09-03T14:01:00Z", "id": "failed-check",
+        "state": "error", "verdict": "fail", "stop": "check",
+        "schedule_id": "judge", "schedule_slot": "2026-09-03T14:00:00Z",
+    }])
+    recovered = tick(root, "2026-09-03T15:02:00+00:00")
+    assert [row["id"] for row in recovered["admitted"]] == ["repair"]
+
+for terminal in (
+    {"state": "error", "verdict": "void", "stop": "check"},
+    {"state": "error", "verdict": "fail", "stop": "timeout"},
+    {"state": "error", "verdict": "fail", "stop": "executor_exit_1"},
+):
+    with scratch_dir(prefix="schedule-no-recovery-") as raw:
+        root = Path(raw)
+        write_jsonl(root / "schedules.jsonl", [
+            schedule("judge", 14),
+            schedule("repair", 15, ["judge"], ["judge"]),
+        ])
+        write_jsonl(root / "fires.jsonl", [{
+            "ts": "2026-09-03T14:00:00Z", "id": "judge",
+            "slot": "2026-09-03T14:00:00Z", "job": "not-recoverable", "lane": "probe",
+        }])
+        terminal.update(ts="2026-09-03T14:01:00Z", id="not-recoverable",
+                        schedule_id="judge", schedule_slot="2026-09-03T14:00:00Z")
+        write_jsonl(root / "dispatch.jsonl", [terminal])
+        refused = tick(root, "2026-09-03T15:02:00+00:00")
+        assert "repair" not in [row["id"] for row in refused["admitted"]]
+        assert any(row["id"] == "repair" and row["reason"] == "dependency_not_ready"
+                   for row in refused["deferred"])
+
+with scratch_dir(prefix="schedule-retry-") as raw:
+    root = Path(raw)
+    write_jsonl(root / "schedules.jsonl", [schedule("retryable", 14)])
+    write_jsonl(root / "fires.jsonl", [{
+        "ts": "2026-09-02T14:00:00Z",
+        "id": "retryable",
+        "slot": "2026-09-02T14:00:00Z",
+        "job": "failed-job",
+        "lane": "shadow",
+    }])
+    write_jsonl(root / "dispatch.jsonl", [{
+        "ts": "2026-09-02T14:01:00Z",
+        "id": "failed-job",
+        "state": "error",
+        "schedule_id": "retryable",
+        "slot": "2026-09-02T14:00:00Z",
+        "verdict": "void",
+        "stop": "error: gateway transport_failed",
+    }])
+    retried = tick(root, "2026-09-02T14:10:00+00:00")
+    assert [row["id"] for row in retried["admitted"]] == ["retryable"]
+    assert len([line for line in (root / "fires.jsonl").read_text().splitlines()
+                if json.loads(line).get("job")]) == 2
+
+with scratch_dir(prefix="schedule-direct-retry-") as raw:
+    root = Path(raw)
+    write_jsonl(root / "schedules.jsonl", [
+        schedule("direct-upstream", 14),
+        schedule("direct-downstream", 15, ["direct-upstream"]),
+    ])
+    write_jsonl(root / "fires.jsonl", [{
+        "ts": "2026-09-02T14:00:00Z",
+        "id": "direct-upstream",
+        "slot": "2026-09-02T14:00:00Z",
+        "job": "scheduled-failure",
+        "lane": "shadow",
+    }])
+    write_jsonl(root / "dispatch.jsonl", [
+        {"ts": "2026-09-02T14:01:00Z", "id": "scheduled-failure",
+         "state": "error", "schedule_id": "direct-upstream",
+         "schedule_slot": "2026-09-02T14:00:00Z", "verdict": "miss"},
+        {"ts": "2026-09-02T14:05:00Z", "id": "manual-retry",
+         "state": "done", "schedule_id": "direct-upstream",
+         "schedule_slot": "2026-09-02T14:00:00Z", "verdict": "pass"},
+        {"ts": "2026-09-02T14:06:00Z", "id": "wrong-day",
+         "state": "done", "schedule_id": "direct-upstream",
+         "schedule_slot": "2026-09-01T14:00:00Z", "verdict": "pass"},
+    ])
+    reconciled = tick(root, "2026-09-02T15:02:00+00:00")
+    assert [row["id"] for row in reconciled["admitted"]] == ["direct-downstream"]
+    assert reconciled["deferred"] == []
+
+with scratch_dir(prefix="schedule-reboot-") as raw:
+    root = Path(raw)
+    dispatch = root / "dispatch.jsonl"
+    write_jsonl(dispatch, [{
+        "ts": "2026-09-02T14:01:00Z",
+        "id": "orphaned-job",
+        "state": "running",
+        "pid": 2147483647,
+        "schedule_id": "after-reboot",
+        "slot": "2026-09-02T14:00:00Z",
+    }])
+    loader = importlib.machinery.SourceFileLoader("lab_tick", str(LAB / "ops/bin/tick"))
+    module_spec = importlib.util.spec_from_loader("lab_tick", loader)
+    lab_tick = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(lab_tick)
+    lab_tick.Q = dispatch
+    lab_tick.LOCK = root / "dispatch.lock"
+    assert lab_tick.recover_orphaned_jobs() == ["orphaned-job"]
+    terminal = json.loads(dispatch.read_text().splitlines()[-1])
+    assert terminal["state"] == "error" and terminal["verdict"] == "void"
+    assert terminal["stop"] == "error: scheduler orphaned_running after restart"
+
+    write_jsonl(root / "schedules.jsonl", [schedule("after-reboot", 14)])
+    write_jsonl(root / "fires.jsonl", [{
+        "ts": "2026-09-02T14:00:00Z",
+        "id": "after-reboot",
+        "slot": "2026-09-02T14:00:00Z",
+        "job": "orphaned-job",
+        "lane": "shadow",
+    }])
+    restarted = tick(root, "2026-09-02T14:10:00+00:00")
+    assert [row["id"] for row in restarted["admitted"]] == ["after-reboot"]
+
+with scratch_dir(prefix="schedule-hard-failure-") as raw:
+    root = Path(raw)
+    write_jsonl(root / "schedules.jsonl", [schedule("hard-failure", 14)])
+    write_jsonl(root / "fires.jsonl", [{
+        "ts": "2026-09-02T14:00:00Z",
+        "id": "hard-failure",
+        "slot": "2026-09-02T14:00:00Z",
+        "job": "failed-job",
+        "lane": "shadow",
+    }])
+    write_jsonl(root / "dispatch.jsonl", [{
+        "ts": "2026-09-02T14:01:00Z",
+        "id": "failed-job",
+        "state": "error",
+        "verdict": "miss",
+        "stop": "check:1",
+    }])
+    failed = tick(root, "2026-09-02T14:10:00+00:00")
+    assert failed["admitted"] == []
+    assert failed["deferred"] == [{
+        "id": "hard-failure",
+        "slot": "2026-09-02T14:00:00Z",
+        "reason": "prior_attempt_failed",
+    }]
+    retried = tick(root, "2026-09-02T14:11:00+00:00",
+                   retry_failed=["hard-failure"])
+    assert [row["id"] for row in retried["admitted"]] == ["hard-failure"]
+    attempts = [json.loads(line) for line in (root / "fires.jsonl").read_text().splitlines()
+                if json.loads(line).get("job")]
+    assert len(attempts) == 2 and attempts[0]["job"] == "failed-job"
+
+# Failed catch-up freezes the caught-up slot for the day: no second automatic
+# admission, and a dependent stays dependency_not_ready on that required slot.
+with scratch_dir(prefix="schedule-catchup-freeze-") as raw:
+    root = Path(raw)
+    write_jsonl(root / "schedules.jsonl", [
+        {**schedule("upstream", 10), "catch_up_window_minutes": 1440},
+        {**schedule("downstream", 12, requires=["upstream"]), "catch_up_window_minutes": 1440},
+    ])
+    # Catch-up fired the 10:00 slot late; it failed hard.
+    write_jsonl(root / "fires.jsonl", [{
+        "ts": "2026-09-02T15:58:00Z",
+        "id": "upstream",
+        "slot": "2026-09-02T10:00:00Z",
+        "job": "catchup-failed",
+        "lane": "shadow",
+    }])
+    write_jsonl(root / "dispatch.jsonl", [{
+        "ts": "2026-09-02T16:00:00Z",
+        "id": "catchup-failed",
+        "schedule_id": "upstream",
+        "schedule_slot": "2026-09-02T10:00:00Z",
+        "state": "error",
+        "verdict": "fail",
+        "stop": "budget:turns",
+    }])
+    later = tick(root, "2026-09-02T16:30:00+00:00")
+    assert later["admitted"] == []
+    assert {"id": "upstream", "slot": "2026-09-02T10:00:00Z",
+            "reason": "prior_attempt_failed"} in later["deferred"]
+    blocked = [row for row in later["deferred"] if row.get("id") == "downstream"]
+    assert blocked and blocked[0].get("reason") == "dependency_not_ready"
+    assert blocked[0].get("dependency") == "upstream"
+    # Still frozen an hour later without retry_failed.
+    still = tick(root, "2026-09-02T17:30:00+00:00")
+    assert still["admitted"] == []
+    assert {"id": "upstream", "slot": "2026-09-02T10:00:00Z",
+            "reason": "prior_attempt_failed"} in still["deferred"]
+
+print("check: dependency waits and transport retries preserve schedule slots")
+print("check: failed catch-up freezes the slot; dependents stay not ready")

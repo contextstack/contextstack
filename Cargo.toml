@@ -1,0 +1,38 @@
+[workspace]
+members = ["director", "gateway", "harness", "sandbox", "tools"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libyaml-safer = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "process", "signal", "time", "net", "io-util", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+module_name_repetitions = { level = "allow", priority = 1 } # Names remain clear at their module boundary.
+must_use_candidate = { level = "allow", priority = 1 } # Avoid annotations on every accessor.
+missing_errors_doc = { level = "allow", priority = 1 } # Internal errors are carried by the wire-compatible text contract.
+
+[profile.release]
+lto = "thin"
+strip = true

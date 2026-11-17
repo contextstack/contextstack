@@ -1,0 +1,121 @@
+[
+  {
+    "adapter": {
+      "auth_mode": "none",
+      "auth_paths": [],
+      "database_parent": null,
+      "localhost_port": null,
+      "project_config_paths": [
+        "/typed home+[test]/workspace/.grok",
+        "/typed home+[test]/workspace/.opencode",
+        "/typed home+[test]/workspace/.pi",
+        "/typed home+[test]/workspace/.claude",
+        "/typed home+[test]/workspace/.cursor",
+        "/typed home+[test]/workspace/opencode.json",
+        "/typed home+[test]/workspace/opencode.jsonc"
+      ]
+    },
+    "expected": [
+      "(deny file-read* (subpath \"/typed home+[test]/Library/Keychains\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.grok\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.opencode\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.pi\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.claude\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.cursor\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.json\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.jsonc\"))"
+    ]
+  },
+  {
+    "adapter": {
+      "auth_mode": "oauth_file",
+      "auth_paths": [
+        "/typed home+[test]/.grok/auth.json",
+        "/typed home+[test]/workspace/private/auth.json"
+      ],
+      "database_parent": null,
+      "localhost_port": null,
+      "project_config_paths": [
+        "/typed home+[test]/workspace/.grok",
+        "/typed home+[test]/workspace/.opencode",
+        "/typed home+[test]/workspace/.pi",
+        "/typed home+[test]/workspace/.claude",
+        "/typed home+[test]/workspace/.cursor",
+        "/typed home+[test]/workspace/opencode.json",
+        "/typed home+[test]/workspace/opencode.jsonc"
+      ]
+    },
+    "expected": [
+      "(deny file-read* (subpath \"/typed home+[test]/Library/Keychains\"))",
+      "(allow file-read* (literal \"/typed home+[test]/.grok/auth.json\"))",
+      "(deny file-write* (literal \"/typed home+[test]/workspace/private/auth.json\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.grok\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.opencode\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.pi\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.claude\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.cursor\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.json\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.jsonc\"))",
+      "(allow file-read* (literal \"/typed home+[test]/.grok/auth.json\"))"
+    ]
+  },
+  {
+    "adapter": {
+      "auth_mode": "opencode_db",
+      "auth_paths": [],
+      "database_parent": "/typed home+[test]/.local/share/opencode",
+      "localhost_port": 321,
+      "project_config_paths": [
+        "/typed home+[test]/workspace/.grok",
+        "/typed home+[test]/workspace/.opencode",
+        "/typed home+[test]/workspace/.pi",
+        "/typed home+[test]/workspace/.claude",
+        "/typed home+[test]/workspace/.cursor",
+        "/typed home+[test]/workspace/opencode.json",
+        "/typed home+[test]/workspace/opencode.jsonc"
+      ]
+    },
+    "expected": [
+      "(deny file-read* (subpath \"/typed home+[test]/Library/Keychains\"))",
+      "(deny file-read* file-write* (subpath \"/typed home+[test]/.local/share/opencode\"))",
+      "(deny network-outbound)",
+      "(allow network-outbound (remote ip \"localhost:321\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.grok\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.opencode\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.pi\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.claude\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.cursor\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.json\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.jsonc\"))"
+    ]
+  },
+  {
+    "adapter": {
+      "auth_mode": "none",
+      "auth_paths": [],
+      "database_parent": null,
+      "localhost_port": "*",
+      "project_config_paths": [
+        "/typed home+[test]/workspace/.grok",
+        "/typed home+[test]/workspace/.opencode",
+        "/typed home+[test]/workspace/.pi",
+        "/typed home+[test]/workspace/.claude",
+        "/typed home+[test]/workspace/.cursor",
+        "/typed home+[test]/workspace/opencode.json",
+        "/typed home+[test]/workspace/opencode.jsonc"
+      ]
+    },
+    "expected": [
+      "(deny file-read* (subpath \"/typed home+[test]/Library/Keychains\"))",
+      "(deny network-outbound)",
+      "(allow network-outbound (remote ip \"localhost:*\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.grok\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.opencode\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.pi\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.claude\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/.cursor\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.json\"))",
+      "(deny file-read* (subpath \"/typed home+[test]/workspace/opencode.jsonc\"))"
+    ]
+  }
+]

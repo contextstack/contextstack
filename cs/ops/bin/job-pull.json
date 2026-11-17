@@ -1,0 +1,8 @@
+{
+  "description": "Tick, on a fleet node (policy/spool.json receiver kind director): accept the director's jobs. Each job's objects (frozen spec, task, prompts) are fetched and sha256-verified, the bundle materialised once into <state>/jobs/<job_id>/, one pending row {spec, task, director_job} appended to <state>/dispatch.jsonl under dispatch.lock, then the job accepted. Idempotent across restarts; an unreachable director changes nothing. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  }
+}

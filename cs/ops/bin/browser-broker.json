@@ -1,0 +1,12 @@
+{
+  "description": "Operator: serve a dedicated Google Chrome (own profile under ~/.contextstack/browser, Chrome's sandbox on, CDP over a pipe) to sandboxed tools, one 0600 unix socket per origin set in policy/browser.json. Verb open {url}: allowlisted navigation only, page text back, every navigation logged. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "headed": {"type": "boolean"},
+      "config": {"type": "string"},
+      "root": {"type": "string"},
+      "chrome": {"type": "string"}
+    }
+  }
+}

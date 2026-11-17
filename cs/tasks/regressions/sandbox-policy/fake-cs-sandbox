@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in for cs-sandbox (contract: --policy P [--cwd D] [--report-dir D] -- tool [args]).
+# Records its argv in $HOME/fake-cs-sandbox.log, then execs the tool unconfined.
+printf '%s\n' "$*" >> "$HOME/fake-cs-sandbox.log"
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
+[ "$1" = "--" ] || { echo "fake-cs-sandbox: no -- in argv" >&2; exit 2; }
+shift
+exec "$@"

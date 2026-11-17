@@ -1,0 +1,79 @@
+{
+  "providers": [
+    {
+      "name": "anthropic",
+      "protocol": "anthropic_messages",
+      "requires_key": true,
+      "endpoint": "https://api.anthropic.com",
+      "default_model": "claude-sonnet-4-5-20250929"
+    },
+    {
+      "name": "openai",
+      "protocol": "openai_chat_completions",
+      "requires_key": true,
+      "endpoint": "https://api.openai.com/v1",
+      "default_model": "gpt-4o"
+    },
+    {
+      "name": "groq",
+      "protocol": "openai_chat_completions",
+      "requires_key": true,
+      "endpoint": "https://api.groq.com/openai/v1",
+      "default_model": "llama-3.3-70b-versatile"
+    },
+    {
+      "name": "together",
+      "protocol": "openai_chat_completions",
+      "requires_key": true,
+      "endpoint": "https://api.together.xyz/v1",
+      "default_model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    },
+    {
+      "name": "lambda",
+      "protocol": "openai_chat_completions",
+      "requires_key": true,
+      "endpoint": "https://api.lambda.ai/v1",
+      "default_model": "hermes-3-llama-3.1-405b-fp8"
+    },
+    {
+      "name": "openrouter",
+      "protocol": "openai_chat_completions",
+      "requires_key": true,
+      "endpoint": "https://openrouter.ai/api/v1",
+      "default_model": "openai/gpt-4o-mini"
+    },
+    {
+      "name": "gemini",
+      "protocol": "openai_chat_completions",
+      "requires_key": true,
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "default_model": "gemini-2.0-flash"
+    },
+    {
+      "name": "typesafe",
+      "protocol": "typesafe_systemone",
+      "requires_key": true,
+      "default_cost_per_1k": 4.2e-05,
+      "endpoint": "https://api.typesafe.ai/v1",
+      "default_model": "jev-latest"
+    },
+    {
+      "name": "ollama",
+      "protocol": "openai_chat_completions",
+      "requires_key": false,
+      "default_cost_per_1k": 0.002,
+      "endpoint": "http://localhost:11434/v1"
+    },
+    {
+      "name": "vllm",
+      "protocol": "openai_chat_completions",
+      "requires_key": false,
+      "endpoint": "http://127.0.0.1:8000/v1"
+    },
+    {
+      "name": "mock",
+      "protocol": "mock",
+      "requires_key": false
+    }
+  ]
+}

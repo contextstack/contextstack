@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""init-toolchains regression (goal.md): cs init detects login-shell toolchains; doctor reports stale entries."""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2]))
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from hermetic_env import hermetic_env
+from scratch import scratch_dir
+
+LAB = HERE.parents[2]
+problems = []
+
+
+def expect(cond, msg):
+    print(("ok   " if cond else "FAIL ") + msg)
+    if not cond:
+        problems.append(msg)
+
+
+def write_atomic(path, data, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(mode)
+
+
+def lookup_script():
+    sys.path.insert(0, str(LAB / "scripts"))
+    import cs_init
+    return ";".join("command -v %s" % name for name in cs_init.TOOLCHAIN_BINARIES)
+
+
+def run_step(home, shell, env_extra=None, verbose=False):
+    config = home / ".contextstack/config"
+    config.mkdir(parents=True, exist_ok=True)
+    env = hermetic_env()
+    env.update(HOME=str(home), SHELL=str(shell), CS_SERVICE_PATH="/usr/bin:/bin"); env.update(env_extra or {})
+    program = (
+        "def _write_atomic(path, data, mode):\n from pathlib import Path\n path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)\n path.write_bytes(data); path.chmod(mode)\n"
+        "import sys; from pathlib import Path; from types import SimpleNamespace; "
+        "sys.path.insert(0, %r); import cs_init; "
+        "init = cs_init.Init.__new__(cs_init.Init); "
+        "init.config = Path(%r); "
+        "init.args = SimpleNamespace(verbose=%s); "
+        "init.cs = SimpleNamespace(HOME=Path(%r), CURRENT=Path(%r)); "
+        "init.nr = __import__('types').SimpleNamespace(SYSTEM_PATH='/usr/bin:/bin', "
+        "write_atomic=_write_atomic); "
+        "lines = []; init.say = lines.append; "
+        "init.detail = (lambda line: lines.append(line)) if %s else (lambda line: None); "
+        "init.step_toolchains(); print('\\n'.join(lines))"
+    ) % (
+        str(LAB / "scripts"),
+        str(config),
+        verbose,
+        str(home),
+        str(home / ".contextstack/current"),
+        verbose,
+    )
+    (home / ".contextstack/current/code/.venv/bin").mkdir(parents=True, exist_ok=True)
+    return subprocess.run(
+        [sys.executable, "-c", program, *(["--verbose"] if verbose else [])],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def shell_script(home, body):
+    script = home / "fixture-shell"
+    script.write_text("#!%s\n%s" % (sys.executable, body))
+    script.chmod(0o755)
+    return script
+
+
+def main():
+    lookup = lookup_script()
+    with scratch_dir(prefix="init-toolchains-") as tmp:
+        home = Path(tmp).resolve() / "home"
+        home.mkdir()
+        config = home / ".contextstack/config"
+        config.mkdir(parents=True, exist_ok=True)
+        destination = config / "toolchains.json"
+        binaries = home / "toolchains/bin"
+        binaries.mkdir(parents=True, exist_ok=True)
+        for name in ("php", "node"):
+            (binaries / name).write_bytes(b"fixture")
+            (binaries / name).chmod(0o755)
+
+        shell = shell_script(
+            home,
+            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')"
+            % (lookup, "".join(str(binaries / n) + "\n" for n in ("php", "node"))),
+        )
+        r = run_step(home, shell)
+        expect(r.returncode == 0, "detection succeeds: " + r.stderr)
+        expected = [{"name": name, "bin": str(binaries)} for name in ("php", "node")]
+        expect(destination.is_file() and json.loads(destination.read_text()) == expected, "toolchains written")
+        expect(r.stdout.strip().splitlines() == ["php: %s" % binaries, "node: %s" % binaries], "one line per add")
+
+        custom = [{"name": "custom", "bin": "/custom"}]
+        destination.write_text(json.dumps(custom, indent=2) + "\n")
+        r = run_step(home, shell)
+        merged = custom + expected
+        expect(json.loads(destination.read_text()) == merged, "merge keeps hand-edited entry")
+        expect("php: %s" % binaries in r.stdout, "merge still prints new lines")
+
+        on_path = home / "usr-bin"
+        on_path.mkdir()
+        (on_path / "php").write_bytes(b"on-path")
+        (on_path / "php").chmod(0o755)
+        destination.unlink()
+        shell = shell_script(
+            home,
+            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(on_path / "php") + "\n"),
+        )
+        r = run_step(home, shell, env_extra={"CS_SERVICE_PATH": "%s:/usr/bin:/bin" % on_path})
+        expect(not destination.exists() and r.stdout.strip() == "", "on service PATH: skip, no file")
+
+        destination.write_text("[]\n")
+        before = destination.read_text()
+        shell = shell_script(home, "import sys, time\ntime.sleep(30)\n")
+        env = hermetic_env()
+        env.update(HOME=str(home), SHELL=str(shell), CS_SERVICE_PATH="/usr/bin:/bin")
+        (home / ".contextstack/current/code/.venv/bin").mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "def _write_atomic(path, data, mode):\n from pathlib import Path\n path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)\n path.write_bytes(data); path.chmod(mode)\nimport sys; sys.path.insert(0, %r); from pathlib import Path; "
+             "from types import SimpleNamespace; import cs_init; "
+             "init = cs_init.Init.__new__(cs_init.Init); init.config = Path(%r); "
+             "init.args = SimpleNamespace(verbose=False); "
+             "init.cs = SimpleNamespace(HOME=Path(%r), CURRENT=Path(%r)); "
+             "init.nr = SimpleNamespace(SYSTEM_PATH='/usr/bin:/bin', write_atomic=_write_atomic); "
+             "init.say = print; init.detail = lambda l: None; init.step_toolchains()" % (
+                 str(LAB / "scripts"), str(config), str(home), str(home / ".contextstack/current"))],
+            env=env, capture_output=True, text=True, timeout=20,
+        )
+        expect(destination.read_text() == before and "toolchains: login shell lookup failed" in r.stdout,
+               "timeout: plain message, file unchanged")
+
+        shell = shell_script(home, "import sys\nsys.exit(1)\n")
+        before = destination.read_text()
+        r = run_step(home, shell)
+        expect(destination.read_text() == before and "toolchains: login shell lookup failed" in r.stdout,
+               "shell failure: plain message, file unchanged")
+
+        destination.unlink(missing_ok=True)
+        shell = shell_script(
+            home,
+            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(home / "missing-php") + "\n"),
+        )
+        r = run_step(home, shell)
+        expect(not destination.exists() and r.stdout.strip() == "", "missing binary skipped")
+
+
+        uv_bin = home / ".local/bin"
+        uv_py = home / ".local/share/uv/python"
+        uv_bin.mkdir(parents=True)
+        uv_py.mkdir(parents=True)
+        uv_path = uv_bin / "uv"
+        uv_path.write_text(
+            "#!" + sys.executable + "\n"
+            "import sys\n"
+            "if sys.argv[1:3] == [\"python\", \"dir\"]:\n print(%r); raise SystemExit(0)\n"
+            % str(uv_py)
+        )
+        uv_path.chmod(0o755)
+        destination.unlink(missing_ok=True)
+        shell = shell_script(
+            home,
+            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(uv_path) + "\n"),
+        )
+        r = run_step(home, shell)
+        uv_expected = {"name": "uv", "bin": str(uv_bin), "python": str(uv_py)}
+        expect(r.returncode == 0, "uv detection succeeds: " + r.stderr)
+        expect(destination.is_file() and json.loads(destination.read_text()) == [uv_expected], "uv toolchain written")
+        expect(r.stdout.strip() == "uv: %s" % uv_bin, "uv line printed")
+
+        cargo_bin = home / ".cargo/bin"
+        cargo_rustup = home / ".rustup"
+        cargo_tc = cargo_rustup / "toolchains/fake"
+        cargo_reg = home / ".cargo/registry"
+        cargo_bin.mkdir(parents=True)
+        cargo_tc.mkdir(parents=True)
+        cargo_reg.mkdir(parents=True)
+        (cargo_rustup / "settings.toml").write_text("version = 3\n")
+        rustc_path = cargo_bin / "rustc"
+        rustc_path.write_text(
+            "#!" + sys.executable + "\n"
+            "import sys\n"
+            "if sys.argv[1:3] == ['--print', 'sysroot']:\n print(%r); raise SystemExit(0)\n"
+            % str(cargo_tc)
+        )
+        rustc_path.chmod(0o755)
+        cargo_path = cargo_bin / "cargo"
+        cargo_path.write_text("#!" + sys.executable + "\nraise SystemExit(0)\n")
+        cargo_path.chmod(0o755)
+        destination.unlink(missing_ok=True)
+        shell = shell_script(
+            home,
+            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(cargo_path) + "\n"),
+        )
+        r = run_step(home, shell)
+        cargo_expected = {"name": "cargo", "bin": str(cargo_bin), "rustup": str(cargo_rustup),
+                          "toolchain": str(cargo_tc), "registry": str(cargo_reg)}
+        expect(r.returncode == 0, "cargo detection succeeds: " + r.stderr)
+        expect(destination.is_file() and json.loads(destination.read_text()) == [cargo_expected], "cargo toolchain written")
+        expect(r.stdout.strip() == "cargo: %s" % cargo_bin, "cargo line printed")
+
+        sys.path.insert(0, str(LAB / "ops/bin"))
+
+        import _toolchains
+        stale = home / ".contextstack/config/toolchains.json"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text(json.dumps([{"name": "php", "bin": "/gone/bin"}], indent=2) + "\n")
+        findings = _toolchains.doctor_findings(stale)
+        expect(len(findings) == 1 and not findings[0]["ok"] and "/gone/bin/php" in findings[0]["detail"],
+               "doctor reports missing toolchain binary")
+
+        stale.write_text(json.dumps([{"name": "cargo", "bin": "/gone/cargo/bin", "rustup": "/gone/rustup",
+                                      "toolchain": "/gone/tc", "registry": "/gone/reg"}], indent=2) + "\n")
+        cargo_findings = _toolchains.doctor_findings(stale)
+        expect(len(cargo_findings) == 1 and not cargo_findings[0]["ok"] and "cargo" in cargo_findings[0]["check"],
+               "doctor reports missing cargo toolchain")
+
+    print("init-toolchains: %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

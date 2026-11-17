@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+# post_turn: same tool+args three times in a row → inject and refuse done
+# for this turn only. No new calls this turn → silent (so a later stop=done
+# is not trapped by a stale log). Hook sees the workspace, not the runner.
+import os, sys
+
+LOG, MARK = ".lab-calls.jsonl", ".lab-doom-mark"
+
+rows = []
+if os.path.isfile(LOG):
+    rows = [ln for ln in open(LOG, encoding="utf-8") if ln.strip()]
+n = len(rows)
+prev = 0
+if os.path.isfile(MARK):
+    try:
+        prev = int(open(MARK, encoding="utf-8").read().strip() or "0")
+    except ValueError:
+        prev = 0
+open(MARK, "w", encoding="utf-8").write(str(n))
+if n <= prev or n < 3:
+    sys.exit(0)
+if rows[-1] == rows[-2] == rows[-3]:
+    print("doom_loop: same tool+args x3 — that observation is already in hand; do not re-issue it.")
+    sys.exit(1)
+sys.exit(0)

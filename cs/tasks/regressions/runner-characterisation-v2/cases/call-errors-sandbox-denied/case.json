@@ -1,0 +1,7 @@
+{
+ "messages": true,
+ "env": {
+  "CS_TOOL_PREFIX": "<ESTATE>/fixture/fx_reporting --report-dir <ESTATE>/ledger/sandbox-reports/cell-a --"
+ },
+ "sandbox_reports": true
+}

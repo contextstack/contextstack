@@ -1,0 +1,9 @@
+[
+ {
+  "error": {
+   "class": "fatal_session",
+   "code": "gateway.no_provider_credential",
+   "message": "no credential for provider"
+  }
+ }
+]

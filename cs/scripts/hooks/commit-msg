@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Strip Co-authored-by so Cursor injection cannot land (AGENTS.md).
+msg="$1"
+case "$msg" in /*) ;; *) msg="$PWD/$msg" ;; esac
+# lab may be a repo of its own or a subfolder of one: root is this file's lab.
+root=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$root" || exit 1
+if grep -qiE 'Co-Authored-By:|Co-authored-by:|Generated with' "$msg"; then
+  grep -viE 'Co-Authored-By:|Co-authored-by:|Generated with' "$msg" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba' > "$msg.stripped"
+  mv "$msg.stripped" "$msg"
+fi
+python3 "$root/scripts/ops-cap.py" commit-msg "$msg" || exit 1
+python3 "$root/scripts/check-red-gate" commit-msg "$msg" || exit 1
+exit 0

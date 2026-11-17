@@ -1,0 +1,181 @@
+{
+  "version": 2,
+  "source": "scripts/tool-reach --manifest (reachability under --no-sweeps; regenerate: scripts/tool-reach --manifest > tools/manifest.json)",
+  "reviewed_by": "the owner, 2026-11-08: node image = tools reached from live specs, hooks, dispatcher, operator and Director without specs/sweeps and specs/judgments as roots, plus operator_roots (vault review record §8)",
+  "roots_counted": [
+    "check",
+    "dispatcher",
+    "operator_doc",
+    "operator_roots"
+  ],
+  "operator_roots": {
+    "names": [
+      "browser_fetch",
+      "browser_session",
+      "defuddle_extract",
+      "evidence_assert",
+      "exec",
+      "fs_edit",
+      "fs_read",
+      "fs_write",
+      "okf",
+      "search",
+      "web_fetch",
+      "web_search"
+    ],
+    "decided_by": "the owner",
+    "date": "2026-11-08",
+    "recorded": "vault review record §8 (Plan.CS.v2.1 §7); browser_session added by the owner 2026-11-09"
+  },
+  "requires_manual": {
+    "browser_fetch": [
+      "gstack browse (LAB_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)",
+      "Playwright chromium_headless_shell-1208 (PLAYWRIGHT_BROWSERS_PATH or .estate/runtime/ms-playwright)"
+    ],
+    "defuddle_extract": [
+      "tools/defuddle/extract.mjs with its node_modules"
+    ],
+    "browser_session": [
+      "a running ops/bin/browser-broker (Google Chrome; policy/browser.json sets), granted by sandbox.json sockets"
+    ]
+  },
+  "tools": [
+    {
+      "name": "browser_fetch",
+      "descriptor": "tools/bin/browser_fetch.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": [
+        "Playwright chromium_headless_shell-1208 (PLAYWRIGHT_BROWSERS_PATH or .estate/runtime/ms-playwright)",
+        "curl",
+        "gstack browse (LAB_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)"
+      ]
+    },
+    {
+      "name": "browser_session",
+      "descriptor": "tools/bin/browser_session.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": [
+        "a running ops/bin/browser-broker (Google Chrome; policy/browser.json sets), granted by sandbox.json sockets",
+        "curl"
+      ]
+    },
+    {
+      "name": "defuddle_extract",
+      "descriptor": "tools/bin/defuddle_extract.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_doc",
+        "operator_roots"
+      ],
+      "requires": [
+        "curl",
+        "node",
+        "tools/defuddle/extract.mjs with its node_modules"
+      ]
+    },
+    {
+      "name": "evidence_assert",
+      "descriptor": "tools/bin/evidence_assert.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": []
+    },
+    {
+      "name": "exec",
+      "descriptor": "tools/bin/exec.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": [
+        "bwrap",
+        "sandbox-exec"
+      ]
+    },
+    {
+      "name": "fs_edit",
+      "descriptor": "tools/bin/fs_edit.json",
+      "runtime": "exe",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": [
+        "target/release/cs-tools"
+      ]
+    },
+    {
+      "name": "fs_read",
+      "descriptor": "tools/bin/fs_read.json",
+      "runtime": "exe",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": [
+        "target/release/cs-tools"
+      ]
+    },
+    {
+      "name": "fs_write",
+      "descriptor": "tools/bin/fs_write.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": []
+    },
+    {
+      "name": "okf",
+      "descriptor": "tools/bin/okf.json",
+      "runtime": "exe",
+      "reached_from": [
+        "check",
+        "dispatcher",
+        "operator_roots"
+      ],
+      "requires": [
+        "target/release/cs-tools"
+      ]
+    },
+    {
+      "name": "search",
+      "descriptor": "tools/bin/search.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": []
+    },
+    {
+      "name": "web_fetch",
+      "descriptor": "tools/bin/web_fetch.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_doc",
+        "operator_roots"
+      ],
+      "requires": [
+        "curl"
+      ]
+    },
+    {
+      "name": "web_search",
+      "descriptor": "tools/bin/web_search.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_doc",
+        "operator_roots"
+      ],
+      "requires": [
+        "curl"
+      ]
+    }
+  ]
+}

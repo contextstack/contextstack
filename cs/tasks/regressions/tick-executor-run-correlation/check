@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import json
+import tempfile
+from pathlib import Path
+import os
+import sys
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must use the same isolated roots as fixture subprocesses.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+loader = importlib.machinery.SourceFileLoader("tick_executor_correlation", str(LAB / "ops/bin/tick"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+tick = importlib.util.module_from_spec(spec)
+loader.exec_module(tick)
+
+with scratch_dir(prefix="tick-correlation-") as raw:
+    ledger = Path(raw) / "ledger.jsonl"
+    ledger.write_text("\n".join(json.dumps(row) for row in (
+        {"spec": "corpus-portfolio-brief", "transcript": "old-local-run",
+         "trial": 1, "verdict": "pass"},
+        {"spec": "specs/sweeps/portfolio-brief.yaml", "transcript": "old-applied",
+         "verdict": "applied", "stop": "merge"},
+        {"spec": "specs/sweeps/portfolio-brief.yaml", "transcript": "new-cli-run",
+         "trial": 1, "verdict": "pass"},
+    )) + "\n", encoding="utf-8")
+    tick.LEDGER = ledger
+    row = tick.execution_row("specs/sweeps/portfolio-brief.yaml",
+                             "corpus-portfolio-brief", 2)
+    assert row["transcript"] == "new-cli-run"
+
+    ledger.write_text("\n".join(json.dumps(row) for row in (
+        {"spec": "specs/sweeps/aidailybrief-monitor.yaml", "transcript": "old-path-run",
+         "trial": 1, "verdict": "pass", "model": "other"},
+        {"spec": "corpus-aidailybrief-monitor", "transcript": "new-local-run",
+         "trial": 1, "verdict": "pass", "model": "local-coder"},
+    )) + "\n", encoding="utf-8")
+    row = tick.execution_row("specs/sweeps/aidailybrief-monitor.yaml",
+                             "corpus-aidailybrief-monitor", 1)
+    assert row["transcript"] == "new-local-run"
+
+    ledger.write_text("\n".join(json.dumps(row) for row in (
+        {"spec": "corpus-dark-factory-landscape-sweep", "transcript": "old-id-run",
+         "trial": 1, "verdict": "pass", "model": "other"},
+        {"spec": "unrelated", "transcript": "new-unrelated-run",
+         "trial": 1, "verdict": "pass", "model": "local-coder"},
+    )) + "\n", encoding="utf-8")
+    row = tick.execution_row("specs/sweeps/dark-factory-landscape-sweep.yaml",
+                             "corpus-dark-factory-landscape-sweep", 1)
+    assert row == {}, "historical matching receipt was reused"
+
+source = (LAB / "ops/bin/tick").read_text(encoding="utf-8")
+assert "before = ledger_size()" in source
+assert "row = execution_row(rel, sid, before)" in source
+print("check: tick binds scheduled CLI and Lab jobs to fresh execution rows")
+
+# Director job 1789261515218486000 carried a grant, but the CLI
+# work order discarded it and froze grant.state=absent, preventing repair.
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from functools import partial
+with scratch_dir(prefix="tick-grant-") as raw:
+    tick.Q = Path(raw) / "dispatch.jsonl"
+    tick.Q.write_text("\n".join(json.dumps(row) for row in (
+        {"state": "pending", "id": "A", "spec": "same.yaml", "grant": "g-alpha"},
+        {"state": "running", "id": "A", "spec": "same.yaml", "grant": "g-alpha"},
+        {"state": "pending", "id": "B", "spec": "same.yaml"},
+        {"state": "pending", "id": "C", "spec": "same.yaml", "grant": "g-gamma"},
+    )) + "\n")
+    for job, expected in (("A", "g-alpha"), ("B", None), ("C", "g-gamma"), ("missing", None), ("", None)):
+        launch = Mock(return_value=SimpleNamespace(returncode=0))
+        with patch.object(tick, "run_teed", partial(tick.run_teed, run=launch)):
+            assert tick.one_executor_trial("same.yaml", "model: claude-code-sonnet", "task", 1, job) == 0
+        payload = json.loads(launch.call_args.kwargs["input"])
+        assert payload.get("grant") == expected, (job, payload, expected)
+print("check: CLI work order preserves only its exact queued job grant")

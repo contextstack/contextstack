@@ -1,0 +1,17 @@
+[
+ {
+  "ok": {
+   "text": "an exe tool and a file pair, both under the prefix",
+   "tool_calls": [
+    {"id": "c1", "name": "fx_exe", "args": {"k": "v w"}},
+    {"id": "c2", "name": "fx_tool", "args": {"mode": "both"}}
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

@@ -1,0 +1,5 @@
+{
+  "mcp_config": "session/mcp.json",
+  "credential_file": "config/lead-credential",
+  "note": "Session host (lane 3): substitute mcp.json CREDENTIAL_FILE with the install's config/lead-credential before --mcp-config."
+}

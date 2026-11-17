@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[3]
+subprocess.run([sys.executable, str(Path(__file__).with_name("verify_retry.py"))], check=True, env={**hermetic_env()})
+with scratch_dir(prefix="executor-timeout-") as raw:
+    lab = Path(raw) / "lab"
+    ops = lab / "ops/bin"
+    task = lab / "tasks/fixture"
+    ledger = lab / "ledger"
+    fake = lab / "fake"
+    for path in (ops, task, ledger, fake):
+        path.mkdir(parents=True, exist_ok=True)
+    for name in ('_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_est.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py",
+                 "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "capture-stimulus", "publish-evidence",
+                 "harvest", "_run_record.py", "_env_policy.py", "_errors.py", "finalize-run"):
+        shutil.copy2(ROOT / "ops/bin" / name, ops / name)
+    from native_runtime import stage_native_runtime
+    stage_native_runtime(ops)
+    for module in sorted((ROOT / "ops/bin").glob("_*.py")):  # direct imports between ops/bin modules: ship every sibling module
+        if not (ops / module.name).exists():
+            shutil.copy2(module, ops / module.name)
+    (lab / "ESTATE").write_text("dev\n")  # finalize-run's node identity
+    for name in ("_executor.py", "capture-stimulus", "publish-evidence", "harvest"):
+        (ops / name).chmod(0o755)
+    claude = fake / "claude"
+    claude.write_text("""#!/usr/bin/env python3
+import os
+import sys
+import time
+from pathlib import Path
+if "Reply with exactly: AUTH_OK" in sys.argv:
+    print("AUTH_OK")
+    raise SystemExit(0)
+marker = Path(os.environ["TMPDIR"]) / "real-call-seen"
+if not marker.exists():
+    marker.write_text("seen")
+    print("OAuth access token has expired", file=sys.stderr)
+    raise SystemExit(1)
+time.sleep(5)
+""", encoding="utf-8")
+    claude.chmod(0o755)
+    template = {
+        "fake-claude": {
+            "binary": str(claude),
+            "args": ["--print", "--model", "sonnet", "{{prompt}}"],
+            "env_drop": ["ANTHROPIC_API_KEY"],
+            "cost_class": "subscription",
+            "cost_usd": 0,
+            "cost_per_1k": 0.01,
+            "auth": "subscription",
+        }
+    }
+    (ops / "executor-templates.json").write_text(
+        json.dumps(template, indent=2) + "\n", encoding="utf-8"
+    )
+    (task / "goal.md").write_text("Do nothing.\n", encoding="utf-8")
+    check = task / "check"
+    check.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    check.chmod(0o755)
+    home = lab / "home"
+    home.mkdir()
+    # This fixture tests receipts, not Seatbelt (covered by the Darwin probes).
+    # Stub only the sandbox launcher so it also runs in confined lanes.
+    launcher = fake / "sandbox-exec"
+    launcher.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n")
+    launcher.chmod(0o755)
+    result = subprocess.run(
+        [str(ops / "_executor.py")],
+        input=json.dumps({
+            "executor": "fake-claude",
+            "task": "tasks/fixture",
+            "exp": "task-fixture",
+            "trial": 1,
+            "timeout_s": 3,  # 1 s raced Python startup under the full check
+        }),
+        cwd=lab,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        env={**{k: v for k, v in hermetic_env().items() if k not in ("LAB_STATE_ROOT", "CSGATEWAY_ENDPOINT")}, "HOME": str(home), "PATH": str(fake) + os.pathsep + os.environ["PATH"], "ANTHROPIC_API_KEY": "must-not-leak"},
+    )
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr, result.stderr
+    receipt = json.loads(result.stdout.splitlines()[-1])
+    assert receipt["verdict"] == "fail" and receipt["stop"] == "timeout", (receipt, result.stderr)
+    assert receipt["cost_class"] == "subscription" and receipt["cost_usd"] == 0
+    rows = [json.loads(line) for line in (ledger / "ledger.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["verdict"] == "fail" and row["stop"] == "timeout"
+    assert row["auth_refresh"] == "pass"
+    assert row["note"] == "task_after_auth_refresh timed out after 3s"
+    run = lab / row["transcript"]
+    assert "stage=task_after_auth_refresh" in (run / "cli.log").read_text()
+    # finalize-run closes the transcript with the runner's footer; the log before it is unchanged.
+    transcript = (run / "transcript.md").read_text()
+    assert transcript.startswith((run / "cli.log").read_text()), transcript
+    assert transcript.endswith("\n---\nstop timeout · verdict **fail** · turns 0 · tools 0 · cost $0.0000\n"), transcript
+    assert json.loads((run / "terminal.json").read_text())["terminal_state"] == "timeout"
+print("check: executor records OAuth-retry timeouts without traceback or lost ledger tail")

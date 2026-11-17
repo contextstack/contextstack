@@ -1,0 +1,8 @@
+{
+  "exit": 1,
+  "stdout": "path escapes workspace: ../a.txt\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"edits\": [{\"newText\": \"b\", \"oldText\": \"a\"}], \"path\": \"../a.txt\"}, \"name\": \"fs_edit\"}\n"
+  },
+  "untouched": true
+}

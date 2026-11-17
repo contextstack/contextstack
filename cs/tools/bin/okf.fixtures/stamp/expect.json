@@ -1,0 +1,10 @@
+{
+  "exit": 0,
+  "stdout": "{\"ok\":true,\"action\":\"stamp\",\"version\":\"0.1\",\"changed\":2}\n",
+  "files": {
+    "corpus/index.md": "---\nokf_version: \"0.1\"\n---\n\n# corpus\n",
+    "corpus/one.md": "---\ntype: \"Legacy Document\"\nschema_version: \"0.1\"\ntitle: One\n---\n\nBody one.\n",
+    "corpus/two.md": "---\ntype: \"Legacy Document\"\nschema_version: \"0.1\"\n---\n\nNo frontmatter here.\n"
+  },
+  "untouched": true
+}

@@ -1,0 +1,36 @@
+{
+ "entry": "run-spec",
+ "env": {
+  "FX_SECRET_OK": "requested-and-permitted",
+  "FX_SECRET_NO": "never-requested"
+ },
+ "policy": {
+  "version": 1,
+  "always": [
+   "PATH",
+   "HOME",
+   "USER",
+   "LOGNAME",
+   "TERM",
+   "LANG",
+   "LC_ALL",
+   "LC_CTYPE",
+   "TMPDIR",
+   "TMP",
+   "TEMP",
+   "SHELL",
+   "HOMEBREW_PREFIX",
+   "HOMEBREW_CELLAR",
+   "LAB_JOB_ID",
+   "LAB_TRIAL",
+   "LAB_SCHEDULE_DATE",
+   "LAB_SCHEDULE_SLOT",
+   "LAB_SCHEDULE_TIMEZONE",
+   "LAB_VIDEO_MUTATION",
+   "LAB_STEP_TTY"
+  ],
+  "on_request": [
+   "FX_SECRET_OK"
+  ]
+ }
+}

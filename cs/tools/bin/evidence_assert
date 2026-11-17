@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+# Validate and register an exact assertion against cached fetch bytes.
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+import _calllog
+
+SWEEP_RESULT = re.compile(r"^(?P<prefix>.*SWEEP-RESULTS-)\d{4}-\d{2}-\d{2}(?P<suffix>[.]md)$")
+
+def fail(message):
+    print("evidence_assert: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+args = json.load(sys.stdin)
+_calllog.record("evidence_assert", args)
+source_url = args.get("source_url")
+quote = args.get("quote")
+source_date = args.get("source_date")
+entry = args.get("entry")
+if not isinstance(source_url, str) or not source_url.startswith("https://"):
+    fail("source_url must be HTTPS")
+if not quote and not source_date:
+    fail("quote or source_date is required")
+if quote is not None and not isinstance(quote, str):
+    fail("quote must be a string")
+if source_date is not None and not isinstance(source_date, str):
+    fail("source_date must be a string")
+
+root = Path.cwd().resolve()
+records = []
+for path in (root / "_evidence" / "fetches").glob("*.json"):
+    row = json.loads(path.read_text(encoding="utf-8"))
+    if row.get("status", 0) in range(200, 300) and source_url in (row.get("requested_url"), row.get("final_url")):
+        records.append((row, path))
+if not records:
+    fail("source_url has no successful fetch evidence")
+record, record_path = max(records, key=lambda item: str(item[0].get("retrieved_at", "")))
+body_rel = record.get("body_path")
+body = (root / str(body_rel)).resolve()
+if not isinstance(body_rel, str) or not body.is_relative_to(root / "_evidence" / "bodies") or not body.is_file():
+    fail("fetch record has an unsafe body_path")
+raw = body.read_bytes()
+if hashlib.sha256(raw).hexdigest() != record.get("sha256") or len(raw) != record.get("bytes"):
+    fail("fetch body does not match its receipt")
+derived_body_rel = None
+derivation_rel = None
+if quote and quote.encode("utf-8") not in raw:
+    for path in sorted((root / "_evidence" / "derivations").glob("*.json")):
+        row = json.loads(path.read_text(encoding="utf-8"))
+        if (row.get("kind") != "derived_extraction"
+                or row.get("source_url") != source_url
+                or row.get("source_sha256") != record.get("sha256")
+                or row.get("source_body") != body_rel
+                or row.get("source_evidence") != str(record_path.relative_to(root))):
+            continue
+        candidate_rel = row.get("body_path")
+        candidate = (root / str(candidate_rel)).resolve()
+        if (not isinstance(candidate_rel, str)
+                or not candidate.is_relative_to(root / "_evidence" / "derived")
+                or not candidate.is_file()):
+            fail("derivation has an unsafe body_path")
+        cooked = candidate.read_bytes()
+        if hashlib.sha256(cooked).hexdigest() != row.get("sha256") or len(cooked) != row.get("bytes"):
+            fail("derived body does not match its receipt")
+        if quote.encode("utf-8") in cooked:
+            derived_body_rel = candidate_rel
+            derivation_rel = str(path.relative_to(root))
+            break
+    if not derived_body_rel:
+        fail("quote is absent from cached and locally-derived bytes")
+if source_date and source_date.encode("utf-8") not in raw:
+    fail("source_date is absent from cached bytes")
+
+if entry is not None:
+    if not isinstance(entry, str) or Path(entry).is_absolute() or ".." in Path(entry).parts:
+        fail("entry must stay inside the workspace")
+    entry_path = (root / entry).resolve()
+    match = SWEEP_RESULT.fullmatch(entry)
+    if not entry_path.is_file() and match:
+        candidates = sorted(root.glob(match.group("prefix") + "*" + match.group("suffix")),
+                            reverse=True)
+        entry_path = next((path.resolve() for path in candidates
+                           if path.is_file() and source_url.encode("utf-8") in path.read_bytes()),
+                          entry_path)
+        if entry_path.is_file():
+            entry = str(entry_path.relative_to(root))
+    if not entry_path.is_relative_to(root) or not entry_path.is_file() or source_url.encode("utf-8") not in entry_path.read_bytes():
+        fail("entry must exist and contain source_url")
+
+assertion = {"schema_version": "0.1", "source_url": source_url, "body_path": body_rel}
+if quote:
+    assertion["quote"] = quote
+if derived_body_rel:
+    assertion["derived_body_path"] = derived_body_rel
+    assertion["derivation"] = derivation_rel
+if source_date:
+    assertion["source_date"] = source_date
+if entry:
+    assertion["entry"] = entry
+target = root / "_evidence" / "assertions.jsonl"
+target.parent.mkdir(parents=True, exist_ok=True)
+if target.is_symlink() or not target.resolve().is_relative_to(root):
+    fail("unsafe assertions path")
+encoded = json.dumps(assertion, sort_keys=True, ensure_ascii=False)
+existing = target.read_text(encoding="utf-8").splitlines() if target.is_file() else []
+action = "existing"
+if encoded not in existing:
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, (encoded + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    action = "registered"
+print(json.dumps({"ok": True, "action": action, "source_url": source_url,
+                  "body_path": body_rel,
+                  **({"derived_body_path": derived_body_rel,
+                      "derivation": derivation_rel} if derived_body_rel else {})}, sort_keys=True))

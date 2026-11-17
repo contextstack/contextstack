@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""The release-bundle workflow builds three platforms and merges their channel manifests.
+
+YAML is read with a stdlib subset (the workflow's own shape: maps, lists, quotes, `|` blocks).
+When target/release/cs-tools is already built, the same file must also match `yaml-json`.
+publish() records one platform; merge() is what the final CI job runs. Scratch dirs are tempfile.
+"""
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+LAB = Path(__file__).resolve().parents[3]
+REPO = LAB.parent
+SCRIPTS = LAB / 'scripts'
+WORKFLOW = REPO / '.github/workflows/release-bundles.yml'
+RUNNERS = {
+    'macos-latest': 'macos-aarch64',
+    'ubuntu-24.04': 'linux-x86_64',
+    'ubuntu-24.04-arm': 'linux-aarch64',
+}
+USES = re.compile(r'[\w.-]+/[\w.-]+@[a-f0-9]{40}\Z')
+
+
+def fail(msg):
+    raise SystemExit('FAIL ' + msg)
+
+
+def check(cond, msg):
+    if not cond:
+        fail(msg)
+
+
+class Yaml:
+    """Indentation YAML for this workflow. Not a general parser."""
+
+    def __init__(self, text):
+        self.lines = text.splitlines()
+        self.i = 0
+
+    def parse(self):
+        line = self._peek()
+        if line is None:
+            return None
+        indent = _indent(line)
+        if line.lstrip().startswith('- '):
+            return self._seq(indent)
+        return self._map(indent)
+
+    def _peek(self):
+        while self.i < len(self.lines):
+            line = self.lines[self.i]
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                return line
+            self.i += 1
+        return None
+
+    def _map(self, indent):
+        mapping = {}
+        while True:
+            line = self._peek()
+            if line is None or _indent(line) != indent or line.lstrip().startswith('- '):
+                return mapping
+            self.i += 1
+            key, value = self._entry(line.strip(), indent)
+            mapping[key] = value
+
+    def _seq(self, indent):
+        items = []
+        while True:
+            line = self._peek()
+            if line is None or _indent(line) != indent or not line.lstrip().startswith('- '):
+                return items
+            self.i += 1
+            rest = line.strip()[2:]
+            if _is_key(rest):
+                # The key sits two columns past the dash, which is the indent of its sibling keys.
+                key, value = self._entry(rest, indent + 2)
+                item = {key: value}
+                nxt = self._peek()
+                if nxt is not None and _indent(nxt) > indent and not nxt.lstrip().startswith('- '):
+                    item.update(self._map(_indent(nxt)))
+                items.append(item)
+            else:
+                items.append(_scalar(rest))
+
+    def _entry(self, text, indent):
+        key, rest = _split_key(text)
+        if rest in ('|', '|-', '|+'):
+            return key, self._literal(indent, rest)
+        if rest == '':
+            return key, self._nested(indent)
+        return key, _scalar(rest)
+
+    def _nested(self, indent):
+        line = self._peek()
+        if line is None or _indent(line) <= indent:
+            return None
+        return self.parse()
+
+    def _literal(self, parent, style):
+        raw = []
+        while self.i < len(self.lines):
+            line = self.lines[self.i]
+            if line.strip() == '':
+                raw.append('')
+                self.i += 1
+                continue
+            if _indent(line) <= parent:
+                break
+            raw.append(line)
+            self.i += 1
+        while raw and raw[-1] == '':
+            raw.pop()
+        if not raw:
+            return '\n' if style == '|' else ''
+        base = min(_indent(line) for line in raw if line)
+        text = '\n'.join(line[base:] if line else '' for line in raw)
+        if style == '|-':
+            return text
+        return text + '\n'
+
+
+def _indent(line):
+    if '\t' in line:
+        fail('workflow YAML uses a tab')
+    return len(line) - len(line.lstrip(' '))
+
+
+def _is_key(text):
+    if not text or text[0] in ('"', "'"):
+        return False
+    return text.endswith(':') or ': ' in text
+
+
+def _split_key(text):
+    if text[0] in ('"', "'"):
+        end = _quoted_end(text)
+        rest = text[end + 1:].strip()
+        if not rest.startswith(':'):
+            fail('YAML key is not followed by a colon: ' + text)
+        return _scalar(text[:end + 1]), rest[1:].strip()
+    if ': ' in text:
+        key, rest = text.split(': ', 1)
+        return key, rest.strip()
+    if text.endswith(':'):
+        return text[:-1].strip(), ''
+    fail('YAML line is not a key: ' + text)
+
+
+def _quoted_end(text):
+    quote, end = text[0], 1
+    while end < len(text):
+        if quote == "'" and text[end] == "'" and end + 1 < len(text) and text[end + 1] == "'":
+            end += 2
+            continue
+        if quote == '"' and text[end] == '\\':
+            end += 2
+            continue
+        if text[end] == quote:
+            return end
+        end += 1
+    fail('unclosed YAML string: ' + text)
+
+
+def _scalar(text):
+    text = text.strip()
+    if not text:
+        return None
+    if text[0] in ('"', "'"):
+        end = _quoted_end(text)
+        body = text[1:end]
+        if text[0] == "'":
+            return body.replace("''", "'")
+        return bytes(body, 'utf-8').decode('unicode_escape')
+    if ' #' in text:
+        text = text.split(' #', 1)[0].rstrip()
+    lowered = text.lower()
+    if lowered in ('true', 'yes', 'on', 'y'):
+        return True
+    if lowered in ('false', 'no', 'off', 'n'):
+        return False
+    if lowered in ('null', '~'):
+        return None
+    if re.fullmatch(r'-?\d+', text):
+        return int(text)
+    return text
+
+
+def load_workflow(path):
+    parsed = Yaml(path.read_text()).parse()
+    binary = os.environ.get('CS_TOOLS_BIN') or str(REPO / 'target/release/cs-tools')
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        sys.path.insert(0, str(LAB / 'ops/bin'))
+        from _yaml import load
+        other = load(path)
+        check(other == parsed, 'stdlib YAML reader disagrees with yaml-json')
+    return parsed
+
+
+def step_text(job):
+    parts = []
+    for step in job.get('steps') or []:
+        run = step.get('run')
+        if isinstance(run, str):
+            parts.append(run)
+    return '\n'.join(parts)
+
+
+def matrix_pairs(job):
+    include = ((job.get('strategy') or {}).get('matrix') or {}).get('include') or []
+    return {(row.get('os'), row.get('target')) for row in include}
+
+
+def uses_pins(text):
+    return re.findall(r'^\s*uses:\s*(\S+)', text, re.M)
+
+
+def uploaded(job):
+    parts = []
+    for step in job.get('steps') or []:
+        body = step.get('with')
+        if isinstance(body, dict) and isinstance(body.get('path'), str):
+            parts.append(body['path'])
+    return '\n'.join(parts)
+
+
+def load_publisher():
+    spec = importlib.util.spec_from_file_location('node_publish', SCRIPTS / 'node_publish.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def bundle(root, target, version, commit, marker):
+    path = root / target / marker
+    path.mkdir(parents=True)
+    (path / 'bundle.json').write_text(json.dumps({
+        'target': target, 'release': version, 'lab_commit': commit}))
+    (path / 'marker').write_text(marker)
+    return path
+
+
+def workflow_contract():
+    sample = Yaml('''
+"on":
+  push:
+    tags:
+      - "v*"
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos-aarch64
+    steps:
+      - name: Build
+        run: |
+          node-bundle build --publish-dir "$OUT"
+''').parse()
+    check(sample['on']['push']['tags'] == ['v*'], 'fixture trigger')
+    check(sample['jobs']['build']['strategy']['matrix']['include'] == [
+        {'os': 'macos-latest', 'target': 'macos-aarch64'}], 'fixture matrix')
+    check(sample['jobs']['build']['steps'][0]['run'] == 'node-bundle build --publish-dir "$OUT"\n', 'fixture block')
+
+    text = WORKFLOW.read_text()
+    doc = load_workflow(WORKFLOW)
+    check(doc['on']['push']['tags'] == ['v*'], 'tag trigger is v*')
+    check('inputs.channel' not in text, 'channels must derive from validated tags')
+    check('${{ github.token }}' in text, 'release uses GITHUB_TOKEN')
+    check(doc.get('permissions') == {'contents': 'read'}, 'workflow defaults to read permission')
+    for pin in uses_pins(text):
+        check(USES.fullmatch(pin) is not None, 'action is not SHA-pinned: ' + pin)
+    for line in text.splitlines():
+        if 'uses:' in line:
+            check(re.search(r' # v[0-9]', line), 'action needs version comment')
+
+    jobs = doc['jobs']
+    build_jobs = []
+    merge_jobs = []
+    for name, job in jobs.items():
+        body = step_text(job)
+        if 'node_publish.py' in body and re.search(r'node_publish\.py merge\b', body):
+            merge_jobs.append((name, job, body))
+        else:
+            build_jobs.append((name, job, body))
+    check(build_jobs, 'no build job')
+    check(merge_jobs, 'no merge step')
+    pairs = set()
+    for name, job, body in build_jobs:
+        check(job.get('permissions', {}).get('contents', 'read') == 'read', 'build cannot write contents')
+        check('node-bundle build' in body and '--publish-dir' in body, name + ' does not build with --publish-dir')
+        check(job.get('runs-on') == '${{ matrix.os }}', name + ' does not run on the matrix os')
+        pairs |= matrix_pairs(job)
+        paths = uploaded(job)
+        check('*.tar.gz' in paths and '*.sha256' in paths, name + ' does not upload the tarball and checksum')
+        check(any('origin/main:RELEASES.json' in step.get('run', '') for step in job['steps']),
+              name + ' does not verify RELEASES.json on main')
+    steps = jobs['build']['steps']
+    names = [step['name'] for step in steps]
+    check(names.index('Build the bundle') < names.index('Sign and notarize the macOS bundle')
+          < names.index('Upload the tarball and checksum'), 'sign between build and upload')
+    sign = steps[names.index('Sign and notarize the macOS bundle')]
+    check(sign['if'] == "runner.os == 'macOS'", 'only sign macOS')
+    helper = (REPO / '.github/scripts/sign-macos-bundle.py').read_text()
+    for command in ('create-keychain', 'set-key-partition-list', 'delete-keychain',
+                    "'notarytool', 'submit'", "'--wait'", "'notarytool', 'log'",
+                    "'--options', 'runtime'", "'--timestamp'", "response.get('status') != 'Accepted'"):
+        check(command in helper, 'signing missing ' + command)
+    cleanup = steps[names.index('Delete temporary signing keychain')]
+    check('always()' in cleanup['if'] and 'security delete-keychain' in cleanup['run'],
+          'keychain cleanup must run after failure')
+    check('set -x' not in text + helper, 'never trace secrets')
+    check(not re.search(r'(?:echo|print).*secrets\.', text + helper), 'never print secrets')
+    for secret, expression in sign['env'].items():
+        check(expression == '${{ secrets.' + secret + ' }}', 'secret must be passed through env')
+    # Execute the real absent-secret branch: no Apple tools or credentials needed.
+    with scratch_dir(prefix='release-unsigned-') as tmp:
+        root = Path(tmp)
+        staged = bundle(root, 'macos-aarch64', 'v1.2.3', 'abc123', 'unsigned')
+        env = {key: value for key, value in hermetic_env().items() if key not in sign['env']}
+        result = subprocess.run([sys.executable, str(REPO / '.github/scripts/sign-macos-bundle.py'),
+                                 str(staged), str(root / 'publish'), 'stable'],
+                                env=env, capture_output=True, text=True)
+        check(result.returncode == 0 and '::warning::' in result.stdout, 'missing secrets skip loudly')
+        check(json.loads((staged / 'bundle.json').read_text())['signing']['status'] == 'unsigned',
+              'unsigned manifest marker')
+        check((root / 'publish/contextstack-macos-aarch64.tar.gz').is_file(), 'unsigned publish')
+    check(pairs == set(RUNNERS.items()), 'matrix is not the three release targets: ' + str(sorted(pairs)))
+    for name, job, body in merge_jobs:
+        check(job.get('permissions') == {'contents': 'write'}, 'only merge has contents write')
+        release = next(step for step in job['steps'] if step['name'] == 'Publish GitHub Release')
+        check(release['env']['GITHUB_TOKEN'] == '${{ github.token }}', 'release token')
+        check(release['env']['GH_REPO'] == '${{ github.repository }}', 'publish in workflow repository')
+        check('contextstack/monorepo' not in release['run'], 'no hard-coded release repository')
+        check('assets=(cs/scripts/install.sh ' in release['run'], 'installer asset on every release')
+        for endpoint in ('"repos/$GH_REPO/git/refs/tags/channel-latest"', '"repos/$GH_REPO/git/refs"'):
+            check(endpoint in release['run'], 'channel tag API uses workflow repository')
+        for command in ('gh release create "$GITHUB_REF_NAME" --verify-tag --latest=true',
+                        'gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --latest=false',
+                        'gh release create channel-latest', '--prerelease --latest=false', 'force=true',
+                        'gh release delete channel-latest --yes --cleanup-tag', '*.tar.gz', '*.sha256',
+                        '/channel/$RELEASE_CHANNEL.json', '/channel/$RELEASE_CHANNEL.txt'):
+            check(command in release['run'], 'release missing ' + command)
+        check('node-bundle build' not in body, name + ' rebuilds a bundle')
+        check(job.get('needs') in ('build', ['build']), name + ' does not wait for the build jobs')
+        paths = uploaded(job)
+        check('*.json' in paths and '*.txt' in paths, name + ' does not upload the merged manifests')
+        check(any('origin/main:RELEASES.json' in step.get('run', '') for step in job['steps']),
+              name + ' does not verify RELEASES.json on main')
+
+
+
+def integrity_assertions(doc):
+    """Independent assertions, also runnable against main without network or checkout."""
+    failures = []
+    for name, job in doc['jobs'].items():
+        steps = job.get('steps', [])
+        gates = [(i, step) for i, step in enumerate(steps)
+                 if 'git merge-base --is-ancestor HEAD refs/remotes/origin/main' in step.get('run', '')]
+        if not gates:
+            failures.append(name + ': main ancestry gate')
+            failures.append(name + ': strict stable/prerelease tag regex')
+            continue
+        i, gate = gates[0]
+        checkouts = [step for step in steps[:i] if str(step.get('uses', '')).startswith('actions/checkout@')]
+        if not checkouts or checkouts[-1].get('with', {}).get('fetch-depth') != 0:
+            failures.append(name + ': full-depth fetch before ancestry gate')
+        body = gate['run']
+        for expected in ("core='(0|[1-9][0-9]*)'", "identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'",
+                         'stable="^v$core\\.$core\\.$core$"',
+                         'pre="^v$core\\.$core\\.$core-$identifier(\\.$identifier)*$"',
+                         '"$GITHUB_REF_TYPE" != tag', 'exit 1'):
+            if expected not in body:
+                failures.append(name + ': strict stable/prerelease tag regex')
+                break
+    for job in doc['jobs'].values():
+        for step in job.get('steps', []):
+            if 'uses' in step and not USES.fullmatch(step['uses']):
+                failures.append('SHA-pinned actions')
+                break
+    if doc.get('permissions') != {'contents': 'read'} or any(
+            job.get('permissions', {'contents': 'read'}) != (
+                {'contents': 'write'} if name == 'merge' else {'contents': 'read'})
+            for name, job in doc['jobs'].items()):
+        failures.append('minimal contents permissions')
+    return sorted(set(failures))
+
+
+def gate_contract():
+    doc = load_workflow(WORKFLOW)
+    gate = next(step['run'] for step in doc['jobs']['merge']['steps']
+                if step.get('name') == 'Validate release tag and main ancestry')
+    with scratch_dir(prefix='release-gate-') as tmp:
+        root = Path(tmp)
+        git = root / 'git'
+        git.write_text('#!/bin/sh\n[ "$*" = "merge-base --is-ancestor HEAD refs/remotes/origin/main" ] || exit 99\nexit "${ANCESTRY_EXIT:-0}"\n')
+        git.chmod(0o755)
+        for tag, expected in [('v0.0.0', 'stable'), ('v12.3.40', 'stable'),
+                              ('v1.2.3-rc.1', 'latest'), ('v1.2.3-0', 'latest'),
+                              ('v1', None), ('v01.2.3', None), ('v1.2.3-01', None),
+                              ('v1.2.3-', None), ('v1.2.3+build', None), ('main', None)]:
+            output = root / 'env'
+            output.write_text('')
+            env = {**hermetic_env(), 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'GITHUB_ENV': str(output), 'GITHUB_REF_TYPE': 'tag', 'GITHUB_REF_NAME': tag}
+            result = subprocess.run(['bash', '-c', gate], env=env, capture_output=True, text=True)
+            check((result.returncode == 0) == bool(expected), 'tag classification ' + tag)
+            if expected:
+                check(output.read_text() == 'RELEASE_CHANNEL=' + expected + '\n', 'channel ' + tag)
+        for updates in ({'ANCESTRY_EXIT': '1'}, {'GITHUB_REF_TYPE': 'branch'}):
+            env.update(GITHUB_REF_NAME='v1.2.3', **updates)
+            result = subprocess.run(['bash', '-c', gate], env=env, capture_output=True, text=True)
+            check(result.returncode != 0 and '::error::' in result.stderr, 'ancestry/ref gate must fail loudly')
+
+def merge_contract(publisher):
+    version, commit = '20261111-abcdef123', 'abcdef123'
+    with scratch_dir(prefix='release-bundles-') as tmp:
+        root = Path(tmp)
+        published = {}
+        for target in RUNNERS.values():
+            published[target] = publisher.publish(
+                bundle(root, target, version, commit, 'one'), root / ('out-' + target), 'stable')
+            check(list(published[target]['platforms']) == [target], target + ' publish wrote more than one platform')
+        dest = root / 'channel'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'node_publish.py'), 'merge', 'stable', str(dest),
+             *[str(root / ('out-' + target)) for target in RUNNERS.values()]],
+            capture_output=True, text=True)
+        check(result.returncode == 0, result.stderr)
+        index = json.loads((dest / 'stable.json').read_text())
+        check(index['version'] == version and index['commit'] == commit, 'merged identity')
+        check(list(index['platforms']) == list(publisher.PLATFORMS), 'merged platform order')
+        lines = (dest / 'stable.txt').read_text().splitlines()
+        check([line.split()[0] for line in lines] == list(publisher.PLATFORMS), 'merged text order')
+        for line in lines:
+            platform, got_version, got_commit, name, checksum = line.split()
+            entry = index['platforms'][platform]
+            check((got_version, got_commit, name, checksum) == (
+                version, commit, entry['tarball'], entry['sha256']), 'merged text row ' + platform)
+            check(name == f'contextstack-{platform}.tar.gz', 'tarball name ' + platform)
+
+        short = [root / 'out-linux-x86_64', root / 'out-linux-aarch64']
+        try:
+            publisher.merge(short, root / 'partial', 'stable')
+        except ValueError as error:
+            check('missing platforms: macos-aarch64' in str(error), str(error))
+        else:
+            fail('partial merge succeeded')
+
+        other = publisher.publish(
+            bundle(root, 'linux-x86_64', version, 'abc123', 'two'), root / 'other-commit', 'stable')
+        try:
+            publisher.merge([root / 'out-linux-x86_64', root / 'other-commit'], root / 'bad-commit', 'stable')
+        except ValueError as error:
+            check('disagree on version or commit' in str(error), str(error))
+        else:
+            fail('mismatched commits merged')
+        check(list(other['platforms']) == ['linux-x86_64'], 'second publish replaced the index')
+
+        clash = publisher.publish(
+            bundle(root, 'linux-x86_64', version, commit, 'three'), root / 'clash', 'stable')
+        try:
+            publisher.merge(
+                [root / ('out-' + target) for target in RUNNERS.values()] + [root / 'clash'],
+                root / 'bad-hash', 'stable')
+        except ValueError as error:
+            check('platform entries disagree: linux-x86_64' in str(error), str(error))
+        else:
+            fail('conflicting platform entries merged')
+        check(clash['platforms']['linux-x86_64']['sha256'] != published['linux-x86_64']['platforms']['linux-x86_64']['sha256'],
+              'distinct bundles hashed the same')
+
+        sidecar = root / 'out-linux-x86_64' / (published['linux-x86_64']['platforms']['linux-x86_64']['tarball'] + '.sha256')
+        sidecar.write_text('0' * 64 + '  ' + sidecar.name[:-7] + '\n')
+        try:
+            publisher.merge([root / ('out-' + target) for target in RUNNERS.values()], root / 'bad-side', 'stable')
+        except ValueError as error:
+            check('sha256 sidecar differs' in str(error), str(error))
+        else:
+            fail('tampered sidecar merged')
+
+        usage = subprocess.run([sys.executable, str(SCRIPTS / 'node_publish.py')], capture_output=True, text=True)
+        check(usage.returncode == 2 and 'usage:' in usage.stderr, 'merge usage')
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == '--audit-ref':
+        source = subprocess.run(['git', 'show', sys.argv[2] + ':.github/workflows/release-bundles.yml'],
+                                cwd=REPO, capture_output=True, text=True, check=True).stdout
+        failures = integrity_assertions(Yaml(source).parse())
+        print('\n'.join('FAIL ' + item for item in failures) or 'PASS integrity assertions')
+        return
+    check(not integrity_assertions(load_workflow(WORKFLOW)),
+          ', '.join(integrity_assertions(load_workflow(WORKFLOW))))
+    workflow_contract()
+    gate_contract()
+    merge_contract(load_publisher())
+    print('PASS: three-target matrix, publish-dir build, merged channel manifests')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,10 @@
+#!/bin/sh
+# cs-tools gate: format, lint, release build, tests. Nonzero on any failure.
+set -eu
+cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo fmt --check -p cs-tools
+cargo clippy -p cs-tools --all-targets -- -D warnings
+cargo build --release -p cs-tools
+cargo test -p cs-tools
+echo "check: cs-tools green"

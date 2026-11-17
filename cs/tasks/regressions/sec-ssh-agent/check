@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""#58: agent profiles deny host ssh-agent sockets. Host: --darwin-probe."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import ast
+import errno
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+OPS = HERE.parents[2] / "ops" / "bin"
+sys.path.insert(0, str(OPS))
+
+import _executor  # noqa: E402
+
+
+REQUIRED = (
+    r'^/private/tmp/com\.apple\.launchd\.[^/]+/',
+    r'^/tmp/com\.apple\.launchd\.[^/]+/',
+    '/bin/launchctl',
+    '2BUA8C4S2C.com.1password',
+    'Secretive.SecretAgent',
+    r'/\.ssh/"',  # all of ~/.ssh: agent.sock, ssh-agent.sock, custom names
+)
+
+
+def executor_profile(home, ws, private, profile):
+    with patch.object(_executor, 'HOME', home), patch.object(sys, 'platform', 'darwin'):
+        _executor.sandbox_cmd('/usr/bin/true', [], ws, private, profile,
+                              env={'PATH': os.environ.get('PATH', ''), 'SSH_AUTH_SOCK': os.environ.get('SSH_AUTH_SOCK')})
+    return profile.read_text()
+
+
+with scratch_dir(prefix='sec-ssh-agent-') as raw:
+    root = Path(raw).resolve()
+    home, ws, private = (root / n for n in ('home', 'workspace', 'private'))
+    for d in (home, ws, private):
+        d.mkdir()
+    profile = root / 'executor.sb'
+    prof = executor_profile(home, ws, private, profile)
+    for token in REQUIRED:
+        assert token in prof, 'profile missing: ' + token
+
+    if '--darwin-probe' not in sys.argv or sys.platform != 'darwin':
+        print('sec-ssh-agent: PASS (offline rules); SKIP host probe without --darwin-probe')
+        raise SystemExit(0)
+
+    capability = subprocess.run(
+        ['sandbox-exec', '-p', '(version 1)(allow default)', '/usr/bin/true'],
+        capture_output=True, text=True, timeout=10,
+    )
+    if capability.returncode != 0:
+        assert 'sandbox_apply: Operation not permitted' in capability.stderr, capability.stderr
+        print('sec-ssh-agent: PASS (offline); SKIP probe (nested sandbox refused; run check --darwin-probe on host)')
+        raise SystemExit(0)
+
+    decoy_dir = Path('/private/tmp') / 'com.apple.launchd.cs-ssh-agent-probe'
+    decoy_sock = decoy_dir / 'Listeners'
+    decoy_dir.mkdir(exist_ok=True)
+    had_sock = decoy_sock.exists()
+    listener = None
+    try:
+        decoy_sock.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(decoy_sock))
+        listener.listen(1)
+        probe = root / 'probe.py'
+        probe.write_text(
+            'import errno, socket, sys\n'
+            'path = sys.argv[1]\n'
+            's = socket.socket(socket.AF_UNIX)\n'
+            'try:\n'
+            '    s.connect(path)\n'
+            'except PermissionError:\n'
+            '    raise SystemExit(0)\n'
+            'except OSError as e:\n'
+            '    if e.errno == errno.EPERM:\n'
+            '        raise SystemExit(0)\n'
+            '    raise\n'
+            'raise SystemExit("connect succeeded")\n'
+        )
+        done = subprocess.run(
+            ['sandbox-exec', '-f', str(profile), sys.executable, str(probe), str(decoy_sock)],
+            env={'HOME': str(home), 'PATH': '/usr/bin:/bin'},
+            cwd=ws, capture_output=True, text=True, timeout=30,
+        )
+        assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+        launch = subprocess.run(
+            ['sandbox-exec', '-f', str(profile), '/bin/launchctl', 'version'],
+            env={'HOME': str(home), 'PATH': '/usr/bin:/bin'},
+            capture_output=True, text=True, timeout=15,
+        )
+        assert launch.returncode != 0, launch.stdout + launch.stderr
+    finally:
+        if listener is not None:
+            listener.close()
+        decoy_sock.unlink(missing_ok=True)
+        if not had_sock:
+            decoy_dir.rmdir()
+
+print('sec-ssh-agent: PASS (offline + Darwin connect probe)')

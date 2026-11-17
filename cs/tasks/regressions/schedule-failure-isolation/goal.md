@@ -1,0 +1,1 @@
+Fable's 09-12 audit. Holding one schedule must defer its dependents without stopping unrelated admissions. N identical first-terminal failures across distinct jobs hold a schedule; duplicates cannot inflate the streak and success breaks it. Silence detection sees missing cron fires even while tick heartbeats are healthy. All shelves are isolated fixtures; no live enqueue.

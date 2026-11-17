@@ -1,0 +1,9 @@
+{
+  "exit": 1,
+  "stdout": "web_fetch: only https URLs are allowed\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"url\": \"http://example.com/\"}, \"name\": \"web_fetch\"}\n",
+    "_evidence/manifest.jsonl": null
+  },
+  "untouched": true
+}

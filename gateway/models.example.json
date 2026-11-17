@@ -1,0 +1,171 @@
+{
+  "models": [
+    {
+      "name": "claude-sonnet-4-20250514",
+      "provider": "anthropic",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": true,
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "claude-opus-4-20250514",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": true,
+      "cost_per_1k": 0.075
+    },
+    {
+      "name": "claude-haiku-3-5-20241022",
+      "provider": "anthropic",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.005
+    },
+    {
+      "name": "gpt-4o",
+      "provider": "openai",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.015
+    },
+    {
+      "name": "gpt-4o-mini",
+      "provider": "openai",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "o3",
+      "provider": "openai",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "cost_per_1k": 0.06
+    },
+    {
+      "name": "gemini-2.5-pro",
+      "provider": "gemini",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "gemini-2.5-flash",
+      "provider": "gemini",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.003
+    },
+    {
+      "name": "llama-3.3-70b-versatile",
+      "provider": "groq",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.001
+    },
+    {
+      "name": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "provider": "together",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false,
+      "cost_per_1k": 0.001
+    },
+    {
+      "name": "Qwen/Qwen2.5-Coder-32B-Instruct",
+      "provider": "together",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "cost_per_1k": 0.002
+    },
+    {
+      "name": "qwen2.5-coder:32b",
+      "provider": "ollama",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false
+    },
+    {
+      "name": "llama3:8b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "general",
+      "preferred": false
+    },
+    {
+      "name": "deepseek-r1:14b",
+      "provider": "ollama",
+      "tier": 2,
+      "capability": "reasoning",
+      "preferred": false
+    },
+    {
+      "name": "claude-sonnet-5",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": true,
+      "cost_per_1k": 0.01,
+      "cost_class": "api"
+    },
+    {
+      "name": "claude-opus-5",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "cost_per_1k": 0.025,
+      "cost_class": "api"
+    },
+    {
+      "name": "claude-code-sonnet",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": true,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.01
+    },
+    {
+      "name": "claude-code-opus",
+      "provider": "anthropic",
+      "tier": 3,
+      "capability": "reasoning",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "claude",
+      "cost_class": "subscription",
+      "cost_per_1k": 0.025
+    },
+    {
+      "name": "claude-code",
+      "provider": "anthropic",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "claude"
+    },
+    {
+      "name": "local-coder",
+      "provider": "vllm",
+      "tier": 1,
+      "capability": "coding",
+      "preferred": true,
+      "cost_per_1k": 0.0,
+      "cost_class": "free_local"
+    }
+  ]
+}

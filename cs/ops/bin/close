@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+# ops/bin/close — operator-called. Close a dispatch job by enqueue id.
+# First-terminal-wins: a second close no-ops. Not a model tool.
+from _dispatch import TERMINAL, first_terminal, qid
+from _estate_io import append_jsonl, state_dir
+from _landing import close_ledger_fields, validate_operator_close
+import fcntl, json, sys, time
+from pathlib import Path
+
+from _roots import roots
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parent.parent
+STATE = roots()["state"]
+# the dispatch shelf tick drains: under the state root (default <code>/ledger, as before)
+Q = STATE / "dispatch.jsonl"
+LOCK = STATE / "dispatch.lock"
+LEDGER = state_dir(LAB) / "ledger.jsonl"
+
+
+a = json.load(sys.stdin)
+jid = str(a.get("id") or a.get("job") or "")
+if not jid:
+    sys.exit("close: enqueue id required")
+state = str(a.get("state") or "operator_close")
+if state not in TERMINAL:
+    sys.exit("close: state must be done, error, or operator_close")
+if state == "operator_close" and a.get("reason"):
+    err = validate_operator_close(LAB, a)
+    if err:
+        sys.exit(err)
+LOCK.parent.mkdir(parents=True, exist_ok=True)
+lf = open(LOCK, "a")
+fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+existing = None
+try:
+    existing = first_terminal(Q, jid)
+    if existing is None:
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "id": jid, "job": jid,
+            "spec": str(a.get("spec") or ""),
+            "state": state, "pid": 0, "note": str(a.get("note") or ""),
+        }
+        if "code" in a:
+            row["code"] = a.get("code")
+        append_jsonl(Q, row, sort_keys=False, compact=False,
+                     sync=False, encoding='utf-8')
+        if state == "operator_close" and a.get("reason"):
+            reason = str(a.get("reason") or "").strip()
+            stop = str(a.get("stop") or "").strip()
+            if not stop:
+                stop = ("operator-close reason " + reason +
+                        (" dest " + str(a.get("dest_sha") or "") if a.get("dest_sha") else "")).strip()
+            led = {
+                "ts": row["ts"], "spec": a.get("spec", ""),
+                "task": a.get("task", ""), "trial": a.get("trial", 1),
+                "model": a.get("model", ""), "verdict": "operator_close",
+                "stop": stop,
+                "cost_usd": 0, "turns": 0, "tool_calls": 0, "seconds": 0,
+                "transcript": a.get("transcript", ""),
+                "run": a.get("run_id", "") or a.get("run", "") or "",
+                "dest": a.get("dest", ""), "merge_sha": a.get("dest_sha", ""),
+                "note": a.get("note") or "",
+            }
+            led.update(close_ledger_fields(a))
+            append_jsonl(LEDGER, led, sort_keys=False, compact=False,
+                         sync=False, encoding='utf-8')
+finally:
+    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    lf.close()
+out = {"ok": True, "id": jid,
+       "state": existing.get("state") if existing is not None else state}
+if existing is not None:
+    out["note"] = "already terminal"
+print(json.dumps(out))

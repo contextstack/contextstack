@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must not resolve the caller's estate.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+
+EFFECT = "youtube_playlist_mutation"
+
+
+def load_script(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# Fixture-owned schedule; authority is exercised against isolated grants below.
+capture = {"id": "fixture-capture", "spec": "specs/fixture.yaml", "lane": "shadow",
+           "task": "tasks/fixture", "timezone": "America/New_York", "external_effects": [EFFECT]}
+with scratch_dir(prefix="scheduled-effects-") as raw:
+    root = Path(raw)
+    (root / "ops/bin").mkdir(parents=True)
+    (root / "specs").mkdir()
+    (root / "grants").mkdir()
+    (root / "ledger").mkdir()
+    destination = root / "dest"
+    destination.mkdir()
+    for name in ('_dispatch.py', '_estate_io.py', '_roots.py', "enqueue", "_grant.py", "_corpus_contract.py", "_workspace_setup.py"):
+        shutil.copy2(LAB / "ops/bin" / name, root / "ops/bin" / name)
+    (root / "specs/fixture.yaml").write_text(
+        "id: fixture\nmodel: local-coder\n", encoding="utf-8")
+    (root / "grants/g-effect.yaml").write_text(
+        "id: g-effect\nrepo: %s\npaths: [result.md]\ngates: [fixture/check]\n"
+        "effects: [%s]\ncommit: true\nexpiry: 2099-01-01T00:00:00Z\nstatus: active\n"
+        % (destination, EFFECT), encoding="utf-8")
+    (root / "grants/g-no-effect.yaml").write_text(
+        "id: g-no-effect\nrepo: %s\npaths: [result.md]\ngates: [fixture/check]\n"
+        "commit: true\nexpiry: 2099-01-01T00:00:00Z\nstatus: active\n"
+        % destination, encoding="utf-8")
+
+    def enqueue(grant_id, effects):
+        return subprocess.run(
+            [str(root / "ops/bin/enqueue")],
+            input=json.dumps({
+                "spec": "specs/fixture.yaml", "lane": "shadow",
+                "resource": str(destination), "grant": grant_id,
+                "external_effects": effects,
+            }), text=True, capture_output=True, cwd=root, env={**hermetic_env()})
+
+    accepted = enqueue("g-effect", [EFFECT])
+    assert accepted.returncode == 0, accepted.stderr
+    row = json.loads((root / "ledger/dispatch.jsonl").read_text().splitlines()[-1])
+    assert row["external_effects"] == [EFFECT]
+    refused = enqueue("g-no-effect", [EFFECT])
+    assert refused.returncode != 0 and "effect not in grant" in refused.stderr
+    malformed = enqueue("g-effect", [EFFECT, EFFECT])
+    assert malformed.returncode != 0 and "unique array" in malformed.stderr
+
+schedule_tick = load_script("effect_schedule_tick", LAB / "ops/bin/schedule-tick")
+seen = []
+real_run = schedule_tick.subprocess.run
+
+
+def fake_run(command, input=None, **kwargs):
+    seen.append((command, json.loads(input)))
+    return SimpleNamespace(returncode=0, stdout='{"id":"fixture-job"}\n', stderr="")
+
+
+schedule_tick.subprocess.run = fake_run
+try:
+    assert schedule_tick.enqueue(capture, "2026-09-06T10:00:00Z", {"head": "abc"}) \
+        == "fixture-job"
+finally:
+    schedule_tick.subprocess.run = real_run
+assert seen[-1][1]["external_effects"] == [EFFECT]
+
+lab_tick = load_script("effect_lab_tick", LAB / "ops/bin/tick")
+old = os.environ.get("LAB_VIDEO_MUTATION")
+os.environ["LAB_VIDEO_MUTATION"] = "operator-canary"
+try:
+    assert "LAB_VIDEO_MUTATION" not in lab_tick.child_env("job", [])
+    authorized = lab_tick.child_env("job", [EFFECT], trial=2)
+    assert authorized["LAB_VIDEO_MUTATION"] == "1"
+    assert authorized["LAB_JOB_ID"] == "job" and authorized["LAB_TRIAL"] == "2"
+finally:
+    if old is None:
+        os.environ.pop("LAB_VIDEO_MUTATION", None)
+    else:
+        os.environ["LAB_VIDEO_MUTATION"] = old
+
+with scratch_dir(prefix="effect-run-spec-") as raw:
+    root = Path(raw)
+    (root / "specs").mkdir()
+    (root / "specs/fixture.yaml").write_text(
+        "id: fixture\nmodel: local-coder\ntrials: 1\n", encoding="utf-8")
+    calls = []
+    original_lab, original_one = lab_tick.LAB, lab_tick.one_trial
+    original_execution_row = lab_tick.execution_row
+    lab_tick.LAB = root
+    lab_tick.one_trial = lambda text, n, task, job, effects: \
+        calls.append((n, job, effects)) or 0
+    lab_tick.execution_row = lambda rel, sid, before: {
+        "spec": sid, "verdict": "pass", "transcript": "",
+    }
+    try:
+        code, _ = lab_tick.run_spec("specs/fixture.yaml", "fixture", "job-1", [EFFECT])
+    finally:
+        lab_tick.LAB, lab_tick.one_trial = original_lab, original_one
+        lab_tick.execution_row = original_execution_row
+    assert code == 0 and calls == [(1, "job-1", [EFFECT])]
+
+assert "external_effects" in lab_tick.JOB_META
+print("check: scheduled external effects require grant authority and are isolated per child")

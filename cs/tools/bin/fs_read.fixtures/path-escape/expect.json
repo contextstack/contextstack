@@ -1,0 +1,8 @@
+{
+  "exit": 1,
+  "stdout": "path escapes workspace: ../x\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"path\": \"../x\"}, \"name\": \"fs_read\"}\n"
+  },
+  "untouched": true
+}

@@ -1,0 +1,62 @@
+[
+ {
+  "ok": {
+   "text": "trying to leave",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fs_write",
+     "args": {
+      "path": "../evil",
+      "content": "x"
+     }
+    },
+    {
+     "id": "2",
+     "name": "fs_read",
+     "args": {
+      "path": "/etc/passwd"
+     }
+    },
+    {
+     "id": "3",
+     "name": "exec",
+     "args": {
+      "cmd": [
+       "cat",
+       "/etc/hosts"
+      ]
+     }
+    },
+    {
+     "id": "4",
+     "name": "exec",
+     "args": {
+      "cmd": [
+       "sh",
+       "-c",
+       "echo hi > ../escaped"
+      ]
+     }
+    },
+    {
+     "id": "5",
+     "name": "exec",
+     "args": {
+      "cmd": [
+       "sh",
+       "-c",
+       "echo hi > inside.txt && cat inside.txt"
+      ]
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

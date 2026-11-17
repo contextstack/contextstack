@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+# Fixture-only image_out tool (SCHEMA Tool, v2 contract): reads shot.png from
+# the workspace and emits {text, image{media_type, base64}}. The undeclared
+# arg {mode: "plain"} prints the bare file name instead (the retired v1
+# contract), so `tool-image-malformed` pins the runner's error observation
+# while the advertised descriptor stays byte-identical to v1's.
+import base64, json, sys
+
+a = json.load(sys.stdin)
+if a.get("mode") == "plain":
+    sys.stdout.write("shot.png")
+    sys.exit(0)
+with open("shot.png", "rb") as f:
+    data = base64.b64encode(f.read()).decode()
+sys.stdout.write(json.dumps({"text": "captured shot.png", "image": {"media_type": "image/png", "base64": data}}))

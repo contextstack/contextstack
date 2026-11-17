@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""weekly-review-schedule: one Monday fire, no second fire that week, one catch-up, report + attention.
+
+A delivery that keeps failing is held after repeated_failure's threshold (default 3), not retried
+forever. A success on the dispatch shelf resets that streak.
+
+Fake clock via schedule-tick's `now`. Temp state root only. Run with
+`env -u LAB_STATE_ROOT -u CSGATEWAY_ENDPOINT`.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+KIT = Path(__file__).resolve().parents[3]
+CS = KIT / "scripts" / "cs"
+CS_REVIEW = KIT / "scripts" / "cs_review.py"
+TICK = KIT / "ops" / "bin" / "schedule-tick"
+# 2026-11-09 and 2026-11-16 are Mondays.
+MONDAY = "2026-11-09T08:00:00+00:00"
+SAME_WEEK = "2026-11-11T12:00:00+00:00"
+MISSED = "2026-11-16T10:00:00+00:00"  # two hours after 08:00, past the 60 minute grace
+AFTER = "2026-11-16T12:00:00+00:00"
+MARKER = "weekly-review-schedule fixture"
+# repeated_failure's default failure_hold_after. The hold is the tick after that many terminals.
+THRESHOLD = 3
+HOLD = "repeated_terminal_failure:review_failed"
+FAILED = []
+
+
+def expect(cond, label, detail=""):
+    print("%s %s%s" % ("ok  " if cond else "FAIL", label, (" : " + str(detail)[:800]) if detail and not cond else ""))
+    if not cond:
+        FAILED.append(label)
+
+
+def stamp(path):
+    try:
+        return path.stat().st_mtime_ns if path.exists() else None
+    except OSError:
+        return None
+
+
+def clean_env(home, hook):
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "TZ": "UTC",
+           "CS_REVIEW_WEEKLY_HOOK": str(hook)}
+    return env
+
+
+def run(argv, env, payload=None):
+    return subprocess.run(argv, input=payload, text=True, capture_output=True, env=env, timeout=60)
+
+
+def schedules(state):
+    path = state / "schedules.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def fires(state):
+    path = state / "schedule-fires.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def job_fires(state):
+    return [row for row in fires(state) if row.get("job") and row.get("job") != "dry-run"]
+
+
+def attention(state):
+    path = state / "attention.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def reports(state):
+    directory = state / "reviews"
+    return sorted(p.name for p in directory.glob("*.md")) if directory.is_dir() else []
+
+
+def terminals(state):
+    path = state / "dispatch.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def latest(state):
+    rows = [row for row in schedules(state) if row.get("id") == "weekly-review"]
+    return rows[-1] if rows else {}
+
+
+def block_reviews(state):
+    """Make the reviews directory unwritable by replacing it with a file, so every delivery fails."""
+    path = state / "reviews"
+    if path.is_dir():
+        shutil.rmtree(path)
+    path.write_text("not a directory\n", encoding="utf-8")
+
+
+def unblock_reviews(state):
+    path = state / "reviews"
+    if path.is_file():
+        path.unlink()
+
+
+def block_report(state, date):
+    """The report path exists as a directory, so that date's delivery cannot write the file."""
+    target = state / "reviews" / ("%s.md" % date)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.mkdir()
+
+
+def install(state, env):
+    return run([sys.executable, str(CS), "review", "schedule", "--state", str(state)], env)
+
+
+def new_state(scratch, name):
+    root = scratch / name
+    home, state = root / "home", root / "state"
+    home.mkdir(parents=True)
+    state.mkdir()
+    hook = root / "review.md"
+    hook.write_text("# Weekly review\n\n%s\n" % MARKER, encoding="utf-8")
+    env = clean_env(home, hook)
+    installed = install(state, env)
+    expect(installed.returncode == 0 and latest(state).get("enabled") is True
+           and latest(state).get("command") == "review-weekly",
+           "%s installs the weekly review" % name,
+           (installed.returncode, installed.stderr, installed.stdout))
+    return state, env
+
+
+def tick(state, now, env):
+    payload = {"now": now, "schedules": str(state / "schedules.jsonl"), "fires": str(state / "schedule-fires.jsonl"),
+               "dispatch": str(state / "dispatch.jsonl"), "lock": str(state / "schedule.lock"),
+               "scan_stale": False, "missed_default": "skip"}
+    result = run([sys.executable, str(TICK)], env, json.dumps(payload))
+    text = (result.stdout or "").strip()
+    body = json.loads(text.splitlines()[-1]) if text else {}
+    return result.returncode, body, (result.stderr or "")[-500:]
+
+
+def check_hold(scratch):
+    state, env = new_state(scratch, "hold")
+    block_reviews(state)
+    when = "2026-11-16T08:00:00+00:00"
+    for n in range(1, THRESHOLD + 1):
+        rc, out, err = tick(state, when, env)
+        row = latest(state)
+        fails = [item for item in terminals(state) if item.get("schedule_id") == "weekly-review"]
+        retried = any(str(item.get("reason") or "").startswith("review_failed:") for item in out.get("deferred") or [])
+        expect(rc == 0 and row.get("enabled") is True and not row.get("hold") and not out.get("admitted")
+               and retried and len(fails) == n and job_fires(state) == [],
+               "failure %d retries and stays enabled" % n, (rc, out, err, row, fails, job_fires(state)))
+    fails = [item for item in terminals(state) if item.get("schedule_id") == "weekly-review"]
+    distinct = {item.get("id") for item in fails}
+    expect(len(distinct) == THRESHOLD and all(
+        item.get("state") == "error" and item.get("verdict") == "void" and item.get("stop") == "review_failed"
+        for item in fails),
+           "failed deliveries are distinct void terminals, not an enqueue", fails)
+    rc, out, err = tick(state, when, env)
+    row = latest(state)
+    deferred = out.get("deferred") or []
+    expect(rc == 0 and row.get("enabled") is False and row.get("hold") == HOLD and not out.get("admitted")
+           and deferred == [{"id": "weekly-review", "reason": HOLD}]
+           and len(terminals(state)) == THRESHOLD,
+           "the failing review is held after the threshold", (rc, out, err, row, deferred, terminals(state)))
+    rc, out, err = tick(state, "2026-11-16T09:00:00+00:00", env)
+    expect(rc == 0 and not out.get("admitted") and not out.get("deferred")
+           and latest(state).get("enabled") is False and latest(state).get("hold") == HOLD
+           and len(terminals(state)) == THRESHOLD and job_fires(state) == [],
+           "a held review is not retried", (rc, out, err, latest(state), terminals(state)))
+
+
+def check_reset(scratch):
+    state, env = new_state(scratch, "reset")
+    week1, week2 = "2026-11-16T08:00:00+00:00", "2026-11-23T08:00:00+00:00"
+    block_reviews(state)
+    for n in range(2):
+        rc, out, err = tick(state, week1, env)
+        expect(rc == 0 and latest(state).get("enabled") is True, "reset setup failure %d" % (n + 1), (rc, out, err))
+    unblock_reviews(state)
+    rc, out, err = tick(state, week1, env)
+    row = latest(state)
+    expect(rc == 0 and len(out.get("admitted") or []) == 1 and row.get("enabled") is True and not row.get("hold")
+           and reports(state) == ["2026-11-16.md"]
+           and [item.get("verdict") for item in terminals(state)] == ["void", "void", "pass"],
+           "a success after failures records a pass and stays enabled",
+           (rc, out, err, row, terminals(state), reports(state)))
+    block_report(state, "2026-11-23")
+    rc, out, err = tick(state, week2, env)
+    expect(rc == 0 and latest(state).get("enabled") is True and not latest(state).get("hold")
+           and [item.get("verdict") for item in terminals(state)] == ["void", "void", "pass", "void"],
+           "one failure after a success does not hold", (rc, out, err, latest(state), terminals(state)))
+    # History here ends void, pass, void. Without the pass those would be three failures and this
+    # tick would hold the row instead of retrying.
+    rc, out, err = tick(state, week2, env)
+    row = latest(state)
+    retried = any(str(item.get("reason") or "").startswith("review_failed:") for item in out.get("deferred") or [])
+    expect(rc == 0 and row.get("enabled") is True and not row.get("hold") and retried
+           and [item.get("verdict") for item in terminals(state)] == ["void", "void", "pass", "void", "void"],
+           "a success resets the consecutive failure count", (rc, out, err, row, terminals(state)))
+    rc, out, err = tick(state, week2, env)
+    expect(rc == 0 and latest(state).get("enabled") is True and not latest(state).get("hold")
+           and [item.get("verdict") for item in terminals(state)].count("void") == THRESHOLD + 2,
+           "the third failure after a success is recorded and not yet held",
+           (rc, out, err, latest(state), terminals(state)))
+    rc, out, err = tick(state, week2, env)
+    row = latest(state)
+    deferred = out.get("deferred") or []
+    expect(rc == 0 and row.get("enabled") is False and row.get("hold") == HOLD and not out.get("admitted")
+           and deferred == [{"id": "weekly-review", "reason": HOLD}],
+           "three failures after a success hold the row", (rc, out, err, row, deferred))
+
+
+def main():
+    real = [Path.home() / ".contextstack" / name / "schedules.jsonl" for name in ("state", "dev-state")]
+    before = {str(path): stamp(path) for path in real}
+    scratch = Path(tempfile.mkdtemp(prefix="weekly-review-schedule-", suffix=".noindex"))
+    try:
+        home, state = scratch / "home", scratch / "state"
+        home.mkdir()
+        state.mkdir()
+        hook = scratch / "review.md"
+        hook.write_text("# Weekly review\n\n%s\n" % MARKER, encoding="utf-8")
+        env = clean_env(home, hook)
+
+        first = run([sys.executable, str(CS), "review", "schedule", "--state", str(state)], env)
+        rows = schedules(state) if (state / "schedules.jsonl").is_file() else []
+        expect(first.returncode == 0 and len(rows) == 1 and rows[0].get("id") == "weekly-review"
+               and rows[0].get("cron") == "0 8 * * 1" and rows[0].get("timezone") == "local"
+               and rows[0].get("missed") == "catch_up" and rows[0].get("command") == "review-weekly"
+               and rows[0].get("enabled") is True and "scheduled weekly-review" in first.stdout,
+               "cs review schedule installs one Monday 08:00 local catch_up row",
+               (first.returncode, first.stderr, first.stdout, rows))
+
+        second = run([sys.executable, str(CS_REVIEW), "schedule", "--state", str(state)], env)
+        expect(second.returncode == 0 and len(schedules(state)) == 1 and "already scheduled" in second.stdout,
+               "a second install does not append another row", (second.returncode, second.stdout, second.stderr))
+
+        rc, out, err = tick(state, MONDAY, env)
+        fired = job_fires(state)
+        expect(rc == 0 and len(out.get("admitted") or []) == 1 and len(fired) == 1
+               and not fired[0].get("catch_up") and reports(state) == ["2026-11-09.md"]
+               and len(attention(state)) == 1, "the first Monday fires once", (rc, out, err, fired, reports(state)))
+
+        rc, out, err = tick(state, SAME_WEEK, env)
+        expect(rc == 0 and not out.get("admitted") and len(job_fires(state)) == 1 and reports(state) == ["2026-11-09.md"]
+               and len(attention(state)) == 1, "a second tick the same week does not fire",
+               (rc, out, err, job_fires(state)))
+
+        rc, out, err = tick(state, MISSED, env)
+        fired = job_fires(state)
+        expect(rc == 0 and len(out.get("admitted") or []) == 1 and len(fired) == 2 and fired[-1].get("catch_up") is True
+               and reports(state) == ["2026-11-09.md", "2026-11-16.md"] and len(attention(state)) == 2,
+               "a missed week catches up exactly once", (rc, out, err, fired, reports(state)))
+
+        rc, out, err = tick(state, AFTER, env)
+        expect(rc == 0 and not out.get("admitted") and len(job_fires(state)) == 2 and len(reports(state)) == 2
+               and len(attention(state)) == 2, "the caught-up week does not fire again",
+               (rc, out, err, job_fires(state)))
+
+        items = attention(state)
+        linked = []
+        for item in items:
+            report = state / str(item.get("report") or "")
+            linked.append(item.get("kind") == "needs_you" and report.is_file() and MARKER in report.read_text(encoding="utf-8")
+                          and item.get("report") == "reviews/%s" % report.name)
+        expect(linked == [True, True], "each attention item links to its report file", items)
+
+        passes = [row for row in terminals(state) if row.get("schedule_id") == "weekly-review"]
+        expect(len(passes) == 2 and all(row.get("verdict") == "pass" and row.get("state") == "done" for row in passes)
+               and latest(state).get("enabled") is True and not latest(state).get("hold"),
+               "successful deliveries record a pass and do not hold", (passes, latest(state)))
+
+        check_hold(scratch)
+        check_reset(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        after = {str(path): stamp(path) for path in real}
+        if after != before:
+            print("FAIL real state schedules.jsonl changed", before, after)
+            FAILED.append("real state untouched")
+    if FAILED:
+        print("weekly-review-schedule: %d failed" % len(FAILED))
+        return 1
+    print("weekly-review-schedule: pass")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

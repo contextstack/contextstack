@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Commit messages need no allocation; attribution stripping and gates still run."""
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / 'tasks/regressions/_lib'))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+with scratch_dir(prefix='commit-message-') as raw:
+    root = Path(raw)
+    hooks = root / 'scripts/hooks'
+    hooks.mkdir(parents=True)
+    hook = hooks / 'commit-msg'
+    shutil.copy2(LAB / 'scripts/hooks/commit-msg', hook)
+    for name in ('ops-cap.py', 'check-red-gate'):
+        (root / 'scripts' / name).write_text(
+            'from pathlib import Path\n'
+            'import sys\n'
+            'assert sys.argv[1] == "commit-msg"\n'
+            'with Path("gates").open("a") as log: log.write(Path(__file__).name + "\\n")\n')
+    message = root / 'message'
+    for text in ('Implement runner change\n', 'Demanded-by: arbitrary unregistered request\n'):
+        message.write_text(text + 'Co-authored-by: Fixture\nGenerated with Fixture\n')
+        subprocess.run([str(hook), str(message)], cwd=root, env=hermetic_env(), check=True)
+        assert message.read_text().strip() == text.strip()
+    assert (root / 'gates').read_text().splitlines() == ['ops-cap.py', 'check-red-gate'] * 2
+    (root / 'scripts/check-red-gate').write_text('raise SystemExit(1)\n')
+    assert subprocess.run([str(hook), str(message)], cwd=root, env=hermetic_env()).returncode == 1
+print('check: commit messages accept unregistered requests, strip attribution and enforce gates')

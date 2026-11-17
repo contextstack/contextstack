@@ -1,0 +1,7 @@
+{
+  "cmd": [
+    "sh",
+    "-c",
+    "echo x > /tmp/tool-fixtures-denied && echo wrote"
+  ]
+}

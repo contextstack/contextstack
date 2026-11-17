@@ -1,0 +1,27 @@
+# Build output
+/target/
+__pycache__/
+.DS_Store
+
+# Lane and run scratch
+.lab-tmp/
+.task-tmp/
+.tmp-*/
+
+# Local agent and tool state (AGENTS.md, CLAUDE.md and shared .claude files are tracked)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.codex/
+.cursor/
+.gemini/
+.gstack/
+.estate/
+.coverage
+/tmp/
+
+# Public export dry runs (scripts/public-export): never commit their output
+/public-export-dryrun*/
+/public-export-dryrun*.report.*
+
+# Lane agents sometimes leave check logs at the repo root: never commit them
+/*.log

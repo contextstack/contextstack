@@ -1,0 +1,13 @@
+{
+ "exit_code": 2,
+ "ops": [],
+ "requests": [],
+ "rows": [],
+ "run_dirs_distinct": true,
+ "runs": [],
+ "stderr": [
+  "lab: specs/fx.yaml: yaml: unmarshal errors:",
+  "  line 12: field surprise not found in type lab.Spec (unknown fields are refused — SCHEMA.md)"
+ ],
+ "stdout": []
+}

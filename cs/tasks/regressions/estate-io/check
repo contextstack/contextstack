@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""real files/processes characterize each shared transport choice."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct ops imports and calls must not resolve the caller's estate either.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _estate_io import (append_jsonl, basename, call_op, digest, git, iter_jsonl,
+                        pid_live, read_jsonl, run_op, sha256_bytes, utc_time)
+from _dispatch import TERMINAL, first_terminal, first_terminal_states, qid, spec_value
+
+
+def raises(kind, fn):
+    try:
+        fn()
+    except kind:
+        return
+    raise AssertionError("expected " + kind.__name__)
+
+
+with scratch_dir(prefix="estate-io-") as raw:
+    root = Path(raw)
+    shelf = root / "rows.jsonl"
+    for strict in (True, False):
+        assert read_jsonl(shelf, strict=strict) == []
+        assert read_jsonl(root, strict=strict) == []
+    raises(TypeError, lambda: read_jsonl(shelf))
+    shelf.write_text('\n{"n":1}\nnull\n[1]\n3\n"text"\ntrue\n')
+    assert read_jsonl(shelf, strict=True) == [{"n": 1}, None, [1], 3, "text", True]
+    assert read_jsonl(shelf, strict=False) == [{"n": 1}]
+    shelf.write_text('{"before":1}\nbroken\n{"after":2}\n')
+    raises(json.JSONDecodeError, lambda: read_jsonl(shelf, strict=True))
+    assert read_jsonl(shelf, strict=False) == [{"before": 1}, {"after": 2}]
+    shelf.write_bytes(b'{"bad":"\xff"}\n')
+    raises(UnicodeDecodeError, lambda: read_jsonl(shelf, strict=True))
+    assert read_jsonl(shelf, strict=False) == [{"bad": "\ufffd"}]
+
+    # Two formerly identical parsers: hour-only, offset and naive input.
+    for text in (' 2026-09-08T12 ', '2026-09-08T12:00:00',
+                 '2026-09-08T12:00:00Z', '2026-09-08T14:00:00+02:00'):
+        assert utc_time(text).isoformat() == '2026-09-08T12:00:00+00:00'
+    for bad in (None, 0, [], '', ' ', 'broken'):
+        assert utc_time(bad) is None
+
+    # A fake Git executable inspects actual argv/env, without exposing secrets.
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "git"
+    fake.write_text("#!" + sys.executable + '\n' + '''import json, os, sys
+if "--bad-bytes" in sys.argv:
+    os.write(1, b"\\xff")
+else:
+    print(json.dumps({"args": sys.argv[1:], "value": os.environ.get("ESTATE_IO_TEST"),
+                      "prompt": os.environ.get("GIT_TERMINAL_PROMPT")}))
+if "--fail" in sys.argv:
+    print("git failed", file=sys.stderr)
+    sys.exit(7)
+''')
+    fake.chmod(0o755)
+    env = {**hermetic_env(), "PATH": str(bin_dir), "ESTATE_IO_TEST": "explicit",
+           "GIT_TERMINAL_PROMPT": "0"}
+    result = git(root, "status", env=env, errors="strict")
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"args": ["-C", str(root), "status"],
+                                       "value": "explicit", "prompt": "0"}
+    with patch.dict(os.environ, {**env, "ESTATE_IO_TEST": "inherited"}):
+        assert json.loads(git(root, "status", env=None, errors="strict").stdout)["value"] == "inherited"
+    raises(UnicodeDecodeError, lambda: git(root, "--bad-bytes", env=env, errors="strict"))
+    assert git(root, "--bad-bytes", env=env, errors="replace").stdout == "\ufffd"
+    result = git(root, "--fail", env=env, errors="strict")
+    assert result.returncode == 7 and result.stderr.strip() == "git failed"
+
+    ops = root / "ops/bin"
+    ops.mkdir(parents=True)
+    child = ops / "child"
+    child.write_text("#!" + sys.executable + '\n' + '''import json, os, sys
+args = json.load(sys.stdin)
+mode = args["mode"]
+if mode == "json":
+    print("progress")
+    print(json.dumps({"cwd": os.getcwd(), "payload": args}))
+elif mode == "text":
+    print("opaque output")
+elif mode == "fail":
+    print("stdout diagnostic")
+    print("stderr diagnostic", file=sys.stderr)
+    sys.exit(9)
+elif mode == "stdout-fail":
+    print("stdout diagnostic")
+    sys.exit(9)
+elif mode == "silent-fail":
+    sys.exit(9)
+''')
+    child.chmod(0o755)
+    body, error = run_op(root, "child", {"mode": "json", "n": 3})
+    assert error is None and body == {"cwd": str(root.resolve()), "payload": {"mode": "json", "n": 3}}
+    assert run_op(root, "child", {"mode": "text"}) == ({"ok": True, "output": "opaque output"}, None)
+    assert run_op(root, "child", {"mode": "fail"}) == (None, "stderr diagnostic")
+    assert run_op(root, "child", {"mode": "stdout-fail"}) == (None, "stdout diagnostic")
+    assert run_op(root, "child", {"mode": "silent-fail"}) == (None, "child failed")
+    raises(IndexError, lambda: run_op(root, "child", {"mode": "empty"}))
+
+    assert call_op(root, "child", {"mode": "json"})["cwd"] == str(root.resolve())
+    raises(json.JSONDecodeError, lambda: call_op(root, "child", {"mode": "text"}))
+    raises(IndexError, lambda: call_op(root, "child", {"mode": "empty"}))
+    for mode, message in (("fail", "stderr diagnostic"), ("stdout-fail", "stdout diagnostic"),
+                          ("silent-fail", "caller fallback")):
+        try:
+            call_op(root, "child", {"mode": mode}, failure="caller fallback")
+        except RuntimeError as exc:
+            assert str(exc) == message
+        else:
+            raise AssertionError("failed op returned success")
+
+with scratch_dir(prefix="estate-transport-") as raw:
+    root = Path(raw)
+    shelf = root / "dispatch.jsonl"
+    assert first_terminal(shelf, "job") is None
+    assert first_terminal(root, "job") is None
+    terminal = {"id": "job", "job": "wrong", "state": "done"}
+    shelf.write_text(json.dumps(terminal) + "\nBROKEN\n")
+    assert first_terminal(shelf, "job") == terminal  # no parse after terminal
+    raises(json.JSONDecodeError, lambda: first_terminal(shelf, "wrong"))
+    assert first_terminal(shelf, "") is None
+    shelf.write_bytes(json.dumps(terminal).encode() + b'\n{"bad":"\xff"}\n')
+    raises(UnicodeDecodeError, lambda: first_terminal(shelf, "job"))  # whole-file decode
+    shelf.write_text('BROKEN\nnull\n{"ok":true}\n')
+    assert list(iter_jsonl(shelf, strict=False, errors="strict", objects_only=False)) == [None, {"ok": True}]
+    assert list(iter_jsonl(shelf, strict=False, errors="strict", objects_only=True)) == [{"ok": True}]
+    assert qid({"id": 0, "job": 7}) == "7"
+    assert first_terminal_states([terminal, {"id": "job", "state": "error"},
+                                  {"job": "other", "state": "running"}]) == {"job": "done"}
+    for field, expected in (("model", ""), ("id", "first"), ("missing", "")):
+        assert spec_value(" model: ignored\nmodel:\nmodel: later\nid: first\nid: second", field) == expected
+    for value, expected in ((None, ""), (0, ""), (" /a/b/ ", "b"), ("/", ""), ("x", "x")):
+        assert basename(value) == expected
+    assert sha256_bytes(b"abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    assert digest({"b": 2, "a": 1}) == sha256_bytes(b'{"a":1,"b":2}')
+
+    for compact in (True, False):
+        for sorted_keys in (True, False):
+            for durable in (True, False):
+                for encoding in (None, "utf-8"):
+                    shelf.write_bytes(b"prefix\n")
+                    with patch("_estate_io.os.fsync", wraps=os.fsync) as sync:
+                        append_jsonl(shelf, {"b": 2, "a": "é"}, sort_keys=sorted_keys,
+                                     compact=compact, sync=durable, encoding=encoding)
+                        assert sync.call_count == int(durable)
+                    expected = '{"a":"\\u00e9","b":2}' if sorted_keys else '{"b":2,"a":"\\u00e9"}'
+                    if not compact:
+                        expected = expected.replace(':', ': ').replace(',', ', ')
+                    assert shelf.read_bytes() == b"prefix\n" + expected.encode() + b"\n"
+    # The real estate wrapper creates its parent and delegates once. A shared
+    # helper shadowed by the wrapper's name must not disable audit receipts.
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("estate_append_fixture", str(LAB / "ops/bin/estate-commit"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    estate = importlib.util.module_from_spec(spec)
+    loader.exec_module(estate)
+    audit = root / "new-parent/audit.jsonl"
+    estate.append_jsonl(audit, {"event": "fixture"})
+    assert audit.read_bytes() == b'{"event":"fixture"}\n'
+    raises(FileNotFoundError, lambda: append_jsonl(root / "absent/rows", {}, sort_keys=True,
+                                                  compact=True, sync=True, encoding="utf-8"))
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+    try:
+        assert pid_live(child.pid)
+    finally:
+        child.terminate()
+        child.wait()
+    assert not pid_live(child.pid) and not pid_live(None)
+    with patch("_estate_io.os.kill", side_effect=PermissionError):
+        assert not pid_live(42)
+
+print("check: shared estate I/O preserves explicit reader, time and process contracts")

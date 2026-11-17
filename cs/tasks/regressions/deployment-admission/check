@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""real public adapter -> production gateway -> private executor."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import json, os, shutil, socket, subprocess, sys, tempfile, time, urllib.request
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / 'scripts'))
+from check_timeout import timeout
+GW = LAB.parent / 'gateway'
+from bindings import validate
+validate(LAB/'ops/bin/executor-templates.json', GW/'models.json')
+with scratch_dir(prefix='admission-boundary-') as raw:
+    # Missing and duplicate aliases must fail before any provider process starts.
+    actual = json.loads((GW/'models.json').read_text())
+    for kind in ('missing', 'ambiguous'):
+        mutant = json.loads(json.dumps(actual))
+        pool = next(d for d in mutant['deployments'] if d['provider'] == 'cli' and 'claude-code-sonnet-patch' in d['models'])
+        if kind == 'missing':
+            pool['models'].remove('claude-code-sonnet-patch')
+        else:
+            mutant['deployments'].append(dict(pool, id='duplicate-claude-fixture'))
+        fixture = Path(raw)/'bindings-mutant.json'
+        fixture.write_text(json.dumps(mutant))
+        try:
+            validate(LAB/'ops/bin/executor-templates.json', fixture)
+        except AssertionError as error:
+            assert 'claude-code-sonnet-patch' in str(error)
+        else:
+            raise AssertionError(kind + ' admission binding accepted')
+    root = Path(raw); estate = root/'lab'; ops = estate/'ops/bin'; ops.mkdir(parents=True)
+    for source in (LAB/'ops/bin').iterdir():
+        if source.is_file(): shutil.copy2(source, ops/source.name)
+    from native_runtime import stage_native_runtime
+    stage_native_runtime(ops)
+    (estate/'ESTATE').write_text('dev\n')  # finalize-run's node identity
+    # No credentials or production configuration enter this gateway.
+    env = {k:v for k,v in os.environ.items() if k in ('HOME','USER','PATH','TMPDIR','LANG')}
+    (root/'home').mkdir()
+    env['HOME'] = str(root/'home')
+    binary = root/'csgateway'
+    shutil.copy2(os.environ.get('CSGATEWAY_BIN') or LAB.parent/'target/release/cs-gateway',binary)  # the Rust gateway check builds
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+    config = {'lab_executor':str(ops/'_executor.py'),'deployments':[
+        {'id':'fixture','provider':'cli','models':['test-echo','alias'],
+         'max_concurrent':1,'max_queued':0,'max_wait_ms':0}]}
+    (root/'models.json').write_text(json.dumps(config))
+    task=estate/'tasks/demo';task.mkdir(parents=True)
+    (task/'goal.md').write_text('Create hello.txt containing hello.\n')
+    (task/'check').write_text('#!/bin/sh\n[ "$(cat hello.txt)" = hello ]\n');(task/'check').chmod(0o755)
+    template={'binary':sys.executable,'args':['-c',"import time;open('started','w').write('yes');exec(\"while not __import__('pathlib').Path('release').exists():time.sleep(.02)\");open('hello.txt','w').write('hello\\n')"],
+              'cost_class':'free_local','cost_usd':0,'cost_per_1k':0,'auth':'none'}
+    (ops/'executor-templates.json').write_text(json.dumps({'test-echo':template,'alias':template}))
+    env.update(CSGATEWAY_CREDENTIALS='off',CSGATEWAY_PORT=str(port),CSGATEWAY_DISCOVERY_HEALTH='off',CSGATEWAY_AUTH_REQUIRED='false',CSAGENT_MODELS_CONFIG=str(root/'models.json'),
+               CSGATEWAY_LAB_ENDPOINT=f'http://127.0.0.1:{port}/v1/ai/lab-execute')
+    env['LAB_JOB_ID']='public-env-fixture'
+    (estate/'ledger').mkdir(exist_ok=True)
+    (estate/'ledger/dispatch.jsonl').write_text(json.dumps({'event':'pending','id':env['LAB_JOB_ID'],'lane':'probe','task':'tasks/demo','grant':''})+'\n')
+    log=(root/'gateway.log').open('w+')
+    server=subprocess.Popen([str(binary)],cwd=root,env=env,stdout=log,stderr=log)
+    child=None
+    try:
+        deadline = time.monotonic() + timeout(30)
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/admission',timeout=timeout(2)) as r:
+                    assert json.load(r)['configuration']['deployments'][0]['max_concurrent']==1
+                break
+            except OSError:
+                if server.poll() is not None:log.seek(0);raise AssertionError(log.read())
+                time.sleep(.05)
+        else:raise AssertionError('gateway startup timed out')
+        order={'executor':'test-echo','task':'tasks/demo','timeout_s':int(timeout(60))}
+        child=subprocess.Popen([sys.executable,str(ops/'executor')],cwd=estate,env=env,
+                               stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        child.stdin.write(json.dumps(order));child.stdin.close();child.stdin=None
+        deadline = time.monotonic() + timeout(60)
+        while time.monotonic() < deadline:
+            if list((estate/'ledger/runs').glob('*/workspace/started')):break
+            if child.poll() is not None:raise AssertionError(child.communicate())
+            time.sleep(.02)
+        else:raise AssertionError('worker not started')
+        refused=subprocess.run([sys.executable,str(ops/'executor')],cwd=estate,env=env,
+                               input=json.dumps({**order,'executor':'alias'}),text=True,capture_output=True,timeout=timeout(5))
+        assert refused.returncode and 'queue_full' in refused.stderr, refused
+        started=list((estate/'ledger/runs').glob('*/workspace/started'))
+        (started[0].parent/'release').write_text('go')
+        output,error=child.communicate(timeout=timeout(30))
+        assert child.returncode==0,(output,error)
+        result=json.loads(output);run=estate/result['transcript']
+        assert (run/'stimulus/goal.md').read_bytes()==(task/'goal.md').read_bytes()
+        assert json.loads((run/'stimulus/manifest.json').read_text())['source']['job_id']==env['LAB_JOB_ID']
+        assert (run/'evidence/manifest.json').is_file()
+        assert len(list((estate/'ledger/runs').iterdir()))==1,'refused alias launched a worker'
+        # Admission is not permission to land: original grant refusal survives HTTP.
+        bad=subprocess.run([sys.executable,str(ops/'executor')],cwd=estate,env=env,
+                           input=json.dumps({**order,'dest':str(root/'destination')}),text=True,capture_output=True,timeout=timeout(10))
+        assert bad.returncode and 'dest merge is parked' in bad.stderr,bad
+        rows=[json.loads(x) for x in (estate/'ledger/ledger.jsonl').read_text().splitlines()]
+        assert rows[0]['calls'][0]['per_call_latency_ms']>=0
+        log.flush();log.seek(0);text=log.read()
+        assert 'queue_wait_ms' in text and 'work_order_latency_ms' in text,text
+    finally:
+        if child is not None and child.poll() is None:child.kill();child.communicate(timeout=timeout(10))
+        server.terminate()
+        try:server.wait(timeout=timeout(15))
+        except subprocess.TimeoutExpired:server.kill();server.wait()
+        log.close()
+print('check: public Lab executor uses gateway admission without bypassing evidence or grants')

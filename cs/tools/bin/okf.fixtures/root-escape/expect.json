@@ -1,0 +1,6 @@
+{
+  "exit": 1,
+  "stdout": "{\"ok\":false,\"error\":\"root escapes workspace\"}\n",
+  "files": {},
+  "untouched": true
+}

@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path.cwd()
+SELF = Path(__file__).resolve()
+failures = []
+
+mutations = (
+    ".write_text(", ".write_bytes(", ".unlink(", "rmtree(",
+    ".mkdir(", ".chmod(",
+)
+guard = "refusing live lab root"
+
+checks = []
+for pat in ("tasks/*/check", "tasks/work/*/check", "tasks/regressions/*/check",
+            "tasks/sweeps/*/check", "tasks/judgments/*/check"):
+    checks.extend(ROOT.glob(pat))
+for check in sorted(checks):
+    rel = check.relative_to(ROOT)
+    if check.resolve() == SELF or not check.is_file() or "setup" in rel.parts:
+        continue
+    text = check.read_text(encoding="utf-8", errors="replace")
+    cwd_root = re.search(r"ROOT\s*=\s*Path\.cwd\(\)", text)
+    mutates = any(token in text for token in mutations)
+    canonical_redirection = re.search(
+        r">\s*(?:\./)?ledger/(?:ledger|dispatch|judgments|shadow)\.jsonl", text
+    )
+    if (cwd_root and mutates) or canonical_redirection:
+        first_mutation = min(
+            (text.find(token) for token in mutations if token in text),
+            default=len(text),
+        )
+        if guard not in text or text.find(guard) > first_mutation:
+            failures.append(str(check))
+
+if failures:
+    for check in failures:
+        print(f"check: {check} can write the live lab control plane without an early guard")
+    sys.exit(1)
+
+print("check: live control-plane task isolation ok")

@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Cloned vendor boots App\\ and Pest with no autoloader edits, <1 MB physical."""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Directly imported estate helpers must see the same isolated roots as children.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+LAB = Path(__file__).resolve().parents[3]
+CHECKLIB = LAB / "scripts/checklib.sh"
+LIMIT = 1024 * 1024
+WRAPPER = '''#!/bin/sh
+. "$CHECKLIB_PATH"
+pest_class ThingTest
+echo check: ok
+'''
+
+
+def git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, env={**hermetic_env()})
+
+
+def write(path, body):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def attach_volume(image, mountroot):
+    subprocess.run(
+        ["hdiutil", "create", "-size", "256m", "-fs", "APFS", "-volname", "labclone", str(image)],
+        check=True, capture_output=True,
+        env={**hermetic_env()},
+    )
+    mountroot.mkdir()
+    subprocess.run(
+        ["hdiutil", "attach", "-nobrowse", "-mountroot", str(mountroot), str(image)],
+        check=True, capture_output=True,
+        env={**hermetic_env()},
+    )
+    return mountroot / "labclone"
+
+
+def detach_volume(mount):
+    subprocess.run(["hdiutil", "detach", str(mount), "-force", "-quiet"], capture_output=True, env={**hermetic_env()})
+
+
+checklib = CHECKLIB.read_text(encoding="utf-8")
+assert ".lab-composer-base.php" not in checklib
+assert "auto_prepend_file" not in checklib
+assert ".lab-pest.php" not in checklib
+
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _setup_workspace import forget_worktree, materialize  # noqa: E402
+
+with scratch_dir(prefix="setup-workspace-clone-vendor-") as raw:
+    host = Path(raw)
+    vol = None
+    try:
+        vol = attach_volume(host / "labclone.sparseimage", host / "mnt")
+        origin = vol / "origin"
+        origin.mkdir()
+        git(origin, "init", "-q", "-b", "main")
+        git(origin, "config", "user.email", "fixture@example.test")
+        git(origin, "config", "user.name", "Fixture")
+        write(origin / "composer.lock", '{"packages":[]}\n')
+        write(origin / "composer.json", '{"name":"lab/fixture"}\n')
+        artisan = write(
+            origin / "artisan",
+            "#!/usr/bin/env php\n"
+            "<?php\n"
+            "require __DIR__ . '/vendor/autoload.php';\n"
+            "if (!class_exists(App\\Providers\\AppServiceProvider::class)) {\n"
+            "    fwrite(STDERR, \"autoload missed workspace App\\\\\\n\");\n"
+            "    exit(1);\n"
+            "}\n"
+            "if (!class_exists(Pest\\TestSuite::class)) {\n"
+            "    fwrite(STDERR, \"Pest missing\\n\");\n"
+            "    exit(1);\n"
+            "}\n"
+            "Pest\\TestSuite::getInstance(getcwd(), 'tests');\n"
+            "$filter = '';\n"
+            "foreach ($argv as $i => $arg) {\n"
+            "    if ($arg === '--filter' && isset($argv[$i + 1])) {\n"
+            "        $filter = $argv[$i + 1];\n"
+            "    }\n"
+            "    if (str_starts_with((string) $arg, '--filter=')) {\n"
+            "        $filter = substr($arg, 9);\n"
+            "    }\n"
+            "}\n"
+            "if ($filter !== 'ThingTest') {\n"
+            "    fwrite(STDERR, \"unexpected filter\\n\");\n"
+            "    exit(1);\n"
+            "}\n"
+            "echo \"OK\\n\";\n",
+        )
+        artisan.chmod(0o755)
+        write(
+            origin / "app/Providers/AppServiceProvider.php",
+            "<?php\nnamespace App\\Providers;\nclass AppServiceProvider {}\n",
+        )
+        write(
+            origin / "tests/Feature/ThingTest.php",
+            "<?php\nclass ThingTest {}\n",
+        )
+        git(origin, "add", ".")
+        git(origin, "commit", "-qm", "base")
+        head = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "HEAD"], text=True, env={**hermetic_env()}).strip()
+
+        lab = vol / "lab"
+        setup = lab / "ledger/setups/corpus"
+        subprocess.run(["git", "clone", "--quiet", str(origin), str(setup)], check=True, env={**hermetic_env()})
+        git(setup, "update-ref", "refs/lab/base", head)
+        write(
+            setup / "vendor/autoload.php",
+            "<?php\n"
+            "$vendorDir = __DIR__;\n"
+            "$baseDir = dirname($vendorDir);\n"
+            "spl_autoload_register(function ($class) use ($vendorDir, $baseDir) {\n"
+            "    $map = [\n"
+            "        'App\\\\' => $baseDir . '/app/',\n"
+            "        'Pest\\\\' => $vendorDir . '/pestphp/pest/src/',\n"
+            "    ];\n"
+            "    foreach ($map as $prefix => $dir) {\n"
+            "        if (!str_starts_with($class, $prefix)) {\n"
+            "            continue;\n"
+            "        }\n"
+            "        $path = $dir . str_replace('\\\\', '/', substr($class, strlen($prefix))) . '.php';\n"
+            "        if (is_file($path)) {\n"
+            "            require $path;\n"
+            "        }\n"
+            "    }\n"
+            "});\n",
+        )
+        write(
+            setup / "vendor/pestphp/pest/src/TestSuite.php",
+            "<?php\n"
+            "namespace Pest;\n"
+            "class TestSuite {\n"
+            "    public static function getInstance(string $root, string $tests): self {\n"
+            "        if (realpath($root) !== realpath(getcwd())) {\n"
+            "            throw new \\RuntimeException('Pest root is not workspace');\n"
+            "        }\n"
+            "        if (!is_file($root . '/app/Providers/AppServiceProvider.php')) {\n"
+            "            throw new \\RuntimeException('Pest cannot see workspace app');\n"
+            "        }\n"
+            "        return new self;\n"
+            "    }\n"
+            "}\n",
+        )
+        (setup / "vendor" / "pkg").mkdir(parents=True)
+        (setup / "vendor" / "pkg" / "blob").write_bytes(b"V" * (32 * 1024 * 1024))
+
+        task = lab / "tasks/work/corpus-cell"
+        task.mkdir(parents=True)
+        (task / "goal.md").write_text("cell\n")
+        (task / "notes.md").write_text("writes: app/*,tests/*\n")
+        (task / "setup").symlink_to(setup)
+
+        before = shutil.disk_usage(vol).used
+        ws = lab / "ledger/runs/run-1/workspace"
+        materialize(task / "setup", ws, task=task, lab=lab)
+        physical = shutil.disk_usage(vol).used - before
+        assert physical < LIMIT, "cloned vendor added %s physical bytes" % physical
+        assert (ws / "vendor").is_dir() and not (ws / "vendor").is_symlink()
+        assert (ws / "app" / "Providers" / "AppServiceProvider.php").is_file()
+
+        env = {k: v for k, v in hermetic_env().items() if k != "LAB_CHECK"}
+        env["CHECKLIB_PATH"] = str(CHECKLIB)
+        wrapper = ws / "check"
+        wrapper.write_text(WRAPPER, encoding="utf-8")
+        wrapper.chmod(0o755)
+        result = subprocess.run(
+            [str(wrapper)], cwd=str(ws), capture_output=True, text=True, env=env,
+        )
+        text = result.stdout + result.stderr
+        assert result.returncode == 0, text
+        assert "check: ok" in result.stdout, text
+        assert "autoload missed workspace App" not in text, text
+        assert not (ws / ".lab-composer-base.php").exists()
+        assert not (ws / ".lab-pest.php").exists()
+
+        cache = next((lab / "ledger/setups/installs").glob("*/vendor"))
+        (ws / "vendor" / "pkg" / "blob").write_bytes(b"W" * 1024)
+        assert (cache / "pkg" / "blob").read_bytes()[:1] == b"V"
+        forget_worktree(ws)
+        for path in (*cache.parent.rglob("*"), cache.parent):
+            if path.exists() and not path.is_symlink():
+                path.chmod(0o755 if path.is_dir() else 0o644)
+    finally:
+        if vol is not None:
+            detach_volume(vol)
+
+print("check: cloned vendor boots App\\ and Pest with no autoloader edits and <1 MB physical")

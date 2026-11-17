@@ -1,0 +1,23 @@
+[
+ {
+  "ok": {
+   "text": "claiming done",
+   "tool_calls": []
+  }
+ },
+ {
+  "ok": {
+   "text": "writing",
+   "tool_calls": [
+    {
+     "id": "2",
+     "name": "fs_write",
+     "args": {
+      "path": "hello.txt",
+      "content": "hello"
+     }
+    }
+   ]
+  }
+ }
+]

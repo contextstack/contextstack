@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import sys
+import tempfile
+from pathlib import Path
+import os
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must use the same isolated roots as fixture subprocesses.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+REAL_LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REAL_LAB / "ops/bin"))
+loader = importlib.machinery.SourceFileLoader("lab_tick_multitask", str(REAL_LAB / "ops/bin/tick"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+tick = importlib.util.module_from_spec(spec)
+loader.exec_module(tick)
+
+with scratch_dir(prefix="tick-multitask-") as raw:
+    root = Path(raw)
+    (root / "specs").mkdir()
+    (root / "specs/fixture.yaml").write_text(
+        "id: multitask-fixture\n"
+        "model: fake-cli\n"
+        "tasks: [tasks/rank1, tasks/rank2]\n"
+        "trials: 1\n", encoding="utf-8")
+    for name in ("rank1", "rank2"):
+        (root / "ledger/runs" / name / "workspace/.git").mkdir(parents=True)
+    calls = []
+    tick.LAB = root
+    tick.TEMPLATES = {"fake-cli": {}}
+    tick.one_executor_trial = lambda rel, text, task, trial, job, effects=None: (calls.append(task) or 0)
+    tick.ledger_size = lambda: 0
+    tick.execution_row = lambda rel, sid, after=0: {
+        "transcript": "ledger/runs/" + calls[-1].split("/")[-1]
+    }
+    tick.is_config_void = lambda row: False
+    code, row = tick.run_spec("specs/fixture.yaml")
+    assert code == 0
+    assert calls == ["tasks/rank1", "tasks/rank2"], calls
+
+    calls.clear()
+    tick.one_executor_trial = lambda rel, text, task, trial, job, effects=None: (
+        calls.append(task) or (7 if task == "tasks/rank1" else 0))
+    code, row = tick.run_spec("specs/fixture.yaml")
+    assert calls == ["tasks/rank1", "tasks/rank2"], calls
+    assert code == 7 and row["transcript"].endswith("rank1"), (code, row)
+
+    # a CLI committing its output leaves a clean tree, not an empty trial.
+    (root / "specs/fixture.yaml").write_text("id: fixture\nmodel: fake-cli\ntasks: [tasks/rank1]\ntrials: 10\n")
+    calls.clear()
+    tick.one_executor_trial = lambda rel, text, task, trial, job, effects=None: (calls.append(task) or 0)
+    skipped = []
+    tick.append_skip = lambda row, trial: skipped.append(trial)
+    tick.git_status = lambda workspace: ""
+    code, row = tick.run_spec("specs/fixture.yaml")
+    assert code == 0 and len(calls) == 10 and not skipped, (code, len(calls), skipped)
+print("check: all declared trials execute; a clean CLI tree never fabricates skipped voids")

@@ -1,0 +1,14 @@
+{
+  "description": "Operator-only: prune workspace clones for terminal scheduled runs after preserving each run's landing manifest. Defaults to a no-write dry run.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "apply": {
+        "type": "boolean",
+        "description": "Actually preserve manifests and remove eligible workspaces. Defaults to false."
+      }
+    },
+    "required": [],
+    "additionalProperties": false
+  }
+}

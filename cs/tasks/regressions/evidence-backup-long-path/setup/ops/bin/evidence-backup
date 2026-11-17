@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Incrementally back up lab run evidence to the DGX without remote deletion."""
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_SOCKET = __import__("os").path.expanduser("~/.local/share/dgx-spark/ssh/api-tunnel.sock")
+DEFAULT_TARGET = "spark:~/contextstack-evidence/runs/"
+
+
+def fail(message):
+    print(json.dumps({"ok": False, "error": message}), file=sys.stderr)
+    return 1
+
+
+def main():
+    ssh = os.environ.get("EVIDENCE_BACKUP_SSH", "/usr/bin/ssh")
+    rsync = os.environ.get("EVIDENCE_BACKUP_RSYNC", "/usr/bin/rsync")
+    socket = Path(os.environ.get("EVIDENCE_BACKUP_SOCKET", DEFAULT_SOCKET))
+    source = Path(os.environ.get("EVIDENCE_BACKUP_SOURCE", str(ROOT / "ledger/runs"))).expanduser()
+    if not source.is_absolute():
+        source = ROOT / source
+    estate_file = ROOT / "ESTATE"
+    estate = estate_file.read_text().strip() if estate_file.exists() else "dev"
+    default_target = "spark:~/contextstack-evidence/prod-1/runs/" if estate == "prod-1" else DEFAULT_TARGET
+    target = os.environ.get("EVIDENCE_BACKUP_TARGET", default_target)
+
+    if not socket.exists():
+        return fail("SSH control socket not found: " + str(socket))
+    if not source.is_dir():
+        return fail("source directory not found: " + str(source))
+    if ":" not in target:
+        return fail("target must be host:path")
+    host, remote = target.split(":", 1)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", host):
+        return fail("invalid target host")
+    if not re.fullmatch(r"[~A-Za-z0-9_./-]+", remote):
+        return fail("invalid target path")
+
+    lock_path = Path(tempfile.gettempdir()) / ("contextstack-evidence-backup-%d.lock" % os.getuid())
+    lock = open(lock_path, "a", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return fail("another evidence backup is running")
+
+    started = time.monotonic()
+    try:
+        mkdir = subprocess.run(
+            [ssh, "-S", str(socket), "-o", "BatchMode=yes", host,
+             "mkdir", "-p", remote.rstrip("/")],
+            capture_output=True, text=True,
+        )
+        if mkdir.returncode != 0:
+            return fail("DGX mkdir failed: " + (mkdir.stderr or mkdir.stdout).strip())
+
+        remote_shell = "%s -S %s -o BatchMode=yes" % (
+            shlex.quote(ssh), shlex.quote(str(socket)))
+        transfer = subprocess.run(
+            [rsync, "-a", "--partial", "-e", remote_shell,
+             str(source) + "/", target],
+            capture_output=True, text=True,
+        )
+        if transfer.returncode != 0:
+            return fail("DGX rsync failed: " + (transfer.stderr or transfer.stdout).strip())
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+    print(json.dumps({
+        "ok": True,
+        "source": str(source),
+        "target": target,
+        "socket": str(socket),
+        "seconds": round(time.monotonic() - started, 3),
+    }, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import hashlib
+import sys
+import tempfile
+from pathlib import Path
+
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _frozen_inputs import MAX_INPUTS, stage_frozen_inputs
+
+
+with scratch_dir(prefix="frozen-inputs-") as raw:
+    root = Path(raw); workspace = root / "workspace"; workspace.mkdir()
+    source = root / "packet.json"; source.write_bytes(b'{"frozen":true}\n')
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    rows = stage_frozen_inputs([
+        {"source": str(source), "dest": "packet.json", "sha256": digest}
+    ], workspace)
+    assert rows == [{"source": str(source), "dest": "packet.json",
+                     "sha256": digest, "bytes": len(source.read_bytes())}]
+    assert (workspace / "packet.json").read_bytes() == source.read_bytes()
+
+    for item, fragment in (
+        ({"source": str(source), "dest": "../escape", "sha256": digest}, "unsafe"),
+        ({"source": str(source), "dest": ".git/config", "sha256": digest}, "unsafe"),
+        ({"source": str(source), "dest": "bad.json", "sha256": "0" * 64}, "hash differs"),
+    ):
+        try:
+            stage_frozen_inputs([item], workspace)
+            raise AssertionError("unsafe input passed")
+        except ValueError as error:
+            assert fragment in str(error)
+    symlink = root / "linked.json"; symlink.symlink_to(source)
+    try:
+        stage_frozen_inputs([
+            {"source": str(symlink), "dest": "linked.json", "sha256": digest}
+        ], workspace)
+        raise AssertionError("symlink source passed")
+    except ValueError as error:
+        assert "absolute regular file" in str(error)
+    try:
+        stage_frozen_inputs([{"source": str(source), "dest": "x%d" % n,
+                              "sha256": digest} for n in range(MAX_INPUTS + 1)], workspace)
+        raise AssertionError("input-count bound passed")
+    except ValueError as error:
+        assert "at most" in str(error)
+
+source_text = (LAB / "ops/bin/_executor.py").read_text()
+assert "stage_frozen_inputs(a.get(\"inputs\"), ws)" in source_text
+assert 'row["frozen_inputs"] = frozen_inputs' in source_text
+print("check: CLI executor stages only bounded hash-verified frozen inputs")

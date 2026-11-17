@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+fake = Path(__file__).resolve().with_name('claude')
+with scratch_dir(prefix='fake-cli-') as raw:
+    root = Path(raw)
+    log = root/'requests.jsonl'
+    env = {'PATH': os.defpath, 'FAKE_CLI_LOG': str(log), 'HOME': str(root)}
+    args = ['--print', '--output-format', 'json', 'fixture prompt']
+    result = subprocess.run([str(fake), *args], env=env, text=True, capture_output=True, check=True, timeout=5)
+    row = json.loads(log.read_text())
+    assert row['args'] == args and row['env']['HOME'] == str(root)
+    assert row['env']['FAKE_CLI_LOG'] == str(log)
+    assert not any(key.endswith('_API_KEY') for key in row['env'])
+    body = json.loads(result.stdout)
+    assert body['result'] == 'canned completion' and body['total_cost_usd'] == 0
+    assert body['usage'] == {'input_tokens': 3, 'output_tokens': 2}
+print('check: fake claude records arguments/environment and emits a canned result')

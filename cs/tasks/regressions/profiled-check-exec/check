@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""OpenCode Go's frozen task check must be executable under the estate deny."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+import json
+import subprocess
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+from _muse_adapter import check_command
+from _cli_native import declared_home_reads
+from _cli_adapter import command
+
+
+def estate_denies(profile, estate):
+    marker = "(deny file-read* file-write* file-link (require-all (subpath "
+    return [line for line in profile.splitlines()
+            if line.startswith(marker) and json.dumps(str(estate)) in line]
+
+
+with scratch_dir(prefix="opencode-go-check-") as raw:
+    root = Path(raw).resolve()
+    home = (root / "personal").resolve()
+    home.mkdir()
+    run = home / ".contextstack/state/runs/r1"
+    stim = run / "stimulus"
+    stim.mkdir(parents=True)
+    script = stim / "check"
+    script.write_text("#!/bin/sh\n"
+                      "if [ -r \"$SECRET\" ] || [ -r \"$DB\" ]; then echo readable >&2; exit 2; fi\n"
+                      "exit 0\n")
+    script.chmod(0o755)
+    sibling = home / ".contextstack/state/runs/other/secret"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("secret\n")
+    store = home / ".local/share/opencode"
+    db = store / "opencode.db"
+    store.mkdir(parents=True)
+    db.write_bytes(b"")
+    tmp = run / "tmp"
+    tmp.mkdir()
+    templates = json.loads((LAB / "ops/bin/executor-templates.json").read_text())
+    profiles = json.loads((LAB / "ops/bin/cli-profiles.json").read_text())
+    tmpl, profile = templates["opencode-go"], profiles["opencode-go"]
+    assert tmpl["auth"] == "opencode_db" and profile["auth"] == "opencode_db"
+    extra = dict(caller_grants=[dict(path=str(path), access="read")
+                                for path in declared_home_reads(tmpl, home, tmp)])
+    estate = (home / ".contextstack").resolve()
+    stim_ex = "(require-not (subpath %s))" % json.dumps(str(stim.resolve()))
+    tmp_ex = "(require-not (subpath %s))" % json.dumps(str(tmp.resolve()))
+    stim_allow = "(allow file-read* (subpath %s))" % json.dumps(str(stim.resolve()))
+    for workspace in (root / "lane", run / "workspace"):
+        workspace.mkdir()
+        cmd = check_command(script, workspace, home, (), extra, tmp)
+        text = cmd[2]
+        denies = estate_denies(text, estate)
+        assert denies, "estate deny missing"
+        for line in denies:
+            assert stim_ex in line and tmp_ex in line, line
+        assert stim_allow in text
+        assert '(allow file-read* file-write* (subpath %s))' % json.dumps(str(tmp)) in text
+        assert str(sibling.parent.resolve()) not in text
+        assert '(allow file-read* (subpath %s))' % json.dumps(str(store)) not in text
+        assert "(allow file-read* (subpath %s))" % json.dumps(str(store)) not in text
+    agent = command(profile, Path("/usr/bin/true"), root / "lane", root / "lane", home, (), [])[2]
+    assert '(deny file-read* file-write* (subpath %s))' % json.dumps(str(store)) in agent
+    env = hermetic_env()
+    env.update(PATH="/usr/bin:/bin", HOME=str(home), TMPDIR=str(tmp),
+               SECRET=str(sibling), DB=str(db))
+    done = subprocess.run(cmd, cwd=root / "lane", env=env, capture_output=True, text=True)
+    if "sandbox_apply: Operation not permitted" in (done.stderr or ""):
+        print("opencode-go check: stimulus path is a read-root exception; nested sandbox refused")
+    else:
+        assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+        print("opencode-go check: stimulus check executes; login store and other runs stay closed")

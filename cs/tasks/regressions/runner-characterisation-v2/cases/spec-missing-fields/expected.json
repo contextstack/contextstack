@@ -1,0 +1,12 @@
+{
+  "exit_code": 2,
+  "ops": [],
+  "requests": [],
+  "rows": [],
+  "run_dirs_distinct": true,
+  "runs": [],
+  "stderr": [
+    "lab: specs/fx.yaml: invalid: budget.turns, model (required; PINNED.md pinned: is the default to copy), tasks, trials"
+  ],
+  "stdout": []
+}

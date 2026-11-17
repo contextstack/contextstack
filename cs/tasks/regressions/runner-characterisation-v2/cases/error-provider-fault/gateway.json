@@ -1,0 +1,9 @@
+[
+ {
+  "error": {
+   "class": "runtime_fault",
+   "code": "gateway.transport_failed",
+   "message": "Post \"http://127.0.0.1:8000/v1/chat/completions\": EOF"
+  }
+ }
+]

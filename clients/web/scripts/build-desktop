@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Build the ContextStack desktop app for release (macOS). See README.md, "Desktop release".
+#
+#   scripts/build-desktop [arm64|x64]
+#
+# What NativePHP's `native:build` does not do, and this adds:
+#   - builds from a release .env (fresh APP_KEY, updater off) instead of this checkout's dev .env;
+#   - gives the packaged app's PHP server 8 workers (LSEnvironment in Info.plist): NativePHP starts
+#     `php -S` without PHP_CLI_SERVER_WORKERS, so one open live-update stream would block every page;
+#   - re-signs with your Developer ID, then makes the .dmg (drag to Applications) and .zip;
+#   - notarizes and staples, with a notarytool Keychain profile or an App Store Connect API key (below);
+#   - puts Electron's binary back for `native:run` (the build's npm install skips its install script).
+#
+# Environment (all optional):
+#   CODESIGN_IDENTITY   signing identity (default: the first "Developer ID Application" one found)
+#   CODESIGN_KEYCHAIN   keychain to find it in and sign from (CI imports its certificate into a temporary one)
+#   NOTARY_PROFILE      a `xcrun notarytool store-credentials` profile, or instead an API key:
+#   NOTARY_KEY, NOTARY_KEY_ID, NOTARY_ISSUER   App Store Connect .p8 path, key ID and issuer ID
+# Without notarization the app opens only on the Mac that built it. Output: nativephp/electron/dist/release/.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+ARCH="${1:-arm64}"
+WORKERS=8
+ELECTRON=vendor/nativephp/desktop/resources/electron
+DIST=nativephp/electron/dist
+OUT="$DIST/release"
+
+[[ "$(uname)" == Darwin ]] || { echo "build-desktop: macOS only" >&2; exit 1; }
+[[ "$ARCH" == arm64 || "$ARCH" == x64 ]] || { echo "build-desktop: arch is arm64 or x64" >&2; exit 1; }
+
+KEYCHAIN=()
+[[ -z "${CODESIGN_KEYCHAIN:-}" ]] || KEYCHAIN=(--keychain "$CODESIGN_KEYCHAIN")
+IDENTITY="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning ${CODESIGN_KEYCHAIN:+"$CODESIGN_KEYCHAIN"} | sed -nE 's/.*"(Developer ID Application:[^"]*)".*/\1/p' | head -1)}"
+[[ -n "$IDENTITY" ]] || { echo "build-desktop: no Developer ID Application identity; set CODESIGN_IDENTITY" >&2; exit 1; }
+
+# Notarization credentials, checked before the long build rather than after it.
+NOTARY=()
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    NOTARY=(--keychain-profile "$NOTARY_PROFILE")
+elif [[ -n "${NOTARY_KEY:-}${NOTARY_KEY_ID:-}${NOTARY_ISSUER:-}" ]]; then
+    [[ -f "${NOTARY_KEY:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER:-}" ]] \
+        || { echo "build-desktop: API-key notarization needs NOTARY_KEY (a .p8 file), NOTARY_KEY_ID and NOTARY_ISSUER" >&2; exit 1; }
+    NOTARY=(--key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER")
+fi
+
+# 1. Release .env, swapped in for the build and put back whatever happens.
+backup=""
+if [[ -f .env ]]; then
+    backup="$(mktemp "${TMPDIR:-/tmp}/client-web-env.XXXXXX")"
+    cp -p .env "$backup"
+fi
+restore_env() {
+    if [[ -n "$backup" ]]; then mv -f "$backup" .env; else rm -f .env; fi
+}
+trap restore_env EXIT
+
+key="base64:$(openssl rand -base64 32)"
+sed -e "s|^APP_ENV=.*|APP_ENV=production|" \
+    -e "s|^APP_DEBUG=.*|APP_DEBUG=false|" \
+    -e "s|^APP_KEY=.*|APP_KEY=${key}|" \
+    -e "s|^LOG_LEVEL=.*|LOG_LEVEL=warning|" \
+    .env.example > .env
+echo "NATIVEPHP_UPDATER_ENABLED=false" >> .env
+
+# NativePHP would notarize from these during the build, before step 3 changes the app: we notarize after.
+unset NATIVEPHP_APPLE_ID NATIVEPHP_APPLE_ID_PASS NATIVEPHP_APPLE_TEAM_ID
+
+php artisan native:build mac "$ARCH" --no-interaction
+
+restore_env
+trap - EXIT
+
+# electron-builder writes x64 to dist/mac and arm64 to dist/mac-arm64. Its own .dmg and .zip predate step 2: drop them.
+APP="$DIST/$([[ "$ARCH" == x64 ]] && echo mac || echo mac-arm64)/ContextStack.app"
+rm -f "$DIST"/*.dmg "$DIST"/*.zip "$DIST"/*.blockmap
+[[ -d "$APP" ]] || { echo "build-desktop: no app at $APP" >&2; exit 1; }
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+
+# 2. Workers for the bundled PHP server.
+PLIST="$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Print :LSEnvironment" "$PLIST" >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$PLIST"
+/usr/libexec/PlistBuddy -c "Delete :LSEnvironment:PHP_CLI_SERVER_WORKERS" "$PLIST" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment:PHP_CLI_SERVER_WORKERS string $WORKERS" "$PLIST"
+
+# 3. Re-sign, then package (ULMO: LZMA, macOS 10.15+, about the size electron-builder makes).
+codesign --force --deep --options runtime --timestamp ${KEYCHAIN[@]+"${KEYCHAIN[@]}"} \
+    --entitlements "$ELECTRON/build/entitlements.mac.plist" --sign "$IDENTITY" "$APP"
+codesign --verify --deep --strict "$APP"
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/client-web-dmg.XXXXXX")"
+ditto "$APP" "$STAGE/ContextStack.app"
+ln -s /Applications "$STAGE/Applications"
+DMG="$OUT/ContextStack-$VERSION-$ARCH.dmg"
+hdiutil create -volname ContextStack -srcfolder "$STAGE" -ov -format ULMO "$DMG" >/dev/null
+rm -rf "$STAGE"
+codesign --force --timestamp ${KEYCHAIN[@]+"${KEYCHAIN[@]}"} --sign "$IDENTITY" "$DMG"
+
+# 4. Notarize (optional): the dmg is submitted; the ticket is stapled to the dmg and the app. Anything but
+#    "Accepted" fails the build, after printing Apple's log for the submission.
+if [[ ${#NOTARY[@]} -gt 0 ]]; then
+    RESULT="$(mktemp "${TMPDIR:-/tmp}/client-web-notary.XXXXXX")"
+    submitted=0
+    xcrun notarytool submit "$DMG" "${NOTARY[@]}" --wait --output-format json > "$RESULT" || submitted=$?
+    cat "$RESULT"
+    status="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("status", ""))' "$RESULT" 2>/dev/null || true)"
+    if [[ "$submitted" -ne 0 || "$status" != Accepted ]]; then
+        id="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$RESULT" 2>/dev/null || true)"
+        [[ -z "$id" ]] || xcrun notarytool log "$id" "${NOTARY[@]}" || true
+        rm -f "$RESULT"
+        echo "build-desktop: notarization was not accepted (status: ${status:-none})" >&2
+        exit 1
+    fi
+    rm -f "$RESULT"
+    xcrun stapler staple "$DMG"
+    xcrun stapler staple "$APP"
+    xcrun stapler validate "$DMG"
+    xcrun stapler validate "$APP"
+else
+    echo "build-desktop: not notarized (set NOTARY_PROFILE, or NOTARY_KEY, NOTARY_KEY_ID and NOTARY_ISSUER)" >&2
+fi
+ditto -c -k --keepParent "$APP" "$OUT/ContextStack-$VERSION-$ARCH.zip"
+
+# 5. Electron's binary for `native:run`.
+if [[ ! -d "$ELECTRON/node_modules/electron/dist/Electron.app" ]]; then
+    (cd "$ELECTRON" && node node_modules/electron/install.js)
+fi
+
+echo "build-desktop: $OUT"
+ls -lh "$OUT"

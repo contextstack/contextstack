@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Fake Google Chrome for the browser-broker regression: speaks CDP on fds 3 (in) and 4 (out), NUL-framed,
+as --remote-debugging-pipe does, and logs argv and every method to $FAKE_CHROME_LOG. Offline pages:
+  https://example.com/        200, text          https://example.com/in   redirect -> https://example.com/
+  https://example.com/out     redirect -> https://evil.example/ (a hop the broker must fail)
+  https://example.com/spoof   loads, but the tab ends on https://evil.example/landed (unintercepted move)
+  https://example.com/popup   loads and opens a second page target    https://other.example/  200, text
+FAKE_CHROME_NO_SANDBOX=1: dies as Chrome does where the host blocks its sandbox, unless given --no-sandbox.
+"""
+import json, os, sys
+
+LOG = os.environ.get("FAKE_CHROME_LOG")
+PAGES = {"https://example.com/": ("Example", "Example fixture page.\n"),
+         "https://other.example/": ("Other", "Other set page.\n"),
+         "https://example.com/spoof": ("Spoof", "should never be returned\n"),
+         "https://example.com/popup": ("Popup", "Page that opened a window.\n")}
+REDIRECTS = {"https://example.com/out": "https://evil.example/", "https://example.com/in": "https://example.com/"}
+
+
+def log(entry):
+    if LOG:
+        with open(LOG, "a") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def send(msg):
+    data = json.dumps(msg).encode() + b"\0"
+    while data:
+        data = data[os.write(4, data):]
+
+
+log({"argv": sys.argv[1:]})
+if os.environ.get("FAKE_CHROME_NO_SANDBOX") and "--no-sandbox" not in sys.argv:
+    # What Chrome prints when the host (Ubuntu's AppArmor userns restriction) blocks its sandbox.
+    print("[FATAL:zygote_host_impl_linux.cc(127)] No usable sandbox! If you are running on Ubuntu 23.10+ ...",
+          file=sys.stderr, flush=True)
+    sys.exit(1)
+targets, nav, buf, rid, url_of = ["INITIAL"], None, b"", 0, {}
+while True:
+    chunk = os.read(3, 1 << 20)
+    if not chunk:
+        sys.exit(0)
+    buf += chunk
+    while b"\0" in buf:
+        raw, buf = buf.split(b"\0", 1)
+        msg = json.loads(raw)
+        method, p, sid, mid = msg["method"], msg.get("params", {}), msg.get("sessionId"), msg["id"]
+        log({"method": method, "params": p})
+        result = {}
+        if method == "Browser.getVersion":
+            result = {"product": "FakeChrome/1"}
+        elif method == "Target.getTargets":
+            result = {"targetInfos": [{"targetId": t, "type": "page", "url": url_of.get(t, "about:blank")} for t in targets]}
+        elif method == "Target.createTarget":
+            targets.append("T%d" % len(targets))
+            result = {"targetId": targets[-1]}
+        elif method == "Target.attachToTarget":
+            result = {"sessionId": "S-" + p["targetId"]}
+        elif method == "Target.closeTarget":
+            if p["targetId"] in targets:
+                targets.remove(p["targetId"])
+            result = {"success": True}
+        elif method == "Target.getTargetInfo":
+            result = {"targetInfo": {"targetId": p["targetId"], "type": "page", "url": url_of.get(p["targetId"], "about:blank")}}
+        elif method == "Page.navigate":
+            rid += 1
+            nav = {"id": mid, "sid": sid, "target": sid[2:], "url": p["url"], "rid": "R%d" % rid}
+            send({"method": "Fetch.requestPaused", "sessionId": sid, "params": {
+                "requestId": nav["rid"], "request": {"url": p["url"]}, "frameId": "F1", "resourceType": "Document"}})
+            continue
+        elif method in ("Fetch.continueRequest", "Fetch.failRequest") and nav and p.get("requestId") == nav["rid"]:
+            send({"id": mid, "sessionId": sid, "result": {}})
+            if method == "Fetch.failRequest":
+                send({"id": nav["id"], "sessionId": sid, "result": {"frameId": "F1", "loaderId": "L1",
+                                                                     "errorText": "net::ERR_BLOCKED_BY_CLIENT"}})
+                nav = None
+            elif nav["url"] in REDIRECTS:
+                rid += 1
+                nav["url"], nav["rid"] = REDIRECTS[nav["url"]], "R%d" % rid
+                send({"method": "Fetch.requestPaused", "sessionId": sid, "params": {
+                    "requestId": nav["rid"], "request": {"url": nav["url"]}, "frameId": "F1", "resourceType": "Document"}})
+            else:
+                found = nav["url"] in PAGES
+                url_of[nav["target"]] = "https://evil.example/landed" if nav["url"].endswith("/spoof") else nav["url"]
+                url_of["page-text-" + nav["target"]] = nav["url"]
+                if nav["url"].endswith("/popup"):
+                    targets.append("POPUP")
+                send({"id": nav["id"], "sessionId": sid, "result": {"frameId": "F1", "loaderId": "L1"}})
+                send({"method": "Network.responseReceived", "sessionId": sid, "params": {
+                    "type": "Document", "loaderId": "L1", "frameId": "F1",
+                    "response": {"url": nav["url"], "status": 200 if found else 404}}})
+                send({"method": "Page.loadEventFired", "sessionId": sid, "params": {}})
+                nav = None
+            continue
+        elif method == "Runtime.evaluate":
+            title, text = PAGES.get(url_of.get("page-text-" + sid[2:], ""), ("Not found", "404 page\n"))
+            result = {"result": {"type": "string", "value": json.dumps({"title": title, "text": text})}}
+        elif method == "Browser.close":
+            send({"id": mid, "result": {}})
+            sys.exit(0)
+        out = {"id": mid, "result": result}
+        if sid:
+            out["sessionId"] = sid
+        send(out)

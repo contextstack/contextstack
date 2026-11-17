@@ -1,0 +1,6 @@
+{
+  "cmd": [
+    "cat",
+    "/etc/passwd"
+  ]
+}

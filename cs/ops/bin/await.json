@@ -1,0 +1,12 @@
+{
+  "description": "Operator: block until an enqueue id is terminal. Dead running pid closes error onto the queue. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string"},
+      "job": {"type": "string"},
+      "timeout": {"type": "integer"}
+    },
+    "required": ["id"]
+  }
+}

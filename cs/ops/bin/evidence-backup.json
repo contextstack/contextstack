@@ -1,0 +1,9 @@
+{
+  "description": "Operator-only DGX evidence backup. Retained-set rsync (rows, stimulus, transcript, evidence, check output, and the post-1b run record: terminal.json, messages.jsonl, check.json, finalized.json); then deletes remote workspace backups only.",
+  "schema": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+  }
+}

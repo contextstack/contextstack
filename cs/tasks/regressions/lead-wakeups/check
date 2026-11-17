@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""Hosted lead child-lane wake-ups: fake events + stub CLI, no real ~/.contextstack."""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct host calls share the isolated environment used by fixture children.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+OPS = KIT / "ops/bin"
+STUB = KIT / "tasks/regressions/lead-session-host/stub_stream_cli"
+STUB_DELAY = KIT / "tasks/regressions/lead-session-host/stub_delayed_cli"
+LEAD = KIT / "lead"
+sys.path.insert(0, str(OPS))
+sys.path.insert(0, str(KIT / "scripts"))
+
+from check_timeout import timeout as check_timeout
+
+import _lead_host  # noqa: E402
+import _lead_wake  # noqa: E402
+import cs_mcp  # noqa: E402
+from fake_events import FakeDirector  # noqa: E402
+
+CONV = "con_fixture_wake"
+problems: list[str] = []
+
+
+def expect(ok: bool, msg: str, detail: str = "") -> None:
+    if not ok:
+        problems.append(msg + ("" if not detail else " (%s)" % detail))
+
+
+def workspace_turn(root: Path, message: str, *, name: str = "turn-wake") -> Path:
+    ws = Path(os.environ["LAB_STATE_ROOT"]) / "jobs" / name
+    if ws.exists():
+        shutil.rmtree(ws)
+    ws.mkdir(parents=True)
+    (ws / "job.json").write_text(json.dumps({"job_id": name, "task": "tasks/turn", "spec": "spec.yaml"}))
+    for rel, src in (
+        ("spec.yaml", LEAD / "spec.yaml"),
+        ("prompts/system.md", LEAD / "prompts/system.md"),
+        ("session/mcp.json", LEAD / "session/mcp.json"),
+        ("session/host.json", LEAD / "session/host.json"),
+    ):
+        dest = ws / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dest)
+    (ws / "conversation").mkdir(exist_ok=True)
+    (ws / "conversation/context.md").write_text("Wake test.\n", encoding="utf-8")
+    turn = ws / "tasks/turn"
+    turn.mkdir(parents=True)
+    (turn / "goal.md").write_text(message, encoding="utf-8")
+    (turn / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (turn / "check").chmod(stat.S_IRWXU)
+    return ws
+
+
+def write_config(cfg: Path, director_url: str) -> None:
+    (cfg / "hosted-lead.json").write_text(
+        json.dumps(
+            {
+                "conversation_id": CONV,
+                "director": director_url,
+                "model": "claude-code-sonnet",
+                "credential_file": "lead-credential",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cfg / "install.json").write_text(json.dumps({"director": director_url}) + "\n", encoding="utf-8")
+    (cfg / "lead-credential").write_text("cslead_test_wake_token\n", encoding="utf-8")
+    os.chmod(cfg / "lead-credential", 0o600)
+
+
+def kill_serve(state: Path) -> None:
+    st = _lead_host.load_state(_lead_host.state_file(state, CONV))
+    pid = st.get("serve_pid")
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(int(pid), 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+    sock = _lead_host.socket_file(state, CONV)
+    sock.unlink(missing_ok=True)
+
+
+def reset_conversation_artifacts(state: Path) -> None:
+    kill_serve(state)
+    sf = _lead_host.state_file(state, CONV)
+    sf.unlink(missing_ok=True)
+    sf.with_suffix(".ndjson").unlink(missing_ok=True)
+    log = state / "lead-sessions" / ("%s-serve.log" % CONV)
+    log.unlink(missing_ok=True)
+    sess = state / "lead-sessions" / CONV
+    (sess / _lead_wake.WATCHES_FILE).unlink(missing_ok=True)
+    spool = sess / _lead_wake.WAKE_SPOOL_DIR
+    if spool.is_dir():
+        shutil.rmtree(spool)
+
+
+def spool_files(state: Path) -> list[Path]:
+    root = state / "lead-sessions" / CONV / _lead_wake.WAKE_SPOOL_DIR
+    return sorted(root.glob("*.json")) if root.is_dir() else []
+
+
+def serve_pid_alive(state: Path) -> bool:
+    pid = _lead_host.load_state(_lead_host.state_file(state, CONV)).get("serve_pid")
+    if not pid:
+        return False
+    try:
+        # The serve is this test process's child (Popen): once it exits it is a zombie until reaped, and
+        # kill(pid, 0) still succeeds. Reap it first.
+        done, _ = os.waitpid(int(pid), os.WNOHANG)
+        if done:
+            return False
+    except ChildProcessError:
+        pass  # not our child: fall through to the signal probe
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+
+
+def director_wake_turns(fake: FakeDirector, conversation: str) -> list[dict]:
+    return [row for row in fake.turns.get(conversation, []) if row.get("origin") == "wake"]
+
+def nudges_from_transcript(state: Path, *, job_id: str | None = None) -> list[str]:
+    found: list[str] = []
+    ndjson = _lead_host.state_file(state, CONV).with_suffix(".ndjson")
+    if ndjson.is_file():
+        for line in ndjson.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("dir") != "in":
+                continue
+            msg = row.get("msg") or {}
+            if msg.get("type") != "user":
+                continue
+            content = (msg.get("message") or {}).get("content", "")
+            if isinstance(content, str) and content.startswith("Lane ") and " ended:" in content:
+                text = content.strip()
+                if job_id and job_id not in text:
+                    continue
+                found.append(text)
+    return found
+
+
+def count_stub_results(ndjson: Path) -> int:
+    if not ndjson.is_file():
+        return 0
+    n = 0
+    for line in ndjson.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("dir") == "out" and row.get("msg", {}).get("type") == "result":
+            n += 1
+    return n
+
+
+def watch_job(sock_path: Path, job_id: str, *, lane: str | None = None) -> None:
+    payload = {"op": "watch_job", "job_id": job_id}
+    if lane:
+        payload["lane"] = lane
+    _lead_host.socket_request(sock_path, payload, timeout=5)
+
+
+def wait_until(predicate, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def start_fixture_env(root: Path, fake: FakeDirector) -> tuple[Path, Path, Path, dict]:
+    state = root / "state"
+    state.mkdir(parents=True)
+    cs_root = root / "cs"
+    cfg = cs_root / "config"
+    cfg.mkdir(parents=True)
+    write_config(cfg, fake.url)
+    env = {
+        **hermetic_env(),
+        "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(cfg), "LAB_CODE_ROOT": str(KIT),
+        "LEAD_HOST_NO_SANDBOX": "1", "CS_EXECUTOR_ALLOW_UNSANDBOXED": "1",
+        "LEAD_WAKE_DIRECTOR_URL": fake.url, "LEAD_HOST_WAKE": "1",
+        "LEAD_WAKE_STALL_S": "3600", "LEAD_WAKE_BATCH_S": "0.15",
+        "LEAD_HOST_SERVE_READY_S": "45", "LEAD_HOST_IDLE_EXIT_S": "3600",
+    }
+    return state, cs_root, cfg, env
+
+
+def boot_session(state: Path, cs_root: Path, env: dict, *, name: str = "turn-wake") -> Path:
+    prev = dict(os.environ.items())
+    os.environ.update(env)
+    try:
+        ws = workspace_turn(state.parent, "Hold while lanes run.", name=name)
+        _FAKE.add_turn(CONV, ws.name)
+        _lead_host.client_turn(
+            ws,
+            conversation_id=CONV,
+            config_root=cs_root / "config",
+            state=state,
+            cli_binary=str(STUB),
+            sandbox=False,
+            timeout=60,
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(prev)
+    return _lead_host.socket_file(state, CONV)
+
+
+def test_single_nudge(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.set_job("job_a", state="running", meta={"lane": "alpha"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-a")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect(str(sock))
+        client.sendall(b'{"op":"watch_job","job_id":"job_forged"}\n')
+        expect(bool(json.loads(client.recv(65536)).get("error")), "watch registration requires serve token")
+    fake.set_job("job_forged", state="done", meta={"lane": "forged"})
+    fake.emit_job_change("job_forged")
+    with patch.dict(os.environ, LEAD_HOST_SOCKET=str(sock)):
+        cs_mcp._report_lead_watch("job_a", lane="alpha")
+    fake.set_job("job_a", state="done", meta={"lane": "alpha"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_a")
+    ok = wait_until(lambda: len(nudges_from_transcript(state)) >= 1, 8)
+    expect(ok, "watched job end produces a nudge")
+    nudges = nudges_from_transcript(state)
+    expect(len(nudges) == 1, "exactly one nudge", str(len(nudges)))
+    expect(not nudges_from_transcript(state, job_id="job_forged"), "unauthenticated watch cannot inject wake-ups")
+    if nudges:
+        expect("job_a" in nudges[0] and "alpha" in nudges[0], "nudge names lane and job", nudges[0])
+    ndjson = _lead_host.state_file(state, CONV).with_suffix(".ndjson")
+    ok_wake = wait_until(lambda: len(director_wake_turns(fake, CONV)) >= 1, 30)  # the reply follows the nudge
+    expect(ok_wake, "wake reply recorded on the Director")
+    expect(count_stub_results(ndjson) == 2, "turn and wake each produce a CLI result", count_stub_results(ndjson))
+    wakes = director_wake_turns(fake, CONV)
+    if wakes:
+        expect(wakes[0].get("reply", "").startswith("WAKE-REPLY"), "Director carries the wake reply", wakes[0])
+
+
+def test_batch_two(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.set_job("job_b1", state="running", meta={"lane": "b1"}, check={"verdict": "pass"})
+    fake.set_job("job_b2", state="running", meta={"lane": "b2"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-b")
+    fake.set_job("job_b1", state="done", meta={"lane": "b1"}, check={"verdict": "pass"})
+    fake.set_job("job_b2", state="done", meta={"lane": "b2"}, check={"verdict": "fail"})
+    fake.emit_job_change("job_b1")
+    fake.emit_job_change("job_b2")
+    # Both events precede registration: only a state refetch can recover them.
+    watch_job(sock, "job_b1", lane="b1")
+    watch_job(sock, "job_b2", lane="b2")
+    time.sleep(float(env.get("LEAD_WAKE_BATCH_S", "0.15")) + 0.2)
+    ok = wait_until(lambda: len(nudges_from_transcript(state, job_id="job_b1")) >= 1, 30)
+    expect(ok, "batched endings produce a nudge")
+    # The nudge is logged when sent; the reply and its wake turn follow. Wait for those before counting.
+    wait_until(lambda: len(director_wake_turns(fake, CONV)) >= 1, 30)
+    nudges = [n for n in nudges_from_transcript(state) if "job_b1" in n or "job_b2" in n]
+    expect(len(nudges) == 1, "two endings become one nudge", str(len(nudges)))
+    expect(count_stub_results(_lead_host.state_file(state, CONV).with_suffix(".ndjson")) == 2,
+           "turn plus one batched wake reply")
+    expect(len(director_wake_turns(fake, CONV)) == 1, "one wake turn on the Director")
+    batched = director_wake_turns(fake, CONV)
+    expect(bool(batched) and sorted((batched[0].get("detail") or {}).get("jobs") or []) == ["job_b1", "job_b2"],
+           "batched wake turn lists both jobs", batched[0] if batched else None)
+    expect(bool(nudges) and "job_b1" in nudges[0] and "job_b2" in nudges[0], "batch mentions both jobs",
+           nudges[0] if nudges else "(no nudge)")
+
+
+def test_nudge_after_turn(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.set_job("job_late", state="running", meta={"lane": "late"}, check={"verdict": "pass"})
+    prev = dict(os.environ.items())
+    os.environ.update(env)
+    ws = workspace_turn(state.parent, "Slow turn.", name="turn-slow")
+    _FAKE.add_turn(CONV, ws.name)
+    slow: list[str] = []
+
+    def slow_turn():
+        try:
+            reply = _lead_host.client_turn(
+                ws,
+                conversation_id=CONV,
+                config_root=cs_root / "config",
+                state=state,
+                cli_binary=str(STUB_DELAY),
+                sandbox=False,
+                timeout=60,
+            )
+            slow.append(reply)
+        except Exception as error:
+            slow.append(str(error))
+
+    thread = threading.Thread(target=slow_turn, daemon=True)
+    thread.start()
+    sock = _lead_host.socket_file(state, CONV)
+    expect(wait_until(sock.is_socket, 25), "slow turn opened serve socket")
+    watch_job(sock, "job_late", lane="late")
+    time.sleep(0.25)
+    fake.set_job("job_late", state="done", meta={"lane": "late"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_late")
+    time.sleep(0.5)
+    expect(
+        len(nudges_from_transcript(state, job_id="job_late")) == 0,
+        "no nudge during in-flight turn",
+        str(nudges_from_transcript(state, job_id="job_late")),
+    )
+    thread.join(timeout=45)
+    expect(slow and slow[0].startswith("STUB-REPLY"), "slow turn completed", slow[:1])
+    time.sleep(0.5)
+    os.environ.clear()
+    os.environ.update(prev)
+    ok = wait_until(lambda: len(nudges_from_transcript(state, job_id="job_late")) >= 1, 15)
+    expect(ok, "nudge arrives after turn completes")
+    ok_rec = wait_until(lambda: len(director_wake_turns(fake, CONV)) >= 1, 15)
+    expect(ok_rec, "wake follow-up recorded after slow turn completes")
+
+
+
+
+def test_wake_turn_after_host_turn(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    """Lead turn ends while a watched job still runs; when the job ends the follow-up is a conversation message."""
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.set_job("job_lane2", state="running", meta={"lane": "lane-2"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-end")
+    watch_job(sock, "job_lane2", lane="lane-2")
+    fake.set_job("job_lane2", state="done", meta={"lane": "lane-2"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_lane2")
+    ok = wait_until(lambda: len(director_wake_turns(fake, CONV)) >= 1, 20)
+    expect(ok, "lane end after host turn becomes a Director wake turn")
+    wakes = director_wake_turns(fake, CONV)
+    expect(len(wakes) == 1, "exactly one wake turn", len(wakes))
+    expect(wakes[0].get("message") == "" and (wakes[0].get("detail") or {}).get("jobs") == ["job_lane2"],
+           "wake turn has no person's message and names the ended job", wakes[0])
+    expect(str(wakes[0].get("reply", "")).startswith("WAKE-REPLY"), "wake reply is the lead follow-up", wakes[0])
+
+def test_resync_after_drop(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.set_job("job_sync", state="running", meta={"lane": "sync"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-sync")
+    watch_job(sock, "job_sync", lane="sync")
+    fake.set_job("job_sync", state="done", meta={"lane": "sync"}, check={"verdict": "pass"})
+    fake.drop_streams()
+    ok = wait_until(lambda: len(nudges_from_transcript(state, job_id="job_sync")) >= 1, 20)
+    expect(ok, "reconnect resync catches job that ended while disconnected")
+    expect(any("job_sync" in n for n in nudges_from_transcript(state, job_id="job_sync")), "resync nudge names job")
+
+
+def test_unwatched_ignored(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    before = len(nudges_from_transcript(state, job_id="job_stranger"))
+    boot_session(state, cs_root, env, name="turn-stranger")
+    fake.set_job("job_stranger", state="done", meta={"lane": "stranger"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_stranger")
+    time.sleep(1.0)
+    after = len(nudges_from_transcript(state, job_id="job_stranger"))
+    expect(after == before, "unwatched job does not nudge", after - before)
+
+
+def test_report_lead_watch_unit() -> None:
+    nudges: list[str] = []
+
+    unit_state = Path(tempfile.mkdtemp(prefix="wake-unit-"))  # persisted watches need a session directory
+
+    class Host:
+        state = unit_state
+        conversation_id = "con_unit_watch"
+
+        def deliver_nudge(self, text):
+            nudges.append(text)
+            return True
+
+    class Client:
+        jobs = {
+            "job_unit_1": {"job_id": "job_unit_1", "state": "done"},
+            "job_unit_2": {"job_id": "job_unit_2", "state": "error"},
+        }
+
+        def get_job(self, job_id):
+            return self.jobs[job_id]
+
+    coord = _lead_wake.WakeCoordinator(
+        Host(), director_url="unused", credential_file=Path("unused"),
+        client_factory=lambda *_: Client(), batch_s=0,
+    )
+    # The ending events have already been lost before either watch exists.
+    coord.watch_job("job_unit_1", lane="one")
+    coord.watch_job("job_unit_2", lane="two")
+    coord.tick_batch()
+    expect(len(nudges) == 1 and all(job in nudges[0] for job in Client.jobs),
+           "registration refetch batches already-ended jobs")
+    coord._resync_after_hello()
+    coord.tick_batch()
+    expect(len(nudges) == 1, "reconnect refetch does not duplicate registration nudges")
+
+    Client.jobs["job_reconnect"] = {"job_id": "job_reconnect", "state": "running"}
+    coord.watch_job("job_reconnect")
+    Client.jobs["job_reconnect"]["state"] = "done"
+    class TimedOutStream:
+        def readline(self):
+            raise TimeoutError("idle HTTP stream")
+
+    # A timed-out buffered reader must be discarded, not retried forever.
+    class RetryAfterTimeout(Exception):
+        pass
+
+    timed_out = TimedOutStream()
+    with patch.object(timed_out, "readline", side_effect=[TimeoutError(), RetryAfterTimeout()]):
+        try:
+            coord._follow(timed_out)
+        except RetryAfterTimeout:
+            expect(False, "timed-out event stream is reopened")
+    opened = []
+
+    def open_stream():
+        opened.append(True)
+        return type("Stream", (), {"close": lambda self: None})()
+
+    def follow(stream):
+        expect("job_reconnect" in coord._notified, "connect refetch precedes following events")
+        coord.stop()
+
+    with patch.object(coord, "_open_stream", open_stream), patch.object(coord, "_follow", follow):
+        coord._run()
+    coord.tick_batch()
+    expect(bool(opened) and len(nudges) == 2 and "job_reconnect" in nudges[-1],
+           "connect recovers an ending without an event")
+
+
+def test_socket_not_listening(mode="bound") -> None:
+    # A bound UNIX socket exists before listen(), and an exited serve leaves the
+    # same file behind. Wait for a real refused connection before becoming ready.
+    with scratch_dir(prefix="lead-socket-", dir="/tmp") as raw:
+        path = Path(raw).resolve() / "host.sock"
+        (path.parent / "token").write_text("fixture-auth")
+        (path.parent / "token").chmod(0o600)
+        refused = threading.Event()
+        failures = []
+        real_socket = socket.socket
+
+        class Client(real_socket):
+            def connect(self, address):
+                try:
+                    return super().connect(address)
+                except (ConnectionRefusedError, FileNotFoundError):
+                    refused.set()
+                    raise
+
+        with real_socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            if mode == "bound":
+                server.bind(str(path))
+            elif mode == "stale":
+                with real_socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+                    stale.bind(str(path))
+
+            def listen_later():
+                try:
+                    assert refused.wait(check_timeout(5)), "client never attempted the bound socket"
+                    if mode != "bound":
+                        path.unlink(missing_ok=True)
+                        server.bind(str(path))
+                    server.listen(1)
+                    server.settimeout(check_timeout(5))
+                    with server.accept()[0] as conn:
+                        request = json.loads(conn.recv(65536))
+                        assert request == {"op": "ping", "token": "fixture-auth"}, request
+                        conn.sendall(b'{"ok":true}\n')
+                except Exception as error:
+                    failures.append(error)
+
+            worker = threading.Thread(target=listen_later, daemon=True)
+            worker.start()
+            try:
+                with patch.object(_lead_host.socket, "socket", Client):
+                    assert _lead_host.socket_request(path, {"op": "ping"}, timeout=1) == {"ok": True}
+            finally:
+                worker.join(timeout=check_timeout(6))
+            assert not worker.is_alive() and not failures, failures
+
+
+def test_review_fixes_unit(root: Path, state: Path, cs_root: Path, env: dict) -> None:
+    """Fixes from the 2026-11-15 lead-host review, pinned without a live serve."""
+    import _lead_wake
+    cfg = root / "unit-config"
+    cfg.mkdir(parents=True)
+    prev_env = dict(os.environ.items())
+    os.environ.update(env)
+    saved = os.environ.pop("LEAD_WAKE_DIRECTOR_URL", None)
+    try:
+        # A real install passes the config directory itself: install.json sits directly in it.
+        (cfg / "install.json").write_text(json.dumps({"director": "http://127.0.0.1:1/"}), encoding="utf-8")
+        expect(_lead_wake.resolve_director_url(cfg) == "http://127.0.0.1:1",
+               "wake finds the Director in <config root>/install.json")
+        expect(_lead_wake.resolve_director_url(cfg, {"director": "http://127.0.0.1:2"}) == "http://127.0.0.1:2",
+               "the conversation's own Director address wins")
+        (cfg / "install.json").unlink()
+        expect(_lead_wake.resolve_director_url(cfg) is None, "no address means no wake (and it is logged)")
+    finally:
+        if saved is not None:
+            os.environ["LEAD_WAKE_DIRECTOR_URL"] = saved
+
+    host = _lead_host.ConversationHost(CONV, state, cs_root / "config", cli_binary="/usr/bin/true", sandbox=False)
+    ws = workspace_turn(root, "unit", name="unit-ws").resolve()  # the host refuses unresolved (macOS /var) paths
+    _FAKE.add_turn(CONV, ws.name)
+    real_make = _lead_host.make_session
+    _lead_host.make_session = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cli failed to launch"))
+    try:
+        try:
+            host.handle_turn(ws, message="hi")
+        except (Exception, SystemExit):
+            pass
+    finally:
+        _lead_host.make_session = real_make
+    expect(host._turn_depth == 0, "a failed session start does not leave wake-ups blocked", host._turn_depth)
+
+    class TimeoutSession:
+        alive = True
+        session_id = None
+        stopped = 0
+
+        def run_turn(self, text, timeout=300):
+            raise TimeoutError("slow")
+
+        def send(self, text):
+            self.sent = text
+
+        def collect_turn(self, timeout=300):
+            raise TimeoutError("slow")
+
+        def stop(self):
+            self.stopped += 1
+            self.alive = False
+            return 0
+
+    sess = TimeoutSession()
+    host._session = sess
+    try:
+        host.handle_turn(ws, message="hi")
+    except TimeoutError:
+        pass
+    expect(sess.stopped == 1, "a timed-out turn stops its session so a late reply cannot leak into the next")
+    expect(host._turn_depth == 0, "turn depth is restored after a timeout", host._turn_depth)
+
+    sess2 = TimeoutSession()
+    host._session = sess2
+    secret = "cslead_fixture_secret_token_do_not_leak"
+    delivered = host.deliver_nudge("Lane x job j1 ended: error, verdict —, error %s" % secret)
+    expect(delivered, "a sent nudge counts as delivered even when its reply times out")
+    expect(sess2.stopped == 1, "a timed-out wake reply stops the session too")
+    log = _lead_host.sessions_root(state) / ("%s-serve.log" % CONV)
+    text = log.read_text(encoding="utf-8") if log.is_file() else ""
+    expect("NUDGE:" in text and secret not in text, "nudge text is redacted in the serve log", text[-300:])
+    os.environ.clear()
+    os.environ.update(prev_env)
+    reset_conversation_artifacts(state)
+
+
+
+
+def test_nonblocking_ping_during_wake(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.set_job("job_ping", state="running", meta={"lane": "ping"}, check={"verdict": "pass"})
+    delay_env = dict(env, LEAD_HOST_CLI_EXTRA=json.dumps(["--turn-delay", "5"]))
+    sock = boot_session(state, cs_root, delay_env, name="turn-ping")
+    watch_job(sock, "job_ping", lane="ping")
+    fake.set_job("job_ping", state="done", meta={"lane": "ping"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_ping")
+    expect(wait_until(lambda: len(nudges_from_transcript(state, job_id="job_ping")) >= 1, 20), "wake nudge started")
+    started = time.monotonic()
+    resp = _lead_host.socket_request(sock, {"op": "ping"}, timeout=2)
+    elapsed = time.monotonic() - started
+    expect(resp.get("ok") is True and elapsed < 2.0, "ping while wake reply pending", {"elapsed": elapsed, "resp": resp})
+
+
+def test_durable_wake_spool(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.wake_posts = 0
+    fake.wake_failures = 2
+    fake.set_job("job_spool", state="running", meta={"lane": "spool"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-spool")
+    watch_job(sock, "job_spool", lane="spool")
+    fake.set_job("job_spool", state="done", meta={"lane": "spool"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_spool")
+    expect(wait_until(lambda: len(director_wake_turns(fake, CONV)) >= 1, 45), "wake turn accepted after spool retries")
+    expect(len(director_wake_turns(fake, CONV)) == 1, "exactly one wake turn", len(director_wake_turns(fake, CONV)))
+    expect(wait_until(lambda: not spool_files(state), 10), "wake reply spool empty")
+
+
+def test_idle_hold_until_watch_ends(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    kill_serve(state)  # a serve left from an earlier test keeps its own (long) idle timeout
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    idle_env = dict(env, LEAD_HOST_IDLE_EXIT_S="2")
+    fake.set_job("job_idle", state="running", meta={"lane": "idle"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, idle_env, name="turn-idle")
+    watch_job(sock, "job_idle", lane="idle")
+    expect(wait_until(lambda: serve_pid_alive(state), 5), "serve running with watched job")
+    expect(wait_until(lambda: not serve_pid_alive(state), 2.5) is False, "idle timeout ignored while job runs")
+    fake.set_job("job_idle", state="done", meta={"lane": "idle"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_idle")
+    expect(wait_until(lambda: len(director_wake_turns(fake, CONV)) >= 1, 30), "wake completes after job ends")
+    expect(wait_until(lambda: not serve_pid_alive(state), 10), "serve exits after idle once watch ends")
+
+
+def test_restart_nudge_after_down(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.set_job("job_down", state="running", meta={"lane": "down"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-down")
+    watch_job(sock, "job_down", lane="down")
+    kill_serve(state)
+  # job ends while host is down
+    fake.set_job("job_down", state="done", meta={"lane": "down"}, check={"verdict": "pass"})
+    boot_session(state, cs_root, env, name="turn-down-2")
+    expect(wait_until(lambda: len(nudges_from_transcript(state, job_id="job_down")) == 1, 30), "restarted serve nudges once")
+    expect(wait_until(lambda: len(director_wake_turns(fake, CONV)) >= 1, 30), "restarted serve records wake turn")
+    nudges = nudges_from_transcript(state, job_id="job_down")
+    expect(len(nudges) == 1, "only one nudge after restart", len(nudges))
+
+
+
+def last_nudge_text(state: Path, *, job_id: str | None = None) -> str:
+    nudges = nudges_from_transcript(state, job_id=job_id)
+    return nudges[-1] if nudges else ""
+
+
+def test_other_lanes_status(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.lead_intents.clear()
+    fake.intents_fail = False
+    fake.add_lead_lane(CONV, "int_lane2", "lane-2", "job_lane2", state="done", check={"verdict": "pass"})
+    fake.add_lead_lane(CONV, "int_lane3", "lane-3", "job_lane3", state="error", error="timeout")
+    fake.add_lead_lane(CONV, "int_lane5", "lane-5", "job_lane5", state="running")
+    fake.set_job("job_watch", state="running", meta={"lane": "lane-1"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-other")
+    watch_job(sock, "job_watch", lane="lane-1")
+    fake.set_job("job_watch", state="done", meta={"lane": "lane-1"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_watch")
+    ok = wait_until(lambda: "Your other lanes:" in last_nudge_text(state, job_id="job_watch"), 20)
+    expect(ok, "nudge includes other-lanes status line")
+    nudge = last_nudge_text(state, job_id="job_watch")
+    expect("lane-2 done (pass)" in nudge and "lane-3 error (timeout)" in nudge and "lane-5 running" in nudge,
+           "other lanes listed with state", nudge)
+    expect("lane-1" not in nudge.split("Your other lanes:", 1)[-1], "just-ended lane omitted from other lanes", nudge)
+
+
+def test_other_lanes_fetch_fail(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.lead_intents.clear()
+    fake.intents_fail = True
+    fake.add_lead_lane(CONV, "int_x", "lane-x", "job_x", state="running")
+    fake.set_job("job_fail", state="running", meta={"lane": "fail"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-int-fail")
+    watch_job(sock, "job_fail", lane="fail")
+    fake.set_job("job_fail", state="done", meta={"lane": "fail"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_fail")
+    ok = wait_until(lambda: len(nudges_from_transcript(state, job_id="job_fail")) >= 1, 20)
+    expect(ok, "nudge still sent when intents fetch fails")
+    nudge = last_nudge_text(state, job_id="job_fail")
+    expect("Your other lanes:" not in nudge, "failed fetch omits other-lanes line", nudge)
+    fake.intents_fail = False
+
+
+def test_other_lanes_overflow(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.lead_intents.clear()
+    for i in range(1, 26):
+        fake.add_lead_lane(CONV, "int_o_%d" % i, "lane-o-%d" % i, "job_o_%d" % i, state="done", check={"verdict": "pass"})
+    fake.set_job("job_overflow", state="running", meta={"lane": "lane-0"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-overflow")
+    watch_job(sock, "job_overflow", lane="lane-0")
+    fake.set_job("job_overflow", state="done", meta={"lane": "lane-0"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_overflow")
+    ok = wait_until(lambda: "and 5 more" in last_nudge_text(state, job_id="job_overflow"), 20)
+    expect(ok, "more than twenty other lanes adds overflow suffix")
+    nudge = last_nudge_text(state, job_id="job_overflow")
+    expect("job_overflow" not in nudge.split("Your other lanes:", 1)[-1], "ended job not in other lanes", nudge)
+
+
+def test_other_lanes_redaction(state: Path, cs_root: Path, env: dict, fake: FakeDirector) -> None:
+    secret = "cslead_fixture_secret_token_do_not_leak"
+    reset_conversation_artifacts(state)
+    fake.turns[CONV] = []
+    fake.lead_intents.clear()
+    fake.add_lead_lane(CONV, "int_sec", "lane-sec", "job_sec", state="error", error=secret)
+    fake.set_job("job_red", state="running", meta={"lane": "lane-red"}, check={"verdict": "pass"})
+    sock = boot_session(state, cs_root, env, name="turn-redact")
+    watch_job(sock, "job_red", lane="lane-red")
+    fake.set_job("job_red", state="done", meta={"lane": "lane-red"}, check={"verdict": "pass"})
+    fake.emit_job_change("job_red")
+    ok = wait_until(lambda: len(nudges_from_transcript(state, job_id="job_red")) >= 1, 20)
+    expect(ok, "nudge with redaction path")
+    nudge = last_nudge_text(state, job_id="job_red")
+    expect("Your other lanes:" in nudge and secret not in nudge and "<redacted>" in nudge,
+           "other-lanes line is redacted", nudge)
+
+
+def main() -> int:
+    for mode in ("bound", "stale", "missing"):
+        test_socket_not_listening(mode)
+    if not STUB.is_file():
+        expect(False, "stub_stream_cli missing")
+        print("lead-wakeups: FAIL")
+        for item in problems:
+            print(" -", item)
+        return 1
+    STUB.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+    STUB_DELAY.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+
+    global _FAKE
+    fake = _FAKE = FakeDirector()
+    fake.start()
+    try:
+        with scratch_dir(prefix="lead-wakeups-") as raw:
+            root = Path(raw)
+            state, cs_root, _cfg, env = start_fixture_env(root, fake)
+            test_report_lead_watch_unit()
+            test_review_fixes_unit(root, state, cs_root, env)
+            test_single_nudge(state, cs_root, env, fake)
+            test_batch_two(state, cs_root, env, fake)
+            test_nudge_after_turn(state, cs_root, env, fake)
+            test_wake_turn_after_host_turn(state, cs_root, env, fake)
+            test_resync_after_drop(state, cs_root, env, fake)
+            test_unwatched_ignored(state, cs_root, env, fake)
+            test_nonblocking_ping_during_wake(state, cs_root, env, fake)
+            test_durable_wake_spool(state, cs_root, env, fake)
+            test_idle_hold_until_watch_ends(state, cs_root, env, fake)
+            test_restart_nudge_after_down(state, cs_root, env, fake)
+            test_other_lanes_status(state, cs_root, env, fake)
+            test_other_lanes_fetch_fail(state, cs_root, env, fake)
+            test_other_lanes_overflow(state, cs_root, env, fake)
+            test_other_lanes_redaction(state, cs_root, env, fake)
+            kill_serve(state)
+    finally:
+        fake.stop()
+
+    if problems:
+        print("lead-wakeups: FAIL")
+        for item in problems:
+            print(" -", item)
+        return 1
+    print("lead-wakeups: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

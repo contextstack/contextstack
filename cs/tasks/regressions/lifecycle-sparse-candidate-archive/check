@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import importlib.machinery
+import importlib.util
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+LAB = Path(__file__).resolve().parents[3]
+HERE = LAB / "ops/bin"
+sys.path.insert(0, str(HERE))
+loader = importlib.machinery.SourceFileLoader("publish_sparse", str(HERE / "publish-evidence"))
+module_spec = importlib.util.spec_from_loader("publish_sparse", loader)
+publish = importlib.util.module_from_spec(module_spec)
+loader.exec_module(publish)
+
+
+def git(repo, *args):
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+with scratch_dir(prefix="sparse-candidate-archive-") as raw:
+    root = Path(raw)
+    repo = root / "repo"
+    staging = root / "evidence"
+    repo.mkdir()
+    staging.mkdir()
+    git(repo, "init", "-q")
+    (repo / "history.bin").write_bytes(b"h" * 20000)
+    git(repo, "add", "history.bin")
+    git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-qm", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    (repo / "result.md").write_text("bounded result\n", encoding="utf-8")
+    git(repo, "add", "result.md")
+    tree = git(repo, "write-tree")
+    publish.MAX_ARCHIVE_SOURCE = 15000
+    publish.MAX_ARCHIVE_BLOB = 15000
+    archive = publish.archive_candidate(
+        repo, tree, {"kind": "git", "commit": base}, staging,
+        [{"status": "A", "path": "result.md"}],
+    )
+    assert archive["scope"] == "changed_files"
+    from _lifecycle_evidence import inspection_workspace
+    with inspection_workspace(root, {"candidate_archive": archive},
+                              evidence_dir=staging) as inspected:
+        assert (inspected / "result.md").read_text() == "bounded result\n"
+        assert not (inspected / "history.bin").exists()
+
+print("check: oversized Git trees fall back to a bounded changed-files inspection archive")

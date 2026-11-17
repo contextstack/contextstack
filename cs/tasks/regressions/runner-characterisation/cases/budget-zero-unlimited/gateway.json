@@ -1,0 +1,76 @@
+[
+ {
+  "ok": {
+   "text": "burst",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    },
+    {
+     "id": "2",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    },
+    {
+     "id": "3",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ],
+   "cost": {
+    "currency": "USD",
+    "amount": "0.500000"
+   }
+  }
+ },
+ {
+  "ok": {
+   "text": "burst again",
+   "tool_calls": [
+    {
+     "id": "4",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    },
+    {
+     "id": "5",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    },
+    {
+     "id": "6",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo"
+     }
+    }
+   ],
+   "cost": {
+    "currency": "USD",
+    "amount": "0.500000"
+   }
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": [],
+   "cost": {
+    "currency": "USD",
+    "amount": "0.500000"
+   }
+  }
+ }
+]

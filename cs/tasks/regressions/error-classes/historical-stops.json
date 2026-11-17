@@ -1,0 +1,526 @@
+[
+{
+"stop": "done",
+"rows": 4337
+},
+{
+"stop": "merge",
+"rows": 1066
+},
+{
+"stop": "budget:turns",
+"rows": 818
+},
+{
+"stop": "budget:tool_calls",
+"rows": 483
+},
+{
+"stop": "error: gateway fatal_session [gateway.no_provider_credential]: provider credential not configured on the gateway",
+"rows": 245
+},
+{
+"stop": "check",
+"rows": 105
+},
+{
+"stop": "skipped:empty-tree",
+"rows": 82
+},
+{
+"stop": "preflight_skip",
+"rows": 72
+},
+{
+"stop": "error: gateway fatal_session [gateway.provider_unsupported]: cs model.call has no cli executor path; inventory entry is cli",
+"rows": 69
+},
+{
+"stop": "budget:usd",
+"rows": 28
+},
+{
+"stop": "apply_failed",
+"rows": 21
+},
+{
+"stop": "error: gateway runtime_fault [gateway.transport_failed]: Post \"http://127.0.0.1:8000/v1/chat/completions\": dial tcp 127.0.0.1:8000: connect: connection refused",
+"rows": 18
+},
+{
+"stop": "executor_exit_1",
+"rows": 18
+},
+{
+"stop": "error: gateway fatal_session [gateway.unknown_model]: unknown model_tier_hint claude-code-sonnet-planner — not in inventory; refuse, never fall through",
+"rows": 17
+},
+{
+"stop": "error: gateway runtime_fault [gateway.transport_failed]: Post \"http://127.0.0.1:8000/v1/chat/completions\": EOF",
+"rows": 15
+},
+{
+"stop": "budget:seconds",
+"rows": 11
+},
+{
+"stop": "error: gateway unreachable: Post \"http://127.0.0.1:9200/v1/cs/model.call\": dial tcp 127.0.0.1:9200: connect: connection refused",
+"rows": 11
+},
+{
+"stop": "timeout",
+"rows": 11
+},
+{
+"stop": null,
+"rows": 8
+},
+{
+"stop": "error: bad gateway response (HTTP 404): invalid character 'p' after top-level value",
+"rows": 5
+},
+{
+"stop": "operator-close reason model_miss dest 1b12bac",
+"rows": 5
+},
+{
+"stop": "interrupted",
+"rows": 4
+},
+{
+"stop": "operator-close reason model_miss dest f28854c",
+"rows": 4
+},
+{
+"stop": "error: gateway fatal_session [gateway.bad_request]: request body decode failed: json: cannot unmarshal array into Go struct field csModelCallRequest.messages.3.content of type string",
+"rows": 3
+},
+{
+"stop": "error: gateway fatal_session [gateway.unknown_model]: unknown model_tier_hint claude-code-opus-judge — not in inventory; refuse, never fall through",
+"rows": 3
+},
+{
+"stop": "error: gateway runtime_fault [gateway.transport_failed]: openai_compat: block content unsupported (role user)",
+"rows": 3
+},
+{
+"stop": "error: gateway unreachable: Post \"http://127.0.0.1:9200/v1/cs/model.call\": EOF",
+"rows": 3
+},
+{
+"stop": "operator-close dest",
+"rows": 3
+},
+{
+"stop": "error: capture-stimulus: exit status 1",
+"rows": 2
+},
+{
+"stop": "error: gateway runtime_fault [gateway.transport_failed]: Post \"http://127.0.0.1:8000/v1/chat/completions\": context deadline exceeded",
+"rows": 2
+},
+{
+"stop": "executor_exit_7",
+"rows": 2
+},
+{
+"stop": "grant_paths",
+"rows": 2
+},
+{
+"stop": "operator-close dest dd93369",
+"rows": 2
+},
+{
+"stop": "operator-close reason model_miss dest 2090ef7",
+"rows": 2
+},
+{
+"stop": "blind human ceiling measured; no product landing",
+"rows": 1
+},
+{
+"stop": "cli_preflight",
+"rows": 1
+},
+{
+"stop": "cli_terminal",
+"rows": 1
+},
+{
+"stop": "cutover-gate wire_probe 10/10 shape_match dest 4f19bd4; stream unknown-model SSE $0",
+"rows": 1
+},
+{
+"stop": "error: gateway fatal_session [gateway.provider_unsupported]: cs model.call has no path for inventory provider openrouter",
+"rows": 1
+},
+{
+"stop": "error: gateway fatal_session [gateway.unknown_model]: unknown model_tier_hint no-such-model — not in inventory; refuse, never fall through",
+"rows": 1
+},
+{
+"stop": "error: gateway fatal_session [gateway.unknown_model]: unknown model_tier_hint qwen3-coder — not in inventory; refuse, never fall through",
+"rows": 1
+},
+{
+"stop": "error: gateway retryable_gateway [gateway.capacity_exhausted]: deployment_unbound: vllm/local-reasoner",
+"rows": 1
+},
+{
+"stop": "error: gateway retryable_gateway [gateway.provider_transient]: anthropic failed with status 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"tools.5.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level\"},\"request_id\":\"req_011Cebz7WPR2vDp2bbHcy2Tm\"}",
+"rows": 1
+},
+{
+"stop": "error: gateway retryable_gateway [gateway.provider_transient]: ollama failed with status 500: {\"error\":{\"message\":\"expected element type \\u003cfunction\\u003e but have \\u003cparameter\\u003e\",\"type\":\"api_error\",\"param\":null,\"code\":null}}\n",
+"rows": 1
+},
+{
+"stop": "error: gateway runtime_fault [gateway.transport_failed]: context deadline exceeded",
+"rows": 1
+},
+{
+"stop": "error: gateway status \"\" (HTTP 404)",
+"rows": 1
+},
+{
+"stop": "error: gateway unreachable: Post \"http://127.0.0.1:9200\": dial tcp 127.0.0.1:9200: connect: operation not permitted",
+"rows": 1
+},
+{
+"stop": "error: gateway unreachable: Post \"http://localhost:9200/v1/cs/model.call\": EOF",
+"rows": 1
+},
+{
+"stop": "error: tool \"dark_news_receipt_call_fix\": open /Users/example/src/contextstack/lab/tools/bin/dark_news_receipt_call_fix.json: no such file or directory — file pair in tools/bin",
+"rows": 1
+},
+{
+"stop": "error: tool \"read\": open /Users/example/src/contextstack/lab/tools/bin/read.json: no such file or directory — file pair in tools/bin",
+"rows": 1
+},
+{
+"stop": "error: tool \"rerun_check\": open /Users/example/src/contextstack/lab/tools/bin/rerun_check.json: no such file or directory — file pair in tools/bin",
+"rows": 1
+},
+{
+"stop": "muse_preflight",
+"rows": 1
+},
+{
+"stop": "muse_terminal",
+"rows": 1
+},
+{
+"stop": "operator implementation: estate identity",
+"rows": 1
+},
+{
+"stop": "operator-close dest 00de63a",
+"rows": 1
+},
+{
+"stop": "operator-close dest 03aa647",
+"rows": 1
+},
+{
+"stop": "operator-close dest 040b989",
+"rows": 1
+},
+{
+"stop": "operator-close dest 071574f",
+"rows": 1
+},
+{
+"stop": "operator-close dest 089c0af",
+"rows": 1
+},
+{
+"stop": "operator-close dest 10359bb",
+"rows": 1
+},
+{
+"stop": "operator-close dest 15f922d",
+"rows": 1
+},
+{
+"stop": "operator-close dest 161abfd",
+"rows": 1
+},
+{
+"stop": "operator-close dest 18511ba",
+"rows": 1
+},
+{
+"stop": "operator-close dest 1de2485",
+"rows": 1
+},
+{
+"stop": "operator-close dest 235b99a",
+"rows": 1
+},
+{
+"stop": "operator-close dest 2793d3f",
+"rows": 1
+},
+{
+"stop": "operator-close dest 304898d",
+"rows": 1
+},
+{
+"stop": "operator-close dest 359ef0a",
+"rows": 1
+},
+{
+"stop": "operator-close dest 3b1aefa",
+"rows": 1
+},
+{
+"stop": "operator-close dest 3ffb766",
+"rows": 1
+},
+{
+"stop": "operator-close dest 40bea93",
+"rows": 1
+},
+{
+"stop": "operator-close dest 487451f",
+"rows": 1
+},
+{
+"stop": "operator-close dest 4876404",
+"rows": 1
+},
+{
+"stop": "operator-close dest 532f9f8",
+"rows": 1
+},
+{
+"stop": "operator-close dest 5712e13",
+"rows": 1
+},
+{
+"stop": "operator-close dest 5c55956",
+"rows": 1
+},
+{
+"stop": "operator-close dest 5ccb38b",
+"rows": 1
+},
+{
+"stop": "operator-close dest 5d2c143",
+"rows": 1
+},
+{
+"stop": "operator-close dest 6262fb1",
+"rows": 1
+},
+{
+"stop": "operator-close dest 68850c4",
+"rows": 1
+},
+{
+"stop": "operator-close dest 6912885",
+"rows": 1
+},
+{
+"stop": "operator-close dest 70962cb",
+"rows": 1
+},
+{
+"stop": "operator-close dest 71e1624",
+"rows": 1
+},
+{
+"stop": "operator-close dest 791a947",
+"rows": 1
+},
+{
+"stop": "operator-close dest 79be79d",
+"rows": 1
+},
+{
+"stop": "operator-close dest 79fe16b",
+"rows": 1
+},
+{
+"stop": "operator-close dest 81e0da3",
+"rows": 1
+},
+{
+"stop": "operator-close dest 82d973a",
+"rows": 1
+},
+{
+"stop": "operator-close dest 843b29e",
+"rows": 1
+},
+{
+"stop": "operator-close dest 843c5de",
+"rows": 1
+},
+{
+"stop": "operator-close dest 9858b4f",
+"rows": 1
+},
+{
+"stop": "operator-close dest 99aa3c2",
+"rows": 1
+},
+{
+"stop": "operator-close dest a07dd2a",
+"rows": 1
+},
+{
+"stop": "operator-close dest a0f3b76",
+"rows": 1
+},
+{
+"stop": "operator-close dest a2c37ab",
+"rows": 1
+},
+{
+"stop": "operator-close dest a9626e8",
+"rows": 1
+},
+{
+"stop": "operator-close dest b156f82",
+"rows": 1
+},
+{
+"stop": "operator-close dest b560d7e",
+"rows": 1
+},
+{
+"stop": "operator-close dest ba4c883",
+"rows": 1
+},
+{
+"stop": "operator-close dest bb12a82",
+"rows": 1
+},
+{
+"stop": "operator-close dest c855aec",
+"rows": 1
+},
+{
+"stop": "operator-close dest d40e2f7",
+"rows": 1
+},
+{
+"stop": "operator-close dest d9014f5",
+"rows": 1
+},
+{
+"stop": "operator-close dest da7a3eb",
+"rows": 1
+},
+{
+"stop": "operator-close dest dc86910",
+"rows": 1
+},
+{
+"stop": "operator-close dest e52aa9a",
+"rows": 1
+},
+{
+"stop": "operator-close dest e690d42",
+"rows": 1
+},
+{
+"stop": "operator-close dest e987834",
+"rows": 1
+},
+{
+"stop": "operator-close dest e9c157b",
+"rows": 1
+},
+{
+"stop": "operator-close dest ec78b7e",
+"rows": 1
+},
+{
+"stop": "operator-close dest f0aaece",
+"rows": 1
+},
+{
+"stop": "operator-close dest f5b0729",
+"rows": 1
+},
+{
+"stop": "operator-close dest f63f887",
+"rows": 1
+},
+{
+"stop": "operator-close dest f886f1f",
+"rows": 1
+},
+{
+"stop": "operator-close dest fe762a1",
+"rows": 1
+},
+{
+"stop": "operator-close reason factory_gap dest 16f556e",
+"rows": 1
+},
+{
+"stop": "operator-close reason factory_gap dest 6b7c133",
+"rows": 1
+},
+{
+"stop": "operator-close reason factory_gap dest bec4201",
+"rows": 1
+},
+{
+"stop": "operator-close reason factory_gap dest d61ea52",
+"rows": 1
+},
+{
+"stop": "operator-close reason factory_gap dest f216f0f",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest 41edd67",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest 4233962",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest 6bcc681",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest af00257",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest b0f79b2",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest ba29471",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest c40d74a",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest cd806d5",
+"rows": 1
+},
+{
+"stop": "operator-close reason model_miss dest d3ff1c4",
+"rows": 1
+},
+{
+"stop": "operator-close: shared run-manifest was overwritten by Rising before dispatch; awaiting phase-specific manifest backfill",
+"rows": 1
+},
+{
+"stop": "preflight_check",
+"rows": 1
+}
+]

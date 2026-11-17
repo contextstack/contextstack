@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Production Python must only transport typed sandbox requests, never emit SBPL."""
+import ast
+from pathlib import Path
+import re
+
+OPS = Path(__file__).resolve().parents[3] / 'ops/bin'
+
+
+def violations(source):
+    tree = ast.parse(source)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            modules = [node.module or ''] if isinstance(node, ast.ImportFrom) else [n.name for n in node.names]
+            if any('_sbpl' in module.split('.') for module in modules):
+                found.append((node.lineno, 'SBPL import'))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if re.search(r'\((?:allow|deny)\s', node.value):
+                found.append((node.lineno, 'rule literal'))
+        if isinstance(node, ast.Call):
+            target, method = '', ''
+            if isinstance(node.func, ast.Attribute):
+                target, method = ast.unparse(node.func.value).lower(), node.func.attr
+            elif isinstance(node.func, ast.Name) and node.func.id == 'open' and node.args:
+                target, method = ast.unparse(node.args[0]).lower(), 'open'
+            profile_target = any(word in target for word in ('profile', 'sandbox'))
+            if method == 'open' and profile_target:
+                modes = [*node.args, *(k.value for k in node.keywords if k.arg == 'mode')]
+                if any(isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in ('a', 'a+', 'ab', 'ab+') for n in modes):
+                    found.append((node.lineno, 'profile append'))
+            if method in ('append', 'extend') and (profile_target or target == 'rules'):
+                found.append((node.lineno, 'profile text append'))
+            if method == 'write_text' and profile_target and any(isinstance(n, ast.BinOp) for n in node.args):
+                found.append((node.lineno, 'profile text append'))
+        if isinstance(node, ast.AugAssign):
+            target = ast.unparse(node.target).lower()
+            if any(word in target for word in ('profile', 'rules', 'cmd[2]', 'command[2]')):
+                found.append((node.lineno, 'profile text append'))
+    return found
+
+
+for example in ('x = "(allow default)"', 'x = f"(deny file-write* {path})"',
+                'from _sbpl import quote', 'import _sbpl',
+                'with profile.open("a") as f: f.write(text)',
+                'with open(profile_path, "a") as f: f.write(text)',
+                'profile.write_text(profile.read_text() + suffix)',
+                'rules.append(rule)', 'cmd[2] += suffix'):
+    assert violations(example), example
+assert not violations('profile.write_bytes(render_native_sandbox(lab, policy, request))')
+assert not violations('from urllib.parse import quote\nx = quote(value)')
+# No allowlist: URL/shell quoting is legitimate and does not emit policy text.
+failures = []
+for path in sorted(OPS.iterdir()):
+    if not path.is_file():
+        continue
+    source = path.read_text()
+    if path.suffix != '.py' and 'python' not in source.split('\n', 1)[0]:
+        continue
+    failures.extend(f'{path.name}:{line}: {reason}' for line, reason in violations(source))
+assert not failures, '\n'.join(failures)
+print('no-python-sbpl: PASS')

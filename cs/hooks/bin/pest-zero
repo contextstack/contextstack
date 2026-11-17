@@ -1,0 +1,9 @@
+#!/bin/sh
+# pest only — does not commit. Nonzero on fail or deprecated/skipped.
+test -x vendor/bin/pest || { echo "no pest"; exit 2; }
+out=$(php vendor/bin/pest 2>&1) || { printf '%s\n' "$out"; exit 1; }
+if printf '%s' "$out" | grep -qiE 'deprecated|skipped'; then
+  printf '%s\nhook: suite still carries skips/deprecations\n' "$out"
+  exit 1
+fi
+exit 0

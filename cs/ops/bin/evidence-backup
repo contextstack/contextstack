@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Incrementally back up retained lab evidence to the DGX."""
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+RETAINED_DIRS = ("stimulus", "evidence")
+# the post-1b run record (terminal.json, messages.jsonl, check.json, finalized.json) is evidence too.
+
+
+def backup_policy():
+    from _roots import roots
+    path = roots()["config"] / "policy/evidence-backup.json"
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+RETAINED_FILES = ("transcript.md", "transcript.jsonl", "check.out", "check.output",
+                  "ready_for_inspection", "terminal.json", "messages.jsonl", "check.json",
+                  "finalized.json")
+
+
+def fail(message):
+    print(json.dumps({"ok": False, "error": message}), file=sys.stderr)
+    return 1
+
+
+def _rsync_version_compat(candidate):
+    try:
+        result = subprocess.run(
+            [candidate, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+    if result.returncode != 0:
+        return False
+    if "openrsync" in result.stdout:
+        return False
+    match = re.search(r"rsync\s+version\s+(\d+)", result.stdout)
+    if not match:
+        return False
+    try:
+        major = int(match.group(1))
+    except ValueError:
+        return False
+    return major >= 3
+
+
+def _resolve_rsync():
+    override = os.environ.get("EVIDENCE_BACKUP_RSYNC")
+    if override:
+        if _rsync_version_compat(override):
+            return override
+        raise ValueError("GNU rsync 3.x required")
+    candidates = [
+        "/opt/homebrew/bin/rsync",
+        "/usr/local/bin/rsync",
+        shutil.which("rsync")
+    ]
+    for candidate in candidates:
+        if candidate and _rsync_version_compat(candidate):
+            return candidate
+    raise ValueError("GNU rsync 3.x required")
+
+
+def rows_target(target):
+    base = target.rstrip("/")
+    return base[:-5] + "/rows/" if base.endswith("/runs") else base + "/rows/"
+
+
+def filter_args():
+    args = ["--exclude", "workspace/"]
+    for name in RETAINED_DIRS:
+        args += ["--include", name + "/***"]
+    for name in RETAINED_FILES:
+        args += ["--include", name]
+    return args + ["--include", "*/", "--exclude", "*"]
+
+
+def main():
+    policy = backup_policy()
+    ssh = os.environ.get("EVIDENCE_BACKUP_SSH") or (policy or {}).get("ssh") or "/usr/bin/ssh"
+    from _estate_io import state_dir  # run evidence lives under the state root
+    source = Path(os.environ.get("EVIDENCE_BACKUP_SOURCE", str(state_dir(ROOT) / "runs"))).expanduser()
+    if not source.is_absolute():
+        source = ROOT / source
+    from _estate_io import estate_dir  # an install's ESTATE is in its config root
+    estate_file = estate_dir(ROOT) / "ESTATE"
+    estate = estate_file.read_text().strip() if estate_file.exists() else "dev"
+    default_target = None
+    if policy:
+        by_estate = policy.get("targets_by_estate") if isinstance(policy.get("targets_by_estate"), dict) else {}
+        default_target = by_estate.get(estate) or policy.get("target")
+    socket_spec = os.environ.get("EVIDENCE_BACKUP_SOCKET") or (policy or {}).get("socket")
+    target = os.environ.get("EVIDENCE_BACKUP_TARGET") or default_target
+    if not target and not socket_spec:
+        print(json.dumps({"ok": True, "skipped": True, "reason": "no evidence-backup configuration (policy/evidence-backup.json or EVIDENCE_BACKUP_* env)"}, sort_keys=True))
+        return 0
+    if not target:
+        return fail("EVIDENCE_BACKUP_TARGET or policy/evidence-backup.json target is required")
+    if not socket_spec:
+        return fail("EVIDENCE_BACKUP_SOCKET or policy/evidence-backup.json socket is required")
+    socket = Path(os.path.expanduser(socket_spec))
+
+    if not socket.exists():
+        return fail("SSH control socket not found: " + str(socket))
+    if not source.is_dir():
+        return fail("source directory not found: " + str(source))
+    if ":" not in target:
+        return fail("target must be host:path")
+    host, remote = target.split(":", 1)
+    rows = rows_target(target)
+    _, rows_remote = rows.split(":", 1)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", host):
+        return fail("invalid target host")
+    if not re.fullmatch(r"[~A-Za-z0-9_./-]+", remote):
+        return fail("invalid target path")
+    if not re.fullmatch(r"[~A-Za-z0-9_./-]+", rows_remote):
+        return fail("invalid rows path")
+
+    try:
+        rsync = _resolve_rsync()
+    except ValueError as error:
+        return fail(str(error))
+
+    lock_path = Path(tempfile.gettempdir()) / ("contextstack-evidence-backup-%d.lock" % os.getuid())
+    lock = open(lock_path, "a", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return fail("another evidence backup is running")
+
+    started = time.monotonic()
+    try:
+        remote_shell = "%s -S %s -o BatchMode=yes" % (
+            shlex.quote(ssh), shlex.quote(str(socket)))
+        for path in (remote, rows_remote):
+            mkdir = subprocess.run(
+                [ssh, "-S", str(socket), "-o", "BatchMode=yes", host,
+                 "mkdir", "-p", path.rstrip("/")],
+                capture_output=True, text=True,
+            )
+            if mkdir.returncode != 0:
+                return fail("DGX mkdir failed: " + (mkdir.stderr or mkdir.stdout).strip())
+
+        transfer = subprocess.run(
+            [rsync, "-a", "--partial", "-e", remote_shell, *filter_args(),
+             str(source) + "/", target],
+            capture_output=True, text=True,
+        )
+        if transfer.returncode != 0:
+            return fail("DGX rsync failed: " + (transfer.stderr or transfer.stdout).strip())
+
+        jsonl = sorted(p for p in source.parent.glob("*.jsonl") if p.is_file()) if source.name == "runs" else []
+        if jsonl:
+            staged = Path(tempfile.mkdtemp(prefix="evidence-rows-"))
+            try:
+                for path in jsonl:
+                    try:
+                        os.link(path, staged / path.name)
+                    except OSError:
+                        shutil.copy2(path, staged / path.name)
+                rows_xfer = subprocess.run(
+                    [rsync, "-a", "--partial", "-e", remote_shell,
+                     str(staged) + "/", rows],
+                    capture_output=True, text=True,
+                )
+                if rows_xfer.returncode != 0:
+                    return fail("DGX rows rsync failed: " + (rows_xfer.stderr or rows_xfer.stdout).strip())
+            finally:
+                shutil.rmtree(staged, ignore_errors=True)
+
+        prune = subprocess.run(
+            [ssh, "-S", str(socket), "-o", "BatchMode=yes", host,
+             "find", remote.rstrip("/"), "-type", "d", "-name", "workspace",
+             "-prune", "-exec", "rm", "-rf", "{}", "+"],
+            capture_output=True, text=True,
+        )
+        if prune.returncode != 0:
+            return fail("DGX workspace prune failed: " + (prune.stderr or prune.stdout).strip())
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+    print(json.dumps({
+        "ok": True,
+        "source": str(source),
+        "target": target,
+        "rows": rows,
+        "socket": str(socket),
+        "seconds": round(time.monotonic() - started, 3),
+    }, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

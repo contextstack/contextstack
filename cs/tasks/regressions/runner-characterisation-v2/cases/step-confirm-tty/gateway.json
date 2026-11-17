@@ -1,0 +1,31 @@
+[
+ {
+  "ok": {
+   "text": "two writes",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fs_write",
+     "args": {
+      "path": "hello.txt",
+      "content": "hello"
+     }
+    },
+    {
+     "id": "2",
+     "name": "fs_write",
+     "args": {
+      "path": "other.txt",
+      "content": "x"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

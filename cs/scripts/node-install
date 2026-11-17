@@ -1,0 +1,89 @@
+#!/bin/sh
+# node-install: install a ContextStack release into the persistent layout under ~/.contextstack, and manage it.
+#
+#   node-install install BUNDLE [activate options]   install the bundle's release (offline), then activate it
+#   node-install switch RELEASE [--wait SECONDS|--no-wait|--force]
+#   node-install select [--gateway go|rust] [--runner go|rust] [--wait SECONDS|--no-wait|--force]
+#   node-install rollback [--wait SECONDS|--no-wait|--force] | status | uninstall [--purge [--purge-secrets]]
+#
+# Offline node image, pinned interpreter and persistent layout. POSIX sh
+# because a fresh target has no Python: this script installs the bundle's interpreter into the release, and
+# everything after that is scripts/node-release under that interpreter (layout, the atomic switch, PATH links,
+# launchd plists on macOS and systemd user units on Linux; its docstring is the contract).
+#
+# install:
+#   1. refuse a bundle for another OS or architecture (bundle.json "target" vs uname) or a non-bundle dir
+#   2. ROOT/releases/<id> (<id> is bundle.json "release"; ROOT is $HOME/.contextstack) gets the bundle's
+#      release/ tree (cs/ code root, bin/,
+#      gateway/models.json), target/release/{cs-tools,cs-sandbox} as hard links to bin/, the interpreter from the
+#      bundle's file:// mirror (UV_OFFLINE=1) in python/ and <kit>/.venv from `uv sync --locked --offline`; `node-bundle verify` writes verify.json (exit 0, or 2 when
+#      only a host runtime is missing), then .complete marks the release whole. A release already complete
+#      is not touched again (install is idempotent); an incomplete one is resumed in place (the venv records
+#      absolute paths, so a release is built where it will live, never renamed).
+#   3. exec node-release activate <id> --from-bundle BUNDLE with the remaining options. Activation keeps the
+#      newest N bundle directories (default 3, --keep), never this bundle and never one a kept release came
+#      from, and points bundles at bundles.noindex (Spotlight skips that name); state/runs stays a real directory.
+# The other commands run node-release from the current release.
+set -eu
+pick_kit() { echo cs; }
+
+ROOT="$HOME/.contextstack"
+usage() {
+  echo "usage: node-install install BUNDLE [options] | switch RELEASE [--wait SECONDS|--no-wait|--force] | select [--gateway go|rust] [--runner go|rust] [--wait SECONDS|--no-wait|--force] | rollback [--wait SECONDS|--no-wait|--force] | status | uninstall [--purge [--purge-secrets]]" >&2
+  exit 1
+}
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case "$cmd" in
+  install) ;;
+  switch|select|rollback|status|uninstall)
+    KIT=$(pick_kit "$ROOT/current")
+    PY="$ROOT/current/$KIT/.venv/bin/python3"
+    [ -x "$PY" ] || { echo "node-install: no current release under $ROOT" >&2; exit 1; }
+    exec "$PY" -I "$ROOT/current/$KIT/scripts/node-release" "$cmd" "$@" ;;
+  *) usage ;;
+esac
+[ $# -ge 1 ] || usage
+[ -d "$1" ] || { echo "node-install: $1 is not a bundle (no such directory)" >&2; exit 1; }
+BUNDLE=$(cd "$1" && pwd)
+shift
+UV="$BUNDLE/uv/uv"
+KIT=$(pick_kit "$BUNDLE/release")
+[ -x "$UV" ] && [ -f "$BUNDLE/bundle.json" ] && [ -d "$BUNDLE/release/$KIT" ] ||
+  { echo "node-install: $BUNDLE is not a bundle (uv/uv, bundle.json, release/cs)" >&2; exit 1; }
+
+TARGET=$(sed -n 's/^  "target": "\([^"]*\)",*$/\1/p' "$BUNDLE/bundle.json")
+ID=$(sed -n 's/^  "release": "\([^"]*\)",*$/\1/p' "$BUNDLE/bundle.json")
+case "$(uname -s)" in Darwin) HOST=macos;; Linux) HOST=linux;; *) HOST=$(uname -s);; esac
+case "$(uname -m)" in arm64|aarch64) HOST="$HOST-aarch64";; x86_64|amd64) HOST="$HOST-x86_64";; *) HOST="$HOST-$(uname -m)";; esac
+[ "$TARGET" = "$HOST" ] || { echo "node-install: bundle is for $TARGET, this host is $HOST" >&2; exit 1; }
+case "$ID" in ""|.*|*/*|*" "*) echo "node-install: bundle.json has no usable \"release\" id: '$ID'" >&2; exit 1;; esac
+
+REL="$ROOT/releases/$ID"
+if [ ! -f "$REL/.complete" ]; then
+  PYVER=$(tr -d '[:space:]' < "$BUNDLE/release/$KIT/.python-version")
+  umask 077
+  mkdir -p "$REL"
+  umask 022
+  echo "node-install: release $ID -> $REL" >&2
+  cp -Rp "$BUNDLE/release/." "$REL/"
+  cp "$BUNDLE/bundle.json" "$REL/bundle.json"
+  mkdir -p "$REL/target/release"
+  for b in cs-tools cs-sandbox; do
+    [ ! -f "$REL/bin/$b" ] || ln -f "$REL/bin/$b" "$REL/target/release/$b"
+  done
+  export UV_OFFLINE=1 UV_NO_PROGRESS=1 UV_PYTHON_PREFERENCE=only-managed
+  export UV_PYTHON_INSTALL_DIR="$REL/python" UV_PYTHON_INSTALL_MIRROR="file://$BUNDLE/python"
+  export UV_CACHE_DIR="$REL/.uv-cache"
+  echo "node-install: python $PYVER from $BUNDLE/python into $REL/python" >&2
+  "$UV" python install --no-bin "$PYVER"
+  (cd "$REL/$KIT" && "$UV" sync --locked --offline --python "$PYVER")
+  rm -rf "$REL/.uv-cache"
+  rc=0
+  "$REL/$KIT/.venv/bin/python3" -I "$REL/$KIT/scripts/node-bundle" verify "$BUNDLE" "$REL" > "$REL/verify.json" || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || { echo "node-install: verify failed (exit $rc), see $REL/verify.json" >&2; exit 1; }
+  : > "$REL/.complete"
+fi
+KIT=$(pick_kit "$REL")
+exec "$REL/$KIT/.venv/bin/python3" -I "$REL/$KIT/scripts/node-release" activate "$ID" --from-bundle "$BUNDLE" "$@"

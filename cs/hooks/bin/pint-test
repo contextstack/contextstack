@@ -1,0 +1,4 @@
+#!/bin/sh
+# pint --test only — does not commit. For 12-pint-class chores.
+test -x vendor/bin/pint || { echo "no pint"; exit 2; }
+php vendor/bin/pint --test

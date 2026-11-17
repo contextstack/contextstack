@@ -1,0 +1,7 @@
+{
+  "description": "Operator/launchd: stale-lock sweep, schedule admission and corpus stale_after pass, then next A2 job. Turns first with aged batch preference. Model capacity belongs to the gateway. --turn-seat admits only Director conversation turns in one reserved process seat alongside ordinary work. Per-resource flock. First-terminal-wins close. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {}
+  }
+}

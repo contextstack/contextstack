@@ -1,0 +1,74 @@
+{
+  "description": "Adapter: freeze the goal, check, spec, prompts, and check dependencies a run consumes into ledger/runs/<run>/stimulus/ before its first model call, with task_sha, stimulus_sha, base identity, and grant state. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "run_dir": {
+        "type": "string"
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "task": {
+        "type": "string"
+      },
+      "spec": {
+        "type": "string"
+      },
+      "spec_sha": {
+        "type": "string"
+      },
+      "tools": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "hooks": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "trial": {
+        "type": "integer"
+      },
+      "adapter": {
+        "type": "string"
+      },
+      "workspace": {
+        "type": "string"
+      },
+      "prompts": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "grant": {
+        "type": "string"
+      },
+      "grant_known": {
+        "type": "boolean"
+      },
+      "authority": {
+        "type": "string"
+      },
+      "executor_files": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 9
+      },
+      "executor_identity": {
+        "type": "object"
+      }
+    },
+    "required": [
+      "run_dir",
+      "task"
+    ],
+    "additionalProperties": false
+  }
+}

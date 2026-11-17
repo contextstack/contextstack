@@ -1,0 +1,18 @@
+[
+ {
+  "ok": {
+   "text": "three failing reads under a reporting wrapper",
+   "tool_calls": [
+    {"id": "1", "name": "fx_tool", "args": {"mode": "fail", "code": 1, "out": "fx: /etc/hosts: Operation not permitted"}},
+    {"id": "2", "name": "fx_tool", "args": {"mode": "fail", "code": 1, "out": "fx: missing.txt: No such file or directory"}},
+    {"id": "3", "name": "fx_tool", "args": {"mode": "fail", "code": 1, "out": "fx: /nonexistent-cs-fixture/x: No such file or directory"}}
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

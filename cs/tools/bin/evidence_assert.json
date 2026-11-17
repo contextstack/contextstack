@@ -1,0 +1,16 @@
+{
+  "runtime": "python3",
+  "sandbox": {"net": "none"},
+  "description": "Register an exact quote or source publication date against successful cached fetch bytes. Quotes may resolve through a validated local Defuddle derivation whose parent raw bytes remain authoritative. Args: {source_url, quote?, source_date?, entry?}.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "source_url": {"type": "string"},
+      "quote": {"type": "string"},
+      "source_date": {"type": "string"},
+      "entry": {"type": "string"}
+    },
+    "required": ["source_url"],
+    "additionalProperties": false
+  }
+}

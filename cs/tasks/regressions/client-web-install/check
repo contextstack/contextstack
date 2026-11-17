@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""client-web-install regression (goal.md, ADR 0017): client-web bundled, installed and served from a fake HOME.
+
+Network-free. Builds bundles and installs as node-install-layout does (its _bundle) and drives cs with cs-cli's
+shims. The client-web build's commands are replaced by stand-ins (composer and npm need the network): they copy the
+checkout's built vendor/ and public/build/ when present, else write placeholders, so serving SKIPs. Temp dirs only;
+never the real launchd, ~/.local/bin or ~/Library/LaunchAgents (asserted); HOME is always fake.
+"""
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "node-install-layout"))
+import _bundle  # noqa: E402
+
+LAB = _bundle.LAB
+INSTALL = LAB / "scripts/node-install"
+A, B, C = "20990101-aaaaaaaaa", "20990102-bbbbbbbbb", "20990103-ccccccccc"
+LABEL = "com.contextstack.client-web"
+LISTEN = "127.0.0.1:8781"
+LOCAL_SECRET = "csl_FAKEclientweblocal00001"  # a stand-in: never a real credential
+ROUTER = "vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php"
+problems = []
+
+
+def fail(msg):
+    problems.append(msg)
+    print("FAIL " + msg)
+
+
+def expect(cond, msg):
+    (print("ok   " + msg) if cond else fail(msg))
+
+
+def node_install(home, *args, user_path="/usr/bin:/bin", **env_more):
+    """The fake HOME's ~/.local/bin always leads the login-shell PATH, so links never fall back to /opt/homebrew/bin."""
+    env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin:%s" % (home, user_path), **env_more)
+    r = subprocess.run(["sh", str(INSTALL), *args], capture_output=True, text=True, env=env, cwd="/")
+    return r, _bundle.report(r.stdout)
+
+
+def tree(root):
+    out = {}
+    for p in sorted(root.rglob("*")) if root.exists() else []:
+        st = p.lstat()
+        out[str(p.relative_to(root))] = os.readlink(p) if p.is_symlink() else (st.st_size, st.st_mtime_ns, st.st_mode)
+    return out
+
+
+def fake_php(where, version):
+    where.mkdir(parents=True, exist_ok=True)
+    (where / "php").write_text('#!/bin/sh\n[ "$1" = -r ] && { printf %d; exit 0; }\nexec sleep 30\n' % version)
+    (where / "php").chmod(0o755)
+    return where / "php"
+
+
+def real_php():
+    """(php, the checkout's client-web) when php >= 8.3 and the checkout has its built vendor/ and public/build/."""
+    nb = _bundle.node_bundle()
+    src = LAB.parent / nb.CLIENT_WEB_SRC
+    php = shutil.which("php")
+    if not php or not (src / "vendor/autoload.php").is_file() or not (src / "public/build/manifest.json").is_file():
+        return None, "no php, or %s has no vendor/ and public/build/ (composer install; npm ci && npm run build)" % src
+    got = subprocess.run([php, "-r", "echo PHP_VERSION_ID;"], capture_output=True, text=True).stdout.strip()
+    return (php, src) if got.isdigit() and int(got) >= 80300 else (None, "php %s is older than 8.3" % got)
+
+
+def stand_in_build(src, php):
+    """CLIENT_WEB_BUILD for a network-free test: the checkout's built trees (cloned) and one real boot, or placeholders."""
+    py = sys.executable
+    if php:
+        clone = ["cp", "-cR"] if sys.platform == "darwin" else ["cp", "-R"]
+        return ([*clone, str(src / "vendor"), "vendor"], ["mkdir", "-p", "public"],
+                [*clone, str(src / "public/build"), "public/build"],
+                [php, "artisan", "package:discover", "--no-interaction"], [php, "artisan", "list", "--no-interaction"])
+    write = ("import pathlib,sys\nfor p in sys.argv[1:]:\n    pathlib.Path(p).parent.mkdir(parents=True, exist_ok=True)\n"
+             "    pathlib.Path(p).write_text('<?php return [];\\n')")
+    return ([py, "-c", write, "vendor/autoload.php", ROUTER, "public/build/manifest.json",
+             "bootstrap/cache/packages.php", "bootstrap/cache/services.php"],)
+
+
+def part_bundle(tmp, php, src):
+    """The release tree node-bundle build --client-web makes; returns it."""
+    nb = _bundle.node_bundle()
+    expect((LAB.parent / nb.CLIENT_WEB_SRC / "artisan").is_file() and nb.CLIENT_WEB == "client-web",
+           "node-bundle: CLIENT_WEB_SRC (%s) names the app; a release calls it client-web/" % nb.CLIENT_WEB_SRC)
+    nb.CLIENT_WEB_BUILD = stand_in_build(src, php)
+    dest = tmp / "cw-tree/client-web"
+    try:
+        meta = nb.build_client_web(dest)
+    except SystemExit as stop:
+        fail("build_client_web: %s" % stop)
+        return None
+    have = {str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()}
+    want = {".env.install.example", "artisan", "composer.json", "composer.lock", "public/index.php", "bootstrap/app.php",
+            "config/client.php", "app/Client/ConnectionStore.php", "routes/web.php", "vendor/autoload.php",
+            "public/build/manifest.json", "bootstrap/cache/packages.php", "bootstrap/cache/services.php", ROUTER}
+    expect(want <= have, "the client-web tree has the app, vendor/, public/build/, package manifests and the env template: "
+           "missing %s" % sorted(want - have))
+    banned = [r for r in have if r in (".env", ".env.example", "auth.json", "AGENTS.md", "CLAUDE.md", "phpunit.xml")
+              or r.startswith(("tests/", "storage/", "node_modules/", ".claude/", ".agents/", ".github/"))]
+    expect(not banned and not (dest / "storage").exists(), "no .env, tests/, storage/, node_modules/ or agent files: %s" % banned[:5])
+    expect(meta.get("src") == nb.CLIENT_WEB_SRC and meta.get("path") == "client-web" and meta.get("requires_php_id") == 80300,
+           "bundle.json's client_web entry names the source, the release folder and php 8.3: %s" % meta)
+    auth = tmp / "auth.json"
+    auth.write_text('{"http-basic": {"composer.fluxui.dev": {"username": "u", "password": "FAKEauth0001"}}}')
+    nb.CLIENT_WEB_BUILD = ([sys.executable, "-c", "import os,sys; sys.exit(0 if 'FAKEauth0001' in os.environ.get('COMPOSER_AUTH', '') else 3)"],
+                           ) + stand_in_build(None, None)
+    try:
+        nb.build_client_web(tmp / "cw-auth/client-web", str(auth))
+        leaked = [str(x) for x in (tmp / "cw-auth").rglob("*") if x.is_file() and b"FAKEauth0001" in x.read_bytes()]
+        expect(not leaked, "--composer-auth reaches composer as COMPOSER_AUTH and is never copied into the release: %s" % leaked)
+    except (SystemExit, subprocess.CalledProcessError) as stop:
+        fail("--composer-auth: the build did not see COMPOSER_AUTH: %s" % stop)
+    nb.CLIENT_WEB_BUILD = ()
+    try:
+        nb.build_client_web(tmp / "cw-empty/client-web")
+        fail("a client-web build with no vendor/ was accepted")
+    except SystemExit as stop:
+        expect("vendor/autoload.php" in str(stop), "a client-web build missing its outputs stops: %s" % stop)
+    r = subprocess.run([sys.executable, str(LAB / "scripts/node-bundle"), "build", "--help"], capture_output=True, text=True)
+    expect("--client-web" in r.stdout, "node-bundle build takes --client-web")
+    return dest
+
+
+def cw_bundle(tmp, name, uv, rid, tree_src, extra=None):
+    out = tmp / name
+    if tree_src:
+        (out / "release").mkdir(parents=True)
+        subprocess.run(["cp", "-cR" if sys.platform == "darwin" else "-R", str(tree_src), str(out / "release/client-web")], check=True)
+    bins = _bundle.fake_bins(tmp / ("fakebin-" + name))
+    rs = tmp / ("fakebin-" + name) / "director-rs"  # this Mac serves the Rust Director beside client-web (C too)
+    rs.write_text("#!/bin/sh\necho director-rs \"$@\"\n")
+    rs.chmod(0o755)
+    bins["director-rs"] = rs
+    _bundle.bundle(out, uv, rid, bins, extra=extra)
+    if tree_src:
+        nb = _bundle.node_bundle()
+        meta = json.loads((out / "bundle.json").read_text())
+        meta["client_web"] = {"src": nb.CLIENT_WEB_SRC, "path": "client-web", "requires_php_id": 80300}
+        nb.write_meta(out, meta)
+        expect("release/client-web/public/index.php" in meta["files"] and "release/client-web/vendor/autoload.php" in meta["files"],
+               "bundle %s: client-web files are listed and hashed" % rid)
+    return out
+
+
+def check_plist(home, root, php):
+    p = plistlib.loads((home / "Library/LaunchAgents" / (LABEL + ".plist")).read_bytes())
+    app = root / "current/client-web"
+    want = [php, "-S", LISTEN, "-t", str(app / "public"), str(app / ROUTER)]
+    env = p["EnvironmentVariables"]
+    text = json.dumps(p)
+    expect(p["ProgramArguments"] == want and p["WorkingDirectory"] == str(app / "public") and p.get("KeepAlive") is True
+           and p.get("RunAtLoad") is True, "client-web plist: php -S %s from current/client-web/public, Laravel's router, "
+           "KeepAlive: %s" % (LISTEN, p["ProgramArguments"]))
+    expect(env.get("PHP_CLI_SERVER_WORKERS") == "4" and env.get("DIRECTOR_ENV_FILE") == str(root / "config/client-web/client-web.env"),
+           "client-web plist: PHP_CLI_SERVER_WORKERS=4, DIRECTOR_ENV_FILE is config/client-web/client-web.env")
+    expect(env.get("PATH", "").split(":")[0] == os.path.dirname(php) and "/opt/homebrew/bin" in env["PATH"].split(":")
+           and "~" not in text and "$HOME" not in text and str(home / ".local/bin") not in text,
+           "client-web plist: explicit PATH (php's dir first), absolute paths only, no PATH link")
+    expect(p["StandardOutPath"] == str(root / "logs/client-web.out.log")
+           and p["StandardErrorPath"] == str(root / "logs/client-web.err.log"), "client-web plist: logs under logs/")
+    agents = sorted(x.name for x in (home / "Library/LaunchAgents").iterdir())
+    dbs = [str(x) for x in root.rglob("*.sqlite") if "state/director" not in str(x)]
+    expect(not [a for a in agents if "schedule" in a or "queue" in a or a.startswith("com.contextstack.director.")] and not dbs,
+           "one client-web agent: no schedule or queue agent, no Laravel director, no database: %s %s" % (agents, dbs))
+    return p
+
+
+def env_differences(root, text):
+    values = dict(re.findall(r"(?m)^([A-Z][A-Z0-9_]*)=(.*)$", text))
+    expected = {"DIRECTOR_URL": "http://127.0.0.1:8780",
+                "DIRECTOR_LOCAL_CREDENTIAL": str(root / "state/director/local-credential"),
+                "LARAVEL_STORAGE_PATH": str(root / "state/client-web"), "APP_URL": "http://" + LISTEN,
+                "SESSION_DRIVER": "file", "CACHE_STORE": "file", "QUEUE_CONNECTION": "sync"}
+    # Name differing fields only: even a malformed env must never expose a key or credential value.
+    differences = [k + (" missing" if k not in values else " differs")
+                   for k, want in expected.items() if values.get(k) != want]
+    differences += ["unexpected " + k for k in values if k.startswith("DB_")]
+    # ROOT paths can legitimately contain '__' (including tempfile's random suffix).
+    if re.search(r"__[A-Z][A-Z0-9_]*__", text):
+        differences.append("unresolved template placeholder")
+    return differences
+
+
+def part_env_differences():
+    root = Path("/tmp/client-web-install-e7gj__1z/home/.contextstack")
+    fields = {"DIRECTOR_URL": "http://127.0.0.1:8780",
+              "DIRECTOR_LOCAL_CREDENTIAL": str(root / "state/director/local-credential"),
+              "LARAVEL_STORAGE_PATH": str(root / "state/client-web"), "APP_URL": "http://" + LISTEN,
+              "SESSION_DRIVER": "file", "CACHE_STORE": "file", "QUEUE_CONNECTION": "sync"}
+    render = lambda fields: "\n".join(k + "=" + v for k, v in fields.items())
+    assert env_differences(root, render(fields)) == []
+    for k in fields:
+        assert k + " differs" in env_differences(root, render({**fields, k: LOCAL_SECRET}))
+        assert k + " missing" in env_differences(root, render({n: v for n, v in fields.items() if n != k}))
+    for token in ("__ROOT__", "__URL__", "__DIRECTOR_URL__"):
+        assert "unresolved template placeholder" in env_differences(root, render(fields) + "\nOTHER=" + token)
+    differences = env_differences(root, render({**fields, "APP_KEY": LOCAL_SECRET, "DB_PASSWORD": LOCAL_SECRET}))
+    assert differences == ["unexpected DB_PASSWORD"] and LOCAL_SECRET not in str(differences)
+    print("ok   env comparison: double underscores in paths, differing/missing fields, placeholders and secret-safe diagnostics")
+
+
+def check_env(root, out):
+    envf = root / "config/client-web/client-web.env"
+    text = envf.read_text()
+    values = dict(re.findall(r"(?m)^([A-Z][A-Z0-9_]*)=(.*)$", text))
+    key = values.get("APP_KEY", "")
+    expect(envf.stat().st_mode & 0o777 == 0o600 and envf.parent.stat().st_mode & 0o777 == 0o700,
+           "client-web.env 0600 in a 0700 config/client-web")
+    expect(re.fullmatch(r"base64:[A-Za-z0-9+/]{43}=", key) is not None and key not in out and key[7:] not in out,
+           "a fresh APP_KEY is written straight into it and never printed")
+    differences = env_differences(root, text)
+    expect(not differences,
+           "client-web.env: the installed Director, its local credential, storage in state/client-web, file sessions and "
+           "cache, sync queue, no database" + (": " + "; ".join(differences) if differences else ""))
+    st = root / "state/client-web"
+    expect(st.stat().st_mode & 0o777 == 0o700 and (st / "framework/sessions").is_dir() and (st / "app/private").is_dir(),
+           "state/client-web created 0700 with Laravel's storage dirs")
+    return key
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class StandIn(http.server.BaseHTTPRequestHandler):
+    """A Director that answers the Client API only with the local credential."""
+    seen = []
+
+    def do_GET(self):
+        auth = self.headers.get("Authorization") or ""
+        StandIn.seen.append((self.path, auth == "Bearer " + LOCAL_SECRET))
+        if auth != "Bearer " + LOCAL_SECRET:
+            body, code = {"error": "unauthenticated"}, 401
+        elif self.path.startswith("/api/v1/client/intents"):
+            body, code = {"intents": [], "jobs": []}, 200
+        else:
+            body, code = {}, 200
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+def get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+    except OSError:
+        return 0, ""
+
+
+def part_run(home, root, p, php):
+    """The plist's own command, its port changed, against a stand-in Director: /intents is 200 with the local credential."""
+    envf = root / "config/client-web/client-web.env"
+    saved = envf.read_bytes()
+    director = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StandIn)
+    threading.Thread(target=director.serve_forever, daemon=True).start()
+    envf.write_text(re.sub(r"(?m)^DIRECTOR_URL=.*$", "DIRECTOR_URL=http://127.0.0.1:%d" % director.server_port, saved.decode()))
+    cred = root / "state/director/local-credential"
+    cred.write_text(LOCAL_SECRET + "\n")
+    cred.chmod(0o600)
+    port = free_port()
+    args = [a if a != LISTEN else "127.0.0.1:%d" % port for a in p["ProgramArguments"]]
+    proc = subprocess.Popen(args, cwd=p["WorkingDirectory"], env=dict(p["EnvironmentVariables"], HOME=str(home)),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        code = 0
+        for _ in range(100):
+            code, _ = get("http://127.0.0.1:%d/up" % port)
+            if code or proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        code, body = get("http://127.0.0.1:%d/intents" % port)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)  # the server and its 4 workers
+        except ProcessLookupError:
+            pass
+        proc.wait(10)
+        director.shutdown()
+        director.server_close()
+        envf.write_bytes(saved)
+        envf.chmod(0o600)
+    err = proc.stderr.read()[-600:]
+    expect(code == 200 and any(path.split("?")[0] == "/api/v1/client/intents" and ok for path, ok in StandIn.seen),
+           "the plist's command serves /intents (200) from the Director with the local credential: %s %s %s"
+           % (code, StandIn.seen[:3], err if code != 200 else ""))
+    expect(LOCAL_SECRET not in body and any((root / "state/client-web/framework/sessions").iterdir())
+           and not (root / "current/client-web/storage").exists(),
+           "its session is in state/client-web, nothing in the release; the page never shows the credential")
+
+
+def part_serve(tmp, uv, managed, cw_tree, php_real):
+    home = tmp / "home"
+    root = home / ".contextstack"
+    agents = home / "Library/LaunchAgents"
+    for rid in (A, B, C):
+        _bundle.seed_python(home, rid, managed)
+    ba = cw_bundle(tmp, "bundle-a", uv, A, cw_tree)
+    bb = cw_bundle(tmp, "bundle-b", uv, B, cw_tree, extra={"RELEASE-B": "b\n"})
+    bc = cw_bundle(tmp, "bundle-c", uv, C, None)
+    php = php_real or str(fake_php(tmp / "php83", 80512))
+    old = fake_php(tmp / "php81", 80100)
+    on_path = "%s:/usr/bin:/bin" % os.path.dirname(php)
+
+    r, rep = node_install(home, "install", str(bc), "--estate", "workstation", "--serve-client-web", LISTEN, "--php", php, "--no-load")
+    expect(r.returncode == 1 and "no client-web/" in rep.get("refused", "") and "--client-web" in rep.get("refused", "")
+           and not os.path.lexists(root / "current"), "--serve-client-web on a release without client-web/: refused, naming "
+           "the bundle flag: %s" % rep.get("refused"))
+    for bad in ("0.0.0.0:8781", "192.0.2.5:8781", "127.0.0.1", "localhost:8781", "[::]:8781"):
+        r, rep = node_install(home, "install", str(ba), "--estate", "workstation", "--serve-client-web", bad, "--php", php, "--no-load")
+        expect(r.returncode == 1 and "Tailscale" in rep.get("refused", "") and "no login" in rep.get("refused", "")
+               and not os.path.lexists(root / "current") and not (root / "config/client-web").exists(),
+               "--serve-client-web %s: refused (loopback or Tailscale only), nothing written" % bad)
+    r, rep = node_install(home, "install", str(ba), "--estate", "workstation", "--serve-client-web", LISTEN, "--php", str(old), "--no-load")
+    expect(r.returncode == 1 and "php >= 8.3" in rep.get("refused", "") and not os.path.lexists(root / "current"),
+           "php older than 8.3: refused: %s" % rep.get("refused"))
+    r, rep = node_install(home, "install", str(ba), "--estate", "workstation", "--serve-client-web", LISTEN, "--no-load",
+                          user_path="/nonexistent-bin")
+    expect(r.returncode == 1 and "php >= 8.3" in rep.get("refused", ""), "no php on the login-shell PATH: refused, naming --php")
+    r, rep = node_install(home, "install", str(ba), "--estate", "workstation", "--serve-client-web", LISTEN, "--serve-director",
+                          "127.0.0.1:8790", "--no-load", user_path=on_path)
+    expect(r.returncode == 1 and "retired" in rep.get("refused", "") and not os.path.lexists(root / "current"),
+           "the retired --serve-director beside it: still refused")
+
+    # This Mac: the Director host serves the Rust Director and client-web; php found on the login-shell PATH.
+    r, rep = node_install(home, "install", str(ba), "--estate", "workstation", "--serve-director-rs", "--serve-client-web", LISTEN,
+                          "--no-load", user_path=on_path)
+    if r.returncode != 0:
+        return fail("install with --serve-client-web: %s %s" % (rep, r.stderr[-800:]))
+    record = json.loads((root / "config/install.json").read_text())
+    cw = rep.get("client_web") or {}
+    expect(record.get("serve_client_web") == LISTEN and record.get("client_web_php") == php and cw.get("url") == "http://" + LISTEN
+           and cw.get("director") == "http://127.0.0.1:8780" and cw.get("env_file", "").endswith("seeded"),
+           "install: recorded (listen, php); reports its URL, its Director and a seeded env file: %s" % cw)
+    p = check_plist(home, root, php)
+    key = check_env(root, r.stdout + r.stderr + (root / "config/install.json").read_text())
+    if php_real:
+        part_run(home, root, p, php)
+    else:
+        print("SKIP serving: %s" % _SKIP)
+    store = root / "state/client-web/app/private/client-web"
+    store.mkdir(mode=0o700, exist_ok=True)
+    (store / "connection.json").write_text('{"mode": "device", "url": "http://192.0.2.103:8780", "token": "csd_FAKE0001"}\n')
+    (store / "connection.json").chmod(0o600)
+    (root / "state/client-web/framework/sessions/fakesession").write_text("s\n")
+    kept, envb = tree(root / "state/client-web"), (root / "config/client-web/client-web.env").read_bytes()
+    same = lambda: tree(root / "state/client-web") == kept and (root / "config/client-web/client-web.env").read_bytes() == envb
+
+    r, rep = node_install(home, "install", str(bb), "--no-load")
+    expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + B and same()
+           and (rep.get("client_web") or {}).get("env_file", "").endswith("kept"),
+           "install B: current -> B; state/client-web and the env file unchanged (bytes, mtime, mode): %s" % rep.get("refused"))
+    check_plist(home, root, php)
+    r, rep = node_install(home, "rollback", "--no-load")
+    expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + A and same(),
+           "rollback: current -> A; client-web's storage and env unchanged")
+    r, rep = node_install(home, "switch", C, "--no-load")
+    expect(r.returncode == 1 and "no client-web/" in rep.get("refused", "") and os.readlink(root / "current") == "releases/" + A,
+           "switch to a release without client-web while it is served: refused, current unchanged")
+    (root / "config/client-web/client-web.env").chmod(0o644)
+    r, rep = node_install(home, "switch", B, "--no-load")
+    expect(r.returncode == 1 and "chmod 600" in rep.get("refused", "") and os.readlink(root / "current") == "releases/" + A,
+           "an env file open to other users: refused with its fix")
+    (root / "config/client-web/client-web.env").chmod(0o600)
+    r, rep = node_install(home, "switch", B, LAUNCHCTL_SHIM_LOG=str(tmp / "launchctl.log"))
+    states = {k: v["launchd"] for k, v in rep.get("plists", {}).items()}
+    log = (tmp / "launchctl.log").read_text() if (tmp / "launchctl.log").exists() else ""
+    expect(r.returncode == 0 and states.get(LABEL) == "bootstrapped" and str(agents / (LABEL + ".plist")) in log,
+           "loading (shimmed launchctl): the client-web agent is bootstrapped: %s" % states)
+    part_cs(home, tmp / "shim", root, key)
+    r, rep = node_install(home, "uninstall", "--purge", "--no-load")
+    expect(r.returncode == 0 and not (agents / (LABEL + ".plist")).exists() and tree(root / "state/client-web") == kept
+           and not (root / "config").exists(), "uninstall --purge: the plist and config/ go; state/client-web stays: %s"
+           % rep.get("refused"))
+
+
+def cs_cli():
+    loader = importlib.machinery.SourceFileLoader("cs_cli_check", str(HERE.parent / "cs-cli/check"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("cs_cli_check", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def part_cs(home, shim, root, key):
+    mod = cs_cli()
+    mod.write_shims(shim)
+    (shim / "http.json").write_text(json.dumps([[":8781/up", [200, "ok"]], [":8780/api/v1/client/me", [401, {"error": "no"}]]]))
+    (root / "logs/client-web.err.log").write_text("boot APP_KEY=%s\nworker 2 ready\n" % key)
+    envf, storage = root / "config/client-web/client-web.env", root / "state/client-web"
+
+    def cs(*args):
+        env = _bundle.dead_network_env(home, PATH="%s:%s" % (shim / "bin", os.environ.get("PATH", "/usr/bin:/bin")))
+        env.pop("CS_PLATFORM", None)
+        r = subprocess.run([str(root / "current/cs/scripts/cs"), *args], capture_output=True, text=True, env=env,
+                           cwd="/", timeout=120)
+        out = r.stdout + r.stderr
+        expect(key not in out and key[7:] not in out and LOCAL_SECRET not in out, "cs %s prints no APP_KEY or credential" % " ".join(args))
+        return r
+
+    r = cs("start", "client-web")
+    calls = (shim / "calls.log").read_text() if (shim / "calls.log").exists() else ""
+    expect(r.returncode == 0 and "launchctl bootstrap" in calls and str(home / "Library/LaunchAgents" / (LABEL + ".plist")) in calls
+           and "now up" in r.stdout, "cs start client-web: bootstraps com.contextstack.client-web: %r" % r.stdout[-300:])
+    r = cs("status", "--json")
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return fail("cs status --json: %r %r" % (r.stdout[-400:], r.stderr[-400:]))
+    cw = d.get("client_web") or {}
+    expect(cw == {"url": "http://" + LISTEN, "answers": True, "http": 200, "director": "http://127.0.0.1:8780",
+                  "env_file": str(envf), "storage": str(storage), "modes": {"env_file": "600", "storage": "700"}},
+           "cs status --json: client-web's URL, answer, Director, env file and storage modes: %s" % cw)
+    expect([v["up"] for v in d["services"].get("client-web", [])] == [True], "cs status: the client-web service is up")
+    r = cs("status")
+    line = "client-web http://%s answers HTTP 200; director http://127.0.0.1:8780; env %s, storage %s (env_file 600, storage 700)" \
+        % (LISTEN, envf, storage)
+    expect(line in r.stdout, "cs status: one client-web line: %r" % [l for l in r.stdout.splitlines() if "client-web" in l])
+    r = cs("logs", "client-web", "-n", "5")
+    expect(r.returncode == 0 and "worker 2 ready" in r.stdout and "APP_KEY=<redacted>" in r.stdout,
+           "cs logs client-web: its log files, the APP_KEY redacted")
+    r = cs("doctor", "--json")
+    found = {f["check"]: f for f in json.loads(r.stdout or "[]")}
+    expect(found.get("client-web http://" + LISTEN, {}).get("ok") is True
+           and all(found.get("client-web mode %s" % n, {}).get("ok") for n in ("env file", "storage"))
+           and found.get("plist paths %s" % LABEL, {}).get("ok") is True and found.get("agent PATH %s" % LABEL, {}).get("ok") is True,
+           "cs doctor: client-web answers; its env file, storage and plist are fine: %s"
+           % {k: v for k, v in found.items() if "client-web" in k and not v["ok"]})
+    envf.chmod(0o644)
+    r = cs("doctor")
+    expect(r.returncode == 1 and "FAIL  client-web mode env file" in r.stdout and "chmod 600 %s" % envf in r.stdout,
+           "cs doctor: an env file readable by others fails, with its fix")
+    envf.chmod(0o600)
+    r = cs("restart", "client-web")
+    expect(r.returncode == 0 and "launchctl kickstart -k gui/%d/%s" % (os.getuid(), LABEL) in (shim / "calls.log").read_text(),
+           "cs restart client-web: kickstart -k")
+    r = cs("stop", "client-web")
+    expect(r.returncode == 0 and "launchctl bootout gui/%d/%s" % (os.getuid(), LABEL) in (shim / "calls.log").read_text(),
+           "cs stop client-web: bootout")
+    (shim / "http.json").write_text("[]")
+    r = cs("doctor", "--json")
+    found = {f["check"]: f for f in json.loads(r.stdout or "[]")}
+    f = found.get("client-web http://" + LISTEN, {})
+    expect(r.returncode == 1 and f.get("ok") is False and "cs start client-web" in f.get("fix", ""),
+           "cs doctor: a client-web that does not answer fails, with cs start client-web as the fix")
+
+
+_SKIP = ""
+
+
+def part_director_url():
+    """client-web talks to the Director served here, else the one this node is registered with, else the default."""
+    loader = importlib.machinery.SourceFileLoader("node_release_cw", str(LAB / "scripts/node-release"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    expect(mod.director_url({"serve_director_rs": True, "director_rs_listen": ["127.0.0.1:8780", "192.0.2.9:8780"]})
+           == "http://127.0.0.1:8780", "director_url: the Director served here, its first listen address")
+    expect(mod.director_url({"director": "http://192.0.2.10:8780/"}) == "http://192.0.2.10:8780",
+           "director_url: a node host's client-web talks to the Director the node is registered with")
+    expect(mod.director_url({}) == "http://127.0.0.1:8780", "director_url: the default when neither is known")
+
+
+def main():
+    global _SKIP
+    part_env_differences()
+    uv, managed = _bundle.host_python()
+    if uv is None:
+        print("SKIP client-web-install: %s" % managed)
+        return 0
+    php, src = real_php()
+    if php is None:
+        _SKIP, src = src, None
+    real = Path.home()
+    watched = [real / ".local/bin", real / "Library/LaunchAgents", Path("/opt/homebrew/bin")]
+    before = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    agents = _bundle.real_agents()
+    part_director_url()
+    tmp = Path(tempfile.mkdtemp(prefix="client-web-install-__", suffix=".noindex"))
+    try:
+        cw_tree = part_bundle(tmp, php, src)
+        if cw_tree:
+            part_serve(tmp, uv, managed, cw_tree, php)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    after = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    expect(before == after, "the real ~/.local/bin, ~/Library/LaunchAgents and /opt/homebrew/bin are unchanged")
+    leak = _bundle.launchd_untouched(agents)
+    expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")
+    print("check: client-web-install %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

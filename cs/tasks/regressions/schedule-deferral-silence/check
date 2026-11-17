@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+import os
+
+# Direct module calls must not resolve the caller's estate.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+
+LAB = Path(__file__).resolve().parents[3]
+
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+with scratch_dir(prefix="schedule-deferral-") as raw:
+    root = Path(raw)
+    ops = root / "ops/bin"
+    ops.mkdir(parents=True)
+    for name in ("schedule-tick", "_grant.py", "_estate_io.py", "_void.py"):
+        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+    (root / "ESTATE").write_text("dev\n")
+    (root / "grants").mkdir()
+    (root / "grants/fixture.yaml").write_text(
+        "id: fixture\nestate: dev\nrepo: /tmp/fixture\n"
+        "paths: [tasks, specs]\ngates: [\"true\"]\ncommit: true\n"
+        "status: active\nexpiry: 2999-01-01T00:00:00Z\n")
+    now = "2026-09-17T16:00:00+00:00"
+    schedules = [
+        {"id": "upstream", "enabled": False, "grant": "fixture", "cron": "0 * * * *",
+         "timezone": "UTC", "task": "tasks/sweeps/fixture", "spec": "specs/sweeps/fixture.yaml",
+         "root": "/tmp/fixture", "lane": "shadow"},
+        {"id": "news", "enabled": True, "grant": "fixture", "cron": "5 * * * *",
+         "timezone": "UTC", "task": "tasks/sweeps/fixture", "spec": "specs/sweeps/fixture.yaml",
+         "root": "/tmp/fixture", "lane": "shadow", "requires": ["upstream"]},
+    ]
+    write_jsonl(root / "schedules.jsonl", schedules)
+    write_jsonl(root / "fires.jsonl", [])
+    write_jsonl(root / "dispatch.jsonl", [])
+    payload = {
+        "now": now, "schedules": str(root / "schedules.jsonl"),
+        "fires": str(root / "fires.jsonl"), "dispatch": str(root / "dispatch.jsonl"),
+        "lock": str(root / "schedule.lock"), "scan_stale": False, "dry_run": True,
+        "local_model_ready": True,
+    }
+    result = subprocess.run([str(ops / "schedule-tick")], input=json.dumps(payload),
+                            text=True, capture_output=True, cwd=str(root), env={**hermetic_env()})
+    assert result.returncode == 0, result.stderr
+    body = json.loads(result.stdout)
+    assert body["deferred"] and body["deferred"][0]["reason"] == "dependency_disabled"
+    fires = [json.loads(line) for line in (root / "fires.jsonl").read_text().splitlines()]
+    assert fires and fires[0]["event"] == "schedule_deferred"
+    assert fires[0]["reason"] == "dependency_disabled" and fires[0]["dependency"] == "upstream"
+
+    import importlib.machinery
+    import importlib.util
+    sys.path.insert(0, str(LAB / "ops/bin"))
+    loader = importlib.machinery.SourceFileLoader("st", str(LAB / "ops/bin/schedule-tick"))
+    spec = importlib.util.spec_from_loader("st", loader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    clock = datetime(2026, 9, 12, 4, 0, tzinfo=timezone.utc)
+    silent = module.zero_fires_past_slot(
+        [{"id": "probe", "enabled": True, "cron": "0 * * * *", "timezone": "UTC"}],
+        [], clock)
+    assert len(silent) == 1 and "3 consecutive slots" in silent[0]["stop"], silent
+    fired = module.zero_fires_past_slot(
+        [{"id": "probe", "enabled": True, "cron": "0 * * * *", "timezone": "UTC"}],
+        [{"id": "probe", "job": "1", "slot": "2026-09-12T03:00:00+00:00"}], clock)
+    assert fired == [], fired
+
+print("check: dependency deferrals write a fire row; N consecutive silent slots alert")

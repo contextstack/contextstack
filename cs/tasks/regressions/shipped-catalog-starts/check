@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""The models.json every release ships starts a gateway on its own (no overlay, temp home, free port)."""
+import json
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from hermetic_env import hermetic_env
+from scratch import scratch_dir
+
+REPO = next(p for p in Path(__file__).resolve().parents if (p / "gateway" / "models.json").is_file())
+BIN = REPO / "target/release/cs-gateway"
+if not BIN.is_file():
+    print("SKIP shipped-catalog-starts: no %s (cargo build --release -p cs-gateway)" % BIN)
+    sys.exit(0)
+
+with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+
+with scratch_dir(prefix="shipped-catalog-") as raw:
+    root = Path(raw)
+    (root / "home").mkdir()
+    (root / "providers.d").mkdir()
+    env = {**hermetic_env(), "HOME": str(root / "home"), "CSAGENT_MODELS_CONFIG": str(REPO / "gateway/models.json"),
+           "CSGATEWAY_PROVIDERS_DIR": str(root / "providers.d"), "CSGATEWAY_PORT": str(port),
+           "CSGATEWAY_AUTH_REQUIRED": "false", "CSGATEWAY_SOCKET": str(root / "gw.sock")}
+    for key in list(env):
+        if key.startswith(("OLLAMA", "OPENAI", "ANTHROPIC", "OPENROUTER")):
+            env.pop(key)
+    log = open(root / "gateway.log", "w")
+    proc = subprocess.Popen([str(BIN)], env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(root))
+    try:
+        deadline = time.time() + 15
+        status = None
+        while time.time() < deadline and proc.poll() is None:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/v1/models?available_only=false" % port, timeout=2) as r:
+                    status = r.status
+                    count = len(json.load(r).get("models", []))
+                    break
+            except OSError:
+                time.sleep(0.2)
+        log.close()
+        text = (root / "gateway.log").read_text()
+        if status != 200:
+            print("FAIL the shipped gateway/models.json does not start a gateway: %s" % text.strip().splitlines()[-1:] )
+            sys.exit(1)
+        print("ok   the shipped catalog starts a gateway and lists %d models" % count)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+print("shipped-catalog-starts: ok")

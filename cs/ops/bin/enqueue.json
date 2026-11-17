@@ -1,0 +1,25 @@
+{
+  "description": "Operator: append a spec onto the A2 dispatch queue. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "spec": {"type": "string"},
+      "note": {"type": "string"},
+      "lane": {"type": "string", "enum": ["production", "manager", "shadow", "probe"]},
+      "batch_id": {"type": "string"},
+      "schedule_id": {"type": "string"},
+      "slot": {"type": "string", "description": "RFC3339 UTC schedule slot."},
+      "schedule_slot": {"type": "string", "description": "Frozen original schedule slot."},
+      "schedule_date": {"type": "string", "description": "Frozen local calendar date for the schedule slot."},
+      "schedule_timezone": {"type": "string", "description": "IANA timezone used to derive schedule_date."},
+      "reference_root": {"type": "string"},
+      "override": {"type": "boolean"},
+      "resource": {"type": "string"},
+      "expected_head": {"type": "string"},
+      "task": {"type": "string"},
+      "grant": {"type": "string"},
+      "dest": {"type": "string"}
+    },
+    "required": ["spec"]
+  }
+}

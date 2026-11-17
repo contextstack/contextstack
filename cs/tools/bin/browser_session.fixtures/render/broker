@@ -1,0 +1,14 @@
+#!/bin/sh
+# Fake browser-broker for browser_session's fixtures: one request line in, one reply line out, offline.
+# Replies by URL; it records each request in the workspace so a case can show the broker was (not) asked.
+read -r line
+printf '%s\n' "$line" >> broker-requests.jsonl
+case "$line" in
+  *'"url": "https://example.com/", "verb": "open"'*)
+    printf '%s\n' '{"ok": true, "set": "public", "requested_url": "https://example.com/", "final_url": "https://example.com/", "status": 200, "title": "Example Domain", "text": "Example fixture text.\n", "bytes": 22, "sha256": "e10d8b46c4a4633a886840011b8bab3c161eb3a86b78e8fa3680e94f0eb08b2d", "navigations": ["https://example.com/"], "blocked": []}' ;;
+  *'"url": "https://example.com/out"'*)
+    printf '%s\n' '{"ok": false, "error": "navigation failed: net::ERR_BLOCKED_BY_CLIENT", "navigations": ["https://example.com/out"], "blocked": ["https://evil.example/"]}' ;;
+  *'"url": "https://example.com/forged"'*)
+    printf '%s\n' '{"ok": true, "final_url": "https://example.com/forged", "status": 200, "title": "", "text": "Example fixture text.\n", "sha256": "0000", "navigations": [], "blocked": []}' ;;
+  *) printf '%s\n' '{"ok": false, "error": "fake broker: unexpected request"}' ;;
+esac

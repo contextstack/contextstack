@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Freeze what a run actually consumes, before its first model call.
+
+Operator/adapter-called, never palette. Writes an immutable
+`ledger/runs/<run>/stimulus/` that the execution adapter reads instead of the
+live task, so a mid-run edit to goal.md or check cannot change what the model
+saw or what verified it.
+
+Records the runner and wrapper binaries (runner_implementation, runner_build,
+sandbox_build: sha256 of each, null when unreadable) and the spec's tools and
+hooks (tool_builds, hook_builds: one sha256 per name, null when unreadable) and
+binds them into env_sha. Also records, outside env_sha, the runner's path and the gateway
+that serves the run (gateway: {endpoint, implementation, version} from its /v1/health). Holds no merge, send, or spend capability. Capture, manifest hashing, and
+durable writes live here rather than in the runner loop (INVARIANTS: a
+capability is a tool, hook, op, or MCP — never loop code).
+"""
+from _lifecycle_evidence import task_sha as canonical_task_sha
+from _estate_io import hardened_git_env, digest, sha256_bytes
+from _estate_io import read_jsonl
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from _estate_io import git
+from _roots import RootsError, job_dir_of, roots
+
+try:  # the four roots (_roots): code (specs, tools, hooks), config (prompts), state (the dispatch shelf)
+    ROOTS = roots()
+except RootsError as error:
+    print("capture-stimulus: " + str(error), file=sys.stderr)
+    raise SystemExit(2)
+LAB, CONFIG, STATE = ROOTS["code"], ROOTS["config"], ROOTS["state"]
+CONTRACT = "lifecycle-v1"
+HASH_ALGO = "sha256"
+# The check may source a shared library from the estate. Freeze it too: a
+# copied wrapper that still reads a mutable absolute path is not frozen.
+DEPENDENCIES = (
+    "scripts/checklib.sh",
+)
+
+
+EXECUTOR_FILES_PREFIX = "ops/bin/"
+MAX_EXECUTOR_FILE_BYTES = 1024 * 1024
+MAX_EXECUTOR_IDENTITY_BYTES = 16 * 1024
+IDENTITY_KEYS = ("runner_implementation", "runner_build", "sandbox_build",
+                 "tool_builds", "hook_builds", "tool_builds_basis")
+
+def build_of(path):
+    """sha256:<hex> of an executable's bytes, or None when it cannot be found or read (never a refusal)."""
+    try:
+        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else None
+    except OSError:
+        return None
+
+
+def import_closure():
+    """scripts/node-bundle's python_closure (its ast import walk), loaded from the code root, or None when absent."""
+    path = LAB / "scripts" / "node-bundle"
+    if not path.is_file():
+        return None
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    loader = SourceFileLoader("_node_bundle", str(path))
+    module = module_from_spec(spec_from_loader("_node_bundle", loader))
+    loader.exec_module(module)
+    return module.python_closure
+
+
+def file_label(f):
+    """A hashed file's name: relative to the lab, else to the repo holding it (a runtime exe's bin such as
+    target/release/cs-tools), else absolute. Lab-relative names keep every earlier digest stable."""
+    for base in (LAB, LAB.resolve().parent):
+        try:
+            return str(f.relative_to(base))
+        except ValueError:
+            continue
+    return str(f)
+
+
+def files_build(files):
+    """One sha256:<hex> over (path, length, bytes) of each file in the given order, or None if one is unreadable."""
+    h = hashlib.sha256()
+    try:
+        for f in files:
+            raw = f.read_bytes()
+            h.update(file_label(f).encode() + b"\0" + len(raw).to_bytes(8, "big") + raw)
+    except (OSError, ValueError):
+        return None
+    return "sha256:" + h.hexdigest()
+
+
+def palette_builds(args):
+    """What the run executes besides the runner (tool_builds, hook_builds), and how far each digest reaches.
+
+    A tool: its executable (a runtime exe descriptor's bin), its descriptor, then (python3 runtime,
+    node-bundle present) every local module it imports transitively, sorted. A hook: its executable and its .json
+    when one exists; no import walk."""
+    closure = import_closure()
+    tools = {}
+    for name in dict.fromkeys(str(n) for n in args.get("tools") or []):
+        exe, desc = LAB / "tools/bin" / name, LAB / "tools/bin" / (name + ".json")
+        helpers = []
+        try:
+            descriptor = json.loads(desc.read_text(encoding="utf-8"))
+            if descriptor.get("bin"):  # runtime exe: the bin both runners exec (_sandbox_policy.tool_argv)
+                exe = LAB.resolve().parent / descriptor["bin"]
+            runtime = descriptor.get("runtime")
+            if closure and runtime == "python3":
+                helpers = sorted((p for p in closure([{"name": name, "runtime": runtime}])[0] if p != exe),
+                                 key=lambda p: str(p.relative_to(LAB)))
+        except (OSError, ValueError, SyntaxError, AttributeError):
+            pass  # unreadable descriptor: files_build reports null; an unparseable tool: no helpers
+        tools[name] = files_build([exe, desc] + helpers)
+    hooks = {}
+    for name in dict.fromkeys(str(n) for n in args.get("hooks") or []):
+        sidecar = LAB / "hooks/bin" / (name + ".json")
+        hooks[name] = files_build([LAB / "hooks/bin" / name] + ([sidecar] if sidecar.is_file() else []))
+    return {"tool_builds": tools, "hook_builds": hooks,
+            "tool_builds_basis": "executable+descriptor+imports" if closure else "executable+descriptor"}
+
+
+def runner_identity(args):
+    """The runner and wrapper binaries this run executes under, or None for other adapters.
+
+    The runner names itself (runner_implementation, runner_path); the wrapper is CS_TOOL_PREFIX's first word,
+    the launcher-resolved cs-sandbox (_sandbox_policy), found on PATH when it is not a path. Unset: no wrapper."""
+    if not args.get("runner_implementation"):
+        return None
+    words = os.environ.get("CS_TOOL_PREFIX", "").split()
+    wrapper = (words[0] if "/" in words[0] else shutil.which(words[0])) if words else None
+    return {"runner_implementation": str(args["runner_implementation"]),
+            "runner_build": build_of(args.get("runner_path")),
+            "sandbox_build": build_of(wrapper) if words else None, **palette_builds(args)}
+
+
+def gateway_identity(endpoint):
+    """Which gateway serves this run's model calls: its /v1/health `implementation` (rust|go) and
+    `version`, read once at capture, before the first call. The runner passes the endpoint it will post to
+    (ops never see CSGATEWAY_ENDPOINT); none passed: None. No answer, or a health without `implementation`
+    (the archived Go gateway, a Rust build before the field): implementation null, never a guess."""
+    if not endpoint:
+        return None
+    import urllib.parse
+    import urllib.request
+    out = {"endpoint": endpoint, "implementation": None, "version": None}
+    try:
+        url = urllib.parse.urlsplit(endpoint)
+        health = urllib.parse.urlunsplit((url.scheme, url.netloc, "/v1/health", "", ""))
+        with urllib.request.urlopen(health, timeout=1.5) as response:
+            body = json.loads(response.read(1 << 16).decode("utf-8"))
+        if isinstance(body, dict):
+            out.update({k: body[k] if isinstance(body.get(k), str) else None for k in ("implementation", "version")})
+    except Exception as exc:  # unreachable, refused, not JSON: recorded, never a refusal
+        out["error"] = type(exc).__name__
+    return out
+
+
+def refuse(message):
+    print("capture-stimulus: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def baseline(workspace):
+    """Base identity the candidate diff is taken against."""
+    ws = Path(workspace)
+    if not ws.is_dir():
+        return {"kind": "absent"}
+    if (ws / ".git").exists():
+        head = git(ws, "rev-parse", "HEAD", env=hardened_git_env(), errors="strict")
+        if head.returncode == 0:
+            return {"kind": "git", "commit": head.stdout.strip()}
+        return {"kind": "git", "commit": "", "note": "no commit yet"}
+    # Non-git baseline: an explicit manifest, never an implied empty tree.
+    files = []
+    for f in sorted(ws.rglob("*")):
+        if f.is_file() and not f.is_symlink():
+            files.append({"path": str(f.relative_to(ws)),
+                          "sha256": sha256_bytes(f.read_bytes()),
+                          "bytes": f.stat().st_size})
+    return {"kind": "manifest", "files": files}
+
+
+def work_order():
+    """The work order this run is executing, by its exact dispatch job id.
+
+    The dispatcher exports LAB_JOB_ID for the child. Matching on spec or task
+    instead picks a sibling job whenever two share them, which silently binds
+    one job's evidence to another job's authority. No id, no work order.
+    """
+    job_id = str(os.environ.get("LAB_JOB_ID") or "").strip()
+    shelf = STATE / "dispatch.jsonl"
+    if not job_id or not shelf.is_file():
+        return None
+    found = None
+    for row in read_jsonl(shelf, strict=False):
+        if str(row.get("id") or row.get("job") or "") != job_id:
+            continue
+        # Later rows for the same job may add fields; keep the richest.
+        if found is None or row.get("grant"):
+            found = row
+    return found
+
+
+def source_record(args):
+    """What produced this run, frozen with it: dispatch and execution.
+
+    The pilot supports one path — a queued production job drained by the
+    dispatcher into the Go runner. Which path a candidate came from has to be
+    answerable from the candidate's own immutable record: a dispatch shelf can
+    be appended to afterwards, and a stimulus cannot.
+    """
+    adapter = str(args.get("adapter") or "unknown")
+    order = work_order()
+    if order is None:
+        return {"adapter": adapter, "origin": "outside the queue",
+                "job_id": "", "lane": ""}
+    return {
+        "adapter": adapter,
+        "origin": "dispatch",
+        "job_id": str(order.get("id") or order.get("job") or ""),
+        # The dispatcher itself reads a lane-less job as production
+        # (ops/bin/tick admit), so that is how it was dispatched.
+        "lane": str(order.get("lane") or "production"),
+        "queued_spec": str(order.get("spec") or ""),
+        "queued_task": str(order.get("task") or ""),
+    }
+
+
+def grant_state(args):
+    """present | absent | unknown — a frozen grant is context, not authority."""
+    gid = str(args.get("grant") or "").strip()
+    if gid:
+        # A caller may name the grant it was handed, but never one the work
+        # order contradicts: that is the same defect as picking a sibling job.
+        order = work_order()
+        ordered = str((order or {}).get("grant") or "").strip()
+        if order is not None and ordered and ordered != gid:
+            refuse("work order %s carries grant %s, not the supplied %s"
+                   % (order.get("id") or "?", ordered, gid))
+    if not gid:
+        # Absent is a claim about the work order, not about the estate.
+        if args.get("grant_known"):
+            return {"state": "absent", "id": "", "provenance": str(args.get("authority") or "")}
+        order = work_order()
+        if order is not None:
+            ordered = str(order.get("grant") or "").strip()
+            if ordered:
+                gid = ordered
+            else:
+                return {"state": "absent", "id": "",
+                        "provenance": "dispatch work order %s carries no grant"
+                                      % (order.get("id") or "?")}
+        else:
+            return {"state": "unknown", "id": "",
+                    "provenance": str(args.get("authority")
+                                      or "no dispatch job id; run is outside the queue")}
+    path = LAB / "grants" / (gid + ".yaml")
+    spec = str(args.get("spec") or "")
+    job = job_dir_of(spec) if spec and Path(spec).is_absolute() else None
+    if job is not None:  # a director job's grant is the copy it carried, never the node's checkout
+        path = job / "grants" / (gid + ".yaml")
+    if not path.is_file():
+        return {"state": "unknown", "id": gid, "provenance": "grant file not found"}
+    return {"state": "present", "id": gid,
+            "sha256": sha256_bytes(path.read_bytes()),
+            "provenance": str(args.get("authority") or "work order")}
+
+
+def main():
+    try:
+        args = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as exc:
+        refuse("invalid JSON: " + str(exc))
+    run_dir = Path(str(args.get("run_dir") or "")).resolve()
+    task = Path(str(args.get("task") or ""))
+    if not str(run_dir) or not task.is_dir():
+        refuse("run_dir and an existing task are required")
+    goal_src = task / "goal.md"
+    check_src = task / "check"
+    if not goal_src.is_file():
+        refuse("task has no goal.md")
+
+    stim = run_dir / "stimulus"
+    if (stim / "manifest.json").is_file():
+        # Immutable: a second capture returns the first, never a new boundary.
+        existing = json.loads((stim / "manifest.json").read_text(encoding="utf-8"))
+        print(json.dumps({"ok": True, "existing": True,
+                          "task_sha": existing.get("task_sha", ""),
+                          "stimulus_sha": existing.get("stimulus_sha", ""),
+                          "env_sha": existing.get("env_sha", ""),
+                          **{k: existing[k] for k in IDENTITY_KEYS if k in existing},
+                          "stimulus": str(stim)}, sort_keys=True))
+        return
+
+    # Build in a sibling temp dir, then publish atomically.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".stimulus-", dir=str(run_dir)))
+    inputs = []
+    try:
+        raw_goal = goal_src.read_bytes()
+        (staging / "goal.md").write_bytes(raw_goal)
+        inputs.append({"role": "goal", "path": "goal.md", "source": str(goal_src),
+                       "sha256": sha256_bytes(raw_goal), "bytes": len(raw_goal)})
+        if check_src.is_file():
+            raw_check = check_src.read_bytes()
+            (staging / "check").write_bytes(raw_check)
+            shutil.copymode(check_src, staging / "check")
+            inputs.append({"role": "check", "path": "check", "source": str(check_src),
+                           "sha256": sha256_bytes(raw_check), "bytes": len(raw_check)})
+        for rel in DEPENDENCIES:
+            src = LAB / rel
+            if not src.is_file():
+                continue
+            dest = staging / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            raw = src.read_bytes()
+            dest.write_bytes(raw)
+            shutil.copymode(src, dest)
+            inputs.append({"role": "check_dependency", "path": rel, "source": str(src),
+                           "sha256": sha256_bytes(raw), "bytes": len(raw)})
+        spec_rel = str(args.get("spec") or "")
+        if spec_rel:
+            spec_src = LAB / spec_rel if not Path(spec_rel).is_absolute() else Path(spec_rel)
+            if spec_src.is_file():
+                raw = spec_src.read_bytes()
+                (staging / "spec.yaml").write_bytes(raw)
+                inputs.append({"role": "spec", "path": "spec.yaml", "source": str(spec_src),
+                               "sha256": sha256_bytes(raw), "bytes": len(raw)})
+        # Model-facing prompt material: frozen, assembled here, and hashed.
+        # The adapter reads system.txt instead of re-reading live prompt files.
+        env = hashlib.sha256()
+        assembled = []
+        # A director job's spec sits in <state>/jobs/<job>/ with the prompts it was dispatched with;
+        # its relative prompts resolve there and only there. Every other spec: the config root, as before.
+        prompt_root = job_dir_of(spec_src) if spec_rel and spec_src.is_file() else None
+        for index, rel in enumerate(list(args.get("prompts") or [])):
+            if not str(rel or "").strip():
+                continue
+            src = Path(rel) if Path(rel).is_absolute() else (prompt_root or CONFIG) / rel
+            if not src.is_file():
+                refuse("prompt not found: " + str(rel))
+            raw = src.read_bytes()
+            env.update(raw)
+            assembled.append("--- %s ---\n%s\n" % (rel, raw.decode("utf-8", "replace")))
+            name = "prompts/%02d-%s" % (index, src.name)
+            dest = staging / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(raw)
+            inputs.append({"role": "prompt", "path": name, "source": str(src),
+                           "sha256": sha256_bytes(raw), "bytes": len(raw)})
+        system_text = "".join(assembled)
+        (staging / "system.txt").write_text(system_text, encoding="utf-8")
+        # env_sha keeps the runner's algorithm: prompts, then each tool and
+        # hook file pair, in spec order.
+        for name in list(args.get("tools") or []):
+            for suffix in ("", ".json"):
+                f = LAB / "tools" / "bin" / (str(name) + suffix)
+                env.update(f.read_bytes() if f.is_file() else b"")
+        for name in list(args.get("hooks") or []):
+            for suffix in ("", ".json"):
+                f = LAB / "hooks" / "bin" / (str(name) + suffix)
+                env.update(f.read_bytes() if f.is_file() else b"")
+
+        executor_files = args.get("executor_files") or []
+        if not isinstance(executor_files, list) or len(executor_files) > 9:
+            refuse("executor_files must be an array of at most 9 paths")
+        executor_identity = args.get("executor_identity")
+        if (executor_files or executor_identity is not None) and \
+                str(args.get("adapter") or "") != "executor":
+            refuse("executor_files/executor_identity require adapter=executor")
+        seen_executor = set()
+        for rel in executor_files:
+            if not isinstance(rel, str):
+                refuse("executor_files paths must be strings")
+            rel_str = rel
+            relp = Path(rel_str)
+            if str(relp) != rel_str:
+                refuse("executor_files path must be canonical")
+            if relp.is_absolute() or ".." in relp.parts:
+                refuse("executor_files path is unsafe: " + rel_str)
+            if not rel_str.startswith(EXECUTOR_FILES_PREFIX):
+                refuse("executor_files must live under %s: %s" % (EXECUTOR_FILES_PREFIX, rel_str))
+            if rel_str in seen_executor:
+                refuse("executor_files duplicate entry: " + rel_str)
+            seen_executor.add(rel_str)
+            exec_src = LAB / relp
+            ancestor = LAB
+            for part in relp.parts:
+                ancestor = ancestor / part
+                if ancestor.is_symlink():
+                    refuse("executor_files may not traverse symlinks")
+            if exec_src.is_symlink() or not exec_src.is_file():
+                refuse("executor_files entry is not a regular file: " + rel_str)
+            raw = exec_src.read_bytes()
+            if len(raw) > MAX_EXECUTOR_FILE_BYTES:
+                refuse("executor_files entry exceeds %d bytes: %s"
+                       % (MAX_EXECUTOR_FILE_BYTES, rel_str))
+            dest_rel = "executor/" + rel_str
+            exec_dest = staging / dest_rel
+            exec_dest.parent.mkdir(parents=True, exist_ok=True)
+            exec_dest.write_bytes(raw)
+            shutil.copymode(exec_src, exec_dest)
+            env.update(b"\0executor_file\0" + rel_str.encode() + b"\0" +
+                       len(raw).to_bytes(8, "big") + raw)
+            inputs.append({"role": "executor_file", "path": dest_rel, "source": str(exec_src),
+                           "sha256": sha256_bytes(raw), "bytes": len(raw)})
+        if executor_identity is not None:
+            if not isinstance(executor_identity, dict):
+                refuse("executor_identity must be an object")
+            identity_bytes = json.dumps(executor_identity, sort_keys=True,
+                                        separators=(",", ":")).encode()
+            if len(identity_bytes) > MAX_EXECUTOR_IDENTITY_BYTES:
+                refuse("executor_identity exceeds %d bytes" % MAX_EXECUTOR_IDENTITY_BYTES)
+            env.update(b"\0executor_identity\0" + identity_bytes)
+        # A different runner, wrapper, tool or hook build is a different execution: bound to env_sha like the executor's.
+        runner = runner_identity(args)
+        if runner is not None:
+            env.update(b"\0runner_identity\0" + json.dumps(runner, sort_keys=True, separators=(",", ":")).encode())
+
+        identity = {
+            "contract_version": CONTRACT,
+            "hash_algo": HASH_ALGO,
+            "run_id": str(args.get("run_id") or run_dir.name),
+            "spec": spec_rel,
+            "spec_sha": str(args.get("spec_sha") or ""),
+            "task": str(task),
+            "trial": args.get("trial"),
+            "adapter": str(args.get("adapter") or "unknown"),
+        }
+        # task_sha keeps the task identity algorithm and is computed from the
+        # material captured for this run, not from a later re-read.
+        computed_task_sha = canonical_task_sha(Path(task))
+        manifest = {
+            **identity,
+            "task_sha": computed_task_sha,
+            "env_sha": env.hexdigest(),
+            "base": baseline(args.get("workspace") or (run_dir / "workspace")),
+            "grant": grant_state(args),
+            "source": source_record(args),
+            "inputs": sorted(inputs, key=lambda i: (i["role"], i["path"])),
+        }
+        if executor_identity is not None:
+            manifest["executor_identity"] = executor_identity
+        manifest.update(runner or {})
+        if runner is not None:  # what ran, outside env_sha: a path or a gateway build is not a different stimulus
+            manifest["runner_path"] = str(args.get("runner_path") or "")
+            manifest["gateway"] = gateway_identity(str(args.get("gateway_endpoint") or ""))
+        # stimulus_sha binds the complete captured manifest. It is not task_sha.
+        manifest["stimulus_sha"] = digest({k: v for k, v in manifest.items()
+                                           if k != "stimulus_sha"})
+        # Mixed-source detection: if any source changed while we were copying,
+        # this snapshot is a mixture of versions and must not be published.
+        for item in inputs:
+            src = Path(item["source"])
+            if not src.is_file() or sha256_bytes(src.read_bytes()) != item["sha256"]:
+                refuse("source changed during capture: " + item["path"])
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        # Checks resolve shared libraries with
+        #   . "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/scripts/..."
+        # Copying the library is not enough: from inside ledger/runs that
+        # resolves to the live lab and executes the live file. Making the
+        # snapshot its own repository root redirects that resolution to the
+        # frozen copy, so the check runs what was captured.
+        subprocess.run(["git", "init", "-q", str(staging)],
+                       capture_output=True, text=True,
+                       env=hardened_git_env())
+        for path in sorted(staging.rglob("*")):
+            if path.is_file():
+                with path.open("rb") as fh:
+                    os.fsync(fh.fileno())
+        os.replace(staging, stim)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    print(json.dumps({"ok": True, "existing": False,
+                      "task_sha": manifest["task_sha"],
+                      "stimulus_sha": manifest["stimulus_sha"],
+                      "env_sha": manifest["env_sha"],
+                      **(runner or {}),
+                      "stimulus": str(stim)}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+{
+  "exit": 0,
+  "stdout": "(no output, exit 0)",
+  "files": {
+    "out.txt": "made",
+    ".lab-calls.jsonl": "{\"args\": {\"cmd\": [\"sh\", \"-c\", \"printf made > out.txt\"]}, \"name\": \"exec\"}\n"
+  },
+  "untouched": true
+}

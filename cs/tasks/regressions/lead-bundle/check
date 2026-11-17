@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""lead-bundle regression (goal.md): template validation and cs lead create on a temp Director.
+
+Never touches the real ~/.contextstack. Uses director-spec's RustTarget and a temp config root only.
+"""
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+REPO = KIT.parent
+sys.path.insert(0, str(KIT / "scripts"))
+sys.path.insert(0, str(REPO / "tests/director-spec"))
+import cs_lead  # noqa: E402
+from harness.targets import RustTarget  # noqa: E402
+from harness.wire import request  # noqa: E402
+
+problems = []
+
+
+def expect(cond, msg, detail=""):
+    print(("ok   " if cond else "FAIL ") + msg + ("" if cond else " %s" % str(detail)[:500]))
+    if not cond:
+        problems.append(msg)
+
+
+def mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def main():
+    files = cs_lead.bundle_files()
+    expect(not validate_reserved(files), "template has no forbidden conversation paths")
+    expect(not cs_lead.validate_bundle(files), "validate_bundle accepts the shipped template", cs_lead.validate_bundle(files))
+    spec = files["spec.yaml"].decode()
+    expect("context: [conversation/context.md]" in spec and "tasks: [tasks/turn]" in spec, "spec names context and turn task")
+    expect(b"start_task" in files["prompts/system.md"] and b"land_task" in files["prompts/system.md"], "system prompt names lane tools and land escalation")
+    mcp = json.loads(files["session/mcp.json"])
+    srv = mcp.get("mcpServers", {}).get("contextstack", {})
+    expect(srv.get("command") == "cs" and "mcp" in srv.get("args", []) and "--credential-file" in srv.get("args", []),
+           "session/mcp.json wires cs mcp --credential-file")
+    expect("--no-land" in srv.get("args", []), "the hosted lead's cs mcp withholds land_task (--no-land)", srv)
+    import cs_mcp  # noqa: E402
+
+    class _Director:
+        pass
+
+    lead_tools = cs_mcp.Tools(_Director(), None, can_land=False)
+    listed = {t["name"] for t in cs_mcp.handle(lead_tools, {"method": "tools/list"})["tools"]}
+    expect("land_task" not in listed and "needs_you" in listed, "--no-land hides land_task from tools/list", sorted(listed))
+    try:
+        cs_mcp.handle(lead_tools, {"method": "tools/call", "params": {"name": "land_task", "arguments": {"repo": "x", "lane": "y"}}})
+        refused = False
+    except LookupError:
+        refused = True
+    expect(refused, "--no-land refuses a direct land_task call")
+    owner = {t["name"] for t in cs_mcp.handle(cs_mcp.Tools(_Director(), None), {"method": "tools/list"})["tools"]}
+    expect("land_task" in owner, "the owner's cs mcp still lists land_task")
+
+    bad = dict(files)
+    bad["conversation/context.md"] = b"forbidden"
+    expect(cs_lead.validate_bundle(bad), "reserved conversation/context.md is rejected")
+    bad2 = dict(files)
+    bad2["tasks/turn/goal.md"] = b"x"
+    expect(cs_lead.validate_bundle(bad2), "reserved tasks/turn/* is rejected")
+
+    binary = Path(os.environ.get("DIRECTOR_BIN") or REPO / "target/release/cs-director")
+    if not binary.is_file():
+        print("SKIP lead-bundle: no director-rs at %s" % binary)
+        return 0
+
+    tmp = tempfile.mkdtemp(prefix="lead-bundle-", suffix=".noindex")
+    target = RustTarget(tmp, binary)
+    try:
+        token, _ = target.register("lead-node")
+        owner_cred = target.data / "local-credential"
+        cs_root = Path(tmp) / "cs"
+        (cs_root / "config").mkdir(parents=True)
+        env = {**hermetic_env(), 'CS_ROOT': str(cs_root), 'HOME': target.env['HOME']}
+        argv = [sys.executable, "-I", str(KIT / "scripts" / "cs"), "lead", "create",
+                "--director", target.url, "--credential-file", str(owner_cred),
+                "--config-root", str(cs_root), "--node", "lead-node", "--title", "fixture lead"]
+        # This contract fixture has no worker. First-turn execution is covered by
+        # cs-lead-create's offline worker fake; retain real Director credential checks here.
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        output = io.StringIO()
+        args = SimpleNamespace(director=target.url, credential_file=str(owner_cred), config_root=str(cs_root),
+                               node="lead-node", model=None, title="fixture lead", name=None)
+        def fixture_welcome(owner, record, save, say, timeout):
+            record["welcome_reply"] = "fixture reply"
+            save()
+        with patch.object(cs_lead, "check_model"), patch.object(cs_lead, "welcome", fixture_welcome), \
+             patch.object(cs_lead, "open_conversation"), contextlib.redirect_stdout(output):
+            shim = cs_lead.types_shim()
+            shim.ROOT, shim.CONFIG = cs_root, cs_root / "config"
+            cs_lead.create(args, shim)
+        combined = output.getvalue()
+        expect(token not in combined and "cslead_" not in combined, "lead token never appears in output", combined[:200])
+
+        meta_path = cs_root / "config/hosted-lead.json"
+        expect(meta_path.is_file(), "hosted-lead.json written")
+        meta = json.loads(meta_path.read_text())
+        cid = meta.get("conversation_id")
+        expect(cid and cid.startswith("con_"), "hosted-lead.json records conversation_id", meta)
+        cred_path = cs_root / "state/lead-sessions" / cid / "lead-credential"
+        expect(cred_path.is_file(), "per-conversation lead credential written")
+        expect(mode(cred_path) == 0o600 and mode(meta_path) == 0o600, "config modes are 0600", (mode(cred_path), mode(meta_path)))
+        lead_token = cred_path.read_text().strip()
+        expect(lead_token.startswith("cslead_"), "credential file holds a lead token prefix only in file", lead_token[:12] + "…")
+
+        conv = request(target.url, "GET", "/api/v1/client/conversations/" + cid, token=owner_cred.read_text().strip())
+        expect(conv.status == 200 and conv.json["conversation"]["node"] == "lead-node", "conversation exists on the node")
+        creds = request(target.url, "GET", "/api/v1/client/credentials", token=owner_cred.read_text().strip())
+        row = next((c for c in (creds.json or {}).get("credentials", []) if c.get("conversation_id") == cid), None)
+        expect(row and row.get("kind") == "lead", "owner lists the minted lead credential", row)
+        me = request(target.url, "GET", "/api/v1/client/me", token=lead_token)
+        expect(me.status == 200 and me.json.get("owner") is False, "lead credential authenticates")
+        # The node's lead host reads what cs lead create wrote, from the installed config root
+        # (LAB_CONFIG_ROOT = ~/.contextstack/config; 2026-11-12 it looked in config/config/).
+        sys.path.insert(0, str(KIT / "ops/bin"))
+        import _lead_host
+        config_root = cs_root / "config"
+        expect(_lead_host.resolve_conversation_id(config_root) == cid, "the lead host finds hosted-lead.json in the config root")
+        expect(_lead_host.credential_path(config_root, cid, cs_root / "state").resolve() == cred_path.resolve(), "the lead host finds the lead credential in the config root")
+        expect(meta.get("credential_file") == "lead-credential", "credential_file is relative to the config root", meta.get("credential_file"))
+    finally:
+        target.close()
+
+    print("lead-bundle: %s" % ("FAIL (%d)" % len(problems) if problems else "ok"))
+    return 1 if problems else 0
+
+
+def validate_reserved(files):
+    for path in files:
+        if path == "conversation/context.md" or path.startswith("tasks/turn/"):
+            return path
+    return None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

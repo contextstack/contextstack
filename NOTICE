@@ -1,0 +1,20 @@
+ContextStack
+
+Copyright (c) 2026 Jeremy Vaught
+
+This project is licensed under the MIT License. See LICENSE in this repository.
+
+---
+
+Third-party notices
+
+The directory sandbox/vendor/codex/ contains files derived from the OpenAI Codex CLI (https://github.com/openai/codex), licensed under the Apache License, Version 2.0. Their LICENSE and NOTICE are in that directory. ContextStack uses them under those terms.
+
+Files vendored unchanged:
+
+- seatbelt_base_policy.sbpl and seatbelt_read_only_platform_defaults.sbpl — from codex-rs/sandboxing/src/ in the Codex repository (commit e54a5713caf331f42a6eef0166186df5f7563c29).
+- linux_sandbox_seccomp.rs.txt — from codex-rs/linux-sandbox/src/seccomp.rs in the same repository (commit d92aae550180544fa2b7f656173c837271de6df3), stored with a .txt suffix so build tools do not compile it.
+
+The sandbox implementation does not load these files at run time. It derives macOS Seatbelt rules and the Linux seccomp denylist from them and cites them in source. See sandbox/README.md for details.
+
+Copyright 2025 OpenAI. Apache License, Version 2.0.

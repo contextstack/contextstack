@@ -1,0 +1,14 @@
+{
+  "description": "Runner/operator: materialize a run workspace as a git worktree with sparse-checkout and APFS-cloned vendor/node_modules. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "required": ["setup", "workspace"],
+    "properties": {
+      "setup": {"type": "string"},
+      "workspace": {"type": "string"},
+      "task": {"type": "string"},
+      "lab": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}

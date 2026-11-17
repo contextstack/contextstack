@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""env-policy regression (goal.md). Isolated estates only; lab/ledger is never written."""
+import json
+import os
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+# Direct ops imports and calls must not resolve the caller's estate either.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / "ops/bin"))
+import _env_policy  # noqa: E402
+
+FAILED = []
+
+
+def expect(ok, what, detail=None):
+    print(("ok   " if ok else "FAIL ") + what + ("" if ok or detail is None else " : %r" % (detail,)))
+    if not ok:
+        FAILED.append(what)
+
+
+SPEC = """id: fx-env-%s
+model: fake
+system: prompts/coder-min.md
+context: []
+tools: []
+post_turn: []
+mcp: []
+env: [%s]
+budget: {turns: 1, tool_calls: 0, usd: 0, seconds: 0}
+tasks: [tasks/fx]
+trials: 1
+hypothesis: "fixture-1972: env-policy regression"
+"""
+BLOCK = SPEC.replace("env: [%s]\n", "env:  # the loader reads a YAML list; block form is one\n  - %s  # why\n")
+POLICY = {"version": 1, "always": ["PATH", "HOME", "TMPDIR", "LAB_TRIAL"], "on_request": ["FX_SECRET_OK"]}
+
+
+def estate(root, name, policy=POLICY):
+    e = root / name
+    for d in ("ops/bin", "ledger", "specs", "tasks/fx", "policy", "scripts"):
+        (e / d).mkdir(parents=True)
+    for p in (LAB / "ops/bin").iterdir():
+        if p.is_file():
+            shutil.copy2(p, e / "ops/bin" / p.name)
+    for p in (LAB / "scripts").glob("*.py"):
+        shutil.copy2(p, e / "scripts" / p.name)
+    (e / "ESTATE").write_text("dev\n")
+    (e / "INVARIANTS.md").write_text("# fixture\n")
+    (e / "tasks/fx/goal.md").write_text("fixture\n")
+    (e / "tasks/fx/check").write_text("#!/bin/sh\nexit 0\n")
+    (e / "tasks/fx/check").chmod(0o755)
+    if policy is not None:
+        (e / "policy/env.json").write_text(json.dumps(policy) + "\n")
+    (e / "specs/ok.yaml").write_text(SPEC % ("ok", "FX_SECRET_OK"))
+    (e / "specs/no.yaml").write_text(SPEC % ("no", "FX_SECRET_NO"))
+    (e / "specs/block.yaml").write_text(BLOCK % ("block", "FX_SECRET_OK"))
+    # Stub runner: records the LAB_CHILD_ENV it was launched with.
+    (e / "lab").write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                           "open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launched.json'), 'a').write("
+                           "json.dumps({'argv': sys.argv[1:], 'LAB_CHILD_ENV': os.environ.get('LAB_CHILD_ENV')}) + '\\n')\n"
+                           "print('  tasks/fx t1 pass stop=done turns=1 tools=0 $0.0000')\n")
+    (e / "lab").chmod(0o755)
+    return e
+
+
+def launches(e):
+    p = e / "launched.json"
+    return [json.loads(l) for l in p.read_text().splitlines()] if p.is_file() else []
+
+
+def clean_env(**extra):
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG") if k in os.environ}
+    env.update(FX_SECRET_OK="permitted", FX_SECRET_NO="never", LAB_CHILD_ENV="STALE FROM THE PARENT")
+    env.update(extra)
+    return env
+
+
+def main():
+    # 1. One list: the Rust runner's literal (the default runner), resolver fallback, committed always.
+    rust = re.search(r'const DEFAULT_ENV: &str = "([^"]+)";', (LAB.parent / "harness/src/process.rs").read_text()).group(1).split()
+    committed = json.loads((LAB / "policy/env.json").read_text())
+    expect(rust == _env_policy.DEFAULT_ENV == committed["always"] and committed.get("version") == 1
+           and committed.get("on_request") == [], "default: process.rs DEFAULT_ENV == _env_policy.DEFAULT_ENV == policy/env.json always",
+           (rust, _env_policy.DEFAULT_ENV, committed))
+    scratch = Path(tempfile.mkdtemp(prefix="env-policy-", suffix=".noindex"))
+    try:
+        # 2. Resolver semantics against a temp estate.
+        e = estate(scratch, "resolve")
+        expect(_env_policy.resolve(e, SPEC % ("ok", "FX_SECRET_OK")) == POLICY["always"] + ["FX_SECRET_OK"],
+               "resolve: always + the permitted request")
+        expect(_env_policy.resolve(e, SPEC % ("x", "PATH")) == POLICY["always"], "resolve: a request already in always is redundant, allowed")
+        try:
+            _env_policy.resolve(e, SPEC % ("no", "FX_SECRET_NO"))
+            expect(False, "resolve: refused request raises")
+        except _env_policy.EnvPolicyError as error:
+            expect(str(error) == 'env "FX_SECRET_NO": not allowed by policy/env.json', "resolve: refusal names the variable and the file", str(error))
+        # The launcher's parser agrees with the Go loader (spec.go `Env []string`): flow or block form, quotes, comments.
+        granted = POLICY["always"] + ["FX_SECRET_OK"]
+        expect(_env_policy.resolve(e, BLOCK % ("b", "FX_SECRET_OK")) == granted, "requested: block form resolves like flow form")
+        expect(_env_policy.resolve(e, SPEC % ("q", '"FX_SECRET_OK", \'PATH\'')) == granted, "requested: quoted flow form")
+        expect(_env_policy.resolve(e, (SPEC % ("c", "FX_SECRET_OK")).replace("OK]", "OK] # why")) == granted,
+               "requested: an inline comment is not a name")
+        expect(_env_policy.resolve(e, SPEC % ("z", "")) == POLICY["always"], "requested: env: [] requests nothing")
+        for form in (BLOCK % ("bn", "FX_SECRET_NO"), (SPEC % ("cn", "FX_SECRET_NO")).replace("NO]", "NO] # why")):
+            try:
+                _env_policy.resolve(e, form)
+                expect(False, "requested: a refused name is refused by its bare name in every form")
+            except _env_policy.EnvPolicyError as error:
+                expect(str(error) == 'env "FX_SECRET_NO": not allowed by policy/env.json',
+                       "requested: a refused name is refused by its bare name in every form", str(error))
+        for scalar in ("FX_SECRET_OK", '"FX_SECRET_OK"'):  # the Go loader refuses a scalar (Env is []string): never a one-item request
+            try:
+                _env_policy.resolve(e, (SPEC % ("s", "X")).replace("env: [X]", "env: " + scalar))
+                expect(False, "requested: scalar %s is refused, never a one-item request" % scalar)
+            except _env_policy.EnvPolicyError as error:
+                expect(str(error) == "env: must be a list, got " + scalar,
+                       "requested: scalar %s is refused, never a one-item request" % scalar, str(error))
+        expect(_env_policy.resolve(estate(scratch, "absent", policy=None), SPEC % ("x", "LAB_TRIAL")) == _env_policy.DEFAULT_ENV,
+               "resolve: no file = the default list")
+        try:
+            _env_policy.resolve(estate(scratch, "absent2", policy=None), SPEC % ("ok", "FX_SECRET_OK"))
+            expect(False, "resolve: no file denies every request outside the default")
+        except _env_policy.EnvPolicyError:
+            expect(True, "resolve: no file denies every request outside the default")
+        bad = estate(scratch, "bad", policy=None)
+        (bad / "policy/env.json").write_text('{"version": 1, "always": "PATH"}')
+        try:
+            _env_policy.load_policy(bad)
+            expect(False, "load: malformed file is an error")
+        except _env_policy.EnvPolicyError as error:
+            expect(str(error).startswith("policy/env.json: "), "load: malformed file is a named error", str(error))
+        # 3. run-spec: the launcher resolves; the runner inherits.
+        e = estate(scratch, "run-spec")
+        r = subprocess.run([str(e / "ops/bin/run-spec"), "specs/ok.yaml"], cwd=str(e), env=clean_env(LAB_RUNNER_BIN=str(e / "lab")),
+                           text=True, capture_output=True, timeout=60)
+        got = launches(e)
+        expect(r.returncode == 0 and len(got) == 1 and got[0]["LAB_CHILD_ENV"] == " ".join(POLICY["always"] + ["FX_SECRET_OK"]),
+               "run-spec: the cell inherits LAB_CHILD_ENV = always + permitted request", (r.returncode, got, r.stderr))
+        r = subprocess.run([str(e / "ops/bin/run-spec"), "specs/block.yaml"], cwd=str(e), env=clean_env(LAB_RUNNER_BIN=str(e / "lab")),
+                           text=True, capture_output=True, timeout=60)
+        got = launches(e)
+        expect(r.returncode == 0 and len(got) == 2 and got[1]["LAB_CHILD_ENV"] == " ".join(POLICY["always"] + ["FX_SECRET_OK"]),
+               "run-spec: a block-form request reaches the cell like a flow-form one", (r.returncode, got, r.stderr))
+        r = subprocess.run([str(e / "ops/bin/run-spec")], input=json.dumps({"spec": "specs/no.yaml"}), cwd=str(e),
+                           env=clean_env(LAB_RUNNER_BIN=str(e / "lab")), text=True, capture_output=True, timeout=60)
+        last = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+        expect(r.returncode == 2 and 'env "FX_SECRET_NO": not allowed by policy/env.json' in r.stderr and len(launches(e)) == 2
+               and last.get("ok") is False and last.get("code") == 2 and "FX_SECRET_NO" in last.get("error", ""),
+               "run-spec: a refused request exits 2 naming it, no cell runs, JSON last line", (r.returncode, r.stderr, last))
+        # 4. tick: child_env and run_spec, imported from the estate (never the live tick).
+        e = estate(scratch, "tick")
+        sys.path.insert(0, str(e / "ops/bin"))
+        os.environ["LAB_CHILD_ENV"] = "STALE FROM THE PARENT"
+        os.environ.pop("LAB_RUNNER_BIN", None)  # the estate's stub, named: the default is the Rust runner
+        os.environ["CS_RUNNER_BIN"] = str(e / "lab")
+        tick = runpy.run_path(str(e / "ops/bin/tick"))
+        expect("LAB_CHILD_ENV" not in tick["child_env"](), "tick.child_env: a stale parent LAB_CHILD_ENV is never inherited")
+        try:  # the stub runner leaves no ledger row, so run_spec ends in its no-row error after launching
+            tick["run_spec"]("specs/ok.yaml")
+        except RuntimeError:
+            pass
+        got = launches(e)
+        expect(len(got) == 1 and got[0]["LAB_CHILD_ENV"] == " ".join(POLICY["always"] + ["FX_SECRET_OK"]) and "-trial" in got[0]["argv"],
+               "tick.run_spec: the runner inherits LAB_CHILD_ENV = always + permitted request", got)
+        (e / "launched.json").unlink()
+        rc, row = tick["run_spec"]("specs/no.yaml")
+        expect(rc == 1 and row.get("verdict") == "void" and row.get("stop") == 'env_policy: env "FX_SECRET_NO": not allowed by policy/env.json'
+               and tick["is_config_void"](row) and not launches(e),
+               "tick.run_spec: refusal = config-void row naming the variable and file; nothing launched", (rc, row, launches(e)))
+        # 5. finalize-run: the node's children get always only.
+        fin = runpy.run_path(str(e / "ops/bin/finalize-run"), run_name="finalize_run_fixture")
+        os.environ.update(FX_SECRET_OK="permitted", FX_SECRET_NO="never", LAB_CHILD_ENV="PATH FX_SECRET_OK")
+        names = set(fin["child_env"]())
+        expect("PATH" in names and not names & {"FX_SECRET_OK", "FX_SECRET_NO", "LAB_CHILD_ENV"},
+               "finalize-run.child_env: always only, no request and no LAB_CHILD_ENV", sorted(names))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("check: env-policy %d assertion(s) failed" % len(FAILED))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Retired product names are migrated once and never accepted at runtime."""
+import json
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import sys
+import tempfile
+
+LAB = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(LAB / 'scripts'))
+sys.path.insert(0, str(LAB / 'ops/bin'))
+from _node_rename import RETIRED, migrate_config
+from _runner import runner_path, runner_kind
+from _sandbox_policy import wrapper_path
+
+with tempfile.TemporaryDirectory(prefix='cs-rename-') as raw:
+    root = Path(raw)
+    code = root / 'cs'
+    code.mkdir()
+    retired_env = RETIRED.upper() + '_'
+    assert runner_path(code, {retired_env + 'RUNNER_BIN': '/bad'}) == root / 'target/release/cs-harness'
+    bindir = root / 'target/release'
+    bindir.mkdir(parents=True)
+    (bindir / (RETIRED + '-sandbox')).write_text('retired')
+    assert wrapper_path(code, {}) is None
+    for name in (RETIRED, RETIRED + '-rs'):
+        try:
+            runner_kind(code, Path(name))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('retired runner accepted')
+    config = root / 'config'
+    config.mkdir()
+    env = config / 'settings.conf'
+    env.write_text('export ' + retired_env + 'RUNNER_BIN=/release/bin/' + RETIRED + '-rs\n')
+    env.chmod(0o600)
+    policy = config / 'policy.json'
+    policy.write_text('["' + retired_env + 'TOOL_PREFIX", "/release/' + RETIRED + '-kit/scripts/cs"]\n')
+    policy.chmod(0o644)
+    foreign = root / 'app.json'
+    foreign.write_text(RETIRED + '-kit')
+    (config / 'app-link').symlink_to(foreign)
+    repos = config / 'repos.json'
+    repos.write_text(json.dumps({'repos': [{'name': 'r', 'tracked_secret_allowlist': [RETIRED + '-kit/tasks/x/secrets.env'],
+                                            'roots': [RETIRED + '-kit/']}]}, indent=2) + '\n')
+    migrate_config(config)
+    assert env.read_text() == 'export CS_RUNNER_BIN=/release/bin/cs-harness\n'
+    # History paths in the decoy allowlist must survive the rename (a renamed entry no longer
+    # matches the old commits and every lane is refused); other values are renamed.
+    migrated = json.loads(repos.read_text())['repos'][0]
+    assert migrated['tracked_secret_allowlist'] == [RETIRED + '-kit/tasks/x/secrets.env'], migrated
+    assert migrated['roots'] == ['cs/'], migrated
+    assert env.stat().st_mode & 0o777 == 0o600
+    assert policy.read_text() == '["CS_TOOL_PREFIX", "/release/cs/scripts/cs"]\n'
+    assert policy.stat().st_mode & 0o777 == 0o644
+    assert foreign.read_text() == RETIRED + '-kit'
+    loader = importlib.machinery.SourceFileLoader('rename_bundle', str(LAB / 'scripts/node-bundle'))
+    spec = importlib.util.spec_from_loader('rename_bundle', loader)
+    bundle = importlib.util.module_from_spec(spec)
+    loader.exec_module(bundle)
+    bundle.LAB = code
+    bundle.release_files = lambda: ['marker']
+    (code / 'marker').write_text('code')
+    (root / 'gateway').mkdir()
+    (root / 'gateway/models.json').write_text('{}')
+    bins = {}
+    for name in (*bundle.BINARIES, 'cs-director'):
+        path = root / name
+        path.write_text('#!/bin/sh\nexit 0\n')
+        path.chmod(0o755)
+        bins[name] = path
+    _, shipped = bundle.stage(root / 'bundle', bundle.host_target(), bins)
+    release = root / 'bundle/release'
+    assert sorted(p.name for p in (release / 'bin').iterdir()) == sorted(bins)
+    assert all(not p.is_symlink() for p in (release / 'bin').iterdir())
+    assert sorted(p.name for p in release.iterdir()) == ['bin', 'cs', 'gateway', 'target']
+    assert sorted(p.name for p in (release / 'target/release').iterdir()) == ['cs-sandbox', 'cs-tools']
+    assert bundle.kit_root(release) == release / 'cs'
+    before = env.stat().st_mtime_ns
+    migrate_config(config)
+    assert env.stat().st_mtime_ns == before
+print('check: cs rename green')

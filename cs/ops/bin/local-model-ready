@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+# Local-only readiness probe for the DGX model tunnel. Demanded-by: 2026-09-02 outage.
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+expected = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LOCAL_CODER_MODEL", "local-coder")
+
+try:
+    url = os.environ.get("LOCAL_CODER_HEALTH_URL")
+    if not url:
+        gateway = Path(__file__).resolve().parents[3] / "modelgateway"
+        config = gateway / "models.estate.json"
+        if not config.exists():
+            config = gateway / "models.json"
+        deployments = json.loads(config.read_text()).get("deployments", []) if config.exists() else []
+        endpoint = next((d["endpoint"] for d in deployments if expected in d.get("models", []) and d.get("endpoint")), "http://127.0.0.1:8000/v1")
+        url = endpoint.rstrip("/") + "/models"
+    with urllib.request.urlopen(url, timeout=2) as response:
+        payload = json.load(response)
+    models = [str(row.get("id") or "") for row in payload.get("data", [])]
+    ready = expected in models
+    print(json.dumps({"ok": ready, "model": expected, "models": models}, sort_keys=True))
+    sys.exit(0 if ready else 1)
+except (OSError, ValueError, urllib.error.URLError) as error:
+    print(json.dumps({"ok": False, "model": expected, "error": str(error)}, sort_keys=True))
+    sys.exit(1)

@@ -1,0 +1,3 @@
+{
+  "_doc": "Every case an implementation fails is dispositioned here by a human, per implementation: go_bug | rs_bug (the case states the intended contract; the implementation is wrong and is not fixed by this suite), fixture_wrong (fix the case instead; never left here), contract_change (a deliberate versioned change pending in both implementations). A passing case that still has a disposition fails the run (stale). Plan.ModelGateway.v2.1 §8."
+}

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+import io,json,pathlib,runpy,sys,tempfile,contextlib
+import os
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+# Direct module calls must use the same isolated roots as fixture subprocesses.
+_clean_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_clean_env)
+LAB=pathlib.Path(__file__).resolve().parents[3]
+sys.path.insert(0,str(LAB/'ops/bin'))
+m=runpy.run_path(str(LAB/'ops/bin/schedule-tick'))
+with scratch_dir() as tmp:
+ p=pathlib.Path(tmp)
+ schedules=[{'id':s,'enabled':s!='held','cron':'0 6 * * *','timezone':'UTC','requires':['held'] if s=='dependent' else []} for s in ['held','dependent','independent']]
+ (p/'schedules').write_text(''.join(json.dumps(r)+'\n' for r in schedules))
+ args={'now':'2026-09-12T06:01:00Z','schedules':str(p/'schedules'),'fires':str(p/'fires'),'dispatch':str(p/'dispatch'),'lock':str(p/'lock'),'scan_stale':False,'dry_run':True,'local_model_ready':True}
+ g=m['main'].__globals__;g['schedule_error']=lambda r:None;g['spec_uses_local_coder']=lambda r:False
+ old=sys.stdin;sys.stdin=io.StringIO(json.dumps(args));out=io.StringIO()
+ try:
+  with contextlib.redirect_stdout(out):m['main']()
+ finally:sys.stdin=old
+ result=json.loads(out.getvalue());assert [r['id'] for r in result['admitted']]==['independent'],result
+ assert result['deferred'][0]['reason']=='dependency_disabled',result
+ (p/'dispatch').write_text(''.join(json.dumps({'id':str(i),'schedule_id':'independent','state':'error','verdict':'fail','stop':'budget:turns'})+'\n' for i in range(3)))
+ sys.stdin=io.StringIO(json.dumps(args));out=io.StringIO()
+ try:
+     with contextlib.redirect_stdout(out):m['main']()
+ finally:sys.stdin=old
+ result=json.loads(out.getvalue());assert result['admitted']==[],result
+ held=json.loads((p/'schedules').read_text().splitlines()[-1]);assert held['id']=='independent' and held['enabled'] is False
+print('check: held dependency defers only its dependent; independent schedule fires')
+from _void import repeated_failure
+s={'id':'bad','failure_hold_after':3}
+r=[{'id':str(i),'schedule_id':'bad','state':'error','verdict':'fail','stop':'budget:turns'} for i in range(3)]
+assert repeated_failure(s,r)=='repeated_terminal_failure:budget:turns'
+assert repeated_failure(s,[r[0]]*6)==''
+assert repeated_failure(s,r+[{'id':'ok','schedule_id':'bad','state':'done','verdict':'pass','stop':'done'}])==''
+assert repeated_failure(s,r[:2]+[{**r[2],'stop':'budget:time'}])==''
+from datetime import datetime,timezone
+now=datetime(2026,9,12,7,tzinfo=timezone.utc)
+s={'id':'probe','enabled':True,'cron':'0 6 * * *','timezone':'UTC','catch_up_window_minutes':30,'enabled_at':'2026-09-09T00:00:00Z'}
+alert=m['zero_fires_past_slot']([s],[],now)
+assert len(alert)==1 and alert[0]['slot']=='2026-09-12T06:00:00Z',alert
+assert m['zero_fires_past_slot']([{**s,'enabled':False}],[],now)==[]
+assert m['zero_fires_past_slot']([{**s,'enabled_at':'2026-09-12T06:30:00Z'}],[],now)==[]
+assert m['zero_fires_past_slot']([s],[{'id':'probe','slot':'2026-09-12T06:00:00Z','job':'real'}],now)==[]
+assert len(m['zero_fires_past_slot']([s],[{'id':'probe','slot':'2026-09-09T06:00:00Z','job':'old'}],now))==1
+print('check: repeated terminal failures hold; missing cron fires surface independently of heartbeat')
+
+assert m["zero_fires_past_slot"]([{**s,"cron":"*/5 * * * *"}],[],now), "frequent cron must not mask silence forever"
+
+assert repeated_failure({'id':'bad','enabled_at':'2026-09-12T00:00:00Z'}, [{**x,'ts':'2026-09-11T23:00:00Z'} for x in r]) == ''

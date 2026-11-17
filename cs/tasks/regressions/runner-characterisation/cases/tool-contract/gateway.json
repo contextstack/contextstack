@@ -1,0 +1,39 @@
+[
+ {
+  "ok": {
+   "text": "three calls",
+   "tool_calls": [
+    {
+     "id": "c1",
+     "name": "fx_tool",
+     "args": {
+      "mode": "echo",
+      "k": "v"
+     }
+    },
+    {
+     "id": "c2",
+     "name": "fx_tool",
+     "args": {
+      "mode": "both"
+     }
+    },
+    {
+     "id": "c3",
+     "name": "fx_tool",
+     "args": {
+      "mode": "fail",
+      "out": "boom",
+      "code": 3
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

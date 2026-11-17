@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""modelgateway-spec runner: the black-box contract suite (Plan.ModelGateway.v2.1 §8).
+
+  run [--impl go] [--fast] [--area A] [--case ID] [--list] [--manifest FILE]
+      [--source-commit SHA] [--json FILE] [--keep] [-v]
+
+The binary under test is $CSGATEWAY_BIN. Unset, the runner builds the
+implementation's working tree (impls/<impl>.json "build") into a temp dir.
+Exit 0 when every selected case passes, is dispositioned for this impl in
+dispositions.json, or is blocked by a profile capability; 1 otherwise.
+There is no --update: a mismatch is dispositioned by a human.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SPEC = Path(__file__).resolve().parent
+REPO = SPEC.parent.parent
+sys.path.insert(0, str(SPEC))
+sys.dont_write_bytecode = True
+
+from harness import manifest  # noqa: E402
+from harness.run import CASES, Run, load_dispositions, run_cases  # noqa: E402
+import cases  # noqa: E402,F401  (registers every case)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--impl", default=os.environ.get("CSGATEWAY_IMPL", "rust"))
+    ap.add_argument("--fast", action="store_true", help="only the offline check subset")
+    ap.add_argument("--area", action="append")
+    ap.add_argument("--case", action="append")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--manifest", help="write the baseline manifest here")
+    ap.add_argument("--source-commit", help="commit the binary was built from (recorded in the manifest)")
+    ap.add_argument("--json", help="write per-case results here")
+    ap.add_argument("--keep", action="store_true", help="keep the run's temp dir (gateway logs)")
+    ap.add_argument("-v", action="store_true")
+    a = ap.parse_args()
+
+    selected = [c for c in CASES if (not a.fast or c.fast) and (not a.area or c.area in a.area) and (not a.case or c.id in a.case)]
+    if a.list:
+        for c in selected:
+            print("%-12s %-34s %-6s %s" % (c.area, c.id, "fast" if c.fast else "slow", c.doc))
+        print("%d case(s)" % len(selected))
+        return 0
+    profile = json.loads((SPEC / "impls" / (a.impl + ".json")).read_text())
+    binary = os.environ.get("CSGATEWAY_BIN")
+    build_dir = None
+    if not binary:
+        build_dir = tempfile.mkdtemp(prefix="modelgateway-spec-build-")
+        binary = os.path.join(build_dir, "csgateway")
+        cmd = [x.replace("{out}", binary) for x in profile["build"]]
+        subprocess.run(cmd, cwd=REPO / profile["source"], check=True, timeout=300)
+    binary = os.path.abspath(binary)
+    started = time.time()
+    run = Run(binary, a.impl, profile, keep=a.keep)
+    try:
+        results = run_cases(run, selected, load_dispositions(), verbose=a.v)
+        if a.manifest:
+            m = manifest.build(run, results, selected, a.source_commit, a.fast, time.time() - started)
+            Path(a.manifest).write_text(json.dumps(m, indent=2, sort_keys=True) + "\n")
+    finally:
+        run.close()
+        if a.keep:
+            print("kept: %s" % run.tmp)
+    if a.json:
+        Path(a.json).write_text(json.dumps(results, indent=2) + "\n")
+    counts = {}
+    for r in results:
+        counts[r["result"]] = counts.get(r["result"], 0) + 1
+    print("modelgateway-spec %s: %d case(s) in %.1fs: %s" % (a.impl, len(results), time.time() - started,
+                                                          ", ".join("%s %d" % kv for kv in sorted(counts.items()))))
+    bad = [r for r in results if r["result"] in ("fail", "pass-stale-disposition")]
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

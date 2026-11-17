@@ -1,0 +1,3 @@
+Keep personal HOME unreadable in every agent template, except declared runtime paths and run roots. Run `check --darwin-probe` on the lead host to verify decoy isolation with Seatbelt.
+
+Issue #63: the same real profiles must reject decoy Unix socket connects with EPERM while DNS resolves. The probe binds only fresh fixture paths; no real Docker, agent, or credential socket is contacted. `sockets_allow` declares absolute literal peers per template; currently all 23 templates declare none beyond the shared mDNSResponder exception. Existing SSH and lead denies remain defense in depth. IP traffic and Mach lookups (including SecurityServer/Keychain) retain their prior policy. Run the real_cli_smoke.py --darwin-probe on the host before accepting startup compatibility.

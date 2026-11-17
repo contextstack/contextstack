@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import scratch_dir
+
+import os
+import tempfile
+from pathlib import Path
+
+LIVE = Path(os.environ.get("LAB_SPILL_RUNS_ROOT") or Path(__file__).resolve().parents[3] / "ledger/runs")
+
+
+def leaks(root):
+    found = []
+    root = Path(root)
+    if not root.is_dir():
+        return found
+    for run in root.iterdir():
+        if not run.is_dir():
+            continue
+        shelf = run / "ledger"
+        if not shelf.is_dir():
+            continue
+        for path in shelf.glob("*.jsonl"):
+            found.append(str(path.relative_to(root)))
+    return found
+
+
+with scratch_dir(prefix="ledger-runs-jsonl-") as raw:
+    planted = Path(raw) / "20260905-copied-lab" / "ledger"
+    planted.mkdir(parents=True)
+    (planted / "ledger.jsonl").write_text("{}\n")
+    assert leaks(Path(raw)), "planted ledger jsonl under a run was not detected"
+
+found = leaks(LIVE)
+if found:
+    print("check: FAIL — ledger jsonl under ledger/runs:\n" + "\n".join(sorted(found)[:20]))
+    raise SystemExit(1)
+print("check: no ledger/*.jsonl under ledger/runs")

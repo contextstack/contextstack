@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fixture-only CS_TOOL_PREFIX: a wrapper that cannot enforce its policy, as cs-sandbox
+# reports it (one stderr line `cs-sandbox: <msg>`, exit 101), so call-errors-sandbox-101 can pin
+# the observation the classifier reads as sandbox_unenforceable. It never runs the tool.
+echo "cs-sandbox: cannot enforce policy: fixture has no sandbox" >&2
+exit 101

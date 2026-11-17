@@ -1,0 +1,8 @@
+{
+  "description": "Director: enable one defined schedule, or register one corpus from schedules/manifest-v1.json as disabled migration-held rows. Both interfaces are estate-bound, attributable and idempotent.",
+  "schema": {"type":"object","required":["schedule_id","grant","grant_digest","actor_id","actor_kind","request_key","expected_digest"],"properties":{"schedule_id":{"type":"string"},"grant":{"type":"string"},"grant_digest":{"type":"string"},"actor_id":{"type":"string"},"actor_kind":{"enum":["human","automated"]},"request_key":{"type":"string"},"expected_digest":{"type":"string"}}},
+  "register_schema": {"type":"object","required":["actor_id","actor_kind","request_key","manifest_digest"],"properties":{"actor_id":{"type":"string"},"actor_kind":{"enum":["human","automated"]},"request_key":{"type":"string"},"manifest_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"additionalProperties":false},
+  "templates": {
+    "probe-hello-smoke": {"cron":"0 6 * * *","timezone":"America/New_York","catch_up_window_minutes":30,"lane":"probe","spec":"specs/hello-smoke.yaml","task":"tasks/create-file"}
+  }
+}

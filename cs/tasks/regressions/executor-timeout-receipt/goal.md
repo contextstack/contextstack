@@ -1,0 +1,1 @@
+Every subscription-CLI timeout path, including a real task retry after successful Claude OAuth refresh, must append a governed failure receipt and preserve a transcript instead of escaping as a traceback.

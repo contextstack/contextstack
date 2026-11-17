@@ -1,0 +1,327 @@
+{
+  "exit_code": 0,
+  "ops": [
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "CS_TOOL_PREFIX",
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "capture-stimulus",
+      "stdin": {
+        "adapter": "runner",
+        "hooks": [],
+        "prompts": [
+          "prompts/coder-min.md"
+        ],
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1",
+        "run_id": "<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1",
+        "runner_implementation": "<RUNNER>",
+        "runner_path": "<RUNNER_PATH>",
+        "spec": "specs/fx.yaml",
+        "spec_sha": "92e7bfd5a95bf247c5f11dacd8c461187b01e8ab27a68cc254b75ba73d320ed9",
+        "task": "tasks/fx",
+        "tools": [
+          "fx_exe",
+          "fx_tool"
+        ],
+        "trial": 1,
+        "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1/workspace"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "CS_TOOL_PREFIX",
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "finalize-run",
+      "stdin": {
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1"
+      }
+    },
+    {
+      "cwd": "<ESTATE>",
+      "env_names": [
+        "CS_TOOL_PREFIX",
+        "HOME",
+        "LANG",
+        "PATH",
+        "TMPDIR"
+      ],
+      "op": "publish-evidence",
+      "stdin": {
+        "adapter": "runner",
+        "check_exit": 0,
+        "check_output": "",
+        "check_skipped": false,
+        "run_dir": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1",
+        "stop": "done",
+        "verdict": "pass"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "1.000000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-tool-exe-dispatch",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only runtime exe tool. Args: any object; echoed back with the argv it ran under.",
+            "name": "fx_exe",
+            "schema": {
+              "properties": {
+                "k": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.990000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "job_id": "lab",
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          },
+          {
+            "content": "an exe tool and a file pair, both under the prefix",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "k": "v w"
+                },
+                "id": "c1",
+                "name": "fx_exe"
+              },
+              {
+                "args": {
+                  "mode": "both"
+                },
+                "id": "c2",
+                "name": "fx_tool"
+              }
+            ]
+          },
+          {
+            "content": "[fx_exe {\"k\":\"v w\"}]\nfx_prefix --tag t1 -- <ESTATE>/fixture/fx_exe_bin | --fixed | two words\n{\"args\": [\"--fixed\", \"two words\"], \"argv0\": \"fx_exe_bin\", \"cwd_base\": \"workspace\", \"stdin\": {\"k\": \"v w\"}}\n",
+            "role": "tool",
+            "tool_call_id": "c1"
+          },
+          {
+            "content": "[fx_tool {\"mode\":\"both\"}]\nfx_prefix --tag t1 -- <ESTATE>/tools/bin/fx_tool\nout-line\nerr-line\n",
+            "role": "tool",
+            "tool_call_id": "c2"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "lab",
+          "role_pack_version": "0"
+        },
+        "run_id": "fx-tool-exe-dispatch",
+        "schema_version": "agent.gateway.model_call.v2",
+        "step_id": "<REQUEST_ID>",
+        "tool_schema": [
+          {
+            "description": "Fixture-only runtime exe tool. Args: any object; echoed back with the argv it ran under.",
+            "name": "fx_exe",
+            "schema": {
+              "properties": {
+                "k": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          {
+            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
+            "name": "fx_tool",
+            "schema": {
+              "properties": {
+                "mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    }
+  ],
+  "rows": [
+    {
+      "cost_class": "api",
+      "cost_usd": 0.02,
+      "env_sha": "<ENV_SHA>",
+      "est_basis": "rate",
+      "est_usd": 0.02,
+      "estate": "dev",
+      "model": "fake-model",
+      "seconds": "<SECONDS>",
+      "spec": "fx-tool-exe-dispatch",
+      "spec_sha": "92e7bfd5a95bf247c5f11dacd8c461187b01e8ab27a68cc254b75ba73d320ed9",
+      "stimulus_sha": "<STIMULUS_SHA>",
+      "stop": "done",
+      "task": "tasks/fx",
+      "task_sha": "2fa288b80c39a119855af1a658911af6838eaae6085b7e4c96dc7a3af8f7ea79",
+      "tool_calls": 2,
+      "transcript": "ledger/runs/<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1",
+      "trial": 1,
+      "ts": "<TS>",
+      "turns": 2,
+      "verdict": "pass"
+    }
+  ],
+  "run_dirs_distinct": true,
+  "runs": [
+    {
+      "dir": "<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1",
+      "entries": [
+        "check.json",
+        "evidence",
+        "finalize.lock",
+        "finalized.json",
+        "messages.jsonl",
+        "ready_for_inspection",
+        "stimulus",
+        "terminal.json",
+        "transcript.md",
+        "workspace"
+      ],
+      "frozen": {
+        "check": "#!/bin/sh\nexit 0\n",
+        "goal.md": "Create hello.txt containing exactly: hello\n"
+      },
+      "messages": [
+        {
+          "budget": {
+            "seconds": 0,
+            "tool_calls": 10,
+            "turns": 4,
+            "usd": 1
+          },
+          "event": "header",
+          "model": "fake",
+          "spec": "fx-tool-exe-dispatch",
+          "task": "tasks/fx",
+          "trial": 1
+        },
+        {
+          "event": "turn",
+          "text": "an exe tool and a file pair, both under the prefix",
+          "turn": 1
+        },
+        {
+          "args": {
+            "k": "v w"
+          },
+          "content": "fx_prefix --tag t1 -- <ESTATE>/fixture/fx_exe_bin | --fixed | two words\n{\"args\": [\"--fixed\", \"two words\"], \"argv0\": \"fx_exe_bin\", \"cwd_base\": \"workspace\", \"stdin\": {\"k\": \"v w\"}}\n",
+          "error": false,
+          "event": "tool",
+          "name": "fx_exe",
+          "turn": 1
+        },
+        {
+          "args": {
+            "mode": "both"
+          },
+          "content": "fx_prefix --tag t1 -- <ESTATE>/tools/bin/fx_tool\nout-line\nerr-line\n",
+          "error": false,
+          "event": "tool",
+          "name": "fx_tool",
+          "turn": 1
+        },
+        {
+          "event": "turn",
+          "text": "done",
+          "turn": 2
+        }
+      ],
+      "transcript": "# fx-tool-exe-dispatch · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nan exe tool and a file pair, both under the prefix\n\n`fx_exe {\"k\":\"v w\"}`\n\n```\nfx_prefix --tag t1 -- <ESTATE>/fixture/fx_exe_bin | --fixed | two words\n{\"args\": [\"--fixed\", \"two words\"], \"argv0\": \"fx_exe_bin\", \"cwd_base\": \"workspace\", \"stdin\": {\"k\": \"v w\"}}\n\n```\n\n`fx_tool {\"mode\":\"both\"}`\n\n```\nfx_prefix --tag t1 -- <ESTATE>/tools/bin/fx_tool\nout-line\nerr-line\n\n```\n\n### turn 2\n\ndone\n\n---\nstop done · verdict **pass** · turns 2 · tools 2 · cost $0.0200\n",
+      "workspace": {}
+    }
+  ],
+  "stderr": [],
+  "stdout": [
+    "  tasks/fx                       t1  pass stop=done turns=2 tools=2 $0.0200"
+  ]
+}

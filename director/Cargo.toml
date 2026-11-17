@@ -1,0 +1,33 @@
+[package]
+name = "cs-director"
+description = "The standalone ContextStack Director: node protocol 1, its own SQLite database, access without login"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cs-director"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1"
+chrono.workspace = true
+getrandom = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "tokio"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

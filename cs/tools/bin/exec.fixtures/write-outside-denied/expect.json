@@ -1,0 +1,10 @@
+{
+  "exit": 1,
+  "stdout": {
+    "regex": "Operation not permitted|Read-only file system"
+  },
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"cmd\": [\"sh\", \"-c\", \"echo x > /tmp/tool-fixtures-denied && echo wrote\"]}, \"name\": \"exec\"}\n"
+  },
+  "untouched": true
+}

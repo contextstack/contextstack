@@ -1,0 +1,6 @@
+{
+ "signal": {
+  "after_requests": 1,
+  "signal": "SIGINT"
+ }
+}

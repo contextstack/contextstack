@@ -1,0 +1,8 @@
+{
+  "exit": 0,
+  "stdout": "hi\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"cmd\": [\"echo\", \"hi\"]}, \"name\": \"exec\"}\n"
+  },
+  "untouched": true
+}

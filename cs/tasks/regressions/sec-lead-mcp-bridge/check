@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""#56: lanes cannot reach the host MCP bridge socket; the bridge bounds connections."""
+import ast
+import errno
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+OPS = Path(__file__).resolve().parents[3] / "ops/bin"
+sys.path.insert(0, str(OPS))
+
+import _executor  # noqa: E402
+
+from sandbox_profile import bridge_denies
+from _lead_mcp import HostMCPBridge, MAX_MCP_CONNECTIONS  # noqa: E402
+
+def executor_profile(home, ws, private, profile):
+    with patch.object(_executor, "HOME", home), patch.object(sys, "platform", "darwin"):
+        _executor.sandbox_cmd("/usr/bin/true", [], ws, private, profile)
+    return profile.read_text()
+
+
+with scratch_dir(prefix="sec-lead-mcp-bridge-", dir="/tmp") as raw:
+    root = Path(raw)
+    home, ws, private = (root / n for n in ("home", "workspace", "private"))
+    for path in (home, ws, private):
+        path.mkdir()
+    profile = root / "executor.sb"
+    text = executor_profile(home, ws, private, profile)
+    rules = bridge_denies(text)
+    assert len(rules) == 5, rules
+    pattern = rules[0].split('#"', 1)[1].split('"', 1)[0]
+    assert re.search(pattern, "/tmp/lead-mcp-regression-probe/mcp.sock")
+
+    script = root / "noop_mcp.py"
+    script.write_text("import sys\nfor line in sys.stdin: pass\n")
+    original = {"mcpServers": {"contextstack": {"command": sys.executable, "args": [str(script)]}}}
+    bridge = HostMCPBridge(original, ws, env={**hermetic_env(), 'HOME': str(home)}, secret_dir=home)
+    try:
+        storm = []
+        for _ in range(MAX_MCP_CONNECTIONS + 50):
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                conn.connect(str(bridge.path))
+                conn.settimeout(0.05)
+                storm.append(conn)
+            except OSError:
+                conn.close()
+        try:
+            assert len(bridge.handlers) <= MAX_MCP_CONNECTIONS, (len(bridge.handlers), len(storm))
+        finally:
+            for conn in storm:
+                conn.close()
+    finally:
+        bridge.close()
+
+if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+    print("sec-lead-mcp-bridge: PASS (offline); SKIP host probe without --darwin-probe")
+    raise SystemExit(0)
+
+capability = subprocess.run(
+    ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+    capture_output=True, text=True, timeout=10,
+)
+if capability.returncode != 0:
+    print("sec-lead-mcp-bridge: PASS (offline); SKIP probe (nested sandbox refused)")
+    raise SystemExit(0)
+
+with scratch_dir(prefix="sec-lead-mcp-probe-", dir="/tmp") as raw:
+    root = Path(raw)
+    home, ws, private = (root / n for n in ("home", "workspace", "private"))
+    for path in (home, ws, private):
+        path.mkdir()
+    profile = root / "executor.sb"
+    executor_profile(home, ws, private, profile)
+    bridge_dir = root / "lead-mcp-probe"
+    bridge_dir.mkdir()
+    sock = bridge_dir / "mcp.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(sock))
+    listener.listen(1)
+    probe = root / "probe.py"
+    probe.write_text(
+        "import errno, socket, sys\n"
+        "s = socket.socket(socket.AF_UNIX)\n"
+        "try:\n    s.connect(sys.argv[1])\n"
+        "except PermissionError:\n    raise SystemExit(0)\n"
+        "except OSError as e:\n"
+        "    if e.errno == errno.EPERM:\n        raise SystemExit(0)\n"
+        "    raise\n"
+        "raise SystemExit('connect succeeded')\n"
+    )
+    try:
+        done = subprocess.run(
+            ["sandbox-exec", "-f", str(profile), sys.executable, str(probe), str(sock)],
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            cwd=ws, capture_output=True, text=True, timeout=30,
+        )
+        assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+    finally:
+        listener.close()
+        sock.unlink(missing_ok=True)
+
+print("sec-lead-mcp-bridge: PASS (offline + Darwin connect probe)")

@@ -1,0 +1,12 @@
+{
+  "exit": 1,
+  "stdout": {
+    "contains": [
+      "unterminated character set at position 0"
+    ]
+  },
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"pattern\": \"[\"}, \"name\": \"search\"}\n"
+  },
+  "untouched": true
+}

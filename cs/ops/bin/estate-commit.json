@@ -1,0 +1,13 @@
+{
+  "description": "Operator: facts-tier commit every tick (append-only ledger and nonempty staged archive verdicts); rules-tier only when scripts/check is green. Refusals and 30-minute dirty files write ledger/estate-commit.jsonl (the operator queue).",
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "force": {
+        "type": "boolean",
+        "description": "Operator/test override for the rules cadence only. Facts still run."
+      }
+    }
+  }
+}

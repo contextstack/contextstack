@@ -1,0 +1,23 @@
+[
+ {
+  "ok": {
+   "text": "writing",
+   "tool_calls": [
+    {
+     "id": "1",
+     "name": "fs_write",
+     "args": {
+      "path": "abort-hello.txt",
+      "content": "hello"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "text": "done",
+   "tool_calls": []
+  }
+ }
+]

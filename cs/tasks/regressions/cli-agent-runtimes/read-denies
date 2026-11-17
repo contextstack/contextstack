@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""Offline profile/guard regression. --darwin-probe runs Seatbelt at landing.
+No real login files are inspected; every path is below a temporary HOME.
+"""
+import ast
+import json
+import os
+import re
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+
+OPS = Path(__file__).resolve().parents[3] / 'ops/bin'
+sys.path.insert(0, str(OPS))
+from _cli_native import LOGIN_PATHS, snapshot_login_files, stage, finish_copies, unstage, verify_login_files
+sys.path.insert(0, str(next(p / 'tasks/regressions/_lib' for p in Path(__file__).resolve().parents if (p / 'tasks/regressions/_lib').is_dir())))
+from sandbox_profile import render_profile, bridge_denies
+
+RUN_DARWIN_PROBE = '--darwin-probe' in sys.argv and sys.platform == 'darwin'
+if RUN_DARWIN_PROBE:
+    capability = subprocess.run(['sandbox-exec', '-p', '(version 1)(allow default)', '/usr/bin/true'],
+                                capture_output=True, text=True, timeout=10)
+    if capability.returncode != 0:
+        assert 'sandbox_apply: Operation not permitted' in capability.stderr, capability.stderr
+        print('SKIP: actual Seatbelt probe (environment refuses sandbox_apply: Operation not permitted)')
+        RUN_DARWIN_PROBE = False
+
+import _executor
+
+
+def fail(reason):
+    raise ValueError(reason)
+
+
+_executor.fail = fail  # the real fail() exits the process; refusals are asserted as exceptions here
+ns = {'sandbox_cmd': _executor.sandbox_cmd, 'require_executor_sandbox': _executor.require_executor_sandbox}
+tree = ast.parse((OPS / '_executor.py').read_text())
+# The guard must also run before either profiled or plain executor dispatch.
+body = ast.unparse(tree)
+assert body.index('require_executor_sandbox()') < body.index("if name == 'muse-code'")
+
+assert body.index('verify_login_files(tmpl, HOME, login_snapshot)', body.index("cli = run_cli(cmd, ws, timeout, 'task')")) < body.index("row['auth_refresh'] = 'started'")
+assert 'and login_tampered is None' in body
+
+with tempfile.TemporaryDirectory(prefix='executor-read-denies-') as raw:
+    root = Path(raw).resolve()
+    home, ws, tmp = root / 'home', root / 'workspace', root / 'tmp'
+    for path in (home, ws, tmp):
+        path.mkdir()
+    _executor.HOME = home
+    secrets = ['.contextstack/director-db-backup/legacy.sqlite',
+               '.contextstack/browser/cookies', '.contextstack/lab/browser-state/cookies', '.contextstack/config/lead-credential', '.contextstack/config/hosted-lead.json',
+               '.contextstack/state/lead-sessions/con_fixture/home/session',
+               '.contextstack/dev-state/lead-sessions/con_fixture/transcript', '.contextstack/credentials/x', '.contextstack/state/director/local-credential',
+               '.contextstack/dev-state/director/db', '.contextstack/gateway/token',
+               '.contextstack/config/gateway/owner-token', '.contextstack/config/node.env',
+               '.contextstack/config/.cs-init-node-token', '.ssh/id_test', '.aws/credentials',
+               '.gnupg/private', '.config/gh/hosts.yml', '.netrc', '.zshrc.secrets',
+               'Library/Keychains/login.keychain-db']
+    for rel in secrets:
+        path = home / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('fake-secret')
+    # Match the installed layout: current is a symlink to one active release.
+    release = home / '.contextstack/releases/decoy-release'
+    (release / 'bin').mkdir(parents=True)
+    (home / '.contextstack/current').symlink_to(release, target_is_directory=True)
+    installed_tool = home / '.contextstack/current/bin/decoy-tool'
+    installed_tool.write_text('public-tool')
+    for rel in ('.env', '.env.local', '.env_prod', '.env-local', '.envrc', '.envrc.local', 'foo.env', 'x.env.bak', '.env.example', 'source.txt'):
+        (ws / rel).write_text('fixture')
+    socket_dirs = [home / '.contextstack/state/lead-sessions/con_decoy/sock',
+                   tmp / ('cs-lead-%s-abcdef0123456789' % os.getuid()),
+                   tmp / 'lead-mcp-decoyprobe']
+    for directory in socket_dirs:
+        directory.mkdir(mode=0o700, parents=True)
+        (directory / 'token').write_text('decoy-only')
+        (directory / 'token').chmod(0o600)
+    (tmp / 'lead-mcp-decoyprobe' / 'mcp.sock').touch()
+    outside = root / 'outside'
+    outside.mkdir()
+    (outside / '.env.example').write_text('outside-example')
+    (home / '.ssh/.env.example').write_text('ssh-example')
+    auth = home / '.codex/auth.json'
+    auth.parent.mkdir()
+    auth.write_text('fake-auth')
+    for rel in LOGIN_PATHS:
+        target = home / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text('fake-login-' + Path(rel).name)
+    (home / 'Library/Keychains/other.keychain-db').write_text('other-secret')
+    templates = json.loads((OPS / 'executor-templates.json').read_text())
+    expected_keychain = {
+        'claude-code', 'claude-code-sonnet', 'claude-code-sonnet-planner',
+        'claude-code-opus', 'claude-code-opus-judge', 'claude-auth-context-probe',
+        'claude-code-sonnet-patch', 'cursor-agent', 'cursor-sol', 'cursor-codex',
+        'cursor-composer', 'cursor-grok', 'cursor-sonnet', 'antigravity', 'antigravity-hydrogen',
+    }
+    actual_keychain = {name for name, tmpl in templates.items() if tmpl.get('keychain') == 'login'}
+    assert actual_keychain == expected_keychain, (actual_keychain, expected_keychain)
+    # All retained grants are subscription-native stores; no API-key/free template gets one.
+    for no_kc in ('pi', 'goose', 'grok', 'codex', 'gemini-cli', 'opencode', 'opencode-go', 'test-echo'):
+
+        assert 'keychain' not in templates[no_kc], no_kc
+    with patch.object(sys, 'platform', 'darwin'):
+        for name, template in templates.items():
+            private = tmp / name
+            private.mkdir()
+            # Plant every declared source; staging never opens its contents.
+            for src in template.get('links', {}).values():
+                if src.startswith('~/'):
+                    target = home / src[2:]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.touch(exist_ok=True)
+            _, links = stage(template, private, home)
+            profile = root / (name + '.sb')
+            ns['sandbox_cmd']('/usr/bin/true', [], ws, private, profile, caller=dict(deny_write_roots=[str(home / p[2:] if p.startswith('~/') else Path(p)) for p in template.get('deny_write', [])]), read_links=links, login_writes=template)
+            text = profile.read_text()
+            for rule in bridge_denies(text):
+                assert rule in text, (name, 'missing lead socket deny', rule)
+            socket_pattern = bridge_denies(text)[0].split('#"', 1)[1].split('"', 1)[0]
+            for directory in socket_dirs:
+                assert re.search(socket_pattern, str(directory / 'token')), (name, directory)
+            estate_deny = '(deny file-read* file-write* file-link (require-all (subpath %s)' % json.dumps(str(home / '.contextstack'))
+            assert estate_deny in text, (name, 'missing blanket estate deny')
+            for rel in [*secrets, *LOGIN_PATHS]:
+                if rel in LOGIN_PATHS or rel.startswith('.contextstack/config/'):
+                    protected = rel
+                elif '/lead-sessions/' in rel:
+                    protected = rel.split('/lead-sessions/')[0] + '/lead-sessions'
+                elif rel == 'Library/Keychains/login.keychain-db':
+                    protected = 'Library/Keychains'
+                else:
+                    protected = rel.rsplit('/', 1)[0] if '/' in rel else rel
+                assert '(deny file-read* (subpath %s))' % json.dumps(str(home / protected)) in text, (name, rel)
+            keychain = home / 'Library/Keychains'
+            needs_keychain = template.get('keychain') == 'login'
+            assert '(allow file-read* (subpath %s))' % json.dumps(str(keychain)) not in text, name
+            kc_pattern = '^' + re.escape(str(keychain)) + r'/login\.keychain-db[^/]*$'
+            expected_kc = {
+                '(allow file-read-metadata (literal %s))' % json.dumps(str(keychain)),
+                '(allow file-read* (regex #"%s"))' % kc_pattern.replace('"', r'\"'),
+            } if needs_keychain else set()
+            actual_kc = {line for line in text.splitlines()
+                         if line.startswith('(allow file-read') and 'Library/Keychains' in line}
+            assert actual_kc == expected_kc, (name, actual_kc, expected_kc)
+            if needs_keychain:
+                assert re.fullmatch(kc_pattern, str(keychain / 'login.keychain-db'))
+                assert re.fullmatch(kc_pattern, str(keychain / 'login.keychain-db-wal'))
+                assert not re.fullmatch(kc_pattern, str(keychain / 'other.keychain-db'))
+                assert not re.fullmatch(kc_pattern, str(keychain / 'login.keychain-db/child'))
+            staged_targets = {link.resolve() for link in links}
+            for link in links:
+                if link.resolve() == keychain:
+                    continue
+                allow = '(allow file-read* (literal %s))' % json.dumps(str(link.resolve()))
+                assert allow in text and text.index(allow) > text[:text.index(bridge_denies(text)[0])].rindex('(deny file-read*'), name
+            for rel in LOGIN_PATHS:
+                login_target = (home / rel).resolve()
+                if login_target not in staged_targets:
+                    assert not any(
+                        line.startswith('(allow file-read') and str(login_target) in line
+                        for line in text.splitlines()
+                    ), (name, rel)
+            assert '(allow default)' in text and '(deny mach-lookup' not in text
+            for pat in (r'/\.env$', r'/\.env\.[^/]+$', r'/\.env_[^/]+$', r'/\.env-[^/]+$', r'/\.envrc[^/]*$', r'/[^/]+\.env$', r'/[^/]+\.env\.[^/]+$'):
+                assert '(deny file-read* file-write* file-link (regex #"%s"))' % pat in text, (name, pat)
+            assert r'(allow file-read* (require-all (subpath %s) (regex #"/\.env\.example$")))' % json.dumps(str(ws.resolve())) in text
+            assert r'(allow file-read* (regex #"/\.env\.example$"))' not in text
+            expected_writes = []
+            for copied in template.get('copies', {}).values():
+                source = home / copied[2:]
+                assert '(allow file-write* (literal %s))' % json.dumps(str(source)) not in text
+                for target in (source, *source.parents):
+                    if target == home:
+                        break
+                    assert '(deny file-write* file-link (literal %s))' % json.dumps(str(target)) in text, (name, str(target))
+                assert '(deny file-write* file-link (literal %s))' % json.dumps(str(source)) in text, (name, str(source))
+            expected_rules = []
+            for kind, value in expected_writes:
+                filt = '(%s %s%s)' % (
+                    kind, '#' if kind == 'regex' else '',
+                    '"' + value.replace('"', r'\"') + '"' if kind == 'regex' else json.dumps(value),
+                )
+                expected_rules.append('(allow file-write* %s)' % filt)
+                expected_rules.append('(deny file-write-create (require-all (vnode-type SYMLINK) %s))' % filt)
+            # Every later write exception must be exactly the declared login scope plus its symlink deny.
+            tail = text[text.index('(deny file-write* (subpath "%s/.claude"))' % home):]
+            actual_rules = [line for line in tail.splitlines()
+                            if line.startswith(('(allow file-write*', '(deny file-write-create (require-all (vnode-type SYMLINK)'))]
+            assert actual_rules == expected_rules, (name, actual_rules, expected_rules)
+            for rule in expected_rules:
+                assert text.index(rule) > text.rindex('(deny file-write* (subpath'), name
+            if (name in ('codex', 'pi') or name.startswith(('claude-code', 'claude-auth-context-probe'))) and RUN_DARWIN_PROBE:
+                stub = private / 'write-probe.py'
+                stub.write_text('''import os, sys
+from pathlib import Path
+home = Path(os.environ['HOME'])
+for directory in [Path(p) for p in sys.argv[2:-1]]:
+    for operation in (lambda: (directory / 'token').read_text(),
+                      lambda: (directory / 'token').write_text('forged'),
+                      lambda: (directory / 'fake-socket').write_text('forged'),
+                      lambda: list(directory.iterdir()),
+                      lambda: (directory / 'token').unlink(),
+                      lambda: directory.rename(directory.with_name('stolen-socket-dir'))):
+        try:
+            operation()
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError('unexpected lead socket access: ' + str(directory))
+if sys.argv[1] in ('codex', 'pi') or sys.argv[1].startswith(('claude-code', 'claude-auth-context-probe')):
+    rel = '.codex/auth.json' if sys.argv[1] == 'codex' else '.pi/agent/auth.json' if sys.argv[1] == 'pi' else '.claude/.credentials.json'
+    real_auth = home / rel
+    private_auth = Path(sys.argv[-1]) / ('codex-home/auth.json' if sys.argv[1] == 'codex' else 'pi-agent/auth.json' if sys.argv[1] == 'pi' else 'claude-home/.claude/.credentials.json')
+    # Refresh stays private: arbitrary workspace content can replace the copy.
+    source = Path('refresh-source')
+    source.write_text('{"tokens":{"account_id":"owner","refresh_token":"rotated"}}')
+    source.replace(private_auth)
+    assert private_auth.is_file() and not private_auth.is_symlink()
+    source.write_text('{"tokens":{"account_id":"attacker"}}')
+    try: source.replace(real_auth)
+    except PermissionError: pass
+    else: raise AssertionError('workspace file replaced real owner login')
+    source.unlink()
+    for operation in (lambda: real_auth.write_text('forged'),
+                      lambda: real_auth.chmod(0o644),
+                      lambda: real_auth.unlink(),
+                      lambda: real_auth.parent.rename(real_auth.parent.with_name('moved-login'))):
+        try: operation()
+        except PermissionError: pass
+        else: raise AssertionError('owner login mutation permitted')
+    auth = real_auth
+    other_auth = home / ('.pi/agent/auth.json' if sys.argv[1] == 'codex' else '.codex/auth.json')
+    symlink_targets = [auth]
+    denied = [auth.parent / 'other']
+for forbidden_read in (other_auth, home / '.claude/.credentials.json', home / '.gemini/oauth_creds.json', home / '.grok/auth.json',
+                       *([] if sys.argv[1].startswith(('claude-code', 'claude-auth-context-probe')) else [home / 'Library/Keychains/login.keychain-db'])):
+    try:
+        forbidden_read.read_text()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('unexpected cross-template read: ' + str(forbidden_read))
+for target in symlink_targets:
+    try:target.unlink()
+    except PermissionError:pass
+    else:
+        raise AssertionError('credential removal permitted')
+    try:
+        target.symlink_to(home / '.ssh/id_test')
+    except (PermissionError, FileExistsError):
+        pass
+    else:
+        raise AssertionError('unexpected symlink create: ' + str(target))
+source = Path('hardlink-source')
+source.write_text('public-fixture')
+for target in (auth, auth.parent):
+    try:os.link(source, target)
+    except (PermissionError, FileExistsError):pass
+    else:raise AssertionError('hardlink replacement permitted')
+try:os.link(auth, Path('credential-alias'))
+except PermissionError:pass
+else:raise AssertionError('credential hardlink export permitted')
+source.unlink()
+for path in denied:
+    try:
+        path.write_text('forbidden')
+    except PermissionError:
+        continue
+    raise AssertionError('unexpected write: ' + str(path))
+''')
+                done = subprocess.run(['sandbox-exec', '-f', str(profile), sys.executable, str(stub), name, *map(str, socket_dirs), str(private)],
+                                      cwd=ws, env={'HOME': str(home), 'PATH': '/usr/bin:/bin'},
+                                      capture_output=True, text=True)
+                assert done.returncode == 0, (name, done.stderr)
+            unstage(links)
+
+        from _muse import sandbox_command
+        muse = sandbox_command(['/usr/bin/true'], ws, home)
+        for rule in bridge_denies(text):
+            assert rule in muse[muse.index('-p') + 1], ('Muse', rule)
+        # Every file-backed template refuses hardlinks before staging/snapshot and after execution.
+        # A refresh (the owner's CLI renaming a new login in during the run) is not tampering: the new
+        # file stays, neither deleted nor rolled back (6th pass R2: verification deleted ~/.claude's
+        # login and wrote stale Codex/Pi tokens back). The sandbox, not this check, blocks agent swaps.
+        for name, template in templates.items():
+            for raw_src in dict.fromkeys(template.get('links', {}).values()):
+                if not raw_src.startswith('~/'):
+                    continue
+                target = home / raw_src[2:]
+                if not target.is_file():
+                    continue
+                for attack in ('hardlink', 'refresh'):
+                    snap = snapshot_login_files(template, home)
+                    source = ws / 'login-swap-source'
+                    source.write_text('public-fixture')
+                    if attack == 'refresh':
+                        source.write_text('refreshed')
+                        source.replace(target)
+                        verify_login_files(template, home, snap)
+                        assert target.is_file() and target.read_text() == 'refreshed', (name, 'refresh undone')
+                        continue
+                    target.unlink()
+                    os.link(source, target)
+                    for operation in (lambda: stage(template, tmp / 'refused-swap', home),
+                                      lambda: snapshot_login_files(template, home)):
+                        try:operation()
+                        except ValueError as error:assert 'hardlink' in str(error), (name, error)
+                        else:raise AssertionError((name, 'hardlink accepted before run'))
+                    try:verify_login_files(template, home, snap)
+                    except ValueError as error:assert 'hardlink' in str(error), (name, error)
+                    else:raise AssertionError((name, attack, 'accepted after run'))
+                    assert source.read_text() == 'public-fixture', 'verification wrote through hardlink'
+                    if snap[target][2] is None:  # no snapshot to restore (Claude): never deleted
+                        assert target.is_file(), (name, 'unrestorable login deleted')
+                    source.unlink(missing_ok=True)
+                    if not target.exists():target.write_text('fixture')
+
+        # Claude receives a private regular copy; its owner login remains untouched.
+        claude = templates['claude-code-sonnet']
+        credential = home / '.claude/.credentials.json'
+        credential.write_text('{"claudeAiOauth":{"accountUuid":"owner"}}')
+        private = tmp / 'claude-file-probe'
+        private.mkdir()
+        records = []
+        _, made = stage(claude, private, home, copy_records=records)
+        copy = private / 'claude-home/.claude/.credentials.json'
+        assert copy.is_file() and not copy.is_symlink()
+        assert copy.stat().st_mode & 0o777 == 0o600
+        copy.write_text('{"claudeAiOauth":{"accountUuid":"attacker"}}')
+        assert finish_copies(records) == [{'source': '~/.claude/.credentials.json', 'status': 'task_copy'}]
+        assert json.loads(credential.read_text())['claudeAiOauth']['accountUuid'] == 'owner'
+        unstage(made)
+        credential.unlink()
+        credential.symlink_to(home / '.ssh/id_test')
+        (tmp / 'claude-swap').mkdir()
+        try:
+            stage(claude, tmp / 'claude-swap', home, copy_records=[])
+        except ValueError as error:
+            assert 'symlink' in str(error)
+        else:
+            raise AssertionError('Claude accepted credential symlink swap')
+        credential.unlink()
+        credential.write_text('fixture')
+
+        # Copied Pi logins validate the owner's source before reading it.
+        pi_tmpl = templates['pi']
+        pi_auth = home / '.pi/agent/auth.json'
+        pi_auth.unlink()
+        pi_auth.symlink_to(home / '.ssh/id_test')
+        try:
+            stage(pi_tmpl, tmp / 'pi-symlink-refuse', home)
+        except ValueError as error:
+            assert 'symlink' in str(error)
+        else:
+            raise AssertionError('stage accepted symlinked auth.json')
+        pi_auth.unlink()
+        pi_auth.write_text('{}')
+        with patch.object(os, 'getuid', return_value=os.getuid() + 1):
+            try:
+                stage(pi_tmpl, tmp / 'pi-uid-refuse', home)
+            except ValueError as error:
+                assert 'not owned by current user' in str(error)
+            else:
+                raise AssertionError('stage accepted login file with wrong owner')
+        # A staged login deliberately inside a denied directory proves later re-allows.
+        (home / '.contextstack/credentials/staged-auth').write_text('fake-auth')
+        _, links = stage({'links': {'{{tmp}}/auth': '~/.contextstack/credentials/staged-auth'}}, tmp, home)
+        profile = root / 'probe.sb'
+        command = ns['sandbox_cmd'](sys.executable, [], ws, tmp, profile, read_links=links)
+    from _muse import sandbox_command
+    with patch.object(sys, 'platform', 'darwin'), patch.object(Path, 'is_file', return_value=True):
+        muse_profile = sandbox_command([sys.executable], ws, home)[2]
+    # Muse uses its workspace as tmpdir (sandbox_command), so compare against that read-root set.
+    for rule in render_profile(home, ws, ws).splitlines():
+        if '(regex #' in rule and 'Library/Keychains' not in rule:
+            assert rule in muse_profile, rule
+    keychain = home / 'Library/Keychains'
+    assert '(allow file-read* (subpath %s))' % json.dumps(str(keychain)) not in muse_profile
+    for rule in render_profile(home, ws, tmp, read_links=(keychain,)).splitlines():
+        if 'Library/Keychains' in rule and rule.startswith('(allow file-read'):
+            assert rule in muse_profile, rule
+    for platform in ('linux', 'freebsd'):
+        with patch.object(sys, 'platform', platform), patch.dict(os.environ, {}, clear=True):
+            try:
+                ns['sandbox_cmd']('stub', ['arg'], ws, tmp, root / 'unused')
+            except ValueError as error:
+                assert 'executor sandbox not available on ' + platform in str(error)
+            else:
+                raise AssertionError('unconfined executor accepted')
+            os.environ['CS_EXECUTOR_ALLOW_UNSANDBOXED'] = 'true'
+            try:
+                ns['require_executor_sandbox']()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('opt-in must be exactly 1')
+            os.environ['CS_EXECUTOR_ALLOW_UNSANDBOXED'] = '1'
+            assert ns['sandbox_cmd']('stub', ['arg'], ws, tmp, root / 'unused') == ['stub', 'arg']
+    if RUN_DARWIN_PROBE:
+        # Stub CLI attempts actual opens, including via symlinks. Never contact a provider.
+        probe = tmp / 'stub.py'
+        denied = [home / '.ssh/id_test', home / '.ssh/.env.example',
+                  home / '.contextstack/credentials/x', outside / '.env.example',
+                  ws / '.env', ws / '.env.local', ws / '.env_prod', ws / '.env-local',
+                  ws / '.envrc', ws / '.envrc.local', ws / 'foo.env', ws / 'x.env.bak',
+                  home / 'Library/Keychains/login.keychain-db']
+        denied.extend(home / rel for rel in secrets)
+        # Unknown future estate state must be private without adding another named deny.
+        future = home / '.contextstack/future-archive/secret'
+        future.parent.mkdir(parents=True)
+        future.write_text('decoy-future-secret')
+        denied.append(future)
+        denied[1].write_text('fake-secret')
+        (ws / 'env-alias').symlink_to(ws / '.env')
+        denied.append(ws / 'env-alias')
+        probe.write_text('''import sys, subprocess
+from pathlib import Path
+for raw in sys.argv[1].split("\\n"):
+    try:
+        Path(raw).read_text()
+    except PermissionError:
+        continue
+    raise AssertionError("secret readable: " + raw)
+DECOYS = ['.env', '.env.local', '.env_prod', '.env-local', '.envrc', '.envrc.local', 'foo.env', 'x.env.bak']
+# Moving/linking the source or replacing a secret destination must be refused.
+for name in DECOYS:
+    for tool in ('mv', 'ln', 'cp'):
+        dest = Path('escape-' + tool)
+        result = subprocess.run(['/bin/' + tool, name, str(dest)], capture_output=True)
+        assert result.returncode != 0, (tool, name, result.stderr)
+        assert not dest.exists() or dest.read_bytes() == b'', (tool, name)
+        dest.unlink(missing_ok=True)
+    source = Path('rename-source')
+    source.write_text('public')
+    for tool in ('mv', 'ln', 'cp'):
+        result = subprocess.run(['/bin/' + tool, str(source), name], capture_output=True)
+        assert result.returncode != 0, ('replace', tool, name, result.stderr)
+    source.unlink()
+    try:
+        Path(name).write_text('created-over')
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('secret overwrite allowed: ' + name)
+fresh = Path('.lab-env-probe')
+fresh.mkdir()
+for name in ('.env', '.env.local'):
+    target = fresh / name
+    try:
+        target.write_text('created')
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('secret create allowed: ' + str(target))
+    source = fresh / 'rename-source'
+    source.write_text('public')
+    result = subprocess.run(['/bin/mv', str(source), str(target)], capture_output=True)
+    assert result.returncode != 0, ('create via rename', name, result.stderr)
+    source.unlink()
+fresh.rmdir()
+for raw in sys.argv[2:]:
+    assert Path(raw).read_text()
+''')
+        done = subprocess.run([*command, str(probe), '\n'.join(map(str, denied)),
+                               str(tmp / 'auth'), str(ws / 'source.txt'), str(ws / '.env.example'), str(installed_tool)],
+                              env={'HOME': str(home), 'PATH': '/usr/bin:/bin'}, cwd=ws,
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        from _muse import sandbox_command
+        muse = sandbox_command([sys.executable, str(probe),
+                                # Muse keeps the whole Keychains folder (BACKLOG #27): exclude only those entries.
+                                '\n'.join(str(p) for p in denied if 'Library/Keychains' not in str(p)),
+                                str(ws / 'source.txt'), str(ws / '.env.example')], ws, home)
+        done = subprocess.run(muse, env={'HOME': str(home), 'PATH': '/usr/bin:/bin'},
+                              cwd=ws, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        # Keychain-backed template probe: securityd/security reads login.keychain-db* with folder metadata only;
+        # directory listing, other.keychain-db, and other templates' login files stay denied.
+        kc_dir = home / 'Library/Keychains'
+        for p in (kc_dir / 'login.keychain-db', kc_dir / 'other.keychain-db'):
+            p.unlink(missing_ok=True)
+        kc_env = {'HOME': str(home), 'CFFIXED_USER_HOME': str(home), 'PATH': '/usr/bin:/bin'}
+        for db, svc, secret in (('login.keychain-db', 'cs-login-probe', 'login-ok'),
+                                ('other.keychain-db', 'cs-other-probe', 'other-secret')):
+            db_path = str(kc_dir / db)
+            subprocess.run(['/usr/bin/security', 'create-keychain', '-p', 'testpass', db_path],
+                           env=kc_env, check=True, capture_output=True)
+            subprocess.run(['/usr/bin/security', 'add-generic-password', '-a', 'probe', '-s', svc, '-w', secret, db_path],
+                           env=kc_env, check=True, capture_output=True)
+        (kc_dir / 'login.keychain-db-wal').write_text('sidecar')
+        kc_probe = tmp / 'kc-probe.py'
+        kc_probe.write_text('''import os, subprocess
+from pathlib import Path
+home = Path(os.environ["HOME"])
+kc = home / "Library/Keychains"
+assert kc.stat().st_mode
+assert (kc / "login.keychain-db").read_bytes()
+assert (kc / "login.keychain-db-wal").read_text() == "sidecar"
+try:
+    os.listdir(kc)
+except PermissionError:
+    pass
+else:
+    raise AssertionError("Keychains directory listing allowed")
+for denied in (kc / "other.keychain-db", home / ".codex/auth.json", home / ".pi/agent/auth.json"):
+    try:
+        denied.read_bytes()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("denied path readable: " + str(denied))
+res = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", "probe", "-s", "cs-login-probe", "-w", str(kc / "login.keychain-db")],
+                     capture_output=True, text=True)
+assert res.returncode == 0 and res.stdout.strip() == "login-ok", (res.returncode, res.stderr)
+other = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", "probe", "-s", "cs-other-probe", "-w", str(kc / "other.keychain-db")],
+                       capture_output=True, text=True)
+assert other.returncode != 0 and "other-secret" not in (other.stdout or ""), other.stdout
+''')
+        # Every retained grant can use the decoy login DB; every other template
+        # must refuse it. Explicit DB arguments avoid modifying Keychain preferences.
+        for name in templates:
+            if name in expected_keychain:
+                args = [sys.executable, str(kc_probe)]
+            else:
+                args = [sys.executable, '-c',
+                        'from pathlib import Path; import sys, subprocess; '
+                        '\ntry: Path(sys.argv[1]).read_bytes()'
+                        '\nexcept PermissionError: pass'
+                        '\nelse: raise AssertionError("unexpected Keychain grant")'
+                        '\nr = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", "probe", '
+                        '"-s", "cs-login-probe", "-w", sys.argv[1]], capture_output=True)'
+                        '\nassert r.returncode != 0 and b"login-ok" not in r.stdout',
+                        str(kc_dir / 'login.keychain-db')]
+            done = subprocess.run(['sandbox-exec', '-f', str(root / (name + '.sb')), *args],
+                                  env=kc_env, cwd=ws, capture_output=True, text=True)
+            assert done.returncode == 0, (name, done.stderr)
+        done = subprocess.run(sandbox_command([sys.executable, str(kc_probe)], ws, home),
+                              env=kc_env, cwd=ws, capture_output=True, text=True)
+        assert done.returncode == 0, ('muse-code', done.stderr)
+        print('PASS: Darwin Seatbelt blocks secret reads; staged auth and workspace readable')
+    else:
+        print('SKIP: actual Seatbelt probe (lead: run read-denies --darwin-probe on Darwin at landing)')
+    unstage(links)
+print('PASS: all template profiles, read denies/re-allows, non-Darwin refusal and explicit opt-in')

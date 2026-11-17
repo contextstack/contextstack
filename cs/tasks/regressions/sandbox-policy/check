@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""sandbox-policy regression (goal.md). Isolated estates only; lab/ledger is never written."""
+import io
+import json
+import os
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+
+# Direct ops imports and calls must not resolve the caller's estate either.
+_fixture_env = hermetic_env()
+os.environ.clear()
+os.environ.update(_fixture_env)
+
+HERE = Path(__file__).resolve().parent
+LAB = HERE.parents[2]
+V2 = HERE.parent / "runner-characterisation-v2"
+sys.path[:0] = [str(LAB / "ops/bin"), str(HERE.parent / "runner-characterisation")]
+import _env_policy  # noqa: E402
+import _harness  # noqa: E402
+import _sandbox_policy as sp  # noqa: E402
+
+FAILED = []
+FAKE = HERE / "fake-cs-sandbox"
+REAL = LAB.parent / "target/release/cs-sandbox"
+GOOD = {"version": 1, "runtime_read": ["$CODE_ROOT", "/usr"], "allow_net": ["none", "all"]}
+SPEC = (HERE / "cell/spec.yaml").read_text()
+
+
+def expect(ok, what, detail=None):
+    print(("ok   " if ok else "FAIL ") + what + ("" if ok or detail is None else " : %r" % (detail,)))
+    if not ok:
+        FAILED.append(what)
+
+
+def refused(fn, what, needle):
+    try:
+        fn()
+        expect(False, what, "no SandboxPolicyError")
+    except sp.SandboxPolicyError as error:
+        expect(needle in str(error), what, str(error))
+
+
+def estate(root, name, policy=GOOD, build=None):
+    """A stub estate: the real ops/bin, a policy, a stub runner that records CS_TOOL_PREFIX.
+    `build`: a fake wrapper at <estate parent>/target/<build>/cs-sandbox (the repo-relative lookup)."""
+    e = root / name / "lab"
+    for d in ("ops/bin", "ledger", "specs", "tasks/fx", "policy", "home"):
+        (e / d).mkdir(parents=True)
+    for p in (LAB / "ops/bin").iterdir():
+        if p.is_file():
+            shutil.copy2(p, e / "ops/bin" / p.name)
+    (e / "ESTATE").write_text("dev\n")
+    (e / "INVARIANTS.md").write_text("# fixture\n")
+    shutil.copytree(HERE / "cell/task", e / "tasks/fx", dirs_exist_ok=True)
+    shutil.copy2(LAB / "policy/env.json", e / "policy/env.json")
+    if policy is not None:
+        (e / "policy/sandbox.json").write_text(policy if isinstance(policy, str) else json.dumps(policy))
+    (e / "specs/ok.yaml").write_text(SPEC)
+    (e / "lab").write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                           "open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launched.json'), 'a').write("
+                           "json.dumps({k: os.environ.get(k) for k in ('CS_TOOL_PREFIX', 'LAB_BROWSER_STATE')}) + '\\n')\n")
+    (e / "lab").chmod(0o755)
+    if build:
+        (e.parent / "target" / build).mkdir(parents=True)
+        shutil.copy2(FAKE, e.parent / "target" / build / "cs-sandbox")
+    return e
+
+
+def cell_of(prefix, wrapper, e):
+    """A launcher-built prefix: wrapper --policy <lab>/policy/sandbox.json --report-dir <state>/sandbox-reports/<cell> --."""
+    head = "%s --policy %s --report-dir %s/" % (wrapper, e.resolve() / sp.POLICY, e.resolve() / "ledger/sandbox-reports")
+    m = re.fullmatch(re.escape(head) + r"(\d+-\d+-[0-9a-f]{8}) --", prefix or "")
+    return m.group(1) if m else None
+
+
+def launches(e):
+    p = e / "launched.json"
+    return [json.loads(l) for l in p.read_text().splitlines()] if p.is_file() else []
+
+
+def clean_env(**extra):
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG") if k in os.environ}
+    env.update(extra)
+    return env
+
+
+def run_spec(e, **extra):
+    return subprocess.run([str(e / "ops/bin/run-spec"), "specs/ok.yaml"], cwd=str(e), text=True, capture_output=True,
+                          env=clean_env(LAB_RUNNER_BIN=str(e / "lab"), **extra), timeout=60)
+
+
+def real_wrapper_cell(scratch):
+    """fs_write, fs_read and exec echo pass under the real cs-sandbox; a symlink read out of the workspace is denied.
+    exec's `cat` follows symlinks on its own (../tool-escapes-workspace), so that denial is the wrapper's, not the tool's.
+    fs_read carried this probe before moving to cs-tools, which refuses the link itself (asserted separately)."""
+    sentinel = "SENTINEL-real-wrapper-%d" % os.getpid()
+    secret = scratch / "outside-secret.txt"
+    secret.write_text(sentinel + "\n")
+    cell = scratch / "cell-real"
+    shutil.copytree(HERE / "cell", cell)
+    (cell / "case.json").write_text(json.dumps({"entry": "run-spec", "sandbox": True, "env": {}}))
+    (cell / "spec.yaml").write_text(SPEC.replace("turns: 5", "turns: 6"))
+    turns = [[("fs_write", {"path": "hello.txt", "content": "hello"})],
+             [("fs_read", {"path": "hello.txt"}), ("exec", {"cmd": ["echo", "sandboxed-echo"]})],
+             [("exec", {"cmd": ["sh", "-c", "ln -s %s link.txt" % secret]})],
+             [("exec", {"cmd": ["cat", "link.txt"]}), ("fs_read", {"path": "link.txt"})]]
+    script = []
+    for i, calls in enumerate(turns):
+        script.append({"ok": {"text": "step %d" % i, "tool_calls": [
+            {"id": "%d-%d" % (i, j), "name": n, "args": a} for j, (n, a) in enumerate(calls)]}})
+    script.append({"ok": {"text": "done", "tool_calls": []}})
+    (cell / "gateway.json").write_text(json.dumps(script))
+    binary = _harness.current_runner()
+    real_build = _harness.build_estate
+
+    def with_release_wrapper(root, *rest):
+        estate = real_build(root, *rest)
+        (root / "target/release").mkdir(parents=True)
+        shutil.copy2(REAL, root / "target/release/cs-sandbox")
+        return estate
+
+    _harness.build_estate = with_release_wrapper  # restored below; the harness has no other hook
+    try:
+        status, actual, root = _harness.run_case(cell, binary, LAB, V2, _harness.load_gateway(V2), scratch, True)
+    finally:
+        _harness.build_estate = real_build
+    verdicts = [r.get("verdict") for r in actual.get("rows", [])]
+    transcript = "".join(r.get("transcript", "") for r in actual.get("runs", []))
+    leftover = [p.name for p in (root / "estate/tmp").iterdir() if p.name.startswith("cs-sandbox-")]
+    expect(actual.get("exit_code") == 0 and verdicts == ["pass"], "real: run-spec cell passes under the release wrapper",
+           (actual.get("exit_code"), verdicts, actual.get("stderr")))
+    expect("hello" in transcript and "sandboxed-echo" in transcript, "real: fs_write, fs_read and exec echo observed in the transcript")
+    expect("Operation not permitted" in transcript and sentinel not in transcript, "real: exec cat through a symlink out of the workspace is denied",
+           transcript[-600:])
+    expect("path escapes workspace: link.txt" in transcript, "real: fs_read (cs-tools) refuses the same symlink itself", transcript[-600:])
+    expect(secret.read_text() == sentinel + "\n" and not leftover, "real: the outside file is untouched and no per-call tmp dir is left", leftover)
+    # the wrapper's reports reach the run dir and the row names the denial.
+    run_dir = next((root / "estate/ledger/runs").iterdir())
+    reports = [json.loads(p.read_text()) for p in sorted((run_dir / "sandbox").glob("*.json"))]
+    row = (actual.get("rows") or [{}])[0]
+    ws = os.path.realpath(str(run_dir / "workspace"))
+    expect(len(reports) == row.get("tool_calls") == 6 and all(r.get("cwd") == ws and r.get("backend") for r in reports),
+           "real: one report per wrapped call, claimed into <run dir>/sandbox/, each with the run's workspace",
+           (len(reports), row.get("tool_calls"), [r.get("cwd") for r in reports][:2], ws))
+    cells = root / "estate/ledger/sandbox-reports"
+    expect(not cells.is_dir() or not any(cells.iterdir()), "real: the cell's report dir is emptied and removed",
+           list(cells.iterdir()) if cells.is_dir() else None)
+    expect((row.get("call_errors") or {}).get("sandbox_denied") == 1 and row.get("sandbox") == {"sandbox_denied": ["exec"]},
+           "real: the denied symlink read is sandbox_denied, naming exec; fs_read's own refusal stays tool_exit",
+           (row.get("call_errors"), row.get("sandbox")))
+
+
+def cell_prefix_rules(scratch):
+    """the launcher's prefix gains a fresh per-cell --report-dir; a preset, or no `--`, is left alone."""
+    built = sp.prefix_value([str(FAKE), "--policy", "/p.json", "--"])
+    a, b = sp.cell_prefix(built, {}, "/state/sandbox-reports"), sp.cell_prefix(built, {}, "/state/sandbox-reports")
+    pat = re.escape(str(FAKE) + " --policy /p.json --report-dir /state/sandbox-reports/") + r"\d+-\d+-[0-9a-f]{8} --"
+    expect(re.fullmatch(pat, a or "") and re.fullmatch(pat, b or "") and a != b, "cell_prefix: --report-dir before --, fresh per cell", (a, b))
+    expect(sp.cell_prefix(built, {"CS_TOOL_PREFIX": built}, "/s") == built and sp.cell_prefix("/usr/bin/env", {}, "/s") == "/usr/bin/env"
+           and sp.cell_prefix(None, {}, "/s") is None and sp.cell_prefix(a, {}, "/s") == a,
+           "cell_prefix: a preset, a prefix without --, none, or one already naming a report dir passes unchanged")
+    refused(lambda: sp.cell_prefix(built, {}, str(scratch / "has space")), "cell_prefix: a report root with whitespace is refused", "whitespace")
+
+
+def sweep_claims(scratch):
+    """finalize-run with no prefix in its environment (tick's sweep) scans <state>/sandbox-reports and claims
+    only the reports whose cwd is the run's workspace; another run's cell dir is untouched."""
+    state = scratch / "sweep-state"
+    run = state / "runs/20261109-000000.000000001-fx-sweep-t1"
+    (run / "workspace").mkdir(parents=True)
+    other_ws = scratch / "other-ws"
+    other_ws.mkdir()
+    tool = os.path.realpath(sp.tool_argv(LAB, "fs_write")[0])
+    events = [{"event": "header", "spec": "fx-sweep", "exp": "fixture", "task": "tasks/fx", "trial": 1, "model": "fake",
+               "budget": {"turns": 1, "tool_calls": 1, "usd": 1, "seconds": 0}},
+              {"event": "tool", "turn": 1, "name": "fs_write", "args": {"path": "/etc/hosts", "content": "x"}, "error": True,
+               "content": "fs_write: /etc/hosts: Operation not permitted\n\nexit: exit status 1"}]
+    (run / "messages.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    (run / "terminal.json").write_text(json.dumps({"run_id": run.name, "transcript": "ledger/runs/" + run.name, "spec": "fx-sweep",
+                                                   "stop": "done", "verdict": "void", "turns": 1, "tool_calls": 1, "cost_usd": 0.0,
+                                                   "est_usd": 0.0, "check_window": 5}))
+
+    def report(cell, ws, n):
+        ws = os.path.realpath(str(ws))
+        d = state / "sandbox-reports" / cell
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ("%d-1.json" % n)).write_text(json.dumps({"backend": "fixture", "tool": tool, "args": [], "cwd": ws, "narrowed": [],
+                                                      "effective_policy": {"read": [ws], "write": [ws], "tmp": "", "write_env": {}}}))
+    report("cell-own", run / "workspace", 1)
+    report("cell-other", other_ws, 2)
+    report("cell-mixed", run / "workspace", 3)
+    report("cell-mixed", other_ws, 4)
+    env = clean_env(LAB_STATE_ROOT=str(state))
+    r = subprocess.run([str(LAB / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(run)}), text=True,
+                       capture_output=True, env=env, cwd=str(LAB), timeout=60)
+    rows = [json.loads(l) for l in (state / "ledger.jsonl").read_text().splitlines()] if (state / "ledger.jsonl").is_file() else []
+    left = sorted("%s/%s" % (p.parent.name, p.name) for p in (state / "sandbox-reports").rglob("*.json"))
+    claimed = sorted(p.name for p in (run / "sandbox").glob("*.json")) if (run / "sandbox").is_dir() else []
+    expect(r.returncode == 0 and claimed == ["1-1.json", "3-1.json"] and left == ["cell-mixed/4-1.json", "cell-other/2-1.json"]
+           and not (state / "sandbox-reports/cell-own").exists(),
+           "sweep: no prefix -> every cell dir scanned; only this run's reports claimed, the emptied dir removed",
+           (r.returncode, r.stdout[-300:], claimed, left))
+    row = rows[-1] if rows else {}
+    expect(row.get("call_errors") == {"sandbox_denied": 1} and row.get("sandbox") == {"sandbox_denied": ["fs_write"]},
+           "sweep: the row counts sandbox_denied and names fs_write", (row.get("call_errors"), row.get("sandbox")))
+    env_file = state / "outbox" / (run.name + ".json")
+    envelope = json.loads(env_file.read_text()) if env_file.is_file() else {}
+    paths = [f["path"] for f in envelope.get("files", [])]
+    expect(envelope.get("sandbox") == {"reports": 2, "backends": ["fixture"], "narrowed": 0, "tools": {"sandbox_denied": ["fs_write"]}}
+           and "sandbox/1-1.json" in paths and "sandbox/3-1.json" in paths,
+           "sweep: the envelope carries the sandbox summary and binds the reports by sha256", (envelope.get("sandbox"), paths))
+
+
+def concurrent_cells(scratch):
+    """two cells running at once that share one report dir (a preset prefix) never mix: each finalize-run
+    claims only the reports whose cwd is its own workspace, and the shared dir is gone once both have."""
+    cell = scratch / "cell-concurrent"
+    shutil.copytree(V2 / "cases/concurrent-two-runs", cell)
+    (cell / "case.json").write_text(json.dumps({"concurrent": 2, "env": {
+        "CS_TOOL_PREFIX": "<ESTATE>/fixture/fx_reporting --report-dir <ESTATE>/ledger/sandbox-reports/shared --"}}))
+    calls = [{"id": str(i), "name": "fx_tool", "args": {"mode": "echo"}} for i in range(3)]
+    (cell / "gateway.json").write_text(json.dumps([{"ok": {"text": "calls", "tool_calls": calls}}] * 2
+                                                  + [{"ok": {"text": "done", "tool_calls": []}}]))
+    binary = _harness.current_runner()
+    status, actual, root = _harness.run_case(cell, binary, LAB, V2, _harness.load_gateway(V2), scratch, True)
+    runs = sorted((root / "estate/ledger/runs").iterdir())
+    seen = []
+    for run in runs:
+        ws = os.path.realpath(str(run / "workspace"))
+        mine = [json.loads(p.read_text()) for p in (run / "sandbox").glob("*.json")] if (run / "sandbox").is_dir() else []
+        term = json.loads((run / "terminal.json").read_text())
+        seen.append((len(mine), term.get("tool_calls"), all(r["cwd"] == ws for r in mine)))
+    shared = root / "estate/ledger/sandbox-reports/shared"
+    expect(len(runs) == 2 and all(n == t and own for n, t, own in seen) and sum(n for n, _, _ in seen) == 6 and not shared.exists(),
+           "concurrent: two cells, one shared report dir: each run claims exactly its own calls' reports, the dir is removed",
+           (seen, [r.get("verdict") for r in actual.get("rows", [])], sorted(shared.iterdir()) if shared.exists() else None))
+
+
+def exe_descriptors(scratch):
+    """a runtime exe tool's descriptor is tools/bin/<name>.json, while the runners exec its bin + args.
+    tool_argv builds that argv; the real wrapper finds the descriptor by bin and args and applies its request."""
+    e = estate(scratch, "exe")
+    (e / "tools/bin").mkdir(parents=True)
+    (e / "fixture").mkdir()
+    multi = e / "fixture/multi"  # inside $CODE_ROOT: a script's interpreter must read it under the policy
+    multi.write_text('#!/bin/sh\necho "multi $*"\n')
+    multi.chmod(0o755)
+    descs = {"r": {"runtime": "exe", "bin": "lab/fixture/multi", "args": ["r", "two words"], "sandbox": {"net": "all"}},
+             "n": {"runtime": "exe", "bin": str(multi), "args": ["n"]},
+             "py": {"runtime": "python3", "sandbox": {"net": "all"}}}
+    for name, d in descs.items():
+        (e / "tools/bin" / (name + ".json")).write_text(json.dumps(d))
+    expect(sp.tool_argv(e, "r") == [str(e.resolve().parent / "lab/fixture/multi"), "r", "two words"],
+           "exe: tool_argv = bin (relative to the repo holding the code root) + args", sp.tool_argv(e, "r"))
+    expect(sp.tool_argv(e, "n") == [str(multi), "n"] and sp.tool_argv(e, "py") == [str(e / "tools/bin/py")],
+           "exe: an absolute bin is kept; any other runtime is the file pair", (sp.tool_argv(e, "n"), sp.tool_argv(e, "py")))
+    if not REAL.is_file():
+        print("skip exe real wrapper: %s is not built" % REAL)
+        return
+    shutil.copy2(LAB / "policy/sandbox.json", e / "policy/sandbox.json")
+    ws, reports = scratch / "exe-ws", scratch / "exe-reports"
+    ws.mkdir()
+
+    def wrapped(argv):
+        before = set(reports.glob("*.json")) if reports.is_dir() else set()
+        r = subprocess.run([str(REAL), "--policy", str(e / "policy/sandbox.json"), "--report-dir", str(reports), "--"] + argv,
+                           cwd=str(ws), input="{}", text=True, capture_output=True, timeout=30, env={**hermetic_env()})
+        new = sorted(set(reports.glob("*.json")) - before) if reports.is_dir() else []
+        return r, (json.loads(new[0].read_text())["effective_policy"]["net"] if new else None)
+
+    for name, net in (("r", "all"), ("n", "none")):
+        r, got = wrapped(sp.tool_argv(e, name))
+        expect(r.returncode == 0 and r.stdout == "multi %s\n" % " ".join(sp.tool_argv(e, name)[1:]) and got == net,
+               "exe real: %s runs as bin + args under the wrapper with its descriptor's net %s" % (name, net), (r.returncode, r.stdout, r.stderr, got))
+    r, got = wrapped([str(multi), "unlisted"])
+    expect(r.returncode == 0 and got == "none", "exe real: args no descriptor names -> the default request (net none)", (r.returncode, r.stderr, got))
+    (e / "tools/bin/twin.json").write_text(json.dumps(descs["r"]))
+    r, got = wrapped(sp.tool_argv(e, "r"))
+    expect(r.returncode == 101 and "runtime exe descriptors name" in r.stderr and got is None,
+           "exe real: two descriptors naming the same bin + args -> 101, the tool not run", (r.returncode, r.stderr))
+
+
+def main():
+    # 1. One list: the two switches reach every child (equality of the three lists is env-policy's).
+    rust = re.search(r'const DEFAULT_ENV: &str = "([^"]+)";', (LAB.parent / "harness/src/process.rs").read_text()).group(1).split()
+    always = json.loads((LAB / "policy/env.json").read_text())["always"]
+    for name in ("CS_TOOL_PREFIX", "CS_SANDBOX_BIN", "LAB_BROWSER_STATE"):
+        expect(name in rust and name in always and name in _env_policy.DEFAULT_ENV, "env: %s in process.rs DEFAULT_ENV, always, _env_policy.DEFAULT_ENV" % name)
+    # 2. The committed policy and the twelve requests.
+    committed = sp.load_policy(LAB)
+    expect(committed is not None and "tmp_in_workspace" not in committed, "policy: committed sandbox.json loads (no tmp key: tmp is per call)", committed)
+    tools = [t["name"] for t in json.loads((LAB / "tools/manifest.json").read_text())["tools"]]
+    reqs = {t: json.loads((LAB / "tools/bin" / (t + ".json")).read_text()).get("sandbox") for t in tools}
+    expect(len(tools) == 12 and all(isinstance(r, dict) and r.get("net") in sp.NETS for r in reqs.values()),
+           "descriptors: every manifest tool requests a sandbox net", reqs)
+    env_requests = {t: r["write_env"] for t, r in reqs.items() if "write_env" in r}
+    expect(env_requests == {"browser_fetch": ["LAB_BROWSER_STATE"]}
+           and committed.get("write_env") == {"LAB_BROWSER_STATE": ["$HOME/.contextstack"]},
+           "write_env: only browser_fetch requests LAB_BROWSER_STATE; the host confines it to $HOME/.contextstack",
+           (env_requests, committed.get("write_env")))
+    profile_requests = {t: r["profile"] for t, r in reqs.items() if "profile" in r}
+    expect(profile_requests == {"browser_fetch": "browser"} and set(committed.get("profiles", {})) == {"browser", "cli-executor"},
+           "profiles: only browser_fetch requests a profile (browser); the host lists browser and the coding agents' cli-executor (ADR 0021)",
+           (profile_requests, committed.get("profiles")))
+    socket_requests = {t: r["sockets"] for t, r in reqs.items() if r.get("sockets")}
+    expect(socket_requests == {"browser_session": ["browser-public"]} and set(committed.get("sockets", {})) == {"browser-public"},
+           "sockets: only browser_session requests one (browser-public); the host lists it",
+           (socket_requests, committed.get("sockets")))
+    scratch = Path(tempfile.mkdtemp(prefix="sandbox-policy-", suffix=".noindex"))
+    try:
+        # 3. Shape: every malformed policy is a named refusal.
+        bad = [("version 2", dict(GOOD, version=2), "version 1"), ("missing key", {k: v for k, v in GOOD.items() if k != "allow_net"}, "want exactly"),
+               ("extra key", dict(GOOD, limits={}), "want exactly"), ("runtime_read scalar", dict(GOOD, runtime_read="/usr"), "runtime_read"),
+               ("runtime_read relative", dict(GOOD, runtime_read=["usr"]), "runtime_read"), ("allow_net unknown", dict(GOOD, allow_net=["lan"]), "allow_net"),
+               ("removed tmp_in_workspace", dict(GOOD, tmp_in_workspace=".lab-tmp"), "want exactly"), ("not json", "{", "policy/sandbox.json: "),
+               ("write_env list", dict(GOOD, write_env=["LAB_X"]), "write_env"), ("write_env root relative", dict(GOOD, write_env={"LAB_X": ["state"]}), "write_env"),
+               ("write_env no roots", dict(GOOD, write_env={"LAB_X": []}), "write_env"), ("write_env bad name", dict(GOOD, write_env={"lab-x": ["/s"]}), "write_env"),
+               ("runtime_read unknown OS", dict(GOOD, runtime_read={"windows": ["/x"]}), "runtime_read"),
+               ("runtime_read per-OS relative", dict(GOOD, runtime_read={"linux": ["usr"]}), "runtime_read"),
+               ("runtime_read per-OS empty", dict(GOOD, runtime_read={}), "runtime_read"),
+               ("profiles unknown name", dict(GOOD, profiles={"gpu": {"read": ["/x"]}}), "profiles"),
+               ("profiles extra key", dict(GOOD, profiles={"browser": {"read": ["/x"], "mach": []}}), "profiles.browser"),
+               ("profiles read relative", dict(GOOD, profiles={"browser": {"read": {"macos": ["x"]}}}), "profiles.browser.read"),
+               ("sockets list", dict(GOOD, sockets=["/s.sock"]), "sockets"),
+               ("sockets bad name", dict(GOOD, sockets={"Browser_X": "/s.sock"}), "sockets"),
+               ("sockets relative", dict(GOOD, sockets={"browser-public": "s.sock"}), "sockets"),
+               ("write_env $TOOL_PYTHON", dict(GOOD, write_env={"LAB_X": ["$TOOL_PYTHON"]}), "write_env"),
+               ("sockets $TOOL_PYTHON", dict(GOOD, sockets={"browser-public": "$TOOL_PYTHON/s.sock"}), "sockets")]
+        for i, (label, pol, needle) in enumerate(bad):
+            e = estate(scratch, "bad%d" % i, pol)
+            refused(lambda: sp.load_policy(e), "shape: %s refused" % label, needle)
+        expect(sp.load_policy(estate(scratch, "absent", None)) is None, "shape: absent file = None (nothing to enforce)")
+        per_os = dict(GOOD, runtime_read={"macos": ["$CODE_ROOT", "/opt/homebrew"], "linux": ["$CODE_ROOT", "/lib64"]})
+        expect(sp.load_policy(estate(scratch, "per-os", per_os)) == per_os, "shape: runtime_read {macos, linux} loads (phase 3b)")
+        expect(isinstance(committed["runtime_read"], dict) and set(committed["runtime_read"]) == {"macos", "linux"},
+               "policy: committed runtime_read carries a macOS and a Linux list", committed["runtime_read"])
+        expect(all("$TOOL_PYTHON" in committed["runtime_read"][os_] for os_ in ("macos", "linux")),
+               "policy: both OS lists read $TOOL_PYTHON, the venv interpreter's install (a release's is outside the code root)",
+               committed["runtime_read"])
+        for os_ in ("macos", "linux"):
+            for entry in committed["runtime_read"][os_]:
+                expect(entry != "$CODE_ROOT",
+                       "policy: runtime_read must not grant the whole code root (%s has %r)" % (os_, entry), entry)
+        expect(any(p.startswith("$REPO_ROOT/target") for p in committed["runtime_read"]["macos"]),
+               "policy: macOS runtime_read names the repo's target/ build trees for runtime exe tools", committed["runtime_read"]["macos"])
+        expect(all("$CODE_ROOT/tools" in committed["runtime_read"][os_] for os_ in ("macos", "linux")),
+               "policy: runtime_read includes $CODE_ROOT/tools (defuddle_extract's tools/defuddle/node_modules lives there)")
+        tool_py = dict(GOOD, runtime_read=["$CODE_ROOT", "$TOOL_PYTHON"])
+        expect(sp.load_policy(estate(scratch, "tool-python", tool_py)) == tool_py, "shape: $TOOL_PYTHON loads in a read list (only)")
+        with_env = dict(GOOD, write_env={"LAB_X": ["$HOME/.contextstack", "/srv/state"]})
+        expect(sp.load_policy(estate(scratch, "write-env", with_env)) == with_env, "shape: optional write_env {VAR: [roots]} loads")
+        with_profile = dict(GOOD, profiles={"browser": {"read": {"macos": ["$HOME/b"], "linux": ["/opt/b"]}}})
+        expect(sp.load_policy(estate(scratch, "profiles", with_profile)) == with_profile, "shape: optional profiles {browser: {read}} loads")
+        with_sockets = dict(GOOD, sockets={"browser-public": "$HOME/.contextstack/browser/sockets/public.sock"})
+        expect(sp.load_policy(estate(scratch, "sockets", with_sockets)) == with_sockets, "shape: optional sockets {name: path} loads")
+        # 4. Resolution rules, decided by explicit envs.
+        debug = estate(scratch, "debug", build="debug")
+        expect(sp.tool_prefix_value(debug, {}).startswith(str(debug.resolve().parent / "target/debug/cs-sandbox") + " "),
+               "rule: wrapper at <repo>/target/debug when no release build")
+        e = estate(scratch, "rules", build="release")
+        want = sp.prefix_value([str(e.resolve().parent / "target/release/cs-sandbox"), "--policy", str(e.resolve() / "policy/sandbox.json"), "--"])
+        expect(sp.tool_prefix_value(e, {"CS_TOOL_PREFIX": "/usr/bin/env"}) == "/usr/bin/env", "rule: a preset prefix passes through unchanged")
+        expect(sp.tool_prefix_value(e, {"CS_TOOL_PREFIX": ""}) == "", "rule: a preset empty prefix passes through (explicitly unconfined)")
+        expect(sp.tool_prefix_value(e, {}) == want, "rule: wrapper at <repo>/target/release -> the prefix", sp.tool_prefix_value(e, {}))
+        expect(sp.tool_prefix_value(e, {"CS_SANDBOX_BIN": str(FAKE)}).startswith(str(FAKE) + " --policy "), "rule: CS_SANDBOX_BIN wins")
+        refused(lambda: sp.tool_prefix_value(estate(scratch, "badpre", "{"), {"CS_TOOL_PREFIX": "x"}),
+                "rule: a malformed policy refuses even with a preset", "policy/sandbox.json")
+        spaced = scratch / "has space"
+        spaced.mkdir()
+        shutil.copy2(FAKE, spaced / "cs-sandbox")
+        refused(lambda: sp.tool_prefix_value(e, {"CS_SANDBOX_BIN": str(spaced / "cs-sandbox")}), "rule: a wrapper path with whitespace is refused", "whitespace")
+        refused(lambda: sp.tool_prefix_value(estate(scratch, "unbuilt"), {"CS_SANDBOX_BIN": str(scratch / "missing")}),
+                "rule: no wrapper -> SandboxPolicyError (refuse unconfined tools)", sp.UNBUILT)
+        err = io.StringIO()
+        got = sp.tool_prefix_value(estate(scratch, "unbuilt-dev"), {"CS_SANDBOX_BIN": str(scratch / "missing"),
+                                                                  sp.DEV_UNCONFINED: "1"}, stderr=err)
+        expect(got is None and err.getvalue() == sp.UNBUILT + "\n",
+               "rule: CS_SANDBOX_DEV_UNCONFINED=1 -> unset plus the development-mode line", (got, err.getvalue()))
+        err = io.StringIO()
+        expect(sp.tool_prefix_value(estate(scratch, "nopol", None), {}, stderr=err) is None and not err.getvalue(),
+               "rule: no policy file -> unset, silent")
+        listed = estate(scratch, "browser-state", dict(GOOD, write_env={"LAB_BROWSER_STATE": ["$HOME/.contextstack"]}))
+        expect(sp.browser_state_value(listed, {"HOME": "/h"}) == "/h/.contextstack/lab/browser-state"
+               and sp.browser_state_value(listed, {"HOME": "/h", "LAB_BROWSER_STATE": "/s"}) == "/s",
+               "rule: policy lists LAB_BROWSER_STATE -> default under $HOME/.contextstack, a set value passes through")
+        expect(sp.browser_state_value(e, {"HOME": "/h"}) is None and sp.browser_state_value(estate(scratch, "nostate", None), {"HOME": "/h"}) is None,
+               "rule: policy without that write_env, or no policy -> LAB_BROWSER_STATE not set")
+        # 5. run-spec: the launcher sets the prefix; the runner inherits it.
+        e = estate(scratch, "run-spec", dict(GOOD, write_env={"LAB_BROWSER_STATE": ["$HOME/.contextstack"]}))
+        r = run_spec(e, CS_SANDBOX_BIN=str(FAKE))
+        first = cell_of(launches(e)[-1]["CS_TOOL_PREFIX"], FAKE, e) if launches(e) else None
+        expect(r.returncode == 0 and first,
+               "run-spec: the runner inherits CS_TOOL_PREFIX = wrapper --policy <lab>/policy/sandbox.json --report-dir <state>/sandbox-reports/<cell> --",
+               (r.returncode, launches(e), r.stderr))
+        run_spec(e, CS_SANDBOX_BIN=str(FAKE))
+        second = cell_of(launches(e)[-1]["CS_TOOL_PREFIX"], FAKE, e)
+        expect(second and second != first, "run-spec: each cell gets its own report dir", (first, second))
+        home = clean_env()["HOME"]
+        expect(launches(e)[-1]["LAB_BROWSER_STATE"] == home + "/.contextstack/lab/browser-state",
+               "run-spec: the runner inherits the LAB_BROWSER_STATE default", launches(e)[-1])
+        run_spec(e, CS_SANDBOX_BIN=str(FAKE), LAB_BROWSER_STATE="/preset/state")
+        expect(launches(e)[-1]["LAB_BROWSER_STATE"] == "/preset/state", "run-spec: a set LAB_BROWSER_STATE passes through")
+        n_launch = len(launches(e))
+        r = run_spec(e, CS_SANDBOX_BIN=str(scratch / "missing"))
+        expect(r.returncode == 2 and sp.UNBUILT in r.stderr and len(launches(e)) == n_launch,
+               "run-spec: no wrapper -> exit 2, no new cell", (r.returncode, r.stderr, len(launches(e)), n_launch))
+        r = run_spec(e, CS_SANDBOX_BIN=str(scratch / "missing"), CS_SANDBOX_DEV_UNCONFINED="1")
+        expect(launches(e)[-1]["CS_TOOL_PREFIX"] is None and sp.UNBUILT in r.stderr,
+               "run-spec: no wrapper with CS_SANDBOX_DEV_UNCONFINED=1 -> unset, stderr says so", r.stderr)
+        r = run_spec(e, CS_TOOL_PREFIX="/usr/bin/env", CS_SANDBOX_BIN=str(FAKE))
+        expect(launches(e)[-1]["CS_TOOL_PREFIX"] == "/usr/bin/env", "run-spec: a preset prefix passes through")
+        e = estate(scratch, "run-spec-bad", dict(GOOD, version=2))
+        r = run_spec(e, CS_SANDBOX_BIN=str(FAKE))
+        expect(r.returncode == 2 and "run-spec: policy/sandbox.json: " in r.stderr and not launches(e), "run-spec: malformed policy exits 2, no cell", r.stderr)
+        # 6. tick: run_spec from the estate (never the live tick).
+        e = estate(scratch, "tick", dict(GOOD, write_env={"LAB_BROWSER_STATE": ["$HOME/.contextstack"]}))
+        sys.path.insert(0, str(e / "ops/bin"))
+        os.environ.pop("CS_TOOL_PREFIX", None)
+        os.environ.pop("LAB_RUNNER_BIN", None)  # _runner: the estate's stub, named (the default is the Rust runner)
+        os.environ["CS_RUNNER_BIN"] = str(e / "lab")
+        os.environ["CS_SANDBOX_BIN"] = str(FAKE)
+        tick = runpy.run_path(str(e / "ops/bin/tick"))
+        try:  # the stub runner leaves no ledger row, so run_spec ends in its no-row error after launching
+            tick["run_spec"]("specs/ok.yaml")
+        except RuntimeError:
+            pass
+        expect(launches(e) and cell_of(launches(e)[-1]["CS_TOOL_PREFIX"], FAKE, e),
+               "tick.run_spec: the runner inherits the prefix with its own report dir", launches(e))
+        want_state = tick["browser_state_value"](e, os.environ)
+        expect(want_state is not None and launches(e)[-1]["LAB_BROWSER_STATE"] == want_state,
+               "tick.run_spec: the runner inherits LAB_BROWSER_STATE", launches(e))
+        (e / "policy/sandbox.json").write_text("{")
+        rc, row = tick["run_spec"]("specs/ok.yaml")
+        expect(rc == 1 and row.get("verdict") == "void" and row.get("stop", "").startswith("sandbox_policy: policy/sandbox.json: ")
+               and tick["config_void_reason"](row) == "sandbox_policy" and len(launches(e)) == 1,
+               "tick.run_spec: malformed policy = config void sandbox_policy, nothing launched", (rc, row))
+        os.environ.pop("CS_SANDBOX_BIN")
+        os.environ.pop("CS_RUNNER_BIN")  # step 6's stub; step 7 runs the default Rust runner
+        # 7. End to end: a real runner and the fake gateway, through run-spec with the fake wrapper.
+        cell = scratch / "cell"
+        shutil.copytree(HERE / "cell", cell)
+        (cell / "case.json").write_text(json.dumps({"entry": "run-spec", "sandbox": True, "env": {"CS_SANDBOX_BIN": str(FAKE)}}))
+        binary = _harness.current_runner()
+        status, actual, root = _harness.run_case(cell, binary, LAB, V2, _harness.load_gateway(V2), scratch, True)
+        est = root / "estate"
+        log = (est / "home/fake-cs-sandbox.log").read_text().splitlines() if (est / "home/fake-cs-sandbox.log").is_file() else []
+        log = [l.replace(str(est.resolve()), "<ESTATE>").replace(str(est), "<ESTATE>") for l in log]
+        # fs_read is a runtime exe tool so the wrapper sees its bin (the harness makes it absolute) + args.
+        tools = {t: " ".join(sp.tool_argv(LAB, t)) if t == "fs_read" else "<ESTATE>/tools/bin/" + t for t in ("fs_write", "fs_read", "exec")}
+        calls = ["--policy <ESTATE>/policy/sandbox.json --report-dir <ESTATE>/ledger/sandbox-reports/<CELL> -- " + tools[t]
+                 for t in ("fs_write", "fs_read", "exec")]
+        verdicts = [r.get("verdict") for r in actual.get("rows", [])]
+        expect(actual.get("exit_code") == 0 and verdicts == ["pass"], "e2e: run-spec cell passes under the prefix", (actual.get("exit_code"), verdicts, actual.get("stderr")))
+        cells = {m for l in log for m in re.findall(r"sandbox-reports/(\S+) --", l)}
+        expect(len(cells) == 1 and [re.sub(r"sandbox-reports/\S+ --", "sandbox-reports/<CELL> --", l) for l in log] == calls,
+               "e2e: every tool call reached the runner as prefix + tool, one report dir for the cell (fake wrapper log)", log)
+        # 7b. runtime exe: the argv both runners build, and the wrapper's descriptor lookup.
+        exe_descriptors(scratch)
+        # 9. reports: the per-cell prefix, the sweep's scan, and two concurrent cells sharing a dir.
+        cell_prefix_rules(scratch)
+        sweep_claims(scratch)
+        concurrent_cells(scratch)
+        # 8. End to end with the real wrapper, found as run-spec finds it (<repo>/target/release beside the lab).
+        if REAL.is_file():
+            real_wrapper_cell(scratch)
+        else:
+            print("skip e2e real wrapper: %s is not built (cargo build --release at the repo root)" % REAL)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("check: sandbox-policy %d assertion(s) failed" % len(FAILED))
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

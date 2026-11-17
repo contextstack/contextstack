@@ -1,0 +1,20 @@
+{
+  "runtime": "exe",
+  "bin": "target/release/cs-tools",
+  "args": ["okf"],
+  "sandbox": {"net": "none"},
+  "provenance": "Rust port in cs-tools (tools/src/okf/) of the Ruby tool removed here: byte-for-byte stdout, stderr, exits and writes; YAML through libyaml 0.2.5's safe port with Psych 5.3's type rules. Also refuses a corpus file whose real location leaves the workspace (tools/README.md).",
+  "description": "Deterministic OKF operations over the current workspace: stamp, migrate, lint, or stale scan.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "action": {"type": "string", "enum": ["stamp", "migrate", "lint", "stale"]},
+      "root": {"type": "string"},
+      "version": {"type": "string"},
+      "from": {"type": "string"},
+      "to": {"type": "string"},
+      "now": {"type": "string"}
+    },
+    "required": ["action"]
+  }
+}

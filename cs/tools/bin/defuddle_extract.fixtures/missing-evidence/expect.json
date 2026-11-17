@@ -1,0 +1,9 @@
+{
+  "exit": 1,
+  "stdout": "defuddle_extract: evidence path is unsafe or missing\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {\"evidence\": \"_evidence/fetches/none.json\"}, \"name\": \"defuddle_extract\"}\n",
+    "_evidence/derivations/manifest.jsonl": null
+  },
+  "untouched": true
+}

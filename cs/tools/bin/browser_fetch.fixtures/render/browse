@@ -1,0 +1,16 @@
+#!/bin/sh
+# Fake gstack browse for the browser_fetch fixture: answers the CDP verbs the tool issues, offline.
+set -eu
+case "$1" in
+  goto) echo "Navigated to $2 (200)" ;;
+  wait) echo "Page loaded" ;;
+  url) echo "https://93.184.216.34/source" ;;
+  js) case "$2" in
+        *querySelectorAll*) printf '[{"text":"Fixture detail","href":"https://93.184.216.34/detail"}]' > "$4" ;;
+        *) printf 'Rendered fact: fixture browser evidence.\n' > "$4" ;;
+      esac
+      echo written ;;
+  archive) printf 'fixture mhtml archive' > "$2"; echo archived ;;
+  stop) ;;
+  *) exit 2 ;;
+esac

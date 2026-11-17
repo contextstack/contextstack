@@ -1,0 +1,17 @@
+{
+  "description": "Long-lived, on a fleet node (launchd com.contextstack.node-listen, KeepAlive): node protocol 2 beside the work. Holds one GET work open (jobs through the job-pull path, control messages recorded before they are acted on: cancel, schedule_change), reports status, live run events and schedules, and fires the node's own schedules. tick still runs the jobs. Not a model tool.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "seconds": {
+        "type": "number",
+        "description": "tests: stop after this many seconds"
+      },
+      "dispatch": {
+        "type": "boolean",
+        "description": "tests: false never starts tick or schedule-tick"
+      }
+    },
+    "additionalProperties": false
+  }
+}

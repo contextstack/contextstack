@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""browser-broker — a dedicated Google Chrome for sandboxed tools, driven over CDP. Operator-run.
+
+    browser-broker serve [--headed] [--keychain] [--allow-no-chrome-sandbox] [--config FILE] [--root DIR] [--chrome PATH]
+
+Starts real Chrome with --user-data-dir=<root>/agent-profile and --remote-debugging-pipe: CDP runs on the
+child's fds 3/4, held only by this process; no debugging port exists. Chrome's own sandbox stays on (this
+runs outside cs-sandbox and never passes --no-sandbox). For each origin set in policy/browser.json it serves
+<root>/sockets/<set>.sock (0600, directory 0700): one JSON line in, one JSON line out. The only verb is
+{"verb": "open", "url": U}: U must be https and its origin in the set; every document request (main frame,
+iframes, each redirect hop) is paused with Fetch.enable and failed when its origin is outside the set; the
+tab's final URL is checked again; the reply carries final_url, status, title, text (<= 5 MiB), its sha256,
+and every navigation allowed or blocked. Tools never speak CDP. Each request is one row in
+<root>/log/broker.jsonl. Root defaults to ~/.contextstack/browser and must lie under ~/.contextstack.
+cs-sandbox grants a set's socket by name (host policy "sockets", descriptor "sockets"). SIGTERM or SIGINT
+closes Chrome and removes the sockets; if Chrome exits, the broker exits 1 (no self-healing).
+Cookie encryption: by default Chrome gets --use-mock-keychain (macOS) and --password-store=basic (Linux), so it
+never prompts for or reads the OS keychain and its cookies are encrypted with a fixed key, protected only by the
+0700 profile dir. --keychain uses the OS keychain instead (the owner, 2026-11-09: available, not the default). The
+mode is fixed per profile in <root>/keychain-mode on first start (switching would make stored cookies
+unreadable), and a start in the other mode refuses.
+Chrome: --chrome, else the first executable of policy/browser.json's "chrome" entry for this OS (a path or a
+list; ~ and globs expand, highest match first), so Linux takes google-chrome, Chromium or Playwright's
+headless shell. Where the host blocks Chrome's own sandbox (Ubuntu's AppArmor userns restriction), Chrome
+dies with "No usable sandbox" and the broker refuses to start. --allow-no-chrome-sandbox (an operator's
+explicit choice, never a default) then retries once with --no-sandbox and says so in the ready line
+(chrome_sandbox: false) and on stderr; Chrome still runs outside cs-sandbox, unconfined.
+"""
+import argparse
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import select
+import signal
+import socket
+import socketserver
+import stat
+import sys
+import threading
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+LAB = Path(__file__).resolve().parents[2]
+STATE = Path.home() / ".contextstack"
+MAX_REQUEST = 64 * 1024
+MAX_TEXT = 5 * 1024 * 1024
+LOAD_TIMEOUT = 45
+NO_SANDBOX = "No usable sandbox"  # Chrome's fatal message when it cannot build its sandbox
+PAGE_JS = "JSON.stringify({title: document.title, text: document.body ? document.body.innerText : ''})"
+
+
+class BrokerError(RuntimeError):
+    pass
+
+
+def origin(url):
+    """scheme://host[:port], lowercased, default port dropped; None for anything but http(s)."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("https", "http") or not parts.hostname:
+        return None
+    default = 443 if parts.scheme == "https" else 80
+    return "%s://%s%s" % (parts.scheme, parts.hostname.lower(), "" if port in (None, default) else ":%d" % port)
+
+
+def load_config(path):
+    cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+    sets = cfg.get("sets") if isinstance(cfg, dict) else None
+    if cfg.get("version") != 1 or not isinstance(sets, dict) or not sets:
+        raise BrokerError("%s: want {version: 1, chrome, sets: {name: [origins]}}" % path)
+    for name, origins in sets.items():
+        if not name or not all(c.islower() or c.isdigit() or c == "-" for c in name):
+            raise BrokerError("set name %r is not [a-z0-9-]+" % name)
+        if not isinstance(origins, list) or not origins or any(
+                not isinstance(o, str) or not o.startswith("https://") or origin(o) != o for o in origins):
+            raise BrokerError("set %s: want https origins (scheme://host, no path), got %r" % (name, origins))
+    return cfg
+
+
+class CDP:
+    """CDP over Chrome's pipe: NUL-terminated JSON messages, our writes on fd 3, its replies on fd 4."""
+
+    def __init__(self, write_fd, read_fd):
+        self.w, self.r, self.buf, self.next, self.on_event = write_fd, read_fd, b"", 0, None
+
+    def send(self, method, params=None, session=None):
+        self.next += 1
+        msg = {"id": self.next, "method": method, "params": params or {}}
+        if session:
+            msg["sessionId"] = session
+        data = json.dumps(msg).encode() + b"\0"
+        try:  # a Chrome that already exited (e.g. no usable sandbox) is a closed pipe, not a crash
+            while data:
+                data = data[os.write(self.w, data):]
+        except BrokenPipeError:
+            raise BrokerError("chrome closed the debugging pipe") from None
+        return self.next
+
+    def _message(self, deadline):
+        while b"\0" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([self.r], [], [], left)[0]:
+                raise BrokerError("chrome did not answer in time")
+            chunk = os.read(self.r, 1 << 20)
+            if not chunk:
+                raise BrokerError("chrome closed the debugging pipe")
+            self.buf += chunk
+        raw, self.buf = self.buf.split(b"\0", 1)
+        return json.loads(raw)
+
+    def pump(self, deadline, until=lambda: False, want=None):
+        """Read messages, dispatching events, until `want` (an id) answers or `until()` holds."""
+        while not until():
+            msg = self._message(deadline)
+            if "id" not in msg:
+                if self.on_event:
+                    self.on_event(msg)
+            elif msg["id"] == want:
+                if "error" in msg:
+                    raise BrokerError("%s" % msg["error"].get("message", msg["error"]))
+                return msg.get("result", {})
+        return None
+
+    def call(self, method, params=None, session=None, timeout=30):
+        return self.pump(time.monotonic() + timeout, want=self.send(method, params, session))
+
+
+class Broker:
+    def __init__(self, cdp, sets, log_path):
+        self.cdp, self.sets, self.log_path, self.lock = cdp, sets, log_path, threading.Lock()
+
+    def log(self, row):
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def handle(self, set_name, request):
+        started, url = time.monotonic(), request.get("url") if isinstance(request, dict) else None
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "set": set_name,
+               "verb": request.get("verb") if isinstance(request, dict) else None, "url": url}
+        state = {"navigations": [], "blocked": [], "loaded": False, "docs": {}}
+        try:
+            if row["verb"] != "open":
+                raise BrokerError("unknown verb %r; the only verb is open" % (row["verb"],))
+            with self.lock:
+                result = self.open(set_name, url, state)
+            row.update(ok=True, final_url=result["final_url"], status=result["status"],
+                       navigations=result["navigations"], blocked=result["blocked"],
+                       bytes=result["bytes"], sha256=result["sha256"])
+            reply = dict(result, ok=True)
+        except (BrokerError, ValueError, OSError) as error:
+            row.update(ok=False, error=str(error), navigations=state["navigations"], blocked=state["blocked"])
+            reply = {"ok": False, "error": str(error), "navigations": state["navigations"], "blocked": state["blocked"]}
+        row["ms"] = int((time.monotonic() - started) * 1000)
+        self.log(row)
+        return reply
+
+    def open(self, set_name, url, state):
+        allowed = set(self.sets[set_name])
+        if not isinstance(url, str) or not url.startswith("https://") or origin(url) not in allowed:
+            raise BrokerError("origin of %r is not in set %s" % (url, set_name))
+        cdp = self.cdp
+        before = self.pages()
+        target = cdp.call("Target.createTarget", {"url": "about:blank"})["targetId"]
+        try:
+            sid = cdp.call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+
+            def on_event(msg):
+                if msg.get("sessionId") != sid:
+                    return
+                method, p = msg.get("method"), msg.get("params", {})
+                if method == "Fetch.requestPaused":
+                    req_url = p.get("request", {}).get("url", "")
+                    ok = origin(req_url) in allowed and req_url.startswith("https://")
+                    state["navigations" if ok else "blocked"].append(req_url)
+                    if ok:
+                        cdp.send("Fetch.continueRequest", {"requestId": p["requestId"]}, sid)
+                    else:
+                        cdp.send("Fetch.failRequest", {"requestId": p["requestId"], "errorReason": "BlockedByClient"}, sid)
+                elif method == "Network.responseReceived" and p.get("type") == "Document":
+                    state["docs"][p.get("loaderId")] = p.get("response", {}).get("status")
+                elif method == "Page.loadEventFired":
+                    state["loaded"] = True
+
+            cdp.on_event = on_event
+            patterns = [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]
+            cdp.call("Fetch.enable", {"patterns": patterns}, sid)
+            cdp.call("Network.enable", {}, sid)
+            cdp.call("Page.enable", {}, sid)
+            nav = cdp.call("Page.navigate", {"url": url}, sid, timeout=LOAD_TIMEOUT)
+            if nav.get("errorText"):
+                raise BrokerError("navigation failed: %s (blocked: %s)" % (nav["errorText"], state["blocked"]))
+            cdp.pump(time.monotonic() + LOAD_TIMEOUT, until=lambda: state["loaded"])
+            final_url = cdp.call("Target.getTargetInfo", {"targetId": target})["targetInfo"]["url"]
+            if origin(final_url) not in allowed:
+                raise BrokerError("final URL %r left set %s" % (final_url, set_name))
+            page = cdp.call("Runtime.evaluate", {"expression": PAGE_JS, "returnByValue": True}, sid)
+            value = json.loads(page.get("result", {}).get("value") or "{}")
+            text = str(value.get("text") or "")
+            raw = text.encode("utf-8")
+            if len(raw) > MAX_TEXT:
+                raise BrokerError("page text exceeds %d bytes" % MAX_TEXT)
+            return {"set": set_name, "requested_url": url, "final_url": final_url,
+                    "status": state["docs"].get(nav.get("loaderId")), "title": str(value.get("title") or ""),
+                    "text": text, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                    "navigations": state["navigations"], "blocked": state["blocked"]}
+        finally:
+            cdp.on_event = None
+            # Our tab, and any window a page opened meanwhile: nothing it loaded outlives the request.
+            try:
+                for stray in {target} | (self.pages() - before):
+                    cdp.call("Target.closeTarget", {"targetId": stray}, timeout=10)
+            except BrokerError:
+                pass
+
+    def pages(self):
+        infos = self.cdp.call("Target.getTargets").get("targetInfos", [])
+        return {t["targetId"] for t in infos if t.get("type") == "page"}
+
+
+def private_dir(path):
+    """mkdir -p 0700; refuse a directory another user owns or others can write (gateway socket rules)."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = path.lstat()
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise BrokerError("%s must be a directory owned by this user and not group/world-writable" % path)
+    return path
+
+
+def clear_socket_path(path):
+    """Before Chrome starts: a stale socket is removed; a live one or a non-socket refuses startup."""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISSOCK(st.st_mode):
+            raise BrokerError("%s exists and is not a socket" % path)
+        probe = socket.socket(socket.AF_UNIX)
+        try:
+            probe.connect(str(path))
+            raise BrokerError("%s is live: another broker is serving it" % path)
+        except OSError:
+            path.unlink()
+        finally:
+            probe.close()
+
+
+def bind_socket(path):
+    """A 0600 listening socket at a cleared path."""
+    old = os.umask(0o177)
+    try:
+        server = Server(str(path), Handler)
+    finally:
+        os.umask(old)
+    os.chmod(path, 0o600)
+    return server
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.connection.settimeout(LOAD_TIMEOUT + 30)
+        line = self.rfile.readline(MAX_REQUEST + 1)
+        try:
+            if len(line) > MAX_REQUEST:
+                raise ValueError("request exceeds %d bytes" % MAX_REQUEST)
+            reply = self.server.broker.handle(self.server.set_name, json.loads(line))
+        except ValueError as error:
+            reply = {"ok": False, "error": "bad request: %s" % error}
+            self.server.broker.log({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                    "set": self.server.set_name, "verb": None, "ok": False,
+                                    "error": reply["error"], "ms": 0})
+        self.wfile.write(json.dumps(reply, sort_keys=True).encode() + b"\n")
+
+
+def find_chrome(entry):
+    """The first executable among a path or list of paths (~ and globs expanded, highest match first)."""
+    for candidate in [entry] if isinstance(entry, str) else entry or []:
+        for path in sorted(glob.glob(os.path.expanduser(candidate)), reverse=True):
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
+def spawn_chrome(chrome, profile, headed, keychain, log, sandbox=True):
+    """Chrome with our pipe ends at fds 3 (it reads) and 4 (it writes); returns (pid, write_fd, read_fd)."""
+    to_chrome_r, to_chrome_w = os.pipe()
+    from_chrome_r, from_chrome_w = os.pipe()
+    # Above 4, so dup2 onto 3 and 4 always copies (a no-op dup2 would keep close-on-exec).
+    moved = [fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 10) for fd in (to_chrome_r, from_chrome_w)]
+    for fd in (to_chrome_r, from_chrome_w):
+        os.close(fd)
+    argv = [chrome, "--remote-debugging-pipe", "--user-data-dir=" + str(profile), "--no-first-run",
+            "--no-default-browser-check"] + ([] if headed else ["--headless"]) \
+        + ([] if keychain else ["--use-mock-keychain", "--password-store=basic"]) \
+        + ([] if sandbox else ["--no-sandbox"]) + ["about:blank"]
+    actions = [(os.POSIX_SPAWN_OPEN, 0, "/dev/null", os.O_RDONLY, 0),
+               (os.POSIX_SPAWN_OPEN, 1, str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
+               (os.POSIX_SPAWN_DUP2, 1, 2),
+               (os.POSIX_SPAWN_DUP2, moved[0], 3), (os.POSIX_SPAWN_DUP2, moved[1], 4)]
+    pid = os.posix_spawn(chrome, argv, dict(os.environ), file_actions=actions, setpgroup=0)
+    for fd in moved:
+        os.close(fd)
+    return pid, to_chrome_w, from_chrome_r
+
+
+def chrome_log_since(path, offset):
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return f.read(1 << 20).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def reap_chrome(pid, wfd, rfd):
+    """After a failed start: close our pipe ends and collect (or kill) the Chrome we spawned."""
+    for fd in (wfd, rfd):
+        os.close(fd)
+    deadline = time.monotonic() + 10
+    while not os.waitpid(pid, os.WNOHANG)[0]:
+        if time.monotonic() >= deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            return
+        time.sleep(0.1)
+
+
+def keychain_mode(root, profile, mode):
+    """Record the cookie-encryption mode on a fresh profile; refuse a profile recorded in the other mode."""
+    marker = root / "keychain-mode"
+    recorded = marker.read_text().strip() if marker.is_file() else None
+    if recorded is None and any(profile.iterdir()):
+        raise BrokerError("%s has no keychain-mode record; its cookie encryption is unknown (start it fresh)" % profile)
+    if recorded not in (None, mode):
+        raise BrokerError("profile was created with keychain-mode %s; this start asked for %s, which would make its "
+                          "cookies unreadable" % (recorded, mode))
+    if recorded is None:
+        marker.write_text(mode + "\n")
+
+
+def serve(args):
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_relative_to(STATE.resolve()):
+        raise BrokerError("--root %s must lie under %s" % (root, STATE))
+    cfg = load_config(args.config)
+    entry = cfg.get("chrome", {}).get("macos" if sys.platform == "darwin" else "linux")
+    chrome = args.chrome or find_chrome(entry)
+    if not chrome or not os.access(chrome, os.X_OK):
+        raise BrokerError("no executable chrome: %r" % (args.chrome or entry,))
+    private_dir(root)
+    profile, sockets, logs = (private_dir(root / d) for d in ("agent-profile", "sockets", "log"))
+    keychain_mode(root, profile, "keychain" if args.keychain else "mock")
+    for name in cfg["sets"]:
+        clear_socket_path(sockets / (name + ".sock"))
+    sandbox, chrome_log = True, logs / "chrome.log"
+    log_start = chrome_log.stat().st_size if chrome_log.exists() else 0
+    pid, wfd, rfd = spawn_chrome(chrome, profile, args.headed, args.keychain, logs / "chrome.log")
+    servers, stopping = [], threading.Event()
+
+    def stop(*_):
+        stopping.set()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    code = 0
+    try:
+        try:
+            cdp = CDP(wfd, rfd)
+            version = cdp.call("Browser.getVersion", timeout=60).get("product")
+        except BrokerError:
+            if NO_SANDBOX not in chrome_log_since(chrome_log, log_start):
+                raise
+            reap_chrome(pid, wfd, rfd)
+            pid = wfd = None
+            if not args.allow_no_chrome_sandbox:
+                raise BrokerError("chrome cannot start its own sandbox on this host (%r in %s; on Ubuntu the AppArmor "
+                                  "unprivileged-userns restriction blocks it). Refusing to run Chrome unsandboxed; "
+                                  "pass --allow-no-chrome-sandbox to accept that explicitly" % (NO_SANDBOX, chrome_log))
+            print("browser-broker: WARNING chrome's own sandbox is unavailable on this host; running Chrome with "
+                  "--no-sandbox because --allow-no-chrome-sandbox was given", file=sys.stderr, flush=True)
+            sandbox = False
+            pid, wfd, rfd = spawn_chrome(chrome, profile, args.headed, args.keychain, logs / "chrome.log", sandbox=False)
+            cdp = CDP(wfd, rfd)
+            version = cdp.call("Browser.getVersion", timeout=60).get("product")
+        broker = Broker(cdp, cfg["sets"], logs / "broker.jsonl")
+        for name in sorted(cfg["sets"]):
+            server = bind_socket(sockets / (name + ".sock"))
+            server.broker, server.set_name = broker, name
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            servers.append(server)
+        print(json.dumps({"ok": True, "chrome": version, "pid": pid, "headed": args.headed, "chrome_sandbox": sandbox,
+                          "sockets": [s.server_address for s in servers]}), flush=True)
+        while not stopping.is_set():
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                pid, code = None, 1
+                print("browser-broker: chrome exited", file=sys.stderr)
+                break
+            stopping.wait(0.5)
+        if pid is not None:
+            with broker.lock:
+                try:
+                    cdp.call("Browser.close", timeout=10)
+                except BrokerError:
+                    pass
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+            Path(server.server_address).unlink(missing_ok=True)
+        if wfd is not None:
+            os.close(wfd)  # Chrome (and the fake) exit when the debugging pipe closes
+        if pid is not None:
+            deadline = time.monotonic() + 10
+            while not os.waitpid(pid, os.WNOHANG)[0]:
+                if time.monotonic() >= deadline:
+                    os.kill(pid, signal.SIGKILL)  # only the Chrome this broker spawned
+                    os.waitpid(pid, 0)
+                    break
+                time.sleep(0.1)
+    return code
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="browser-broker")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("serve")
+    s.add_argument("--headed", action="store_true")
+    s.add_argument("--keychain", action="store_true", help="encrypt cookies with the OS keychain (not the default)")
+    s.add_argument("--allow-no-chrome-sandbox", action="store_true",
+                   help="if this host blocks Chrome's own sandbox, run Chrome with --no-sandbox (never the default)")
+    s.add_argument("--config", default=str(LAB / "policy/browser.json"))
+    s.add_argument("--root", default=str(STATE / "browser"))
+    s.add_argument("--chrome")
+    args = parser.parse_args()
+    try:
+        return serve(args)
+    except (BrokerError, OSError, ValueError) as error:
+        print("browser-broker: %s" % error, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

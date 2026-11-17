@@ -1,0 +1,9 @@
+{
+  "exit": 1,
+  "stdout": "web_fetch: url must be a nonempty string of at most 4096 characters\n",
+  "files": {
+    ".lab-calls.jsonl": "{\"args\": {}, \"name\": \"web_fetch\"}\n",
+    "_evidence/manifest.jsonl": null
+  },
+  "untouched": true
+}

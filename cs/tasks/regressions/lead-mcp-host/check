@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Offline host MCP proxy regression; no installed state or credentials."""
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+
+OPS = Path(__file__).resolve().parents[3] / "ops/bin"
+sys.path.insert(0, str(OPS))
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from hermetic_env import hermetic_env
+from _lead_mcp import HostMCPBridge
+from _lead_host import redact_text
+from _lead_session import redact_msg
+from _job_reason import redact as redact_secrets
+
+# Transcript, socket replies and MCP-adjacent errors use the common secret vocabulary.
+secrets = ['cslead_fixture_secret', 'sk-ant-fixture_secret_1234', 'sk-proj-fixture_secret_1234',
+           'ghp_fixture_secret_1234', 'github_pat_fixture_secret_1234', 'AKIAABCDEFGHIJKLMNOP',
+           'AIza' + 'A' * 35, 'eyJ' + 'A' * 25 + '.payload.signature']
+body = ' '.join(secrets) + ' Bearer fixture-secret-bearer FOO_API_KEY=fixture-env-secret'
+for scrub in (redact_text, redact_msg, redact_secrets):
+    safe = scrub(body)
+    assert all(secret not in safe for secret in secrets), safe
+    assert 'fixture-secret-bearer' not in safe and 'fixture-env-secret' not in safe
+assert redact_msg({'content': [body]}) == {'content': [redact_text(body)]}
+
+
+with tempfile.TemporaryDirectory(prefix="lead-mcp-test-", dir="/tmp") as raw:
+    root = Path(raw)
+    cred = root / "host-only-credential"
+    cred.write_text("decoy")
+    marker = root / "started"
+    script = root / "fake_mcp.py"
+    script.write_text('''import json, os, sys
+from pathlib import Path
+Path(os.environ["START_MARKER"]).write_text("started")
+assert Path(sys.argv[1]).read_text() == "decoy"
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"jsonrpc":"2.0", "id":request["id"], "result":{"host_credential_read":True}}), flush=True)
+''')
+    original = {"mcpServers": {"contextstack": {"command": sys.executable, "args": [str(script), str(cred)]}}}
+    bridge = HostMCPBridge(original, root, env={**hermetic_env(), "HOME": str(root), "START_MARKER": str(marker)}, secret_dir=root / "session-home")
+    try:
+        assert str(cred) not in json.dumps(bridge.config)
+        assert "decoy" not in json.dumps(bridge.config)
+        assert bridge.token not in json.dumps(bridge.config)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.connect(str(bridge.path))
+            conn.sendall(b"wrong-capability\n")
+            assert conn.recv(1) == b""
+        assert not marker.exists(), "unauthorized connection launched host code"
+        server = bridge.config["mcpServers"]["contextstack"]
+        command = [server["command"], *server["args"]]
+        if sys.platform == "darwin":
+            profile = '(version 1) (allow default) (deny file-read* (literal %s))' % json.dumps(str(cred.resolve()))
+            denied = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c",
+                                     "from pathlib import Path; import sys; Path(sys.argv[1]).read_text()", str(cred)],
+                                    capture_output=True, text=True)
+            if "sandbox_apply: Operation not permitted" in denied.stderr:
+                print("SKIP lead-mcp-host Seatbelt probe: outer sandbox disallows sandbox_apply")
+            else:
+                assert denied.returncode != 0, "sandbox could read host credential decoy"
+                command = ["/usr/bin/sandbox-exec", "-p", profile, *command]
+        done = subprocess.run(command, input='{"jsonrpc":"2.0","id":7,"method":"tools/list"}\n',
+                              text=True, capture_output=True, timeout=10, env={**hermetic_env(), "HOME": str(root)})
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == {"jsonrpc": "2.0", "id": 7, "result": {"host_credential_read": True}}
+        assert marker.is_file()
+    finally:
+        bridge.close()
+        bridge.close()
+    assert not bridge.root.exists()
+    assert not bridge.children and not any(t.is_alive() for t in bridge.handlers)
+print("lead-mcp-host: ok (host-only decoy credential, capability guard, proxy roundtrip, cleanup)")

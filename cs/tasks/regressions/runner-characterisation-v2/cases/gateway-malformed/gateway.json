@@ -1,0 +1,14 @@
+[
+ {
+  "raw": "not json"
+ },
+ {
+  "body": {
+   "status": "degraded"
+  }
+ },
+ {
+  "raw": "<html>oops</html>",
+  "http_status": 500
+ }
+]

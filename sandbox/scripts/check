@@ -1,0 +1,10 @@
+#!/bin/sh
+# cs-sandbox gate: format, lint, release build, tests. Nonzero on any failure.
+set -eu
+cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo fmt --check -p cs-sandbox
+cargo clippy -p cs-sandbox --all-targets -- -D warnings
+cargo build --release -p cs-sandbox
+cargo test -p cs-sandbox
+echo "check: cs-sandbox green"

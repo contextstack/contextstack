@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""metadata-only shim; queries CLI version, never model output or credentials."""
+import json
+import os
+import pwd
+import shutil
+import subprocess
+from pathlib import Path
+
+def observe():
+    personal = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    lookup = subprocess.run(
+        ['/usr/bin/security', 'find-generic-password', '-s', 'Claude Code-credentials'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+    )
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    binary = shutil.which("claude")
+    version = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=10) if binary else None
+    return {
+        'classification': 'probe',
+        'config_names': sorted(p.name for p in config.iterdir()) if config.is_dir() else [],
+        'cli_path': binary,
+        'cli_version': version.stdout.strip() if version and version.returncode == 0 else None,
+        'cli_version_exit': version.returncode if version else None,
+        'HOME': os.environ.get('HOME'),
+        'USER': os.environ.get('USER'),
+        'CLAUDE_CONFIG_DIR': os.environ.get('CLAUDE_CONFIG_DIR'),
+        'claude_directory': str(Path.home() / '.claude'),
+        'claude_directory_exists': (Path.home() / '.claude').is_dir(),
+        'auth_profile_source_path': None,
+        'auth_profile_source_exists': None,
+        'personal_claude_config_path': str(personal / '.claude.json'),
+        'personal_claude_config_exists': (personal / '.claude.json').is_file(),
+        'keychain_find_exit': lookup.returncode,
+    }
+
+if __name__ == '__main__':
+    result = observe()
+    Path('auth-context.json').write_text(json.dumps(result, sort_keys=True) + '\n')
+    print(json.dumps({'type': 'result', 'is_error': False, 'result': 'metadata captured'}))

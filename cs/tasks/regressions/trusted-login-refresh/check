@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Decoy credentials only: fresh refresh staging, owner wins, and actionable pauses."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / 'ops/bin'))
+sys.path.insert(0, str(ROOT / 'tasks/regressions/_lib'))
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+from _cli_native import stage_copies, finish_copies
+from _login_refresh import SOURCES, maintain, notice, clear_pause, refresh_command, codex_refresh
+from _provider_limits import active_templates, is_limited, load
+
+
+def credential(cli, token='old', identity='owner'):
+    if cli == 'pi':
+        return {'openai-codex': {'accountId': identity, 'access': token, 'refresh': 'decoy-' + token}}
+    if cli == 'codex':
+        return {'tokens': {'account_id': identity, 'access_token': token, 'refresh_token': 'decoy-' + token}}
+    return {'user_id': identity, 'key': token, 'refresh_token': 'decoy-' + token, 'auth_mode': 'oauth'}
+
+
+for cli, source in SOURCES.items():
+    for case in ('success', 'owner', 'revision', 'identity', 'missing_identity', 'failed', 'unchanged_identity_missing'):
+        with scratch_dir(prefix='trusted-refresh-') as raw:
+            root = Path(raw).resolve()
+            home, task, state = (root / name for name in ('home', 'task', 'state'))
+            real = home / source[2:]
+            real.parent.mkdir(parents=True)
+            original = credential(cli)
+            if case == 'unchanged_identity_missing':
+                if cli == 'pi': original['openai-codex'].pop('accountId')
+                elif cli == 'codex': original['tokens'].pop('account_id')
+                else: original.pop('user_id')
+            real.write_text(json.dumps(original))
+            records = stage_copies({'copies': {str(task / 'auth.json'): source}}, task, home)
+            # Agent may forge any token/identity in its copy. It is destroyed, never used.
+            records[0]['copy'].write_text(json.dumps(credential(cli, 'JOB_TOKEN', 'attacker')))
+            results = finish_copies(records)
+            assert results[0]['status'] == 'task_copy'
+            assert json.loads(real.read_text()) == original
+            assert not (task / 'auth.json').exists()
+            def run(command, cwd, env):
+                copy = Path(env['CODEX_HOME' if cli == 'codex' else 'PI_CODING_AGENT_DIR']) / 'auth.json'
+                assert json.loads(copy.read_text()) == original
+                assert copy != task / 'auth.json'
+                assert Path(env['HOME']).is_relative_to(cwd)
+                update = credential(cli, 'trusted', 'other' if case == 'identity' else 'owner')
+                if case in ('missing_identity', 'unchanged_identity_missing'):
+                    if cli == 'pi': del update['openai-codex']['accountId']
+                    elif cli == 'codex': del update['tokens']['account_id']
+                    else: del update['user_id']
+                copy.write_text(json.dumps(original if case == 'unchanged_identity_missing' else update))
+                if case == 'owner': real.write_text(json.dumps(credential(cli, 'owner-new')))
+                if case == 'revision':
+                    replacement = real.with_suffix('.new')
+                    replacement.write_text(json.dumps(original))
+                    replacement.replace(real)
+                return case != 'failed'
+            # Grok is production notice-only. Exercise its writeback identity guard with
+            # an injected trusted runner; this does not enable a production invocation.
+            with patch('_login_refresh.refresh_command', return_value=['fixed-probe']):
+                status = maintain(cli, [], results, False, home=home, root=root / 'refresh',
+                                  env=hermetic_env(), sandbox=lambda command, cwd: command, run=run)
+            expected = {'success': 'written_back', 'owner': 'owner_changed', 'revision': 'owner_changed',
+                        'identity': 'identity_changed', 'missing_identity': 'identity_missing',
+                        'unchanged_identity_missing': 'identity_missing', 'failed': 'refresh_failed'}[case]
+            assert status == expected, (cli, case, status)
+            wanted = credential(cli, 'trusted') if case == 'success' else credential(cli, 'owner-new') if case == 'owner' else original
+            assert json.loads(real.read_text()) == wanted, (cli, case)
+            if case == 'success': assert real.stat().st_mode & 0o777 == 0o600
+            if status != 'written_back':
+                notice(state, cli, cli, home=home)
+                notice(state, cli, cli, home=home)
+                rows = [json.loads(line) for line in (state / 'attention.jsonl').read_text().splitlines()]
+                assert len(rows) == 1 and rows[0]['kind'] == 'needs_you'
+                assert 'sign in again' in rows[0]['question']
+                assert is_limited(cli, active_templates(state))[0]
+                with patch('_provider_limits.time.time', return_value=4000000000):
+                    assert cli in load(state)['templates'], 'login pauses must not age out'
+                assert 'JOB_TOKEN' not in json.dumps(rows) + (state / 'provider-limits.json').read_text()
+                clear_pause(state, cli)
+                assert not is_limited(cli, active_templates(state))[0]
+                # Signing in again (the owner's login file changes) lifts the pause with no run needed.
+                notice(state, cli + '-relogin', cli, home=home)
+                assert is_limited(cli + '-relogin', active_templates(state))[0]
+                assert is_limited(cli + '-relogin', active_templates(state))[0], 'unchanged login keeps the pause'
+                import os as _os
+                st = real.stat()
+                _os.utime(real, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+                assert not is_limited(cli + '-relogin', active_templates(state))[0], 're-login must lift the pause'
+                # A missing login file keeps the pause until one appears.
+                gone = home / 'gone'
+                notice(state, cli + '-gone', cli, home=gone)
+                assert is_limited(cli + '-gone', active_templates(state))[0]
+
+assert refresh_command('grok', []) is None
+assert '--no-tools' in refresh_command('pi', ['--model', 'openai-codex/test'])
+assert refresh_command('codex', []) == ['codex', '--ignore-user-config', '-c', 'cli_auth_credentials_store="file"', 'app-server']
+# Exercise the real Codex RPC driver with a fake stdio server. No inference RPCs allowed.
+with scratch_dir(prefix='codex-refresh-rpc-') as raw:
+    root = Path(raw)
+    server = root / 'server.py'
+    server.write_text('''import json,sys
+for line in sys.stdin:
+ r=json.loads(line)
+ if r['method']=='initialize':
+  print(json.dumps({'id':1,'result':{}}),flush=True)
+ elif r['method']=='initialized': pass
+ else:
+  assert r == {'id':2,'method':'account/read','params':{'refreshToken':True}}
+  print(json.dumps({'id':2,'result':{'account':{'type':'chatgpt'}}}),flush=True)
+''')
+    assert codex_refresh([sys.executable, str(server)], root, hermetic_env(), 3)
+    assert not codex_refresh([sys.executable, '-c', 'import time; time.sleep(5)'], root, hermetic_env(), .1)
+
+# Execute the executor's actual finalizer, including timeout/cancel finalization.
+import ast
+import copy
+import _executor
+from _provider_limits import record_limit
+for message in ('OpenAI Codex token refresh error: rejected', 'refresh_token_reused',
+                'Not signed in', 'No API key found for openai-codex', 'Authentication required'):
+    assert _executor.LOGIN_EXPIRED.search(message), message
+# The broad sign-in signals apply only to CLIs with a trusted refresh, never as the generic pattern.
+assert not _executor.AUTH_EXPIRED.search('Authentication required')
+main = next(n for n in ast.parse((ROOT / 'ops/bin/_executor.py').read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name == 'main')
+finalizer = copy.deepcopy(next(n for n in main.body if isinstance(n, ast.FunctionDef)
+                             and n.name == 'finalize_login_copies'))
+finalizer.body = [ast.Global(n.names) if isinstance(n, ast.Nonlocal) else n for n in finalizer.body]
+code = compile(ast.fix_missing_locations(ast.Module(body=[finalizer], type_ignores=[])), 'executor-finalizer', 'exec')
+for cli, source in SOURCES.items():
+    for failed in (False, True, 'wrong_output', 'timeout'):
+        for expired in (False, True):
+            with scratch_dir(prefix='executor-login-finalizer-') as raw:
+                root = Path(raw).resolve()
+                home, run, tmp, ws, state = (root / name for name in ('home', 'run', 'tmp', 'workspace', 'state'))
+                for path in (run, tmp, ws): path.mkdir()
+                real = home / source[2:]
+                real.parent.mkdir(parents=True)
+                real.write_text(json.dumps(credential(cli)))
+                records = stage_copies({'copies': {str(tmp / 'auth.json'): source}}, tmp, home)
+                if not expired: records[0]['copy'].write_text(json.dumps(credential(cli, 'JOB_TOKEN')))
+                def sandbox(binary, args, work, temp, profile, **kwargs):
+                    assert work == temp and work != ws and work != tmp
+                    assert kwargs['caller']['deny_write_roots'] == [str(ws), str(tmp)]
+                    return [binary, *args]
+                def probe(command, cwd, env, *unused):
+                    login = Path(env['CODEX_HOME' if cli == 'codex' else 'PI_CODING_AGENT_DIR']) / 'auth.json'
+                    assert json.loads(login.read_text()) == credential(cli)
+                    login.write_text(json.dumps(credential(cli, 'trusted')))
+                    if failed == 'timeout':
+                        raise subprocess.TimeoutExpired(command, 60, output='PRIVATE_TOKEN')
+                    return not failed
+                def pi_probe(command, cwd, env, *unused):
+                    okay = probe(command, cwd, env)
+                    if failed == 'wrong_output':
+                        return subprocess.CompletedProcess(command, 0, 'AUTH_OK\nextra', '')
+                    return subprocess.CompletedProcess(command, 1 if not okay else 0, 'AUTH_OK\n', '')
+                scope = dict(Path=Path, os=os, json=json, row={}, native_copies=records,
+                             login_refresh_status=None, finish_copies=finish_copies,
+                             binary=cli, args=['--model', 'fixture'], name='template-' + cli,
+                             run_dir=run, ws=ws, cli_tmp=tmp, cli_env=hermetic_env(), HOME=home,
+                             sandbox_policy=root / 'policy', sandbox_cmd=sandbox,
+                             LAB=ROOT, state_dir=lambda lab: state)
+                exec(code, scope)
+                with patch('_muse.run_process', side_effect=pi_probe), patch('_login_refresh.codex_refresh', side_effect=probe):
+                    scope['finalize_login_copies'](expired=expired)
+                    scope['finalize_login_copies']()  # Idempotent ledger/emit finalization.
+                bad = bool(failed) or cli == 'grok'
+                assert scope['row']['trusted_login_refresh'] == ('notice_only' if cli == 'grok' else 'refresh_failed' if failed else 'written_back')
+                assert json.loads(real.read_text()) == credential(cli, 'old' if bad else 'trusted')
+                assert not records and not (tmp / 'auth.json').exists()
+                assert 'JOB_TOKEN' not in json.dumps(scope['row']) and 'PRIVATE_TOKEN' not in json.dumps(scope['row'])
+                # Only a job that reported a sign-in failure, with no successful trusted refresh, pauses
+                # and notifies. A successful job whose maintenance refresh failed, or a quota error
+                # (Grok's 402 is not a login), never raises a false "sign-in expired" notice.
+                paused = bad and expired
+                assert is_limited('template-' + cli, active_templates(state))[0] == paused, (cli, failed, expired)
+                if not paused:
+                    assert not (state / 'attention.jsonl').exists() or not (state / 'attention.jsonl').read_text().strip()
+                if paused:
+                    record_limit(state, 'template-' + cli, {'message': 'quota', 'via': 'stderr', 'resets_at': '2000-01-01T00:00:00Z'})
+                    assert is_limited('template-' + cli, active_templates(state))[0]
+                    assert len((state / 'attention.jsonl').read_text().splitlines()) == 1
+
+# The owner refreshing their own login during a job (owner_changed) needs no maintenance.
+assert maintain('codex', [], [{'status': 'owner_changed'}], False, home=Path('/nonexistent'),
+                root=Path('/nonexistent/refresh'), env={}, sandbox=lambda c, r: c) is None
+
+# The existing production-profile attack suite now includes Grok's copied login.
+if '--darwin-probe' in sys.argv:
+    subprocess.run([str(ROOT / 'tasks/regressions/attack-login-rename/check'), '--darwin-probe'],
+                   check=True, env=hermetic_env())
+print('check: fresh trusted login copies, owner/identity guards, content-free notices and persistent dispatch pauses')

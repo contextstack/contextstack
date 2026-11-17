@@ -1,0 +1,6 @@
+{
+ "argv": [
+  "-task",
+  "tasks/fx2"
+ ]
+}

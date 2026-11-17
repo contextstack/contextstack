@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""cargo/rustc, toolchain, and registry are readable in Seatbelt; credentials and registry writes are denied."""
+import ast
+import json
+import re
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+sys.path[:0] = [str(KIT / "ops/bin"), str(HERE.parent / "_lib")]
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+import _executor
+import _toolchains
+
+if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
+    print("lane-toolchain-cargo: SKIP (requires --darwin-probe on macOS)")
+    raise SystemExit(0)
+
+with scratch_dir(dir="/tmp", prefix="lane-cargo-") as raw:
+    root = Path(raw).resolve()
+    home, ws, tmp = root / "home", root / "ws", root / "tmp"
+    cargo_bin = home / ".cargo/bin"
+    registry = home / ".cargo/registry"
+    credentials = home / ".cargo/credentials.toml"
+    rustup = home / ".rustup"
+    toolchain = rustup / "toolchains/fake-host"
+    sibling = home / ".cargo/private"
+    for directory in (cargo_bin, registry, rustup, toolchain / "bin", sibling.parent, ws, tmp):
+        directory.mkdir(parents=True, exist_ok=True)
+    credentials.write_text("token=secret\n")
+    sibling.write_text("private")
+    (registry / "fixture").write_text("cache")
+    (rustup / "settings.toml").write_text('default_toolchain = "fake-host"\n')
+    rustc = toolchain / "bin/rustc"
+    rustc.write_text(
+        "#!" + sys.executable + "\n"
+        "import os, sys\n"
+        "if sys.argv[1:3] == ['--print', 'sysroot']:\n"
+        " print(%r); raise SystemExit(0)\n"
+        "i = sys.argv.index('-o')\n"
+        "Path = __import__('pathlib').Path\n"
+        "out = Path(sys.argv[i + 1])\n"
+        "out.parent.mkdir(parents=True, exist_ok=True)\n"
+        "out.write_bytes(b'')\n"
+        % str(toolchain)
+    )
+    rustc.chmod(0o755)
+    cargo = cargo_bin / "cargo"
+    cargo.write_text(
+        "#!" + sys.executable + "\n"
+        "import subprocess, sys\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1:] == ['--version']:\n print('cargo 1.0.0'); raise SystemExit(0)\n"
+        "if sys.argv[1:2] == ['build'] and '--target-dir' in sys.argv:\n"
+        " td = sys.argv[sys.argv.index('--target-dir') + 1]\n"
+        " src = Path('src/main.rs')\n"
+        " out = Path(td) / 'debug' / 'probe'\n"
+        " subprocess.check_call([%r, str(src), '-o', str(out)])\n raise SystemExit(0)\n"
+        " raise SystemExit('unexpected: ' + repr(sys.argv))\n"
+        % str(rustc)
+    )
+    cargo.chmod(0o755)
+    (cargo_bin / "rustc").write_text('#!/bin/sh\nexec "%s" "$@"\n' % rustc)
+    (cargo_bin / "rustc").chmod(0o755)
+    (ws / "src").mkdir(parents=True)
+    (ws / "Cargo.toml").write_text('[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n')
+    (ws / "src/main.rs").write_text('fn main() {}\n')
+    entry = {
+        "name": "cargo",
+        "bin": str(cargo_bin),
+        "rustup": str(rustup),
+        "toolchain": str(toolchain),
+        "registry": str(registry),
+    }
+    config = root / "toolchains.json"
+    config.write_text(json.dumps([entry]))
+    os.environ.update(HOME=str(home), CS_TOOLCHAINS_FILE=str(config))
+    _toolchains.discover.cache_clear()
+    _toolchains.discover_path_dirs.cache_clear()
+    _toolchains.discover_sandbox_links.cache_clear()
+    discovered = _toolchains.discover()
+    assert str(toolchain) in discovered and str(registry) in discovered, discovered
+    assert str(cargo_bin) not in discovered
+    links = [str(p) for p in _toolchains.discover_sandbox_links()]
+    assert str(cargo.resolve()) in links and str((cargo_bin / "rustc").resolve()) in links, links
+    env_probe = _toolchains.cargo_lane_env(tmp, ws)
+    assert env_probe["CARGO_HOME"].startswith(str(tmp))
+    assert env_probe["CARGO_NET_OFFLINE"] == "true"
+    assert env_probe["CARGO_TARGET_DIR"] == str(ws / "target")
+    assert env_probe["RUSTUP_HOME"] == str(rustup.resolve())
+    assert (Path(env_probe["CARGO_HOME"]) / "registry").is_symlink()
+    import _executor
+    # The same pins the old source-extraction loader set, for the rest of this probe: the real helpers then read
+    # this fixture HOME and a minimal allowlist instead of the machine's.
+    _executor.HOME = home
+    _executor.PATH_FALLBACK = "/usr/bin:/bin"
+    _executor.KEEP_ENV = {"HOME"}
+    _executor.CRED_ENV = re.compile("SECRET")
+    _executor.fail = lambda msg: sys.exit(msg)
+    ns = {"allowlist_env": _executor.allowlist_env, "sandbox_cmd": _executor.sandbox_cmd}
+    child = {**hermetic_env(), **ns["allowlist_env"]([], tmp, ws)}
+    assert child["CARGO_TARGET_DIR"] == str(ws / "target")
+    target = ws / "target"
+    command = (
+        'cargo --version; '
+        '! /bin/cat "$1"; '
+        '! /usr/bin/touch "$2/new-cache"; '
+        '! /bin/sh -c \'printf x >> "$1/fixture"\' inner "$2"; '
+        'cargo build --target-dir "$3"; '
+        'test -f "$3/debug/probe"'
+    )
+    cmd = ns["sandbox_cmd"](
+        "/bin/sh",
+        ["-c", command, "probe", str(credentials), str(registry), str(target)],
+        ws, tmp, tmp / "profile.sb",
+    )
+    profile_text = (tmp / "profile.sb").read_text()
+    assert '(allow file-read-metadata (literal %s))' % json.dumps(str(cargo_bin.resolve())) in profile_text
+    result = subprocess.run(cmd, env=child, cwd=ws, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and "cargo 1.0.0" in result.stdout, result
+    assert credentials.read_text() == "token=secret\n"
+    assert (registry / "fixture").read_text() == "cache"
+    assert not (registry / "new-cache").exists()
+    assert (target / "debug" / "probe").is_file()
+    assert cargo.read_text().startswith("#!"), "cargo binary was modified"
+
+    assert str(rustup) in discovered, discovered
+    templates = json.loads((KIT / "ops/bin/executor-templates.json").read_text())
+    tmpl = templates["cursor-composer"]
+    from _cli_native import stage as stage_native
+    sandbox_caller = dict(deny_write_roots=[str(home / p[2:] if p.startswith("~/") else Path(p)) for p in tmpl.get("deny_write", [])])
+    native_env, native_links = stage_native(tmpl, tmp, home)
+    cli_env = {**child, **native_env}
+    assert str(cargo_bin.resolve()) in cli_env["PATH"].split(os.pathsep), cli_env["PATH"]
+    native_cmd = ns["sandbox_cmd"](
+        "/bin/sh",
+        ["-c", "cargo --version; ! /bin/cat \"$1\"", "native", str(credentials)],
+        ws, tmp, tmp / "native-agent.sb",
+        read_links=native_links, login_writes=tmpl, read_roots=(), caller=sandbox_caller,
+    )
+    native_result = subprocess.run(native_cmd, env=cli_env, cwd=ws, capture_output=True, text=True, timeout=30)
+    assert native_result.returncode == 0 and "cargo 1.0.0" in native_result.stdout, native_result
+    check_script = ws / "stimulus" / "check"
+    check_script.parent.mkdir(parents=True, exist_ok=True)
+    check_script.write_text("#!/bin/sh\ncargo --version\n")
+    check_script.chmod(0o755)
+    check_cmd = ns["sandbox_cmd"](
+        str(check_script), [], ws, tmp, tmp / "check-native.sb",
+        read_links=native_links, login_writes=tmpl, read_roots=(check_script.parent,), caller=sandbox_caller,
+    )
+    check_result = subprocess.run(check_cmd, env=cli_env, cwd=ws, capture_output=True, text=True, timeout=30)
+    assert check_result.returncode == 0 and "cargo 1.0.0" in check_result.stdout, check_result
+print("lane-toolchain-cargo: PASS")
