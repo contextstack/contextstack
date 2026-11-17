@@ -60,6 +60,7 @@ impl Profile {
     }
 
     /// Seatbelt rules the profile adds; `tmp` is the call's canonical tmp dir.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn seatbelt_rules(
         self,
         tmp: &Path,
@@ -88,6 +89,7 @@ impl Profile {
 }
 
 /// Every ancestor of `path` except `/`, nearest first.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn strict_ancestors(path: &Path) -> Vec<PathBuf> {
     path.ancestors()
         .skip(1)

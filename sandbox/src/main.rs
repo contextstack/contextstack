@@ -23,6 +23,7 @@ mod profile;
 mod report;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod sbpl;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod seatbelt;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod seccomp;
