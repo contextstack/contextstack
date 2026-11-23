@@ -14,6 +14,11 @@
       "tag": "v0.2.0-rc.1",
       "commit": "3108ee09c6a689e0807114148aa9aabbc1fc09be",
       "channel": "latest"
+    },
+    {
+      "tag": "v0.2.0-rc.2",
+      "commit": "cfb635598ceb95f727c8d238a6ea6c485f361340",
+      "channel": "latest"
     }
   ]
 }
