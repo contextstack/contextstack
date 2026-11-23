@@ -10,8 +10,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
-CHECKLIB = LAB / "scripts/checklib.sh"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+CHECKLIB = CODE_ROOT / "scripts/checklib.sh"
 WRAPPER = '''#!/bin/sh
 . "$CHECKLIB_PATH"
 route_equiv students.progress
@@ -61,7 +61,7 @@ def assert_fail(result, label):
 
 with scratch_dir(prefix="checklib-route-equiv-named-") as raw:
     root = Path(raw)
-    env = {k: v for k, v in os.environ.items() if k != "LAB_CHECK"}
+    env = {k: v for k, v in os.environ.items() if k != "CS_CHECK"}
     env.update(
         CHECKLIB_PATH=str(CHECKLIB),
         GIT_CONFIG_GLOBAL="/dev/null",

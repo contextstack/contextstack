@@ -6,7 +6,7 @@ from pathlib import Path
 from _estate_io import state_dir, append_jsonl,estate_id,estate_matches,read_jsonl
 from _grant import cover,load,same_repo,schedule_error
 
-LAB=Path(__file__).resolve().parents[2]
+CODE_ROOT=Path(__file__).resolve().parents[2]
 ACTOR=re.compile(r'director:(human|automated):user:[1-9][0-9]*')
 EFFECT=re.compile(r'[a-z][a-z0-9_]{0,63}')
 STAGE_FIELDS={'id','cron','timezone','catch_up_window_minutes','lane','spec','task',
@@ -40,7 +40,7 @@ def actor(args,allowed):
 
 def grant_path(gid):
     for suffix in ('.yaml','.yml'):
-        path=LAB/'grants'/(gid+suffix)
+        path=CODE_ROOT/'grants'/(gid+suffix)
         if path.is_file():
             return path
     raise ValueError('grant not found')
@@ -68,7 +68,7 @@ def authority(value):
 def rel_file(value,label):
     if not isinstance(value,str) or not value or Path(value).is_absolute() or '..' in Path(value).parts:
         raise ValueError(label+' path invalid')
-    path=LAB/value
+    path=CODE_ROOT/value
     if not path.exists():
         raise ValueError(label+' missing')
     return path
@@ -126,15 +126,15 @@ def enable_one(args):
     error=schedule_error(row)
     if error:
         raise ValueError(error)
-    ok,error,_=cover(args['grant'],repo=str(LAB),paths=[row['spec'],row['task']])
+    ok,error,_=cover(args['grant'],repo=str(CODE_ROOT),paths=[row['spec'],row['task']])
     if not ok:
         raise ValueError(error)
     if hashlib.sha256(grant_path(args['grant']).read_bytes()).hexdigest()!=args.get('grant_digest'):
         raise ValueError('grant digest changed')
-    spec=LAB/row['spec']
+    spec=CODE_ROOT/row['spec']
     if not spec.is_file() or re.search(r'^verdict:',spec.read_text(),re.M):
         raise ValueError('schedule needs a runnable spec, not an archival verdict')
-    shelves=state_dir(LAB);shelves.mkdir(exist_ok=True)
+    shelves=state_dir(CODE_ROOT);shelves.mkdir(exist_ok=True)
     with (shelves/'schedule.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         history=read_jsonl(shelves/'schedules.jsonl',strict=True)
@@ -147,13 +147,13 @@ def enable_one(args):
         prior=next((old for old in reversed(history) if old.get('id')==sid),None)
         if digest(prior)!=args.get('expected_digest'):
             raise ValueError('schedule revision changed')
-        row.update(event='schedule_updated' if prior else 'schedule_created',estate=estate_id(LAB),ts=datetime.now(timezone.utc).isoformat(),actor_id=args['actor_id'],actor_kind=kind,request_key=args['request_key'],request_digest=request_digest)
+        row.update(event='schedule_updated' if prior else 'schedule_created',estate=estate_id(CODE_ROOT),ts=datetime.now(timezone.utc).isoformat(),actor_id=args['actor_id'],actor_kind=kind,request_key=args['request_key'],request_digest=request_digest)
         append_jsonl(shelves/'schedules.jsonl',row,sort_keys=True,compact=False,sync=True,encoding='utf-8')
         print(json.dumps({'ok':True,'replayed':False,'schedule':row,'digest':digest(row)}))
 
 def register(args,corpus):
     kind=actor(args,{'actor_id','actor_kind','request_key','manifest_digest'})
-    manifest_path=LAB/'schedules/manifest-v1.json'
+    manifest_path=CODE_ROOT/'schedules/manifest-v1.json'
     manifest_sha=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if args.get('manifest_digest')!=manifest_sha:
         raise ValueError('manifest digest changed')
@@ -170,8 +170,8 @@ def register(args,corpus):
     if not isinstance(auth,dict) or set(auth)!={'prior','new'}:
         raise ValueError('write authority invalid')
     prior_authority=authority(auth['prior']);new_authority=authority(auth['new'])
-    estate=estate_id(LAB)
-    if not estate_matches(LAB,new_authority['estate']):  # a dev authority continues on workstation
+    estate=estate_id(CODE_ROOT)
+    if not estate_matches(CODE_ROOT,new_authority['estate']):  # a dev authority continues on workstation
         raise ValueError('new write authority differs from estate')
     new_grants={item['id'] for item in new_authority['grants']}
     stages=definition.get('stages')
@@ -184,7 +184,7 @@ def register(args,corpus):
     known=set(ids)
     if any(dep not in known for row in rows for dep in row.get('requires',[])):
         raise ValueError('schedule dependency outside corpus')
-    shelves=state_dir(LAB);shelves.mkdir(exist_ok=True)
+    shelves=state_dir(CODE_ROOT);shelves.mkdir(exist_ok=True)
     request_digest=digest({'operation':'register','corpus':corpus,**args})
     with (shelves/'schedule.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
@@ -223,7 +223,7 @@ def register(args,corpus):
 
 def transition(args,corpus,operation,schedule_id=None):
     kind=actor(args,{'actor_id','actor_kind','request_key','manifest_digest'})
-    manifest_path=LAB/'schedules/manifest-v1.json'
+    manifest_path=CODE_ROOT/'schedules/manifest-v1.json'
     manifest_sha=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if args.get('manifest_digest')!=manifest_sha:
         raise ValueError('manifest digest changed')
@@ -237,9 +237,9 @@ def transition(args,corpus,operation,schedule_id=None):
     if not isinstance(auth,dict) or set(auth)!={'prior','new'}:
         raise ValueError('write authority invalid')
     prior_authority=authority(auth['prior']);new_authority=authority(auth['new'])
-    estate=estate_id(LAB)
+    estate=estate_id(CODE_ROOT)
     expected_estate=prior_authority['estate'] if operation=='hold' else new_authority['estate']
-    if not estate_matches(LAB,expected_estate):
+    if not estate_matches(CODE_ROOT,expected_estate):
         raise ValueError(operation+' estate differs from manifest authority')
     stages=definition.get('stages')
     if not isinstance(stages,list) or not stages:
@@ -254,7 +254,7 @@ def transition(args,corpus,operation,schedule_id=None):
     allowed={item['id'] for item in (prior_authority if operation=='hold' else new_authority)['grants']}
     request_digest=digest({'operation':operation,'corpus':corpus,**args,
                            **({'schedule_id':schedule_id} if schedule_id else {})})
-    shelves=state_dir(LAB);shelves.mkdir(exist_ok=True)
+    shelves=state_dir(CODE_ROOT);shelves.mkdir(exist_ok=True)
     target_hold='authority_handoff_'+new_authority['estate'] if operation=='hold' else 'shadow_active'
     changed=[]
     with (shelves/'schedule.lock').open('a') as lock:

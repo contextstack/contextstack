@@ -94,12 +94,12 @@ impl Gateway {
 
     /// `GET /v1/budgets`: `(status, body)`.
     pub fn budgets(&self) -> Result<(u16, Value), Fault> {
-        self.call("GET", "/v1/budgets", &[], b"")
+        self.get("/v1/budgets")
     }
 
     /// `GET` under `/v1/…` on the gateway (no owner token): `(status, body)`.
     pub fn get(&self, path: &str) -> Result<(u16, Value), Fault> {
-        self.call("GET", path, &[], b"")
+        self.call("GET", path, &[], b"", TIMEOUT)
     }
 
     /// `PUT /v1/budgets` with the owner token: `(status, body)`.
@@ -110,6 +110,17 @@ impl Gateway {
             "/v1/budgets",
             &[("X-ContextStack-Owner-Token", token.as_str())],
             document,
+            TIMEOUT,
+        )
+    }
+
+    pub(crate) fn model_call(&self, body: &Value) -> Result<(u16, Value), Fault> {
+        self.call(
+            "POST",
+            "/v1/agent/model.call",
+            &[],
+            body.to_string().as_bytes(),
+            Duration::from_secs(12),
         )
     }
 
@@ -119,6 +130,7 @@ impl Gateway {
         path: &str,
         extra: &[(&str, &str)],
         body: &[u8],
+        timeout: Duration,
     ) -> Result<(u16, Value), Fault> {
         let down = |e: &dyn std::fmt::Display| {
             Fault::Unavailable(format!("the gateway at {}: {e}", self.addr))
@@ -146,7 +158,7 @@ impl Gateway {
         head.push_str("\r\n");
         let mut stream = TcpStream::connect_timeout(&self.addr, TIMEOUT).map_err(|e| down(&e))?;
         stream
-            .set_read_timeout(Some(TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .map_err(|e| down(&e))?;
         stream
             .set_write_timeout(Some(TIMEOUT))

@@ -1,8 +1,8 @@
 {
   "exit": 1,
-  "stdout": "oops\n",
+  "stdout": "Command 'sh' exited 3. Pass {\"cmd\":[\"ls\",\"docs\"]} for argv or {\"cmd\":\"cd docs && ls | head\"} for shell syntax.\noops\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"cmd\": [\"sh\", \"-c\", \"echo oops >&2; exit 3\"]}, \"name\": \"exec\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"cmd\": [\"sh\", \"-c\", \"echo oops >&2; exit 3\"]}, \"name\": \"exec\"}\n"
   },
   "untouched": true
 }

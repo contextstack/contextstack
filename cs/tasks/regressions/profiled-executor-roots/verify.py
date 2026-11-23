@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 _fixture_env = hermetic_env()
 os.environ.clear()
@@ -11,7 +12,7 @@ os.environ.update(_fixture_env)
 
 SOURCE = Path(__file__).resolve().parents[3]
 def isolated_env(home):
-    env = {k: v for k, v in hermetic_env().items() if not k.startswith(('LAB_', 'GIT_', 'CSGATEWAY_'))}
+    env = {k: v for k, v in hermetic_env().items() if not k.startswith(('CS_', 'GIT_', 'CSGATEWAY_'))}
     return {**env, 'HOME': str(home), 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1',
             'GIT_AUTHOR_NAME': 'fixture', 'GIT_AUTHOR_EMAIL': 'fixture@local',
             'GIT_COMMITTER_NAME': 'fixture', 'GIT_COMMITTER_EMAIL': 'fixture@local'}
@@ -46,14 +47,14 @@ def check_harvest_lock():
             sys.path.insert(0, str(SOURCE / 'ops/bin'))
             from _harvest_git import git as harvest_git
             logged = harvest_git(root, 'log', '-1', '--format=%s')
-            assert logged.stdout.strip() == 'lab: lock (fixture)', (logged.stdout, logged.stderr)
+            assert logged.stdout.strip() == 'cs: lock (fixture)', (logged.stdout, logged.stderr)
             assert git('rev-parse', '-q', '--verify', 'HEAD', check=False).returncode != 0, 'harvest wrote the workspace .git'
             # Plain setup directories nested under a repo must be copied, never discovered as that repo.
             sys.path.insert(0, str(SOURCE / 'ops/bin'))
             from _setup_workspace import materialize
             setup = root / 'setup'; setup.mkdir(); (setup / 'input.txt').write_text('fixture')
             workspace = root / 'workspace'
-            materialize(setup, workspace, lab=root, env=env)
+            materialize(setup, workspace, code_root=root, env=env)
             assert not (workspace / '.git').exists(), 'plain setup inherited its containing repo'
             assert (workspace / 'input.txt').read_text() == 'fixture'
         finally:
@@ -177,13 +178,13 @@ def failure_diagnostics(root):
 
 with tempfile.TemporaryDirectory(prefix='profiled-executor-roots-') as raw, failure_diagnostics(Path(raw).resolve()):
     root = Path(raw).resolve()
-    lab = root / 'release/cs'; ops = lab / 'ops/bin'; ops.mkdir(parents=True)
+    code_root = root / 'release/cs'; ops = code_root / 'ops/bin'; ops.mkdir(parents=True)
     for path in (SOURCE / 'ops/bin').iterdir():
         if path.is_file():
             shutil.copy2(path, ops / path.name)
     from native_runtime import stage_native_runtime
     stage_native_runtime(ops)
-    (lab / 'ESTATE').write_text('dev\n')
+    (code_root / 'ESTATE').write_text('dev\n')
     state, config, workspaces = root / 'state', root / 'config', root / 'workspaces'
     for d in (state, config, workspaces):
         d.mkdir()
@@ -217,13 +218,13 @@ for event in OP:print(json.dumps(event))
                      "    (run / 'sandbox.sb').write_text(cmd[2])\n"
                      "    return cmd\n")
 
-    before = listing(lab)
+    before = listing(code_root)
     env = isolated_env(home)
-    # Bound discovery even for copied lab tools running from a nested fixture directory.
+    # Bound discovery even for copied code_root tools running from a nested fixture directory.
     subprocess.run(['git', '-C', str(root), 'init', '-q'], env=env, check=True)
     env.setdefault('CS_TOOLS_BIN', str(SOURCE.parent / 'target/release/cs-tools'))
-    env.update(HOME=str(home), LAB_STATE_ROOT=str(state), LAB_CONFIG_ROOT=str(config), LAB_WORKSPACES_ROOT=str(workspaces))
-    r = subprocess.run([sys.executable, str(ops / '_executor.py')], cwd=lab, env=env, text=True, capture_output=True,
+    env.update(HOME=str(home), CS_STATE_ROOT=str(state), CS_CONFIG_ROOT=str(config), CS_WORKSPACES_ROOT=str(workspaces))
+    r = subprocess.run(cli_command(sys.executable, ops / '_executor.py'), cwd=code_root, env=env, text=True, capture_output=True,
                        input=json.dumps({'executor': 'opencode', 'task': str(task), 'exp': 'FIXTURE-ROOTS', 'timeout_s': 15}),
                        timeout=60)
     assert r.stdout.strip(), (r.returncode, r.stderr)
@@ -241,8 +242,8 @@ for event in OP:print(json.dumps(event))
     assert evidence['capture_state'] == 'complete' and [f['path'] for f in evidence['files']] == ['answer.txt'], evidence
     assert (workspaces / run_id / 'workspace/answer.txt').read_text() == 'done\n'
     assert (workspaces / run_id / 'workspace/.git').is_dir(), 'scratch workspace must own its git metadata'
-    assert not (lab / 'ledger').exists(), 'a node run never lands under the code root'
-    after = listing(lab)
+    assert not (code_root / 'ledger').exists(), 'a node run never lands under the code root'
+    after = listing(code_root)
     assert after == before, sorted(after ^ before)
     # Profiled repo lanes use pinned host git, preserve their diff and commit on the lane branch.
     sys.path.insert(0, str(ops))
@@ -269,8 +270,8 @@ for event in OP:print(json.dumps(event))
     lane = Path(lane_info['path'])
     env_decoys = ('.env', '.env.local', '.env_prod', '.env-local', '.envrc', '.envrc.local', 'foo.env', 'x.env.bak')
     task.joinpath('setup').rmdir()
-    (lab / 'specs').mkdir()
-    spec = lab / 'specs/lane.yaml'
+    (code_root / 'specs').mkdir()
+    spec = code_root / 'specs/lane.yaml'
     spec.write_text('id: profiled-lane\nmodel: opencode\nrepo: demo\nlane: profiled\n')
     targets = [main / 'answer.txt', Path(sibling['path']) / 'answer.txt', main / '.git/config']
     # Probes run under the same lane restrictions as the agent, including protected staged config and .env denies.
@@ -308,7 +309,7 @@ for name in DECOYS:
         pass
     else:
         raise AssertionError('secret overwrite allowed: ' + name)
-fresh = Path('.lab-env-probe')
+fresh = Path('.cs-env-probe')
 fresh.mkdir()
 for name in ('.env', '.env.local'):
     target = fresh / name
@@ -375,7 +376,7 @@ assert Path('answer.txt').read_text() == 'done\n'
             profiles[template].update(auth='opencode_db', cost_class='subscription')
             (ops / 'cli-profiles.json').write_text(json.dumps(profiles))
         spec.write_text('id: profiled-lane\nmodel: %s\nrepo: demo\nlane: profiled\n' % template)
-        r = subprocess.run([sys.executable, str(ops / '_executor.py')], cwd=lab, env=env, text=True,
+        r = subprocess.run(cli_command(sys.executable, ops / '_executor.py'), cwd=code_root, env=env, text=True,
                            capture_output=True, timeout=60, input=json.dumps({
                                'executor': template, 'task': str(task), 'spec': 'specs/lane.yaml',
                                'exp': 'FIXTURE-LANE', 'timeout_s': 15}))
@@ -401,10 +402,10 @@ assert Path('answer.txt').read_text() == 'done\n'
             with sqlite3.connect(db) as conn:
                 real_rows = sorted(conn.execute('SELECT provider_id, token FROM credential').fetchall())
             assert real_rows == [('anthropic', 'foreign-fixture-auth'), ('opencode-go', 'go-fixture-auth')], real_rows
-            assert not list((lane / '.lab-tmp').glob('*/data/opencode/opencode.db*')), 'staged opencode.db left behind'
+            assert not list((lane / '.cs-tmp').glob('*/data/opencode/opencode.db*')), 'staged opencode.db left behind'
         assert git(main, 'rev-parse', 'HEAD') == base and (main / 'answer.txt').read_text() == 'before\n'
         assert not git(lane, 'diff', 'HEAD'), 'node committed the changes'
-        probe_paths = list((lane / '.lab-tmp').glob('cli-home-*/tmp/probe-*.json'))
+        probe_paths = list((lane / '.cs-tmp').glob('cli-home-*/tmp/probe-*.json'))
         assert len(probe_paths) == (2 if template == 'opencode' else 4), probe_paths
         for probe_path in probe_paths:
             probe = json.loads(probe_path.read_text())
@@ -437,7 +438,7 @@ assert Path('answer.txt').read_text() == 'done\n'
     for name in env_decoys:  # refresh synthetic secrets for the failing-check run
         (lane / name).write_text('SECRET=1\n')
     (task / 'check').write_text('#!/bin/sh\nexit 1\n')
-    r = subprocess.run([sys.executable, str(ops / '_executor.py')], cwd=lab, env=env, text=True,
+    r = subprocess.run(cli_command(sys.executable, ops / '_executor.py'), cwd=code_root, env=env, text=True,
                        capture_output=True, timeout=60, input=json.dumps({
                            'executor': 'opencode-go', 'task': str(task), 'spec': 'specs/lane.yaml',
                            'exp': 'FIXTURE-RED', 'timeout_s': 15}))
@@ -449,7 +450,7 @@ assert Path('answer.txt').read_text() == 'done\n'
     (config / 'cli-pins.json').unlink(missing_ok=True)
     (ops / 'cli-profiles.json').write_text(json.dumps(profiles))
     spec.write_text('id: profiled-lane\nmodel: opencode\nrepo: demo\nlane: profiled\nbudget:\n  memory_mb: 1\n')
-    r = subprocess.run([sys.executable, str(ops / '_executor.py')], cwd=lab, env=env, text=True,
+    r = subprocess.run(cli_command(sys.executable, ops / '_executor.py'), cwd=code_root, env=env, text=True,
                        capture_output=True, timeout=60, input=json.dumps({
                            'executor': 'opencode', 'task': str(task), 'spec': 'specs/lane.yaml',
                            'exp': 'FIXTURE-MEMCAP', 'timeout_s': 15}))

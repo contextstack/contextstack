@@ -23,26 +23,23 @@ import tempfile
 import time
 import threading
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+sys.path.insert(0, str(_SCRIPTS.parent / "ops/bin"))
+from _agent_discovery import AGENTS, discover_agents, probe_agent
 import _install_setup
 from _node_services import release_bin
 
 FIRST_JOB = "cs-init-first-job"
-# name: (executor template the gateway runs it with, or None when only reported)
-AGENTS = {"claude": "claude-code", "codex": "codex", "gemini": "gemini-cli", "cursor-agent": "cursor-agent",
-          "opencode": None, "pi": "pi", "goose": "goose", "grok": "grok"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")  # director-rs node names
 PROVIDERS = ("anthropic", "openai", "groq", "together", "lambda", "openrouter", "gemini")  # csgateway credentials
 LABELS = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini", "cursor-agent": "Cursor",
           "opencode": "OpenCode", "pi": "Pi", "goose": "Goose", "grok": "Grok"}
 LOGINS = {"claude": [], "codex": ["login"], "cursor-agent": ["login"], "gemini": []}
 REPLY = "hello from ContextStack"
-TOOLCHAIN_BINARIES = ("php", "node", "npm", "composer", "cargo", "go", "python3", "uv")
 
 
 def sign_in_command(name):
@@ -174,90 +171,20 @@ class Init:
         return "%s:%s" % (venv, self.nr.SYSTEM_PATH)
 
     def step_toolchains(self):
-        import shutil
         sys.path.insert(0, str(_SCRIPTS.parent / "ops/bin"))
-        from _toolchains import binary_roots, _grantable, cargo_toolchain_paths, uv_python_dir
+        from _toolchains import login_toolchain_additions
 
         destination = self.config / "toolchains.json"
-        shell = os.environ.get("SHELL")
-        if not shell:
-            return
-        existing = []
-        if destination.is_file():
-            try:
-                loaded = json.loads(destination.read_text(encoding="utf-8"))
-                if isinstance(loaded, list):
-                    existing = loaded
-            except (OSError, ValueError):
-                pass
-        lookup = ";".join("command -v %s" % name for name in TOOLCHAIN_BINARIES)
         try:
-            result = subprocess.run([shell, "-lic", lookup], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    text=True, timeout=15, stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired):
-            self.say("toolchains: login shell lookup failed")
+            existing, added = login_toolchain_additions(destination, self.service_path())
+            if added:
+                self.config.mkdir(parents=True, exist_ok=True)
+                self.nr.write_atomic(destination, (json.dumps(existing + added, indent=2) + "\n").encode(), 0o644)
+        except (OSError, ValueError) as error:
+            self.say("toolchains: %s" % error)
             return
-        if result.returncode != 0:
-            self.say("toolchains: login shell lookup failed")
-            return
-        service_path = self.service_path()
-        detected = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            binary = Path(line)
-            if not binary.is_absolute() or binary.name not in TOOLCHAIN_BINARIES or not binary.is_file():
-                continue
-            if shutil.which(binary.name, path=service_path):
-                continue
-            if binary.name == "uv":
-                python = uv_python_dir(binary)
-                if python is None or not _grantable(python):
-                    continue
-                bindir = binary.parent.resolve()
-                entry = {"name": "uv", "bin": str(bindir), "python": str(python)}
-                if entry not in detected:
-                    detected.append(entry)
-                continue
-            if binary.name == "cargo":
-                paths = cargo_toolchain_paths(binary)
-                if paths is None:
-                    continue
-                if not _grantable(paths["rustup"]) or not _grantable(paths["toolchain"]):
-                    continue
-                registry = paths.get("registry")
-                if registry is not None and not _grantable(registry):
-                    continue
-                bindir = binary.parent.resolve()
-                entry = {"name": "cargo", "bin": str(bindir), "rustup": str(paths["rustup"]),
-                         "toolchain": str(paths["toolchain"])}
-                if registry is not None:
-                    entry["registry"] = str(registry)
-                if entry not in detected:
-                    detected.append(entry)
-                continue
-            for root in binary_roots(binary):
-                root = root.resolve()
-                entry = {"name": binary.name, "bin": str(root)}
-                if root.is_dir() and _grantable(root) and entry not in detected:
-                    detected.append(entry)
-        merged = list(existing)
-        seen = {(e.get("name"), e.get("bin")) for e in existing if isinstance(e, dict)}
-        added = []
-        for entry in detected:
-            key = (entry["name"], entry["bin"])
-            if key not in seen:
-                merged.append(entry)
-                seen.add(key)
-                added.append(entry)
-        if not added:
-            return
-        self.config.mkdir(parents=True, exist_ok=True)
-        self.nr.write_atomic(destination, (json.dumps(merged, indent=2) + "\n").encode(), 0o644)
         for entry in added:
             self.say("%s: %s" % (entry["name"], entry["bin"]))
-            self.detail("%s: %s" % (entry["name"], entry["bin"]))
 
     def agent_path(self):
         """The PATH the gateway resolves CLIs on (its plist), else what it would be; CS_AGENT_PATH overrides (tests)."""
@@ -268,57 +195,7 @@ class Init:
         return path or "%s:%s" % (self.cs.HOME / ".local/bin", self.nr.SYSTEM_PATH)
 
     def probe(self, name, path):
-        import shutil
-        exe = shutil.which(name, path=path)
-        if exe is None and name == "grok":  # Grok Build installs beside its login, off the gateway PATH
-            candidate = self.cs.HOME / ".grok/bin/grok"
-            exe = str(candidate) if candidate.is_file() else None
-        out = {"name": name, "template": AGENTS[name], "path": exe, "version": None, "signed_in": None, "how": "not installed"}
-        if not exe:
-            return out
-        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")}  # as the executor runs it
-        env["PATH"] = path
-        v = self.run([exe, "--version"], 15, env=env)
-        out["version"] = (v.stdout or v.stderr).strip().splitlines()[0][:60] if v.returncode == 0 and (v.stdout or v.stderr).strip() else None
-        if name == "claude":
-            r = self.run([exe, "auth", "status", "--json"], 20, env=env)
-            try:
-                doc = json.loads(r.stdout)
-            except ValueError:
-                doc = {}
-            out["signed_in"] = bool(doc.get("loggedIn")) if isinstance(doc, dict) and "loggedIn" in doc else None
-            out["how"] = "claude auth status: %s" % (doc.get("authMethod") or "?" if out["signed_in"] else
-                                                     "not signed in (run: claude, then /login)" if out["signed_in"] is False
-                                                     else "no answer")
-        elif name == "codex":
-            r = self.run([exe, "login", "status"], 20, env=env)
-            text = (r.stdout + r.stderr).strip().splitlines()
-            out["signed_in"] = r.returncode == 0 and "logged in" in (text[0].lower() if text else "")
-            out["how"] = "codex login status: %s" % ((text[0][:60] if text else "?") if out["signed_in"] else "not signed in (run: codex login)")
-        elif name == "gemini":
-            settings = self.cs.read_json(self.cs.HOME / ".gemini/settings.json", {}) or {}
-            auth = ((settings.get("security") or {}).get("auth") or {}).get("selectedType") or settings.get("selectedAuthType")
-            out["signed_in"] = auth == "oauth-personal"
-            out["how"] = ("settings: Google sign-in chosen (not verified without a call)" if out["signed_in"]
-                          else "settings name no Google sign-in (run: gemini, then sign in)")
-        elif name == "cursor-agent":
-            r = self.run([exe, "status"], 20, env=env)
-            text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", r.stdout + r.stderr).lower()
-            out["signed_in"] = r.returncode == 0 and "logged in" in text and "not logged in" not in text
-            out["how"] = "cursor-agent status: %s" % ("signed in" if out["signed_in"] else "not signed in (run: cursor-agent login)")
-        elif name == "opencode":
-            r = self.run([exe, "auth", "list"], 20, env=env)
-            n = len([l for l in r.stdout.splitlines() if l.rstrip().endswith("stored")])
-            out["signed_in"] = n > 0
-            out["how"] = "opencode auth list: %d credential(s) stored" % n
-        elif name in ("pi", "goose", "grok"):
-            # Presence only. Login/config artifacts may sit beside provider secrets; this probe opens none of them.
-            marker = {"pi": self.cs.HOME / ".pi/agent/auth.json",
-                      "goose": self.cs.HOME / ".config/goose/config.yaml",
-                      "grok": self.cs.HOME / ".grok/auth.json"}[name]
-            out["signed_in"] = marker.is_file()
-            out["how"] = "login/config present" if out["signed_in"] else "no login/config at %s" % marker
-        return out
+        return probe_agent(name, path, self.cs.HOME, self.run, lambda path, default: self.cs.read_json(path, default))
 
     def interactive(self):
         return not self.args.yes and sys.stdin.isatty()
@@ -362,8 +239,7 @@ class Init:
     def step_agents(self):
         path = self.agent_path()
         self.say("Checking installed agents and sign-ins…")
-        with ThreadPoolExecutor(len(AGENTS)) as pool:
-            found = list(pool.map(lambda n: self.probe(n, path), AGENTS))
+        found = discover_agents(path, self.probe)
         self.write_agent_capabilities(found)
         for agent in found:
             self.report_agent(agent)
@@ -393,7 +269,7 @@ class Init:
             return
         sys.path.insert(0, str(kit))
         from _cli_pins import ensure_pin, package_sha256, profiled_templates, resolve_binary
-        env = {"LAB_CONFIG_ROOT": str(self.config)}
+        env = {"CS_CONFIG_ROOT": str(self.config)}
         path_probe = self.agent_path()
         probe_env = {k: v for k, v in os.environ.items()
                      if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GROK_API_KEY")}
@@ -775,10 +651,7 @@ def main(cs, args):
         init.step_disk()
     with init.stage("Checking agents"):
         agents = init.step_agents()
-    try:  # best-effort: a slow or broken login shell must never fail init
-        init.step_toolchains()
-    except (OSError, subprocess.SubprocessError, ValueError) as error:
-        init.detail("toolchains: not detected (%s)" % error)
+    init.step_toolchains()
     init.step_cli_pins()
     with init.stage("Starting services"):
         name = init.step_services()

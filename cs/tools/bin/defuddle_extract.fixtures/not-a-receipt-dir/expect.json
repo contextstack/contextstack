@@ -2,7 +2,7 @@
   "exit": 1,
   "stdout": "defuddle_extract: evidence must be a canonical fetch receipt\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"evidence\": \"_evidence/bodies/6b5a9c6e6bf4a6c40dec1a1d6a6a1e1e441439cf83d45f71406f6385c39d7c77.html\"}, \"name\": \"defuddle_extract\"}\n",
+    ".cs-calls.jsonl": "{\"args\": {\"evidence\": \"_evidence/bodies/6b5a9c6e6bf4a6c40dec1a1d6a6a1e1e441439cf83d45f71406f6385c39d7c77.html\"}, \"name\": \"defuddle_extract\"}\n",
     "_evidence/derivations/manifest.jsonl": null
   },
   "untouched": true

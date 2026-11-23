@@ -29,8 +29,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "node-install-layout"))
 import _bundle  # noqa: E402
 
-LAB = _bundle.LAB
-INSTALL = LAB / "scripts/node-install"
+CODE_ROOT = _bundle.CODE_ROOT
+INSTALL = CODE_ROOT / "scripts/node-install"
 A, B, C = "20990101-aaaaaaaaa", "20990102-bbbbbbbbb", "20990103-ccccccccc"
 LABEL = "com.contextstack.client-web"
 LISTEN = "127.0.0.1:8781"
@@ -73,7 +73,7 @@ def fake_php(where, version):
 def real_php():
     """(php, the checkout's client-web) when php >= 8.3 and the checkout has its built vendor/ and public/build/."""
     nb = _bundle.node_bundle()
-    src = LAB.parent / nb.CLIENT_WEB_SRC
+    src = CODE_ROOT.parent / nb.CLIENT_WEB_SRC
     php = shutil.which("php")
     if not php or not (src / "vendor/autoload.php").is_file() or not (src / "public/build/manifest.json").is_file():
         return None, "no php, or %s has no vendor/ and public/build/ (composer install; npm ci && npm run build)" % src
@@ -98,7 +98,7 @@ def stand_in_build(src, php):
 def part_bundle(tmp, php, src):
     """The release tree node-bundle build --client-web makes; returns it."""
     nb = _bundle.node_bundle()
-    expect((LAB.parent / nb.CLIENT_WEB_SRC / "artisan").is_file() and nb.CLIENT_WEB == "client-web",
+    expect((CODE_ROOT.parent / nb.CLIENT_WEB_SRC / "artisan").is_file() and nb.CLIENT_WEB == "client-web",
            "node-bundle: CLIENT_WEB_SRC (%s) names the app; a release calls it client-web/" % nb.CLIENT_WEB_SRC)
     nb.CLIENT_WEB_BUILD = stand_in_build(src, php)
     dest = tmp / "cw-tree/client-web"
@@ -134,7 +134,7 @@ def part_bundle(tmp, php, src):
         fail("a client-web build with no vendor/ was accepted")
     except SystemExit as stop:
         expect("vendor/autoload.php" in str(stop), "a client-web build missing its outputs stops: %s" % stop)
-    r = subprocess.run([sys.executable, str(LAB / "scripts/node-bundle"), "build", "--help"], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(CODE_ROOT / "scripts/node-bundle"), "build", "--help"], capture_output=True, text=True)
     expect("--client-web" in r.stdout, "node-bundle build takes --client-web")
     return dest
 
@@ -477,7 +477,7 @@ _SKIP = ""
 
 def part_director_url():
     """client-web talks to the Director served here, else the one this node is registered with, else the default."""
-    loader = importlib.machinery.SourceFileLoader("node_release_cw", str(LAB / "scripts/node-release"))
+    loader = importlib.machinery.SourceFileLoader("node_release_cw", str(CODE_ROOT / "scripts/node-release"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
@@ -500,7 +500,7 @@ def main():
         _SKIP, src = src, None
     real = Path.home()
     watched = [real / ".local/bin", real / "Library/LaunchAgents", Path("/opt/homebrew/bin")]
-    before = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    before = [_bundle.directory_snapshot(w) for w in watched]
     agents = _bundle.real_agents()
     part_director_url()
     tmp = Path(tempfile.mkdtemp(prefix="client-web-install-__", suffix=".noindex"))
@@ -510,7 +510,7 @@ def main():
             part_serve(tmp, uv, managed, cw_tree, php)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    after = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    after = [_bundle.directory_snapshot(w) for w in watched]
     expect(before == after, "the real ~/.local/bin, ~/Library/LaunchAgents and /opt/homebrew/bin are unchanged")
     leak = _bundle.launchd_untouched(agents)
     expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")

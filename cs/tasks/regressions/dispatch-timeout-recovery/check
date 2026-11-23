@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 TASK = Path(__file__).resolve().parent
-LAB = TASK.parents[2]
+CODE_ROOT = TASK.parents[2]
 # The Rust gateway scripts/check builds (the Go one is archived); $CSGATEWAY_BIN overrides it.
 GATEWAY = Path(os.environ.get("CSGATEWAY_BIN") or TASK.parents[3] / "target/release/cs-gateway")
 
@@ -111,7 +111,7 @@ with scratch_dir(prefix="dispatch-timeout-") as raw:
         gateway = "http://127.0.0.1:" + str(port)
         wait_for(lambda: request(gateway + "/v1/admission")[0] == 200, processes, log=output)
 
-        estate = root / "lab"
+        estate = root / "code_root"
         ops = estate / "ops/bin"
         ops.mkdir(parents=True)
         (estate / "ledger").mkdir()
@@ -120,19 +120,19 @@ with scratch_dir(prefix="dispatch-timeout-") as raw:
         (estate / "tasks/timeout").mkdir(parents=True)
         (estate / "tasks/complete").mkdir(parents=True)
         (estate / "grants").mkdir()
-        for source in (LAB / "ops/bin").iterdir():
+        for source in (CODE_ROOT / "ops/bin").iterdir():
             if source.is_file():
                 shutil.copy2(source, ops / source.name)
-        for name in ("estate-commit", "corpus-audit", "void-watch", "shadow-cycle"):
+        for name in ("corpus-audit", "void-watch", "shadow-cycle"):
             (ops / name).write_text("#!/bin/sh\necho '{\"ok\":true,\"skip\":\"fixture\"}'\n")
             (ops / name).chmod(0o755)
         (ops / "local-model-ready").write_text("#!/bin/sh\nexit 0\n")
         (ops / "local-model-ready").chmod(0o755)
         # The default runner, found where tick's default looks: <code root>/../target/release/cs-harness.
-        sys.path.append(str(LAB / "ops/bin"))
+        sys.path.append(str(CODE_ROOT / "ops/bin"))
         from _runner import built_runner
         (root / "target/release").mkdir(parents=True)
-        shutil.copy2(built_runner(LAB), root / "target/release/cs-harness")
+        shutil.copy2(built_runner(CODE_ROOT), root / "target/release/cs-harness")
         (estate / "ESTATE").write_text("dev\n")
         (estate / "INVARIANTS.md").write_text("Isolated dispatcher timeout fixture.\n")
         (estate / "PINNED.md").write_text("pinned: fake-paid\n")

@@ -7,4 +7,4 @@ when `python3 -m coverage` is available; it is not a hard gate.
 
 Run:
 
-    cd cs && env -u LAB_STATE_ROOT tasks/regressions/py-core-units/check
+    cd cs && env -u CS_STATE_ROOT tasks/regressions/py-core-units/check

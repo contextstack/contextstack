@@ -6,6 +6,7 @@
 //! before it. Every step runs inside the caller's transaction, under the database lock, so two devices posting at
 //! once still queue one behind the other.
 
+use crate::decision_log::{self, TurnLog};
 use crate::jobs::{BundleFile, Plan};
 use crate::store::{Record, Store, touch};
 use crate::thread::{self, Choice, Past, Summary};
@@ -35,12 +36,13 @@ struct Conv {
     held: bool,
     revision: i64,
     project: Option<String>,
+    lead: bool,
 }
 
 fn load(db: &Connection, id: &str) -> Res<Option<Conv>> {
     db.query_row(
         "SELECT conversation_id, node, spec, spec_version, model, instructions_tokens, tools, held, revision,
-                project_id
+                project_id, lead
          FROM conversations WHERE conversation_id = ?1",
         params![id],
         |r| {
@@ -55,6 +57,7 @@ fn load(db: &Connection, id: &str) -> Res<Option<Conv>> {
                 held: r.get(7)?,
                 revision: r.get(8)?,
                 project: r.get(9)?,
+                lead: r.get(10)?,
             })
         },
     )
@@ -119,7 +122,14 @@ fn summary_by_id(db: &Connection, id: &str) -> Res<Option<Summary>> {
 }
 
 /// Offer a job made of the conversation's spec bundle plus the generated context, goal and check.
-fn make_job(store: &Store, db: &Connection, conv: &Conv, context: &str, goal: &str) -> Res<String> {
+fn make_job(
+    store: &Store,
+    db: &Connection,
+    conv: &Conv,
+    context: &str,
+    goal: &str,
+    log: Option<&TurnLog>,
+) -> Res<String> {
     let mut stmt = db
         .prepare_cached(
             "SELECT path, sha256, bytes, mode FROM conversation_files WHERE conversation_id = ?1 ORDER BY path",
@@ -141,7 +151,10 @@ fn make_job(store: &Store, db: &Connection, conv: &Conv, context: &str, goal: &s
         (thread::CONTEXT_PATH, context.as_bytes(), 0o644),
         (thread::GOAL_PATH, goal.as_bytes(), 0o644),
         (thread::CHECK_PATH, thread::CHECK, 0o755),
-    ] {
+    ]
+    .into_iter()
+    .chain(log.map(|log| (decision_log::TURN_PATH, log.markdown.as_bytes(), 0o644)))
+    {
         store.put_object(data)?;
         files.push(BundleFile {
             path: path.into(),
@@ -189,7 +202,14 @@ pub fn start_summary(
         .filter(|t| t.seq > from)
         .collect();
     let context = thread::render(base.as_ref(), &turns);
-    let job = make_job(store, db, &conv, &context, &thread::summary_goal(through))?;
+    let job = make_job(
+        store,
+        db,
+        &conv,
+        &context,
+        &thread::summary_goal(through),
+        None,
+    )?;
     let id = format!("sum_{}", util::ulid()?.to_lowercase());
     db.execute(
         "INSERT INTO summaries (summary_id, conversation_id, through_seq, based_on, redoes, job_id, state,
@@ -226,11 +246,55 @@ pub(crate) fn set_turn(
     Ok(())
 }
 
+/// Record and advance a new turn inside the caller's write transaction.
+pub(crate) fn enqueue(
+    store: &Store,
+    db: &Connection,
+    conversation: &str,
+    message: &str,
+    actor: &str,
+    origin: &str,
+) -> Res<String> {
+    let turn = format!("trn_{}", util::ulid()?.to_lowercase());
+    db.execute(
+        "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at, origin)
+         VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?2), ?3,
+                 'queued', ?4, ?5, ?6)",
+        params![turn, conversation, message, actor, now_utc(), origin],
+    )
+    .map_err(db_err)?;
+    touch(db, Record::Turn, &turn).map_err(db_err)?;
+    touch(db, Record::Conversation, conversation).map_err(db_err)?;
+    advance(store, db, conversation)?;
+    Ok(turn)
+}
+
 /// Start the next turn when nothing is running and the queue is not held. Call after any change to a conversation.
 pub fn advance(store: &Store, db: &Connection, conv_id: &str) -> Res<()> {
     // Each pass starts a turn, waits, or ends a turn that cannot start and looks again.
     while step(store, db, conv_id)? {}
     Ok(())
+}
+
+fn failed_summary_through(db: &Connection, conv_id: &str) -> Res<Option<i64>> {
+    // The newest summary attempt failed: its portion is not tried again until someone redoes it.
+    Ok(db
+        .query_row(
+            "SELECT through_seq, state FROM summaries WHERE conversation_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            params![conv_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?
+        .filter(|(_, s)| s == "error")
+        .map(|(t, _)| t))
+}
+
+fn project_log(db: &Connection, conv: &Conv) -> Res<Option<TurnLog>> {
+    match (conv.lead, conv.project.as_deref()) {
+        (true, Some(project)) => decision_log::for_turn(db, project).map_err(|e| e.2),
+        _ => Ok(None),
+    }
 }
 
 fn step(store: &Store, db: &Connection, conv_id: &str) -> Res<bool> {
@@ -285,18 +349,11 @@ fn step(store: &Store, db: &Connection, conv_id: &str) -> Res<bool> {
     }
     let turns = past(db, conv_id, seq)?;
     let best = best_summary(db, conv_id, seq)?;
-    // The newest summary attempt failed: its portion is not tried again until someone redoes it.
-    let failed: Option<i64> = db
-        .query_row(
-            "SELECT through_seq, state FROM summaries WHERE conversation_id = ?1 ORDER BY rowid DESC LIMIT 1",
-            params![conv_id],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(db_err)?
-        .filter(|(_, s)| s == "error")
-        .map(|(t, _)| t);
-    let budget = thread::budget(&conv.model, conv.instructions, conv.tools);
+    let failed = failed_summary_through(db, conv_id)?;
+    let log = project_log(db, &conv)?;
+    let instructions =
+        conv.instructions + log.as_ref().map_or(0, |log| thread::tokens(&log.markdown));
+    let budget = thread::budget(&conv.model, instructions, conv.tools);
     match thread::choose(&turns, &message, best.as_ref(), &budget, failed) {
         Choice::Summarise { through, based_on } => {
             start_summary(
@@ -318,7 +375,13 @@ fn step(store: &Store, db: &Connection, conv_id: &str) -> Res<bool> {
             Ok(false)
         }
         Choice::Send { summary, over } => {
-            let eligible = Eligible { turn, seq, message };
+            let eligible = Eligible {
+                turn,
+                seq,
+                message,
+                log,
+                budget,
+            };
             send(
                 store,
                 db,
@@ -337,6 +400,8 @@ struct Eligible {
     turn: String,
     seq: i64,
     message: String,
+    log: Option<TurnLog>,
+    budget: thread::Budget,
 }
 
 /// Offer the eligible turn's job with the summary (if any) and the turns after it whole. `Ok(true)` when the job
@@ -351,11 +416,11 @@ fn send(
     over: bool,
 ) -> Res<bool> {
     let (conv_id, turn, seq, message) = (conv.id.as_str(), &el.turn, el.seq, &el.message);
-    let budget = thread::budget(&conv.model, conv.instructions, conv.tools);
+    let budget = &el.budget;
     let from = summary.map_or(0, |s| s.through);
     let whole: Vec<Past> = turns.into_iter().filter(|t| t.seq > from).collect();
     let context = thread::render(summary, &whole);
-    let ctx = json!({
+    let mut ctx = json!({
         "conversation_revision": conv.revision, "spec_version": conv.spec_version, "model": conv.model,
         "context_window": budget.window, "window_source": budget.source, "threshold_tokens": budget.threshold,
         "tokens": thread::tokens(&context) + thread::tokens(message), "over_threshold": over,
@@ -363,7 +428,10 @@ fn send(
         "summary_through_seq": summary.map(|s| s.through),
         "whole_from_seq": whole.first().map(|t| t.seq), "whole_through_seq": whole.last().map(|t| t.seq),
     });
-    match make_job(store, db, conv, &context, message) {
+    if let Some(log) = &el.log {
+        ctx["decision_log"] = json!({"revision": log.revision, "entry_count": log.entry_count});
+    }
+    match make_job(store, db, conv, &context, message, el.log.as_ref()) {
         Ok(job) => {
             set_turn(
                 db,

@@ -101,7 +101,7 @@ echo "$id" >> "$HOME/installs"
         (public / 'RELEASES.json').write_text(text)
 
     def release(version, channel='stable', commit='abc123'):
-        (bundle / 'bundle.json').write_text(json.dumps({'release': version, 'lab_commit': commit, 'target': target}))
+        (bundle / 'bundle.json').write_text(json.dumps({'release': version, 'code_commit': commit, 'target': target}))
         if re.fullmatch(r'v(0|[1-9][0-9]*)\..*', version):
             manifest_rows[:] = [row for row in manifest_rows if row['tag'] != version]
             manifest_rows.append({
@@ -122,7 +122,7 @@ echo "$id" >> "$HOME/installs"
         "CS_RELEASES_MANIFEST_URL": f"http://127.0.0.1:{port}/RELEASES.json",
         "CS_INSTALL_DEV": "1", "PYTHONDONTWRITEBYTECODE": "1",
     }
-    for key in ('LAB_STATE_ROOT', 'CSGATEWAY_ENDPOINT'):
+    for key in ('CS_STATE_ROOT', 'CSGATEWAY_ENDPOINT'):
         env.pop(key, None)
 
     tools = root / 'tools'
@@ -423,7 +423,7 @@ esac
         (tools / 'curl').symlink_to(curl_real)
         write_fake_uname('Linux', 'x86_64')
         (bundle / 'bundle.json').write_text(
-            json.dumps({'release': 'v99.0.0', 'lab_commit': 'abc123', 'target': 'linux-x86_64'})
+            json.dumps({'release': 'v99.0.0', 'code_commit': 'abc123', 'target': 'linux-x86_64'})
         )
         publisher.publish(bundle, public, 'stable')
         Quiet.redirects.clear()

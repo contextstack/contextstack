@@ -28,6 +28,7 @@ set -eu
 pick_kit() { echo cs; }
 
 ROOT="$HOME/.contextstack"
+RELEASES="$ROOT/releases"
 usage() {
   echo "usage: node-install install BUNDLE [options] | switch RELEASE [--wait SECONDS|--no-wait|--force] | select [--gateway go|rust] [--runner go|rust] [--wait SECONDS|--no-wait|--force] | rollback [--wait SECONDS|--no-wait|--force] | status | uninstall [--purge [--purge-secrets]]" >&2
   exit 1
@@ -35,13 +36,49 @@ usage() {
 [ $# -ge 1 ] || usage
 cmd=$1
 shift
+
+# Resolve the installer behind the PATH link so even an older target bundle
+# uses the activation checks shipped with the invoking installer.
+SCRIPT=$0
+while [ -L "$SCRIPT" ]; do
+  link=$(readlink "$SCRIPT")
+  case "$link" in
+    /*) SCRIPT=$link ;;
+    *) SCRIPT=$(dirname "$SCRIPT")/$link ;;
+  esac
+done
+SCRIPTS=$(CDPATH= cd -- "$(dirname "$SCRIPT")" && pwd)
+
+lock_install() {
+  [ -z "${NODE_INSTALL_LOCK_FD:-}" ] || return 0
+  helper=$1
+  shift
+  if [ -x "$helper" ] && [ "$("$helper" node-install-lock 2>/dev/null)" = node-install-lock ]; then
+    exec "$helper" node-install-lock "$RELEASES" "$SCRIPT" "$cmd" "$@"
+  fi
+  lock_python="$ROOT/current/cs/.venv/bin/python3"
+  [ -x "$lock_python" ] || lock_python=python3
+  exec "$lock_python" -I -B -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from _node_layout import exec_locked
+exec_locked(sys.argv[2], sys.argv[3:])
+' "$SCRIPTS" "$SCRIPT" "$cmd" "$@"
+}
+
 case "$cmd" in
   install) ;;
   switch|select|rollback|status|uninstall)
     KIT=$(pick_kit "$ROOT/current")
     PY="$ROOT/current/$KIT/.venv/bin/python3"
+    case "$cmd" in
+      switch|select|rollback)
+        if [ -x "$PY" ] || [ -f "$RELEASES/install.lock" ]; then
+          lock_install "$ROOT/current/bin/cs-tools" "$@"
+        fi ;;
+    esac
     [ -x "$PY" ] || { echo "node-install: no current release under $ROOT" >&2; exit 1; }
-    exec "$PY" -I "$ROOT/current/$KIT/scripts/node-release" "$cmd" "$@" ;;
+    exec "$PY" -I "$SCRIPTS/node-release" "$cmd" "$@" ;;
   *) usage ;;
 esac
 [ $# -ge 1 ] || usage
@@ -60,7 +97,9 @@ case "$(uname -m)" in arm64|aarch64) HOST="$HOST-aarch64";; x86_64|amd64) HOST="
 [ "$TARGET" = "$HOST" ] || { echo "node-install: bundle is for $TARGET, this host is $HOST" >&2; exit 1; }
 case "$ID" in ""|.*|*/*|*" "*) echo "node-install: bundle.json has no usable \"release\" id: '$ID'" >&2; exit 1;; esac
 
-REL="$ROOT/releases/$ID"
+lock_install "$BUNDLE/release/bin/cs-tools" "$BUNDLE" "$@"
+
+REL="$RELEASES/$ID"
 if [ ! -f "$REL/.complete" ]; then
   PYVER=$(tr -d '[:space:]' < "$BUNDLE/release/$KIT/.python-version")
   umask 077
@@ -86,4 +125,4 @@ if [ ! -f "$REL/.complete" ]; then
   : > "$REL/.complete"
 fi
 KIT=$(pick_kit "$REL")
-exec "$REL/$KIT/.venv/bin/python3" -I "$REL/$KIT/scripts/node-release" activate "$ID" --from-bundle "$BUNDLE" "$@"
+exec "$REL/$KIT/.venv/bin/python3" -I "$SCRIPTS/node-release" activate "$ID" --from-bundle "$BUNDLE" "$@"

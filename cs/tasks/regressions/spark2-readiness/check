@@ -23,7 +23,7 @@ try:
         assert r.returncode==expected,(aliases,requested,r.stdout)
         assert json.loads(r.stdout)['model']==requested
     with scratch_dir() as raw:
-        root=Path(raw); target=root/'lab/ops/bin/local-model-ready';target.parent.mkdir(parents=True)
+        root=Path(raw); target=root/'code_root/ops/bin/local-model-ready';target.parent.mkdir(parents=True)
         shutil.copy2(op,target)
         gateway=root/'modelgateway';gateway.mkdir()
         (gateway/'models.json').write_text(json.dumps({'deployments':[{'models':['local-reasoner'],'endpoint':f'http://127.0.0.1:{server.server_port}/v1'}]}))
@@ -33,8 +33,8 @@ try:
         # Exercise the dispatcher's real alias selector and readiness adapter.
         source=ast.parse((op.parent/'tick').read_text())
         functions=[n for n in source.body if isinstance(n,ast.FunctionDef) and n.name in {'local_model','local_model_ready'}]
-        spec=root/'lab/specs/fixture.yaml';spec.parent.mkdir();spec.write_text('model: local-reasoner\n')
-        namespace={'LAB':root/'lab','HERE':target.parent,'subprocess':subprocess,'spec_value':lambda text,key:text.split(':',1)[1].strip()}
+        spec=root/'code_root/specs/fixture.yaml';spec.parent.mkdir();spec.write_text('model: local-reasoner\n')
+        namespace={'CODE_ROOT':root/'code_root','HERE':target.parent,'subprocess':subprocess,'spec_value':lambda text,key:text.split(':',1)[1].strip()}
         exec(compile(ast.Module(body=functions,type_ignores=[]),'tick','exec'),namespace)
         assert namespace['local_model']({'spec':'specs/fixture.yaml'})=='local-reasoner'
         assert namespace['local_model_ready']('local-reasoner')

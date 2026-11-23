@@ -15,6 +15,21 @@ fn name(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
+fn model_name(model: &str) -> bool {
+    if let Some(gateway) = model.strip_prefix("harness:") {
+        gateway.len() <= 100
+            && gateway
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && gateway
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
+    } else {
+        name(model)
+    }
+}
+
 fn slug(s: &str) -> String {
     let mut out = String::new();
     for c in s.to_ascii_lowercase().chars() {
@@ -187,12 +202,17 @@ pub fn agents(agent: Option<&str>) -> Result<Value, No> {
     }
 }
 
-fn budget(profile: &Value, given: Option<&Value>) -> Result<Value, No> {
+fn budget(profile: &Value, harness_coder: bool, given: Option<&Value>) -> Result<Value, No> {
     let mut budget = json!({"turns":300,"tool_calls":0,"usd":0,"seconds":3600});
-    for overlay in [profile.get("budget"), given]
-        .into_iter()
-        .flatten()
-        .filter(|v| !v.is_null())
+    let harness_default = json!({"turns":120});
+    for overlay in [
+        profile.get("budget"),
+        harness_coder.then_some(&harness_default),
+        given,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|v| !v.is_null())
     {
         let obj = overlay
             .as_object()
@@ -235,6 +255,35 @@ fn lane_check(check: Option<&str>, agent: Option<&str>, read_only: bool) -> Stri
 
 type BuiltBundle = (Map<String, Value>, Vec<(String, String, u32)>);
 
+fn spec_model_and_tools(
+    model: &str,
+    read_only: bool,
+    repo_view: bool,
+    agent: Option<&str>,
+) -> Result<(String, &'static str), No> {
+    if !model_name(model) {
+        return Err(No::invalid("invalid model name"));
+    }
+    let harness = model.strip_prefix("harness:");
+    if harness.is_none() && !crate::capabilities::is_cli_template(model) {
+        return Err(No::invalid(&format!(
+            "unknown executor template {model}; use harness:<gateway-model> for a gateway model"
+        )));
+    }
+    let spec_model = harness.map_or_else(|| model.to_owned(), |gateway| json!(gateway).to_string());
+    let tools = match (harness.is_some(), read_only && !repo_view, agent) {
+        (true, true, Some("coder" | "researcher")) => "[fs_read, request_action]",
+        (true, false, Some("coder")) => {
+            "[fs_read, fs_write, fs_edit, exec, repo_search, run_check, request_action]"
+        }
+        (true, false, Some("researcher")) => "[fs_read, fs_write, exec, request_action]",
+        (true, true, _) => "[fs_read]",
+        (true, false, _) => "[fs_read, fs_write, exec]",
+        (false, _, _) => "[]",
+    };
+    Ok((spec_model, tools))
+}
+
 /// Resolve a lane request and build its files without writing objects.
 pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
     let m = input
@@ -258,12 +307,13 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
     let model = get("model")?
         .or(profile["model"].as_str())
         .unwrap_or("cursor-sol");
-    if !name(model) {
-        return Err(No::invalid("invalid model name"));
-    }
     let repo = get("repo")?.filter(|s| !s.is_empty());
     let lane = get("lane")?.filter(|s| !s.is_empty());
-    if repo.is_some() != lane.is_some() || repo.into_iter().chain(lane).any(|s| !name(s)) {
+    let read_only = profile["writes"].as_bool() == Some(false);
+    let repo_view = read_only && repo.is_some() && lane.is_none();
+    if (!repo_view && repo.is_some() != lane.is_some())
+        || repo.into_iter().chain(lane).any(|s| !name(s))
+    {
         return Err(No::invalid(
             "repo and lane must be valid names and supplied together",
         ));
@@ -272,16 +322,20 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
         .zip(lane)
         .map(|(repo, lane)| crate::repos::lane_name(repo, lane, &Value::Null));
     let lane = chosen_lane.as_deref();
-    if agent.is_some() && profile["lane"].as_bool() != Some(repo.is_some()) {
+    if agent.is_some() && !repo_view && profile["lane"].as_bool() != Some(lane.is_some()) {
         return Err(No::invalid("agent workspace does not match repo and lane"));
     }
     let task_slug = slug(lane.unwrap_or(title));
     let task = format!("tasks/{task_slug}");
-    let budget = budget(&profile, m.get("budget"))?;
+    let budget = budget(
+        &profile,
+        agent == Some("coder") && model.starts_with("harness:"),
+        m.get("budget"),
+    )?;
     let check = lane_check(
         get("check")?.or(profile["check"].as_str()),
         agent,
-        repo.is_some() && profile["writes"].as_bool() == Some(false),
+        lane.is_some() && read_only,
     );
     if let Some(system) = get("system")?.filter(|s| !s.is_empty()) {
         prompt = system.into();
@@ -290,7 +344,12 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
         json!({"lane":lane.unwrap_or(&task_slug),"model":model,"agent":agent.unwrap_or(model)});
     if let Some(repo) = repo {
         meta["repo"] = json!(repo);
-        meta["branch"] = json!(format!("lane/{}", lane.unwrap_or_default()));
+    }
+    if let Some(lane) = lane {
+        meta["branch"] = json!(format!("lane/{lane}"));
+    }
+    if repo_view {
+        meta["repo_read_only"] = json!("true");
     }
     if let Some(sha) = digest {
         meta["agent_sha256"] = json!(sha);
@@ -298,8 +357,9 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
     if let Some(t) = get("task_type")?.or(profile["task_type"].as_str()) {
         meta["task_type"] = json!(t);
     }
+    let (spec_model, tools) = spec_model_and_tools(model, read_only, repo_view, agent)?;
     let mut spec_text = format!(
-        "id: lane-{task_slug}\nmodel: {model}\nsystem: prompts/system.md\ncontext: []\ntools: []\nmcp: []\nbudget: {{turns: {}, tool_calls: {}, usd: {:?}, seconds: {}}}\ntasks: [tasks/{task_slug}]\ntrials: 1\nhypothesis: {}\n",
+        "id: lane-{task_slug}\nmodel: {spec_model}\nsystem: prompts/system.md\ncontext: []\ntools: {tools}\nmcp: []\nbudget: {{turns: {}, tool_calls: {}, usd: {:?}, seconds: {}}}\ntasks: [tasks/{task_slug}]\ntrials: 1\nhypothesis: {}\n",
         budget["turns"],
         budget["tool_calls"],
         budget["usd"].as_f64().unwrap_or(0.0),
@@ -307,12 +367,13 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
         json!(title)
     );
     if let Some(repo) = repo {
-        writeln!(
-            spec_text,
-            "repo: {repo}\nlane: {}",
-            lane.unwrap_or_default()
-        )
-        .map_err(|e| No::internal(&e))?;
+        writeln!(spec_text, "repo: {repo}").map_err(|e| No::internal(&e))?;
+    }
+    if let Some(lane) = lane {
+        writeln!(spec_text, "lane: {lane}").map_err(|e| No::internal(&e))?;
+    }
+    if repo_view {
+        spec_text.push_str("repo_read_only: true\n");
     }
     let spec = spec_text;
     let fields = json!({"title":title.chars().take(200).collect::<String>(),"spec":"spec.yaml","task":task,"trials":1,"meta":meta}).as_object().cloned().ok_or_else(|| No::invalid("invalid lane"))?;
@@ -328,25 +389,43 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
 }
 
 /// Select before freezing the offered bundle: profiles belong here, availability to the node.
-fn available_model(model: &str, profile: &Value, status: &Value) -> Result<String, No> {
-    let Some(caps) = status.get("agent_capabilities") else {
-        return Ok(model.into());
-    };
-    let now = util::now_utc();
+fn available_model(
+    model: &str,
+    profile: &Value,
+    status: &Value,
+    node: &str,
+    explicit: bool,
+) -> Result<String, No> {
+    let caps_reported = status
+        .get("agent_capabilities")
+        .is_some_and(Value::is_object);
     let ready = |candidate: &str| {
-        caps["templates"]
-            .as_array()
-            .is_some_and(|rows| rows.iter().any(|v| v.as_str() == Some(candidate)))
-            && !status["provider_limits"].as_array().is_some_and(|rows| {
-                rows.iter().any(|r| {
-                    r["template"].as_str() == Some(candidate)
-                        && r["resets_at"].as_str().is_none_or(|at| at > now.as_str())
-                })
-            })
+        if let Some(model) = candidate.strip_prefix("harness:") {
+            model_name(candidate)
+                && crate::capabilities::validate_harness_model(model, status, node).is_ok()
+        } else if caps_reported {
+            crate::capabilities::can_run(candidate, status)
+        } else {
+            true
+        }
     };
     if ready(model) {
         return Ok(model.into());
     }
+    if explicit {
+        if let Some(model) = model.strip_prefix("harness:") {
+            return crate::capabilities::validate_harness_model(model, status, node)
+                .map(|()| format!("harness:{model}"))
+                .map_err(|e| No::invalid(&e));
+        }
+        return Err(No::invalid(&format!(
+            "node {node} cannot run executor template {model}"
+        )));
+    }
+    let caps = status
+        .get("agent_capabilities")
+        .cloned()
+        .unwrap_or(Value::Null);
     let chain = profile["fallback"].as_array().cloned().unwrap_or_default();
     let preferred = caps["preferred"]
         .as_str()
@@ -375,14 +454,18 @@ fn resolve_offer(
         let entry = crate::repos::entry(repo).map_err(|e| No::invalid(&e))?;
         lane["lane"] = json!(crate::repos::lane_name(repo, requested, &entry));
     }
-    if let Some(agent) = request["agent"].as_str() {
-        let (profile, _, _) = profile(Some(agent), code)?;
+    if request["agent"].is_string()
+        || request["model"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("harness:"))
+    {
+        let (profile, _, _) = profile(request["agent"].as_str(), code)?;
         let model = match request.get("model") {
             None | Some(Value::Null) => profile["model"].as_str(),
             Some(Value::String(model)) => Some(model.as_str()),
             Some(_) => return Err(No::invalid("lane.model must be a string")),
         }
-        .filter(|model| name(model))
+        .filter(|model| model_name(model))
         .ok_or_else(|| No::invalid("invalid model name"))?;
         let status: Option<String> = state
             .store
@@ -398,13 +481,24 @@ fn resolve_offer(
         let status = status
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(Value::Null);
-        lane["model"] = json!(available_model(model, &profile, &status)?);
+        let explicit = request.get("model").is_some_and(Value::is_string);
+        lane["model"] = json!(available_model(
+            model,
+            &profile,
+            &status,
+            node.unwrap_or("node"),
+            explicit
+        )?);
     }
     Ok(lane)
 }
 
 /// Expand a built-in intent into the ordinary uploaded-bundle representation.
-pub fn expand(state: &State, m: &mut Map<String, Value>) -> Result<(), No> {
+pub fn expand(
+    state: &State,
+    client: &crate::access::Client,
+    m: &mut Map<String, Value>,
+) -> Result<(), No> {
     let Some(lane) = m.get("lane") else {
         return Ok(());
     };
@@ -418,7 +512,28 @@ pub fn expand(state: &State, m: &mut Map<String, Value>) -> Result<(), No> {
     }
     let code = root()?;
     let lane = resolve_offer(state, lane, m.get("node").and_then(Value::as_str), &code)?;
-    let (mut fields, contents) = build(&lane, &code)?;
+    let (mut fields, mut contents) = build(&lane, &code)?;
+    match lane.get("context") {
+        None => {}
+        Some(context) if *context == json!([]) => {}
+        Some(context) if *context == json!(["decision_log"]) => {
+            let project = m
+                .get("project_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| No::invalid("decision_log context requires project_id"))?;
+            let markdown = crate::decision_log::attachment(&state.store.db(), client, project)?;
+            let task = fields["task"].as_str().unwrap_or_default();
+            if let Some((_, goal, _)) = contents
+                .iter_mut()
+                .find(|(p, _, _)| p == &format!("{task}/goal.md"))
+            {
+                goal.push_str("\n\nRead the project decision log in the job context at `context/decision-log.md`.\n");
+            }
+            contents.push((format!("{task}/context/decision-log.md"), markdown, 420));
+            fields["meta"]["context"] = json!("decision_log");
+        }
+        Some(_) => return Err(No::invalid("context must be [] or [\"decision_log\"]")),
+    }
     let mut meta = match m.get("meta") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(meta)) if meta.values().all(Value::is_string) => meta.clone(),
@@ -447,23 +562,31 @@ mod tests {
         let profile = json!({"fallback": ["codex", "claude-code"]});
         let status = json!({"agent_capabilities": {"templates": ["codex", "claude-code"], "preferred": "claude-code"}});
         assert_eq!(
-            available_model("cursor-sol", &profile, &status).map_err(|e| e.2)?,
+            available_model("cursor-sol", &profile, &status, "node", false).map_err(|e| e.2)?,
             "claude-code"
         );
         assert_eq!(
-            available_model("codex", &profile, &status).map_err(|e| e.2)?,
+            available_model("codex", &profile, &status, "node", false).map_err(|e| e.2)?,
             "codex"
         );
         let none = json!({"agent_capabilities": {"templates": []}});
-        let error = available_model("cursor-sol", &profile, &none)
+        let error = available_model("cursor-sol", &profile, &none, "node", false)
             .err()
             .ok_or("expected refusal")?;
         assert!(error.2.contains("no installed, signed-in agent"));
         let limited = json!({"agent_capabilities": {"templates": ["codex", "claude-code"], "preferred": "codex"},
             "provider_limits": [{"template": "codex"}]});
         assert_eq!(
-            available_model("cursor-sol", &profile, &limited).map_err(|e| e.2)?,
+            available_model("cursor-sol", &profile, &limited, "node", false).map_err(|e| e.2)?,
             "claude-code"
+        );
+        let fallback = json!({"fallback": ["harness:missing", "harness:local-coder"]});
+        let native = json!({"agent_capabilities": {
+            "templates": [], "harness": true, "harness_models": ["local-coder"]
+        }});
+        assert_eq!(
+            available_model("cursor-sol", &fallback, &native, "node", false).map_err(|e| e.2)?,
+            "harness:local-coder"
         );
         Ok(())
     }
@@ -526,6 +649,35 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn coder_turn_defaults_follow_the_selected_executor() -> Result<(), String> {
+        let code = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut input = json!({
+            "title":"Change", "goal":"Fix it", "repo":"project", "lane":"change", "agent":"coder"
+        });
+        for (model, task_budget, turns, seconds, usd) in [
+            ("harness:local-coder", Value::Null, 120, 3600, 0.0),
+            ("harness:api-model", json!({"usd": 0.5}), 120, 3600, 0.5),
+            (
+                "harness:local-coder",
+                json!({"turns": 17, "seconds": 90}),
+                17,
+                90,
+                0.0,
+            ),
+            ("cursor-sol", Value::Null, 300, 3600, 0.0),
+        ] {
+            input["model"] = json!(model);
+            input["budget"] = task_budget;
+            let (_, files) = build(&input, &code).map_err(|e| e.2)?;
+            let spec: Value = serde_yaml::from_str(&files[0].1).map_err(|e| e.to_string())?;
+            assert_eq!(spec["budget"]["turns"], turns, "{model}");
+            assert_eq!(spec["budget"]["seconds"], seconds, "{model}");
+            assert_eq!(spec["budget"]["usd"], usd, "{model}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn profile_defaults_overrides_and_guard() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let agents = dir.path().join("cs/agents");
@@ -569,6 +721,32 @@ mod tests {
     }
 
     #[test]
+    fn read_only_profile_can_open_a_repo_without_a_lane() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let agents = dir.path().join("cs/agents");
+        std::fs::create_dir_all(&agents).map_err(|e| e.to_string())?;
+        let profile = "---\nname: researcher\ndescription: Reads code\nmodel: codex\nwrites: false\nlane: false\n---\nResearch\n";
+        let path = agents.join("researcher.md");
+        std::fs::write(&path, profile).map_err(|e| e.to_string())?;
+        let input =
+            json!({"title":"Research", "goal":"Read", "repo":"project", "agent":"researcher"});
+        let (fields, files) = build(&input, dir.path()).map_err(|e| e.2)?;
+        let spec: Value = serde_yaml::from_str(&files[0].1).map_err(|e| e.to_string())?;
+        assert_eq!(spec["repo"], "project");
+        assert_eq!(spec["repo_read_only"], true);
+        assert!(spec.get("lane").is_none());
+        assert!(fields["meta"].get("branch").is_none());
+
+        std::fs::write(&path, profile.replace("writes: false", "writes: true"))
+            .map_err(|e| e.to_string())?;
+        assert!(build(&input, dir.path()).is_err());
+        let mut scratch = input;
+        scratch["repo"] = Value::Null;
+        assert!(build(&scratch, dir.path()).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn listing_empty_sorted_and_shared_validation() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let agents = dir.path().join("cs/agents");
@@ -601,7 +779,7 @@ mod tests {
             json!({"other":3}),
             json!([]),
         ] {
-            assert!(budget(&json!({}), Some(&invalid)).is_err());
+            assert!(budget(&json!({}), false, Some(&invalid)).is_err());
         }
     }
 }

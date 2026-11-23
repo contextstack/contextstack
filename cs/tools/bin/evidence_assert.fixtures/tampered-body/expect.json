@@ -3,7 +3,7 @@
   "stdout": "evidence_assert: fetch body does not match its receipt\n",
   "files": {
     "_evidence/assertions.jsonl": null,
-    ".lab-calls.jsonl": "{\"args\": {\"quote\": \"The fixture fact is stable.\", \"source_url\": \"https://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"quote\": \"The fixture fact is stable.\", \"source_url\": \"https://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
   },
   "untouched": true
 }

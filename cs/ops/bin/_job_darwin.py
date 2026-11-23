@@ -83,8 +83,12 @@ def owned_pids(supervisor_pid, identity, deadline):
     for pid in _darwin_pids():
         if time.monotonic() >= deadline:
             raise RuntimeError("Darwin job process cleanup deadline exceeded")
+        if pid == supervisor_pid:
+            continue
         birth = _pid_identity(pid)
-        if birth is not None and responsible_pid(pid) == supervisor_pid:
+        # Responsibility names a numeric PID. A process created before
+        # this instance of the anchor cannot belong to its job.
+        if birth is not None and birth[-1] > identity[-1] and responsible_pid(pid) == supervisor_pid:
             if _pid_identity(pid) == birth:
                 owned[pid] = birth
     return owned if _pid_identity(supervisor_pid) == identity else {}
@@ -106,12 +110,22 @@ def finish(supervisor_pid, identity, deadline):
         time.sleep(min(0.005, max(0, deadline - time.monotonic())))
 
 
-def _drain(identity):
+def _drain(identity, child_pid, child_identity):
     deadline = time.monotonic() + 2
+    # A directly launched program can acquire its own responsibility.
+    # Freeze that child before sweeping so its anchor stays live until its
+    # descendants are gone, then reap the child itself.
+    if child_identity is not None:
+        _signal_pid(child_pid, child_identity, signal.SIGSTOP)
     while True:
         descendants = owned_pids(os.getpid(), identity, deadline)
+        if child_identity is not None:
+            descendants.update(owned_pids(child_pid, child_identity, deadline))
+            descendants.pop(child_pid, None)
         descendants.pop(os.getpid(), None)
         if not descendants:
+            if child_identity is not None:
+                _signal_pid(child_pid, child_identity, signal.SIGKILL)
             return
         for sig in (signal.SIGSTOP, signal.SIGKILL):
             for pid, birth in descendants.items():
@@ -139,6 +153,7 @@ def supervise(command):
         # Preserve the CLI/check's own session and process group; responsibility
         # ownership survives setsid and remains anchored in this supervisor.
         child = subprocess.Popen(command, start_new_session=True)
+        child_identity = _pid_identity(child.pid)
         while child.poll() is None and not cancelled:
             time.sleep(0.01)
         return child.returncode if child.returncode is not None else -signal.SIGTERM
@@ -149,7 +164,9 @@ def supervise(command):
             # removing this anchor while an undiscovered descendant may live.
             while True:
                 try:
-                    _drain(identity)
+                    # A reaped child can no longer act as a responsibility anchor.
+                    live_identity = child_identity if child.poll() is None else None
+                    _drain(identity, child.pid, live_identity)
                     break
                 except Exception as error:
                     # Keep ownership while retrying, but a denied signal must

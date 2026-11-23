@@ -103,12 +103,15 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "messages.jsonl",
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],

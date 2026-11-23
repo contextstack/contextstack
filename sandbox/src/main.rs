@@ -29,6 +29,7 @@ mod seatbelt;
 mod seccomp;
 mod ssh_agent_deny;
 mod tmp;
+mod widening;
 mod write_env;
 
 use std::env;
@@ -237,6 +238,10 @@ struct Call<'a> {
     /// Symlinks on the way to runtime paths; bwrap recreates them, Seatbelt needs none.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     links: Vec<(PathBuf, PathBuf)>,
+    #[cfg(target_os = "macos")]
+    deny_write: Vec<PathBuf>,
+    #[cfg(target_os = "macos")]
+    deny_unlink: Vec<PathBuf>,
 }
 
 /// What a backend reports back: the exit status, the pid for the report name, the profile hash.
@@ -257,9 +262,20 @@ fn launch(
     effective: &mut Effective,
     _: &mut Vec<Narrowing>,
 ) -> Result<Launched, Failure> {
-    let profile = seatbelt::profile(effective, call.socket)?;
-    let profile_sha256 = format!("{:x}", Sha256::digest(profile.as_bytes()));
+    let mut profile = seatbelt::profile(effective, call.socket)?;
+    for path in &call.deny_unlink {
+        use std::fmt::Write as _;
+        let path = sbpl::quote(path)?;
+        let _ = writeln!(profile, "(deny file-write-unlink (subpath {path}))");
+    }
+    for path in &call.deny_write {
+        use std::fmt::Write as _;
+        let quoted = sbpl::quote(path)?;
+        let _ = writeln!(profile, "(deny file-write* file-link (subpath {quoted}))");
+    }
+    let profile_sha256 = hex::encode(Sha256::digest(profile.as_bytes()));
     let mut command = Command::new(seatbelt::SANDBOX_EXEC);
+    cs_child_signals::reset_on_exec(&mut command);
     command
         .arg("-p")
         .arg(&profile)
@@ -353,13 +369,55 @@ fn launch(
     Ok(Launched {
         status: ran.status,
         pid: ran.pid,
-        profile_sha256: format!("{:x}", Sha256::digest(&ran.identity)),
+        profile_sha256: hex::encode(Sha256::digest(&ran.identity)),
     })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn launch(_: &Call<'_>, _: &mut Effective, _: &mut Vec<Narrowing>) -> Result<Launched, Failure> {
     backend_available().map(|()| unreachable!())
+}
+
+fn grant_repo_view(
+    effective: &mut Effective,
+    view: &cli::RepoView,
+) -> Result<Vec<PathBuf>, Failure> {
+    let canonical = |path: &Path| {
+        path.canonicalize()
+            .map_err(|error| unenforceable(format!("repo view {}: {error}", path.display())))
+    };
+    let snapshot = canonical(&view.path)?;
+    let mut denied = vec![snapshot.clone()];
+    for path in &view.deny_write {
+        let path = canonical(path)?;
+        if !denied.contains(&path) {
+            denied.push(path);
+        }
+    }
+    let mut readable = vec![snapshot];
+    for path in view.read_roots.iter().chain(&view.read_links) {
+        let path = canonical(path)?;
+        if !denied.contains(&path) {
+            denied.push(path.clone());
+        }
+        readable.push(path);
+    }
+    // Reject intersecting writable binds. A parent bind or a nested write grant would
+    // otherwise expose these trees on Linux, where reads use read-only mounts.
+    for path in &denied {
+        if effective
+            .write
+            .iter()
+            .any(|root| path.starts_with(root) || root.starts_with(path))
+        {
+            return Err(unenforceable(format!(
+                "repo view overlaps writable root: {}",
+                path.display()
+            )));
+        }
+    }
+    effective.read.extend(readable);
+    Ok(denied)
 }
 
 fn execute(run: &cli::Run) -> Result<i32, Failure> {
@@ -369,7 +427,11 @@ fn execute(run: &cli::Run) -> Result<i32, Failure> {
     let home = policy::home_from_env()?;
     let workspace = workspace(run.cwd.as_deref())?;
     let tool = resolve_tool(&run.tool)?;
-    let descriptor = policy::descriptor_for(&tool, &run.args, &code_root)?;
+    let descriptor = if run.widening.is_some() {
+        None
+    } else {
+        policy::descriptor_for(&tool, &run.args, &code_root)?
+    };
     let request = policy::load_request(descriptor.as_deref())?;
     // Removed when this function returns, on every path, after the child has exited.
     let call_tmp = tmp::CallTmp::create(&env::temp_dir())?;
@@ -383,13 +445,42 @@ fn execute(run: &cli::Run) -> Result<i32, Failure> {
         &home,
         &|name: &str| env::var_os(name),
     )?;
-    policy::grant_tool_read(&mut effective, &tool);
-    let socket = gateway_socket(effective.net)?;
-    let links = if cfg!(target_os = "linux") {
-        policy::runtime_links(&host, effective.profile, &code_root, &home)?
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    let deny_unlink = if let Some(grant) = &run.widening {
+        widening::apply(&mut effective, grant, &host, &tool, &run.args)?
     } else {
         Vec::new()
     };
+    if run.widening.is_some() {
+        effective.read.push(tool.canonicalize().map_err(|error| {
+            unenforceable(format!("cannot resolve approved executable: {error}"))
+        })?);
+    } else {
+        policy::grant_tool_read(&mut effective, &tool);
+    }
+    let deny_write = run
+        .repo_view
+        .as_ref()
+        .map(|view| grant_repo_view(&mut effective, view))
+        .transpose()?
+        .unwrap_or_default();
+    let socket = gateway_socket(effective.net)?;
+    let mut links = Vec::new();
+    if cfg!(target_os = "linux") {
+        links = policy::runtime_links(&host, effective.profile, &code_root, &home)?;
+        if let Some(view) = &run.repo_view {
+            for path in &view.read_links {
+                let target = path
+                    .canonicalize()
+                    .map_err(|error| unenforceable(error.to_string()))?;
+                if *path != target {
+                    links.push((path.clone(), target));
+                }
+            }
+        }
+    } else if let Some(view) = &run.repo_view {
+        effective.read.extend(view.read_links.iter().cloned());
+    }
     let call = Call {
         run,
         tool: &tool,
@@ -397,7 +488,13 @@ fn execute(run: &cli::Run) -> Result<i32, Failure> {
         tmp,
         socket: socket.as_deref(),
         links,
+        #[cfg(target_os = "macos")]
+        deny_write,
+        #[cfg(target_os = "macos")]
+        deny_unlink,
     };
+    #[cfg(not(target_os = "macos"))]
+    drop(deny_write);
     let started = Instant::now();
     let launched = launch(&call, &mut effective, &mut narrowed)?;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -425,6 +522,46 @@ fn execute(run: &cli::Run) -> Result<i32, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lane_git_and_toolchain_bindings_stay_read_only() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let workspace = base.join("workspace");
+        let gitdir = base.join("worktree-admin");
+        let objects = base.join("objects");
+        let toolchain = base.join("toolchain");
+        for dir in [&workspace, &gitdir, &objects, &toolchain] {
+            std::fs::create_dir(dir)?;
+        }
+        let host = serde_json::from_str(r#"{"version":1,"runtime_read":[],"allow_net":["none"]}"#)?;
+        let (mut effective, _) = policy::intersect(
+            &host,
+            &policy::Request::default(),
+            &workspace,
+            &base.join("tmp"),
+            &base,
+            &base,
+            &|_: &str| None,
+        )
+        .map_err(|error| error.message().to_owned())?;
+        let mut binding = cli::RepoView {
+            path: gitdir.clone(),
+            deny_write: Vec::new(),
+            read_roots: vec![objects.clone(), toolchain.clone()],
+            read_links: Vec::new(),
+        };
+        let denied = grant_repo_view(&mut effective, &binding)
+            .map_err(|error| error.message().to_owned())?;
+        for path in [gitdir, objects, toolchain] {
+            assert!(effective.read.contains(&path));
+            assert!(denied.contains(&path));
+            assert!(!effective.write.contains(&path));
+        }
+        binding.read_roots.push(workspace);
+        assert!(grant_repo_view(&mut effective, &binding).is_err());
+        Ok(())
+    }
 
     #[test]
     fn signal_deaths_map_to_128_plus_n() {

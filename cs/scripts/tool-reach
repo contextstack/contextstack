@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tool-reach — read-only reachability of lab tools, hooks, ops and scripts.
+"""tool-reach — read-only reachability of code_root tools, hooks, ops and scripts.
 
 Plan.CS.v2.1 §7: a tool or helper is removable when nothing reachable from
 the roots depends on it. This computes that graph and prints JSON (or a table
@@ -20,13 +20,13 @@ import json, os, re, stat, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[1]
-REPO = LAB.parent
+CODE_ROOT = Path(__file__).resolve().parents[1]
+REPO = CODE_ROOT.parent
 BIN_DIRS = ["tools/bin", "hooks/bin", "ops/bin", "scripts", "scripts/hooks"]
 IDENT = r"[A-Za-z0-9_.-]+"
 
 
-def rel(p): return str(Path(p).resolve().relative_to(LAB))
+def rel(p): return str(Path(p).resolve().relative_to(CODE_ROOT))
 def read(p):
     try: return Path(p).read_text(encoding="utf-8", errors="replace")
     except OSError: return ""
@@ -47,7 +47,7 @@ def exe_bin(p):
 def collect_nodes():
     nodes, descriptors, assets = {}, {}, set()
     for d in BIN_DIRS:
-        for p in sorted((LAB / d).iterdir()) if (LAB / d).is_dir() else []:
+        for p in sorted((CODE_ROOT / d).iterdir()) if (CODE_ROOT / d).is_dir() else []:
             if not p.is_file() or p.name == "__pycache__" or p.name == "tool-reach": continue  # skip self
             if p.suffix == ".json":
                 exe = p.with_suffix("")
@@ -66,7 +66,7 @@ RE_IMPORT = re.compile(r"^\s*(?:from|import)\s+(_?\w+)", re.M)
 RE_PATH = re.compile(r"(?:tools/bin|ops/bin|hooks/bin|scripts/hooks|scripts)/(" + IDENT + ")")
 RE_SIB = re.compile(r"/\s*[\"'](" + IDENT + r")[\"']")            # HERE / "name"
 RE_SPLIT = re.compile(r"\"(tools|ops|hooks)\"\s*/\s*\"bin\"\s*/\s*\"(" + IDENT + r")\"")
-RE_TOOL_ARGV = re.compile(r"tool_argv\([^,()]*,\s*[\"'](" + IDENT + r")[\"']")  # _sandbox_policy.tool_argv(LAB, "okf")
+RE_TOOL_ARGV = re.compile(r"tool_argv\([^,()]*,\s*[\"'](" + IDENT + r")[\"']")  # _sandbox_policy.tool_argv(CODE_ROOT, "okf")
 # Dynamic: a bin-dir join whose last part is an identifier/expression, or an
 # f-string under a bin dir. Such a file gets an edge to EVERY node basename it
 # mentions as a complete string literal (conservative; flagged dynamic_refs).
@@ -111,7 +111,7 @@ def edges_for(path, text, nodes, assets, bydir):
     # 3. Sibling joins HERE / "x", and "tools" / "bin" / "x".
     for m in RE_SIB.findall(text): t.update(resolve(m, nodes, [here]))
     for d, m in RE_SPLIT.findall(text): t.update(resolve(m, nodes, [f"{d}/bin"]))
-    # 3b. A tool exec'd through its descriptor: tool_argv(LAB, "name") (okf as cs-tools).
+    # 3b. A tool exec'd through its descriptor: tool_argv(CODE_ROOT, "name") (okf as cs-tools).
     for m in RE_TOOL_ARGV.findall(text): t.update(resolve(m, nodes, ["tools/bin"]))
     # 4. Dynamic construction: any node basename quoted anywhere in the file.
     dyn = bool(RE_DYN.search(text))
@@ -143,13 +143,13 @@ def spec_fields(text):
 
 
 def spec_roots(spec_rel, nodes, templates, src):
-    f = spec_fields(read(LAB / spec_rel))
+    f = spec_fields(read(CODE_ROOT / spec_rel))
     names = [f"tools/bin/{t}" for t in f["tools"]] + [f"hooks/bin/{h}" for h in f["post_turn"]] + \
             [f"tools/bin/{m}" for m in f["mcp"]]
-    # model: naming an executor template whose binary lives under lab.
+    # model: naming an executor template whose binary lives under code_root.
     b = templates.get(f["model"] or "", {}).get("binary", "")
     bp = Path(os.path.expanduser(b)) if b else None
-    if bp and bp.is_absolute() and str(bp).startswith(str(LAB)) and bp.exists(): names.append(rel(bp))
+    if bp and bp.is_absolute() and str(bp).startswith(str(CODE_ROOT)) and bp.exists(): names.append(rel(bp))
     found = [n for n in names if n in nodes]
     missing = [(src, n) for n in names if n not in nodes]
     return found, missing
@@ -168,7 +168,7 @@ def collect_roots(nodes, with_sweeps):
     roots, sources, missing = {}, {}, []
     def add(kind, names, src):
         roots.setdefault(kind, set()).update(names); sources.setdefault(kind, set()).add(src)
-    tpl_path = LAB / "ops/bin/executor-templates.json"
+    tpl_path = CODE_ROOT / "ops/bin/executor-templates.json"
     templates = json.loads(read(tpl_path) or "{}")
     # (a) live specs. specs/*.yaml is the lead's definition. specs/sweeps and
     # specs/judgments were archived 2026-11-09 (prune); the kinds stay so an
@@ -176,37 +176,37 @@ def collect_roots(nodes, with_sweeps):
     globs = [("spec", "specs/*.yaml")] + ([("spec_sweep", "specs/sweeps/*.yaml"),
                                            ("spec_judgment", "specs/judgments/*.yaml")] if with_sweeps else [])
     for kind, g in globs:
-        for s in sorted(LAB.glob(g)):
+        for s in sorted(CODE_ROOT.glob(g)):
             f, miss = spec_roots(rel(s), nodes, templates, rel(s)); add(kind, f, rel(s)); missing += miss
     # (b) pending dispatch jobs, (c) enabled schedules (latest revision per id).
-    for r in last_state(LAB / "ledger/dispatch.jsonl", "state").values():
-        if r.get("state") == "pending" and (LAB / r["spec"]).is_file():
+    for r in last_state(CODE_ROOT / "ledger/dispatch.jsonl", "state").values():
+        if r.get("state") == "pending" and (CODE_ROOT / r["spec"]).is_file():
             f, miss = spec_roots(r["spec"], nodes, templates, "job " + r["id"]); add("job", f, r["spec"]); missing += miss
-    for r in last_state(LAB / "ledger/schedules.jsonl", "cron").values():
-        if r.get("enabled") and (LAB / r["spec"]).is_file():
+    for r in last_state(CODE_ROOT / "ledger/schedules.jsonl", "cron").values():
+        if r.get("enabled") and (CODE_ROOT / r["spec"]).is_file():
             f, miss = spec_roots(r["spec"], nodes, templates, "schedule " + r["id"]); add("schedule", f, r["spec"]); missing += miss
     # (d) hooks: spec-declared by name, so all are roots.
     add("hook", [n for n in nodes if n.startswith("hooks/bin/")], "hooks/bin/*")
     # (e) dispatcher runtime: the named ops, launchd plists + loop-watcher
     # scripts, and the ops the runner calls (harness/src: op(root, "x")).
     add("dispatcher", [f"ops/bin/{n}" for n in ("tick", "schedule-tick", "enqueue", "close", "executor") if f"ops/bin/{n}" in nodes], "ops/bin (named)")
-    # The gateway's models.json names lab_executor (ops/bin/_executor.py): the
-    # indirect call behind ops/bin/executor's POST /v1/ai/lab-execute.
+    # The gateway's models.json names cli_executor (ops/bin/_executor.py): the
+    # indirect call behind ops/bin/executor's POST /v1/agent/cli.run.
     for p in list(REPO.glob("loop-watcher/*.sh")) + list(REPO.glob("loop-watcher/*.plist")) + \
-             list(LAB.glob("ops/launchd/*.plist")) + [REPO / "gateway/models.json"]:
+             list(CODE_ROOT.glob("ops/launchd/*.plist")) + [REPO / "gateway/models.json"]:
         add("dispatcher", [x for m in RE_PATH.finditer(read(p)) for x in resolve(m.group(1), nodes, BIN_DIRS)], str(p.relative_to(REPO)))
     for p in sorted(REPO.glob("harness/src/*.rs")):
         add("dispatcher", [f"ops/bin/{m}" for m in re.findall(r"\bop\(\s*(?:self\.)?root,\s*\"([a-z-]+)\"", read(p)) if f"ops/bin/{m}" in nodes], str(p.relative_to(REPO)))
     # (f) OPERATOR.md names the ops a human runs by hand: a documented entry
     # point, kept as its own kind so it can be weighed separately.
-    add("operator_doc", [x for m in RE_PATH.finditer(read(LAB / "OPERATOR.md")) for x in resolve(m.group(1), nodes, BIN_DIRS)], "OPERATOR.md")
+    add("operator_doc", [x for m in RE_PATH.finditer(read(CODE_ROOT / "OPERATOR.md")) for x in resolve(m.group(1), nodes, BIN_DIRS)], "OPERATOR.md")
     # (i) scripts/check and the git hooks that run it; the rule scripts they
     # name become reachable through ordinary edges.
     add("check", ["scripts/check"] + [n for n in nodes if n.startswith("scripts/hooks/")], "scripts/check, scripts/hooks/*")
     # (h) fixtures: every tasks/**/check (depth 1-2). Literal paths plus, for
     # checks that name a bin dir, quoted node basenames (they often build
-    # LAB / "tools/bin" / name from a tuple). Helper imports resolve by name.
-    for p in sorted(LAB.glob("tasks/*/check")) + sorted(LAB.glob("tasks/*/*/check")):
+    # CODE_ROOT / "tools/bin" / name from a tuple). Helper imports resolve by name.
+    for p in sorted(CODE_ROOT.glob("tasks/*/check")) + sorted(CODE_ROOT.glob("tasks/*/*/check")):
         text = read(p); names = set()
         # A check that hands off to a sibling script (CHECK.py, verify.py, ...)
         # is scanned together with it; setup/ trees are frozen copies, not followed.
@@ -230,7 +230,7 @@ def compute(with_sweeps):
     nodes, descriptors, assets = collect_nodes()
     edges, asset_refs, dynamic = {}, {}, []
     for n in nodes:
-        t, a, dyn = edges_for(n, read(LAB / n), nodes, assets, None)
+        t, a, dyn = edges_for(n, read(CODE_ROOT / n), nodes, assets, None)
         edges[n] = sorted(t); asset_refs[n] = sorted(a)
         if dyn: dynamic.append(n)
     for exe, d in descriptors.items():          # descriptor -> executable
@@ -283,7 +283,7 @@ def requires_of(tool, out):
     while stack:
         n = stack.pop()
         if n in seen: continue
-        seen.add(n); text = read(LAB / n)
+        seen.add(n); text = read(CODE_ROOT / n)
         cmds.update(RE_WHICH.findall(text))
         cmds.update(os.path.basename(c) for c in RE_ARGV0.findall(text) if not c.startswith("{"))
         cmds.update(os.path.basename(c) for c in RE_ABSBIN.findall(text))
@@ -296,7 +296,7 @@ def manifest(out):
     --no-sweeps, plus the operator-named utilities. Hand-held fields come from
     the committed manifest (operator_roots, requires_manual); no timestamp, so
     the output is stable until the tree changes."""
-    prior = json.loads(read(LAB / "tools/manifest.json") or "{}")
+    prior = json.loads(read(CODE_ROOT / "tools/manifest.json") or "{}")
     op = prior.get("operator_roots") or {}
     manual = prior.get("requires_manual") or {}
     if not op.get("names"): sys.exit("tools/manifest.json: operator_roots.names is missing; the generator copies it through")

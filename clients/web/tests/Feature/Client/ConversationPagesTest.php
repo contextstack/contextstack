@@ -917,3 +917,17 @@ it('lists archived conversations apart, and moves one between the views as it is
     $page->call('applyStream', [['kind' => 'conversation', 'id' => 'con_old', 'revision' => 30, 'deleted' => true]])
         ->assertDontSee('put away')->assertSee('No archived conversations.');
 });
+
+it('shows an approval the conversation\'s attention links, in place of a question to answer', function () {
+    fakeThread(conversationRecord(['attention' => attentionRecord([
+        'source_kind' => 'action_approval', 'action_approval_id' => 'apr_1', 'question' => 'Pushing leaves the machine.', 'job_id' => 'job_lane',
+    ])]), [], [], [
+        director('action-approvals/apr_1') => Http::response(['id' => 'apr_1', 'job_id' => 'job_lane', 'status' => 'needs_owner', 'argv' => ['git', 'push', 'origin', 'lane/fix it'],
+            'needs' => ['network'], 'reason' => 'Push the lane branch.', 'verdict' => 'no_go', 'review_reason' => 'Pushing leaves the machine.']),
+    ]);
+
+    Livewire::test('pages::client.conversation', ['conversation' => 'con_1'])
+        ->assertSee("git push origin 'lane/fix it'")
+        ->assertSee('Approve')
+        ->assertDontSee('Needs your answer');
+});

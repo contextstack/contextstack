@@ -2,7 +2,7 @@
 """node-install-layout regression (goal.md): the persistent ~/.contextstack layout in a fake HOME.
 
 Network-free. Needs uv and a uv-managed interpreter of the pinned version (as tasks/regressions/node-install);
-otherwise SKIP with the reason. Temp dirs only; the real HOME, ~/.local/bin and lab/ are never written (asserted).
+otherwise SKIP with the reason. Temp dirs only; the real HOME, ~/.local/bin and code_root/ are never written (asserted).
 """
 import sys
 from pathlib import Path
@@ -14,6 +14,7 @@ import os
 import plistlib
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,8 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _bundle  # noqa: E402
 
-LAB = _bundle.LAB
-INSTALL = LAB / "scripts/node-install"
+CODE_ROOT = _bundle.CODE_ROOT
+INSTALL = CODE_ROOT / "scripts/node-install"
 A, B, C = "20990101-aaaaaaaaa", "20990102-bbbbbbbbb", "20990103-ccccccccc"
 problems = []
 
@@ -46,7 +47,8 @@ def expect(cond, msg, detail=""):
 def node_install(home, *args, path_probe=None):
     env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH=path_probe if path_probe is not None
                                    else "%s/.local/bin:/usr/bin:/bin" % home)
-    r = subprocess.run(["sh", str(INSTALL), *args], capture_output=True, text=True, env=env, cwd=str(LAB.parent))
+    r = subprocess.run(["sh", str(INSTALL), *args], capture_output=True, text=True, env=env,
+                       cwd=str(CODE_ROOT.parent), umask=0o022)
     return r, _bundle.report(r.stdout)
 
 
@@ -77,11 +79,11 @@ def check_plists(home, root, runner="cs-harness", gateway="cs-gateway", credenti
     expect(genv.get("CSGATEWAY_PROVIDERS_DIR") == str(root / "config/gateway/providers.d")
            and genv.get("CSAGENT_MODELS_CONFIG") == str(root / "gateway/models.json")
            and genv.get("CSGATEWAY_SOCKET") == "default"
-           and genv.get("LAB_STATE_ROOT") == str(root / "state") and genv.get("PATH", "").startswith(str(root / "current" / kit / ".venv/bin") + ":"),
+           and genv.get("CS_STATE_ROOT") == str(root / "state") and genv.get("PATH", "").startswith(str(root / "current" / kit / ".venv/bin") + ":"),
            "gateway plist: providers.d under config, derived models.json, the state root, the release's python3 first")
     models = json.loads((root / "gateway/models.json").read_text())
-    expect(models.get("lab_executor") == str(root / "current" / kit / "ops/bin/_executor.py"),
-           "derived models.json points lab_executor into current, not the dev checkout")
+    expect(models.get("cli_executor") == str(root / "current" / kit / "ops/bin/_executor.py"),
+           "derived models.json points cli_executor into current, not the dev checkout")
     expect(genv.get("CSGATEWAY_CREDENTIALS") == credentials,
            "gateway plist: CSGATEWAY_CREDENTIALS=%s on a node (never the Keychain unless asked): %r"
            % (credentials, genv.get("CSGATEWAY_CREDENTIALS")))
@@ -91,9 +93,9 @@ def check_plists(home, root, runner="cs-harness", gateway="cs-gateway", credenti
     expect(node["ProgramArguments"][0] == str(root / "current" / kit / ".venv/bin/python3")
            and node["ProgramArguments"][1] == str(root / "current" / kit / "ops/bin/tick"),
            "node plist runs tick with the release's interpreter by absolute path")
-    expect({k: env.get(k) for k in ("LAB_CONFIG_ROOT", "LAB_STATE_ROOT", "LAB_WORKSPACES_ROOT", "CS_RUNNER_BIN")} ==
-           {"LAB_CONFIG_ROOT": str(root / "config"), "LAB_STATE_ROOT": str(root / "state"),
-            "LAB_WORKSPACES_ROOT": str(root / "workspaces"), "CS_RUNNER_BIN": str(root / "current/bin" / runner)},
+    expect({k: env.get(k) for k in ("CS_CONFIG_ROOT", "CS_STATE_ROOT", "CS_WORKSPACES_ROOT", "CS_RUNNER_BIN")} ==
+           {"CS_CONFIG_ROOT": str(root / "config"), "CS_STATE_ROOT": str(root / "state"),
+            "CS_WORKSPACES_ROOT": str(root / "workspaces"), "CS_RUNNER_BIN": str(root / "current/bin" / runner)},
            "node plist: configured roots outside the code tree, runner %s" % runner)
     expect(env.get("CSGATEWAY_ENDPOINT") == "http://127.0.0.1:9200/v1/agent/model.call",
            "node plist names the local gateway's model-call endpoint (the runner refuses to start without it)")
@@ -115,7 +117,7 @@ def run_tick(home, node):
 def run_gateway(home, root):
     """The gateway plist's own command and environment (a free port, socket and credential store off): it must
     come up healthy. First fall (prod-1, 2026-11-10): the shipped models.json named the dev checkout's
-    lab_executor, and the gateway exited at startup."""
+    cli_executor, and the gateway exited at startup."""
     gw = plistlib.loads((home / "Library/LaunchAgents/com.contextstack.csgateway-socket.plist").read_bytes())
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -151,23 +153,26 @@ def part_layout(tmp, uv, managed):
     home = tmp / "home"
     root = home / ".contextstack"
     bins = _bundle.fake_bins(tmp / "fakebin")
-    real_gateway = LAB.parent / "target/release/cs-gateway"  # the default gateway (the owner 2026-11-10); else the fake
+    real_gateway = CODE_ROOT.parent / "target/release/cs-gateway"  # the default gateway (the owner 2026-11-10); else the fake
     if os.access(real_gateway, os.X_OK):
         bins["cs-gateway"] = real_gateway
     _bundle.bundle(tmp / "bundle-a", uv, A, bins)
     _bundle.bundle(tmp / "bundle-b", uv, B, bins, extra={"RELEASE-B": "b\n"})
     _bundle.seed_python(home, A, managed)
     _bundle.seed_python(home, B, managed)
-    director = ["--node", "test-node", "--director", "http://127.0.0.1:9", "--installation", "inst-test", "--no-load"]
+    director = ["--node", "test-node", "--director", "http://127.0.0.1:1", "--installation", "inst-test"]
 
     r, rep = node_install(home, "install", str(tmp / "bundle-a"), *director)
     if r.returncode != 0:
         return fail("install A: exit %s %s\n%s" % (r.returncode, rep, r.stderr[-2000:]))
     expect(os.readlink(root / "current") == "releases/" + A and (root / "releases" / A / ".complete").is_file(),
            "install A: current -> releases/%s" % A)
-    expect(all((root / d).is_dir() and (root / d).stat().st_mode & 0o077 == 0
-               for d in ("config", "state", "workspaces", "logs", "config/gateway/providers.d")),
-           "config/, state/, workspaces/, logs/, config/gateway/providers.d exist, 0700")
+    private_roots = (root, root / "state", root / "workspaces")
+    expect(all(p.is_dir() and stat.S_IMODE(p.stat().st_mode) == 0o700 for p in private_roots),
+           "fresh loaded install under umask 022: install, state and workspace roots are 0700")
+    expect(all((root / d).is_dir() and stat.S_IMODE((root / d).stat().st_mode) == 0o700
+               for d in ("config", "logs", "config/gateway/providers.d")),
+           "config/, logs/ and config/gateway/providers.d exist, 0700")
     expect(os.readlink(root / "bundles") == "bundles.noindex"
            and (root / "bundles.noindex").is_dir() and not (root / "bundles.noindex").is_symlink()
            and (root / "bundles.noindex").stat().st_mode & 0o077 == 0
@@ -175,25 +180,25 @@ def part_layout(tmp, uv, managed):
            "new install: bundles is a symlink to bundles.noindex; state/runs stays a real directory")
     rel = root / "releases" / A
     expect(all((rel / "bin" / n).is_file() for n in _bundle.BIN_NAMES) and not any((rel / "cs" / d).exists() for d in ("ledger", "specs", "tasks"))
-           and not os.path.lexists(rel / "lab"),
-           "release: bin/ holds all four binaries; cs/ has no ledger/, specs/, tasks/; no lab entry (the link is dropped)")
+           and not os.path.lexists(rel / "code_root"),
+           "release: bin/ holds all four binaries; cs/ has no ledger/, specs/, tasks/; no code_root entry (the link is dropped)")
     expect(not any(p.is_symlink() for p in (rel / "bin").iterdir()),
            "release: binaries have no compatibility symlinks")
     expect(not (rel / "cs-kit").exists(), "release: only cs code root")
-    expect(not any((rel / "bin" / n).exists() for n in ("lab", "cs", "cs-go", "csgateway")),
-           "release: no bin/lab, bin/cs, bin/cs-go or bin/csgateway (cs-harness and csgateway-rs; Go is archived, 2026-11-10)")
+    expect(not any((rel / "bin" / n).exists() for n in ("code_root", "cs", "cs-go", "csgateway")),
+           "release: no bin/cs, bin/cs-go or bin/csgateway (the release ships cs-harness and cs-gateway)")
     expect(os.path.samefile(rel / "target/release/cs-tools", rel / "bin/cs-tools"),
            "release: target/release/cs-tools is bin/cs-tools (where descriptors resolve it)")
     spool = json.loads((root / "config/policy/spool.json").read_text())
     expect((root / "config/ESTATE").read_text() == "test-node\n" and spool["receiver"] == {
-        "kind": "director", "url": "http://127.0.0.1:9", "node": "test-node", "token_env": "CONTEXTSTACK_NODE_TOKEN",
+        "kind": "director", "url": "http://127.0.0.1:1", "node": "test-node", "token_env": "CONTEXTSTACK_NODE_TOKEN",
         "installation": "inst-test"},
         "config: ESTATE and a director receiver, with --installation's ID, in policy/spool.json (node protocol §2)")
     links = home / ".local/bin"
     expect({n: os.readlink(links / n) for n in ("csgateway", "cs", "node-install")} ==
            {"csgateway": str(root / "current/bin/cs-gateway"), "cs": str(root / "current/cs/scripts/cs"),
-            "node-install": str(root / "current/cs/scripts/node-install")} and not os.path.lexists(links / "lab"),
-           "PATH links in ~/.local/bin (on the login PATH) point through current; cs is the Rust runner; no lab link")
+            "node-install": str(root / "current/cs/scripts/node-install")} and not os.path.lexists(links / "code_root"),
+           "PATH links in ~/.local/bin (on the login PATH) point through current; cs is the Rust runner; no code_root link")
     node = check_plists(home, root)
     listen = plistlib.loads((home / "Library/LaunchAgents/com.contextstack.node-listen.plist").read_bytes())
     expect(listen["ProgramArguments"][:1] == node["ProgramArguments"][:1]
@@ -206,11 +211,17 @@ def part_layout(tmp, uv, managed):
     else:
         print("SKIP gateway start: target/release/cs-gateway is not built")
 
-    snapshot = (tree(root / "releases"), tree(home / "Library"), tree(links),
+    def install_snapshot():
+        releases = tree(root / "releases")
+        lock = (root / "releases/install.lock").lstat()
+        # Each invocation records its PID. Compare the lock's identity and mode.
+        releases["install.lock"] = (lock.st_dev, lock.st_ino, lock.st_mode)
+        return (releases, tree(home / "Library"), tree(links),
                 (root / "config/install.json").read_bytes(), (root / "config/policy/spool.json").read_bytes())
-    r, rep2 = node_install(home, "install", str(tmp / "bundle-a"), *director)
-    after = (tree(root / "releases"), tree(home / "Library"), tree(links),
-             (root / "config/install.json").read_bytes(), (root / "config/policy/spool.json").read_bytes())
+
+    snapshot = install_snapshot()
+    r, rep2 = node_install(home, "install", str(tmp / "bundle-a"), *director, "--no-load")
+    after = install_snapshot()
     expect(r.returncode == 0 and after == snapshot and not any(p["changed"] for p in rep2["plists"].values()),
            "install A again: idempotent (releases, plists, links and config unchanged)")
     expect(os.readlink(root / "bundles") == "bundles.noindex" and not (root / "state/runs").is_symlink(),
@@ -224,12 +235,13 @@ def part_layout(tmp, uv, managed):
     expect(tree(rel) == code_before, "tick wrote nothing into the code tree")
     expect((root / "state/dispatch.jsonl").is_file(), "tick wrote its shelf under state/")
 
-    os.symlink(str(root / "current/bin/lab"), links / "lab")  # what a release before the command rename linked
+    for path in private_roots:
+        path.chmod(0o755)
     r, rep = node_install(home, "install", str(tmp / "bundle-b"), "--no-load")
-    expect(r.returncode == 0 and not os.path.lexists(links / "lab") and str(links / "lab") in rep.get("retired_links_removed", []),
-           "upgrade: our old `lab` link is removed and reported")
     expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + B and (root / "releases" / A).is_dir()
            and rep.get("previous") == A, "install B: current -> B, A kept")
+    expect(all(stat.S_IMODE(p.stat().st_mode) == 0o700 for p in private_roots),
+           "upgrade repairs 0755 install, state and workspace roots")
     kept = json.loads((root / "config/policy/spool.json").read_text())["receiver"]
     expect(kept["node"] == "test-node" and kept.get("installation") == "inst-test",
            "install B without options keeps the recorded node, director and installation")
@@ -253,7 +265,7 @@ def part_layout(tmp, uv, managed):
     try:
         write_dispatch(running_row("job-wait", sleeper.pid))
         proc = subprocess.Popen(["sh", str(INSTALL), "switch", A, "--wait", "5"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=str(LAB.parent))
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=str(CODE_ROOT.parent))
         time.sleep(1)
         sleeper.terminate()
         sleeper.wait(5)
@@ -350,7 +362,7 @@ def part_layout(tmp, uv, managed):
     r, rep = node_install(home, "select", "--credentials", "off", "--no-load")
     check_plists(home, root)
     env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home, PATH="/usr/bin:/bin")
-    r = subprocess.run(["sh", str(INSTALL), "select", "--credentials", "off"], capture_output=True, text=True, env=env, cwd=str(LAB.parent))
+    r = subprocess.run(["sh", str(INSTALL), "select", "--credentials", "off"], capture_output=True, text=True, env=env, cwd=str(CODE_ROOT.parent))
     expect(r.returncode == 1 and "refusing the real launchctl" in _bundle.report(r.stdout).get("refused", ""),
            "without --no-load and without a shim, a fake HOME never reaches the real launchctl: %s" % r.stdout[-200:])
 
@@ -360,7 +372,7 @@ def part_layout(tmp, uv, managed):
 
     r, rep = node_install(home, "uninstall", "--no-load")
     expect(r.returncode == 0 and not os.path.lexists(root / "current") and not (root / "releases").exists()
-           and not any(os.path.lexists(links / n) for n in ("csgateway", "cs", "node-install", "lab"))
+           and not any(os.path.lexists(links / n) for n in ("csgateway", "cs", "node-install", "code_root"))
            and not any((home / "Library/LaunchAgents").iterdir()),
            "uninstall: plists, links, current and releases/ removed")
     expect(all((root / d).is_dir() for d in ("config", "state")) and (root / "config/ESTATE").is_file(),
@@ -374,7 +386,7 @@ def part_director_host(tmp, uv, managed):
     root = home / ".contextstack"
     existing = {"gateway/providers.d/dgx.json": '{"schema": "csgateway.providers.v1", "providers": []}',
                 "gateway/discovery-health.json": "{}", "gateway/csgateway.err.log": "old log\n",
-                "lab/setups/s1/marker": "setup\n", "browser/browser-state/x": "b\n", "director/estate/ledger.jsonl": "{}\n",
+                "code_root/setups/s1/marker": "setup\n", "browser/browser-state/x": "b\n", "director/estate/ledger.jsonl": "{}\n",
                 "credentials/openai": "not-a-real-key\n", "state/ledger.jsonl": '{"estate": "dev"}\n',
                 "state/runs/r1/terminal.json": "{}\n", "estate-deploy/cache": "c\n"}
     for rel, text in existing.items():
@@ -414,12 +426,13 @@ def part_director_host(tmp, uv, managed):
     changed = []
     for k, v in before.items():
         got = after.get(k)
-        if got == v:
+        if got == v or k == "state":
             continue
         if (root / k).is_dir() and isinstance(got, tuple) and got[2] == v[2]:
             continue  # a dir may gain entries; its mode stays
         changed.append(k)
-    expect(not changed, "every pre-existing file is unchanged (size, mtime, mode), every dir keeps its mode: %s" % changed)
+    expect(not changed and stat.S_IMODE((root / "state").stat().st_mode) == 0o700,
+           "existing files and other directory modes are preserved, and the state root is repaired: %s" % changed)
     expect(not (root / "state/runs").is_symlink()
            and (root / "state/runs/r1/terminal.json").read_text() == "{}\n",
            "existing state/runs is left in place (a real directory)")
@@ -506,11 +519,11 @@ def part_estate_rename(tmp, uv, managed):
     nenv = plistlib.loads(nplist.read_bytes())["EnvironmentVariables"] if nplist.is_file() else {}
     envf = root / "config/node.env"
     expect(r.returncode == 0 and (root / "config/ESTATE").read_text() == "workstation\n"
-           and (spool.get("receiver") or {}).get("node") == "workstation" and nenv.get("LAB_STATE_ROOT") == str(root / "state")
-           and nenv.get("LAB_CONFIG_ROOT") == str(root / "config") and envf.stat().st_mode & 0o777 == 0o600
+           and (spool.get("receiver") or {}).get("node") == "workstation" and nenv.get("CS_STATE_ROOT") == str(root / "state")
+           and nenv.get("CS_CONFIG_ROOT") == str(root / "config") and envf.stat().st_mode & 0o777 == 0o600
            and "fake-token-not-real-0001" not in r.stdout + r.stderr,
-           "rename: --estate workstation --node workstation registers node workstation; the node plist sets the install's LAB_STATE_ROOT and "
-           "LAB_CONFIG_ROOT; the token goes only to node.env (0600): %s" % rep.get("refused"))
+           "rename: --estate workstation --node workstation registers node workstation; the node plist sets the install's CS_STATE_ROOT and "
+           "CS_CONFIG_ROOT; the token goes only to node.env (0600): %s" % rep.get("refused"))
     node_install(home, "uninstall", "--no-load")
 
 
@@ -534,8 +547,6 @@ def part_foreign(tmp, uv, managed):
     (home / ".local/bin").mkdir(parents=True)
     foreign = home / ".local/bin/csgateway"
     foreign.write_text("#!/bin/sh\necho somebody else's\n")
-    other_lab = home / ".local/bin/lab"  # a `lab` that is not ours (GitLab's CLI is named lab): never refused, never removed
-    other_lab.write_text("#!/bin/sh\necho gitlab\n")
     _bundle.seed_python(home, A, managed)
     r, rep = node_install(home, "install", str(tmp / "bundle-a"), "--no-load")
     expect(r.returncode == 1 and str(foreign) in rep.get("refused", ""), "foreign ~/.local/bin/csgateway: refused, named: %s" % (rep.get("refused") or ((r.returncode, rep, r.stderr[-400:]),)))
@@ -546,14 +557,16 @@ def part_foreign(tmp, uv, managed):
     expect(r.returncode == 0 and foreign.read_text().startswith("#!/bin/sh") and (home / ".local/bin/cs").is_symlink()
            and "com.contextstack.node.plist" not in os.listdir(home / "Library/LaunchAgents"),
            "--skip-link csgateway installs the rest; no director receiver means no node plist")
-    expect(other_lab.read_text() == "#!/bin/sh\necho gitlab\n", "a foreign `lab` (not ours) is left alone by the retired-link cleanup")
     genv = plistlib.loads((home / "Library/LaunchAgents/com.contextstack.csgateway-socket.plist").read_bytes())["EnvironmentVariables"]
     cred = root / "credentials"
     expect(genv.get("CSGATEWAY_CREDENTIALS") == str(cred) and cred.is_dir() and cred.stat().st_mode & 0o777 == 0o700
            and not any(cred.iterdir()), "fresh director host: credentials file by default, its dir created empty and 0700")
+    lock = root / "releases/install.lock"
+    expect(lock.is_file(), "install leaves its lock under releases/")
     r, rep = node_install(home, "uninstall", "--purge", "--no-load")
-    expect(r.returncode == 0 and foreign.is_file() and other_lab.is_file() and not (root / "config").exists() and not (root / "state").exists(),
+    expect(r.returncode == 0 and foreign.is_file() and not (root / "config").exists() and not (root / "state").exists(),
            "uninstall --purge removes config/ and state/, leaves the foreign file")
+    expect(not lock.exists(), "uninstall --purge removes the install lock")
 
 
 def part_link_dir(tmp, uv, managed):
@@ -572,13 +585,13 @@ def part_link_dir(tmp, uv, managed):
 
 
 def part_path_profiles(tmp):
-    sys.path.insert(0, str(LAB / "scripts"))
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
     import importlib.machinery
     import importlib.util
     env_home = os.environ.get("HOME")
     os.environ["HOME"], os.environ["NODE_INSTALL_USER_PATH"] = str(tmp / "probe-home"), "/usr/bin:/bin"
     try:
-        loader = importlib.machinery.SourceFileLoader("node_release", str(LAB / "scripts/_node_layout.py"))
+        loader = importlib.machinery.SourceFileLoader("node_release", str(CODE_ROOT / "scripts/_node_layout.py"))
         mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("node_release", loader))
         loader.exec_module(mod)  # HOME is read at import: the probe home, never the real one
         import io
@@ -694,10 +707,10 @@ sys.stdout.write(json.dumps({"removed": removed, "decoy": decoy.is_dir(), "victi
                              "live": (root / "live").is_dir()}))
 """
     env = _bundle.dead_network_env(home)
-    for key in ("LAB_STATE_ROOT", "LAB_CONFIG_ROOT", "LAB_WORKSPACES_ROOT"):
+    for key in ("CS_STATE_ROOT", "CS_CONFIG_ROOT", "CS_WORKSPACES_ROOT"):
         env.pop(key, None)
-    r = subprocess.run([sys.executable, "-I", "-c", probe, str(LAB / "scripts"), str(home)],
-                       capture_output=True, text=True, env=env, cwd=str(LAB.parent))
+    r = subprocess.run([sys.executable, "-I", "-c", probe, str(CODE_ROOT / "scripts"), str(home)],
+                       capture_output=True, text=True, env=env, cwd=str(CODE_ROOT.parent))
     try:
         got = json.loads(r.stdout)
     except ValueError:
@@ -719,7 +732,7 @@ def main():
         return 0
     real = Path.home()
     watched = [real / ".local/bin", real / "Library/LaunchAgents"]
-    before = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    before = [_bundle.directory_snapshot(w) for w in watched]
     host_py = {str(p): p.stat().st_mtime_ns for p in managed.rglob("*") if p.is_file() and not p.is_symlink()}
     agents = _bundle.real_agents()
     tmp = Path(tempfile.mkdtemp(prefix="node-install-layout-", suffix=".noindex"))
@@ -734,7 +747,7 @@ def main():
         part_link_dir(tmp, uv, managed)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    after = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    after = [_bundle.directory_snapshot(w) for w in watched]
     expect(before == after, "the real ~/.local/bin and ~/Library/LaunchAgents are unchanged")
     leak = _bundle.launchd_untouched(agents)
     expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")

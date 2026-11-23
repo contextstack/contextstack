@@ -4,23 +4,22 @@
 Follows the runner through the phase 1b shrink: the binary, and the real
 tools, hooks, ops and prompt copied into each estate, come from the
 CURRENT working tree: the default Rust runner (../target/release/cs-harness, which
-scripts/check builds). $CS_RUNNER_BIN overrides the binary;
-pointing it at a Go `lab` build runs the same cases against the archived runner. The harness is
-shared with ../runner-characterisation (`_harness.py`); cases/, fixture/
-and the fake gateway are this set's own.
+scripts/check builds). $CS_RUNNER_BIN overrides the Rust harness binary.
 """
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-V1 = HERE.parent / "runner-characterisation"
-sys.path.insert(0, str(V1))
 import _harness  # noqa: E402
+import _turn_review  # noqa: E402
 
 
 def source(scratch):
-    return _harness.current_runner(), _harness.LAB
+    return _harness.current_runner(), _harness.CODE_ROOT
 
 
 if __name__ == "__main__":
-    sys.exit(_harness.main(HERE, "runner characterisation v2", source))
+    result = _harness.main(HERE, "runner characterisation v2", source)
+    if not any(arg == "--only" or arg.startswith("--only=") for arg in sys.argv[1:]):
+        result |= int(not _turn_review.check())
+    sys.exit(result)

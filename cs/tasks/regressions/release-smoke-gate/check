@@ -65,7 +65,8 @@ with scratch_dir(prefix="release-smoke-gate-", dir="/tmp") as tmp:
                 shutil.copy2(src, scripts / src.name)
         shutil.copytree(KIT / "policy", rel / "cs/policy")
         (rel / "cs/ops/bin").mkdir(parents=True)
-        shutil.copy2(KIT / "ops/bin/executor-templates.json", rel / "cs/ops/bin/executor-templates.json")
+        for name in ("executor-templates.json", "_agent_discovery.py"):
+            shutil.copy2(KIT / "ops/bin" / name, rel / "cs/ops/bin" / name)
         (rel / "cs/.venv/bin").mkdir(parents=True)
         (rel / "cs/.venv/bin/python3").symlink_to(sys.executable)
         (rel / ".complete").touch()
@@ -74,6 +75,8 @@ with scratch_dir(prefix="release-smoke-gate-", dir="/tmp") as tmp:
         executable(rel / "bin/cs-director", '''#!%s
 import json, os, pathlib, sqlite3, sys, time, uuid
 args = sys.argv
+if args[1:] == ["--schema-version"]:
+    sys.exit(print(0))
 bundle = pathlib.Path(args[args.index("--bundle")+1])
 spec = (bundle / "spec.yaml").read_text()
 assert "tools: []" in spec and "mcp: []" in spec
@@ -110,7 +113,7 @@ print(json.dumps({"job_id": job}))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     # the gate waits for the gateway the executor posts to; this fake answers every GET, so it stands in for it
-    env["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % server.server_address[1]
+    env["CSGATEWAY_CLI_ENDPOINT"] = "http://127.0.0.1:%d/v1/agent/cli.run" % server.server_address[1]
     url = "http://127.0.0.1:%s" % server.server_port
     def reset():
         current = root / "current"

@@ -126,7 +126,7 @@ def main():
         me = request(target.url, "GET", "/api/v1/client/me", token=lead_token)
         expect(me.status == 200 and me.json.get("owner") is False, "lead credential authenticates")
         # The node's lead host reads what cs lead create wrote, from the installed config root
-        # (LAB_CONFIG_ROOT = ~/.contextstack/config; 2026-11-12 it looked in config/config/).
+        # (CS_CONFIG_ROOT = ~/.contextstack/config; 2026-11-12 it looked in config/config/).
         sys.path.insert(0, str(KIT / "ops/bin"))
         import _lead_host
         config_root = cs_root / "config"

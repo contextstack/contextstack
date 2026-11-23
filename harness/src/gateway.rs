@@ -5,6 +5,7 @@ use crate::spec::default_on_null;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use std::cell::Cell;
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Preserve argument bytes: tools and transcript observations receive the original JSON.
@@ -17,6 +18,20 @@ pub struct ToolCall {
     #[serde(deserialize_with = "default_on_null")]
     pub name: String,
     pub args: RawArguments,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub invalid_arguments: bool,
+}
+
+impl ToolCall {
+    fn normalize_history(&mut self) {
+        // Native tool history requires an object even when exec received a bare string.
+        if self.name == "exec"
+            && self.args.get().starts_with('"')
+            && let Ok(args) = RawValue::from_string(format!(r#"{{"cmd":{}}}"#, self.args.get()))
+        {
+            self.args = RawArguments(Some(args));
+        }
+    }
 }
 
 /// Absent arguments reach tools as empty input; explicit null keeps its four bytes.
@@ -60,11 +75,29 @@ pub enum Message {
     },
 }
 
+impl Message {
+    pub(crate) fn assistant(content: String, mut tool_calls: Vec<ToolCall>) -> Self {
+        for call in &mut tool_calls {
+            call.normalize_history();
+        }
+        Self::Assistant {
+            content,
+            tool_calls,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Request<'a> {
     messages: &'a [Message],
     #[serde(flatten)]
     fields: Value,
+}
+
+#[derive(Default)]
+pub(crate) struct ToolOffer<'a> {
+    pub schemas: Option<&'a [Value]>,
+    pub choice: Option<Value>,
 }
 
 /// The gateway owns accounting classification; the runner sums the supplied numbers.
@@ -76,9 +109,44 @@ pub struct Response {
     pub tool_calls: Vec<ToolCall>,
     pub est_usd: f64,
     pub charged_usd: f64,
+    pub provider_reported_usd: Option<f64>,
     /// `usage` input and output tokens (WIRE Response); absent, non-integer or negative is `None`.
     pub usage: [Option<i64>; 2],
 }
+
+/// A failed call, including any charge the gateway settled before its terminal stream error.
+#[derive(Debug, PartialEq)]
+pub struct CallFailure {
+    pub message: String,
+    pub charged_usd: f64,
+    pub provider_reported_usd: Option<f64>,
+    pub cost_class: String,
+}
+
+impl From<String> for CallFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            charged_usd: 0.0,
+            provider_reported_usd: None,
+            cost_class: String::new(),
+        }
+    }
+}
+
+impl From<&str> for CallFailure {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_owned())
+    }
+}
+
+impl fmt::Display for CallFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CallFailure {}
 
 /// What a streamed reply tells the caller as it arrives (WIRE Response, Stream).
 pub enum Partial<'a> {
@@ -97,11 +165,46 @@ pub const CEILING_STOP: &str = "budget:usd_ceiling";
 /// Where `call` reports a streamed reply's partials; an error aborts the call with that error.
 pub type Sink<'s> = dyn FnMut(Partial<'_>) -> Result<(), String> + 's;
 
-/// An endpoint and its fixed model/run identities, with a reusable HTTP client.
+pub(crate) struct CallTrace<'a> {
+    pub run: &'a str,
+    pub job: Option<&'a str>,
+    pub turn: i64,
+    pub id: String,
+    sends: [Cell<Option<&'static str>>; 2],
+}
+
+impl<'a> CallTrace<'a> {
+    pub fn new(run: &'a str, job: Option<&'a str>, turn: i64) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Self {
+            run,
+            job,
+            turn,
+            id: format!("{run}-{nanos}-{turn}"),
+            sends: Default::default(),
+        }
+    }
+
+    pub fn sends(&self) -> Vec<Value> {
+        self.sends
+            .iter()
+            .enumerate()
+            .filter_map(|(index, outcome)| {
+                outcome
+                    .get()
+                    .map(|outcome| json!({"send_index": index + 1, "outcome": outcome}))
+            })
+            .collect()
+    }
+}
+
+/// An endpoint and its fixed model identity, with a reusable HTTP client.
 pub struct Gateway {
     pub endpoint: String,
     pub model: String,
-    pub run_id: String,
     client: reqwest::Client,
     /// Whether calls stream: set once per run by `probe`, cleared by `gateway.streaming_unsupported`.
     stream: Cell<bool>,
@@ -139,6 +242,7 @@ struct WireCost {
     class: String,
     est_usd: Option<f64>,
     charged_usd: Option<f64>,
+    charged: Option<f64>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -170,15 +274,16 @@ fn tool_calls<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<ToolCall
 
 impl Gateway {
     /// Reject an absent endpoint; provider credentials never belong in the runner.
-    pub fn new(endpoint: String, model: String, run_id: String) -> Result<Self, String> {
+    pub fn new(endpoint: String, model: String) -> Result<Self, String> {
         if endpoint.is_empty() {
             return Err("no gateway endpoint: set CSGATEWAY_ENDPOINT".into());
         }
         Ok(Self {
             endpoint,
             model,
-            run_id,
-            client: reqwest::Client::new(),
+            client: cs_http_client::builder()
+                .build()
+                .map_err(|e| e.to_string())?,
             stream: Cell::new(false),
         })
     }
@@ -208,74 +313,75 @@ impl Gateway {
 
     /// Invoke once, bounded by the remaining run deadline or the legacy 120-second default.
     /// `max_usd` is the most this call may spend, sent as WIRE's `budget.max_usd`; `None` sends none.
-    pub async fn call(
+    pub(crate) async fn call(
         &self,
         messages: &[Message],
-        tools: Option<&[Value]>,
+        tools: ToolOffer<'_>,
         max_usd: Option<f64>,
         control: &Control,
         sink: &mut Sink<'_>,
-    ) -> Result<Response, String> {
+        trace: &CallTrace<'_>,
+    ) -> Result<Response, CallFailure> {
         let timeout = control
             .deadline
             .map_or(Duration::from_secs(120), |deadline| {
                 deadline.saturating_duration_since(tokio::time::Instant::now())
             });
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos();
-        let id = format!("{}-{nanos}", self.run_id);
         let mut body = json!({
             "schema_version": "agent.gateway.model_call.v2",
-            "request_id": id,
-            "job_id": "lab",
-            "run_id": self.run_id,
-            "step_id": id,
-            "role": {
-                "role_pack_name": "lab",
-                "role_pack_version": "0",
-                "role_name": "loop"
-            },
-            "capability": {
-                "kind": "generic",
-                "model_tier_hint": self.model
-            },
-            "tool_schema": tools,
+            "request_id": trace.id,
+            "run_id": trace.run,
+            "step_id": trace.turn,
+            "role": {"role_pack_name": "cs", "role_pack_version": "0", "role_name": "loop"},
+            "capability": {"kind": "generic", "model_tier_hint": self.model},
+            "tool_schema": tools.schemas,
             "budget": {
                 "timeout_ms": timeout.as_millis().max(1),
                 "max_output_tokens": 4096
             }
         });
+        if let Some(choice) = tools.choice {
+            body["tool_choice"] = choice;
+        }
+        if let Some(job) = trace.job {
+            body["job_id"] = json!(job);
+        }
         if let Some(usd) = max_usd {
             body["budget"]["max_usd"] = format!("{:.6}", usd.max(0.0)).into();
         }
         let opened = Cell::new(false);
         let exchange = async {
+            let mut index = 1;
             if self.stream.get() {
                 if let Some(reply) = self
-                    .exchange(messages, &body, Some(&mut *sink), &opened)
+                    .exchange(messages, &body, Some(&mut *sink), &opened, trace, index)
                     .await?
                 {
                     return Ok(reply);
                 }
-                // Refused before any connection, at $0: this run stays unary from here on.
+                // The gateway refused streaming before contacting the provider.
                 self.stream.set(false);
+                index += 1;
             }
-            let reply = self.exchange(messages, &body, None, &opened).await?;
-            reply.ok_or_else(|| "gateway refused a unary call as a stream".into())
+            let reply = self
+                .exchange(messages, &body, None, &opened, trace, index)
+                .await?;
+            reply.ok_or_else(|| CallFailure::from("gateway refused a unary call as a stream"))
         };
         let result = tokio::select! {
             biased;
-            () = control.stopped() => Err(self.cancel_error(control.reason() == Some("interrupted"))),
-            () = tokio::time::sleep(timeout) => Err(self.cancel_error(false)),
             result = exchange => result,
+            () = control.stopped() => Err(self.cancel_error(control.reason() == Some("interrupted")).into()),
+            () = tokio::time::sleep(timeout) => Err(self.cancel_error(false).into()),
         };
-        match (&result, opened.get()) {
-            (_, false) => {}
-            (Ok(_), true) => sink(Partial::Done)?,
-            (Err(_), true) => {
-                let _ = sink(Partial::Discard);
+        if opened.get() {
+            let reported = sink(if result.is_ok() {
+                Partial::Done
+            } else {
+                Partial::Discard
+            });
+            if result.is_ok() {
+                reported?;
             }
         }
         result
@@ -288,37 +394,44 @@ impl Gateway {
         fields: &Value,
         sink: Option<&mut Sink<'_>>,
         opened: &Cell<bool>,
-    ) -> Result<Option<Response>, String> {
+        trace: &CallTrace<'_>,
+        index: usize,
+    ) -> Result<Option<Response>, CallFailure> {
         let mut fields = fields.clone();
         if sink.is_some() {
             fields["stream"] = json!(true);
         }
+        fields["send_index"] = json!(index);
+        let outcome = &trace.sends[index - 1];
+        outcome.set(Some("unknown"));
         let mut response = self
             .client
             .post(&self.endpoint)
             .json(&Request { messages, fields })
             .send()
             .await
-            .map_err(|error| self.transport_error(&error))?;
+            .map_err(|error| {
+                if error.is_connect() {
+                    outcome.set(Some("connection_failed"));
+                }
+                CallFailure::from(self.transport_error(&error))
+            })?;
+        outcome.set(Some("delivered"));
         let status = response.status().as_u16();
         let sse = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .is_some_and(|kind| kind.as_bytes().starts_with(b"text/event-stream"));
-        let wire = match sink {
-            Some(sink) if sse => match self.fold(&mut response, status, sink, opened).await? {
-                Some(wire) => wire,
-                None => return Ok(None),
-            },
-            _ => {
-                let raw = response
-                    .bytes()
-                    .await
-                    .map_err(|error| self.transport_error(&error))?;
-                decode(&raw, status)?
-            }
+        let wire = if let Some(sink) = sink.filter(|_| sse) {
+            self.fold(&mut response, status, sink, opened).await?
+        } else {
+            let raw = response
+                .bytes()
+                .await
+                .map_err(|error| self.transport_error(&error))?;
+            Some(decode(&raw, status)?)
         };
-        finish(wire, status).map(Some)
+        wire.map(|reply| finish(reply, status)).transpose()
     }
 
     /// Fold SSE chunks into the unary reply: delta text, then the stop chunk's fields (WIRE Stream).
@@ -357,14 +470,12 @@ impl Gateway {
                     _ => return Ok(Some(chunk)),
                 }
             }
-            match response.chunk().await {
-                Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
-                Ok(None) => {
-                    let error = "stream ended without a stop chunk";
-                    return Err(format!("bad gateway response (HTTP {status}): {error}"));
-                }
-                Err(error) => return Err(self.transport_error(&error)),
-            }
+            let bytes = response
+                .chunk()
+                .await
+                .map_err(|error| self.transport_error(&error))?
+                .ok_or_else(|| bad_response(status, "stream ended without a stop chunk"))?;
+            buffer.extend_from_slice(&bytes);
         }
     }
 
@@ -401,19 +512,24 @@ impl Gateway {
     }
 }
 
+fn bad_response(status: u16, error: &str) -> String {
+    format!("bad gateway response (HTTP {status}): {error}")
+}
+
 fn decode(raw: &[u8], status: u16) -> Result<WireResponse, String> {
     serde_json::from_slice::<Option<WireResponse>>(raw)
-        .map_err(|error| {
-            let error = json_error(raw, &error);
-            format!("bad gateway response (HTTP {status}): {error}")
-        })
+        .map_err(|error| bad_response(status, &json_error(raw, &error)))
         .map(Option::unwrap_or_default)
 }
 
 /// Unary and folded replies alike: an error is the gateway's own, and an ok reply must carry cost.
-fn finish(wire: WireResponse, status: u16) -> Result<Response, String> {
+fn finish(wire: WireResponse, status: u16) -> Result<Response, CallFailure> {
+    let cost = wire.cost.unwrap_or_default();
+    let provider_reported_usd = cost
+        .charged
+        .filter(|charge| charge.is_finite() && *charge > 0.0);
     if wire.status != "ok" {
-        return Err(wire.error.map_or_else(
+        let message = wire.error.map_or_else(
             || format!("gateway status {:?} (HTTP {status})", wire.status),
             |error| {
                 let text = format!(
@@ -427,11 +543,18 @@ fn finish(wire: WireResponse, status: u16) -> Result<Response, String> {
                     _ => text,
                 }
             },
-        ));
+        );
+        return Err(CallFailure {
+            message,
+            charged_usd: cost.charged_usd.unwrap_or(0.0),
+            provider_reported_usd,
+            cost_class: cost.class,
+        });
     }
-    let cost = wire.cost.unwrap_or_default();
     let (Some(est_usd), Some(charged_usd)) = (cost.est_usd, cost.charged_usd) else {
-        return Err("gateway omitted cost numbers (WIRE Response cost)".into());
+        return Err(CallFailure::from(
+            "gateway omitted cost numbers (WIRE Response cost)",
+        ));
     };
     Ok(Response {
         text: wire.message.unwrap_or_default().content,
@@ -440,6 +563,7 @@ fn finish(wire: WireResponse, status: u16) -> Result<Response, String> {
         cost_class: cost.class,
         est_usd,
         charged_usd,
+        provider_reported_usd,
         usage: ["input_tokens", "output_tokens"]
             .map(|key| wire.usage[key].as_i64().filter(|n| *n >= 0)),
     })
@@ -579,18 +703,15 @@ mod tests {
     /// A gateway already told the model streams, and the partials it reported, as text.
     async fn streamed(
         replies: &[(&str, String)],
-    ) -> Result<(Result<Response, String>, Vec<String>, Vec<String>), String> {
+    ) -> Result<(Result<Response, CallFailure>, Vec<String>, Vec<String>), String> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
-        let gateway = Gateway::new(
-            format!("http://{address}/v1/agent/model.call"),
-            "m".into(),
-            "r".into(),
-        )?;
+        let gateway = Gateway::new(format!("http://{address}/v1/agent/model.call"), "m".into())?;
         gateway.stream.set(true);
         let mut partials = Vec::new();
+        let call_trace = CallTrace::new("r", Some("job-test"), 7);
         let mut sink = |p: Partial<'_>| {
             partials.push(match p {
                 Partial::Delta(d) => format!("+{d}"),
@@ -611,8 +732,17 @@ mod tests {
             }
             Ok::<_, String>(requests)
         };
-        let (requests, response) =
-            tokio::join!(serving, gateway.call(&[], None, None, &control, &mut sink));
+        let (requests, response) = tokio::join!(
+            serving,
+            gateway.call(
+                &[],
+                ToolOffer::default(),
+                None,
+                &control,
+                &mut sink,
+                &call_trace
+            )
+        );
         Ok((response, partials, requests?))
     }
 
@@ -621,8 +751,11 @@ mod tests {
         let stop = r#"{"kind":"stop","stop_reason":"end_turn","provider":"p","model":"m","cost":{"class":"free_local","est_usd":0.5,"charged_usd":0},"usage":{"input_tokens":20,"output_tokens":30}}"#;
         let body = frames(&[&delta("hi "), &delta("there"), stop]);
         let (response, partials, requests) = streamed(&[(SSE, body)]).await?;
-        let unary = finish(decode(OK.as_bytes(), 200)?, 200)?;
-        assert_eq!(format!("{:?}", response?), format!("{unary:?}"));
+        let unary = finish(decode(OK.as_bytes(), 200)?, 200).map_err(|e| e.message)?;
+        assert_eq!(
+            format!("{:?}", response.map_err(|e| e.message)?),
+            format!("{unary:?}")
+        );
         assert_eq!(partials, ["+hi ", "+there", "done"]);
         assert!(requests[0].contains(r#""stream":true"#), "{}", requests[0]);
         Ok(())
@@ -632,7 +765,7 @@ mod tests {
     async fn streamed_tool_calls_keep_argument_bytes() -> Result<(), String> {
         let stop = r#"{"kind":"stop","model":"m","tool_calls":[{"id":"c1","name":"t","args":{ "b":1 }}],"cost":{"est_usd":0,"charged_usd":0}}"#;
         let (response, partials, _) = streamed(&[(SSE, frames(&[stop]))]).await?;
-        let response = response?;
+        let response = response.map_err(|e| e.message)?;
         assert_eq!((response.text.as_str(), response.tool_calls.len()), ("", 1));
         assert_eq!(response.tool_calls[0].args.get(), r#"{ "b":1 }"#);
         assert_eq!(partials, ["done"]);
@@ -640,17 +773,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_error_chunk_discards_the_partial_text() -> Result<(), String> {
-        let error = r#"{"kind":"error","cost":{"amount":"0.000000"},"error":{"class":"runtime","code":"gateway.upstream_error","message":"boom"}}"#;
+    async fn an_error_chunk_discards_the_partial_text_and_retains_cost() -> Result<(), String> {
+        let error = r#"{"kind":"error","cost":{"amount":"0.004200","class":"api","est_usd":0.0042,"charged_usd":0.0042},"error":{"class":"runtime","code":"gateway.upstream_error","message":"boom"}}"#;
         let (response, partials, _) = streamed(&[(SSE, frames(&[&delta("half"), error]))]).await?;
+        let Err(failure) = response else {
+            return Err("accepted terminal stream error".into());
+        };
         assert_eq!(
-            response.err().as_deref(),
-            Some("gateway runtime [gateway.upstream_error]: boom")
+            failure.message,
+            "gateway runtime [gateway.upstream_error]: boom"
         );
+        assert_eq!(failure.charged_usd, 0.0042);
+        assert_eq!(failure.cost_class, "api");
         assert_eq!(partials, ["+half", "discard"]);
         let (response, partials, _) = streamed(&[(SSE, frames(&[&delta("half")]))]).await?;
         let error = "bad gateway response (HTTP 200): stream ended without a stop chunk";
-        assert_eq!(response.err().as_deref(), Some(error));
+        let Err(failure) = response else {
+            return Err("accepted incomplete stream".into());
+        };
+        assert_eq!(failure.message, error);
         assert_eq!(partials, ["+half", "discard"]);
         Ok(())
     }
@@ -660,9 +801,28 @@ mod tests {
         let refusal = r#"{"kind":"error","error":{"class":"fatal_session","code":"gateway.streaming_unsupported","message":"no"}}"#;
         let replies = [(SSE, frames(&[refusal])), ("application/json", OK.into())];
         let (response, partials, requests) = streamed(&replies).await?;
-        assert_eq!(response?.text, "hi there");
+        assert_eq!(response.map_err(|e| e.message)?.text, "hi there");
         assert!(partials.is_empty(), "{partials:?}");
         assert!(requests[0].contains(r#""stream":true"#) && !requests[1].contains("stream"));
+        let bodies = requests
+            .iter()
+            .map(|raw| {
+                let (_, body) = raw.split_once("\r\n\r\n").ok_or("missing request body")?;
+                serde_json::from_str::<Value>(body).map_err(|_| "invalid request body")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(bodies[0]["request_id"], bodies[1]["request_id"]);
+        assert!(
+            bodies[0]["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        for (i, body) in bodies.iter().enumerate() {
+            assert_eq!(body["job_id"], "job-test");
+            assert_eq!(body["run_id"], "r");
+            assert_eq!(body["step_id"], 7);
+            assert_eq!(body["send_index"], i + 1);
+        }
         Ok(())
     }
 
@@ -672,11 +832,7 @@ mod tests {
             .await
             .map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
-        let gateway = Gateway::new(
-            format!("http://{address}/v1/agent/model.call"),
-            "m".into(),
-            "r".into(),
-        )?;
+        let gateway = Gateway::new(format!("http://{address}/v1/agent/model.call"), "m".into())?;
         let control = Control::default();
         for (body, expected) in [
             (
@@ -707,7 +863,7 @@ mod tests {
             .await
             .map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
-        let gateway = Gateway::new(format!("http://{address}/"), "m".into(), "r".into())?;
+        let gateway = Gateway::new(format!("http://{address}/"), "m".into())?;
         for (usage, expected) in [
             (
                 r#","usage":{"input_tokens":12,"output_tokens":3}"#,
@@ -724,13 +880,21 @@ mod tests {
             let body =
                 format!(r#"{{"status":"ok","cost":{{"est_usd":0,"charged_usd":0}}{usage}}}"#);
             let control = Control::default();
+            let call_trace = CallTrace::new("r", None, 1);
             let mut sink = |_: Partial<'_>| Ok(());
             let (served, response) = tokio::join!(
                 serve_once(&listener, &body),
-                gateway.call(&[], None, None, &control, &mut sink)
+                gateway.call(
+                    &[],
+                    ToolOffer::default(),
+                    None,
+                    &control,
+                    &mut sink,
+                    &call_trace
+                )
             );
             served.map_err(|e| e.to_string())?;
-            assert_eq!(response?.usage, expected, "{usage}");
+            assert_eq!(response.map_err(|e| e.message)?.usage, expected, "{usage}");
         }
         Ok(())
     }
@@ -741,19 +905,27 @@ mod tests {
             .await
             .map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
-        let gateway = Gateway::new(format!("http://{address}/"), "m".into(), "r".into())?;
+        let gateway = Gateway::new(format!("http://{address}/"), "m".into())?;
         for (max_usd, expected) in [
             (Some(0.0125), Some("0.012500")),
             (Some(-1.0), Some("0.000000")),
             (None, None),
         ] {
             let control = Control::default();
+            let call_trace = CallTrace::new("r", None, 1);
             let mut sink = |_: Partial<'_>| Ok(());
             let (request, response) = tokio::join!(
                 serve(&listener, "application/json", OK),
-                gateway.call(&[], None, max_usd, &control, &mut sink)
+                gateway.call(
+                    &[],
+                    ToolOffer::default(),
+                    max_usd,
+                    &control,
+                    &mut sink,
+                    &call_trace
+                )
             );
-            response?;
+            response.map_err(|e| e.message)?;
             let request = request.map_err(|e| e.to_string())?;
             let body = request.split_once("\r\n\r\n").map_or("", |(_, b)| b);
             let body: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
@@ -769,14 +941,18 @@ mod tests {
             let raw = format!(
                 r#"{{"status":"error","error":{{"class":"fatal_session","code":"gateway.policy_denied","message":"no","budget":{{"reason":{reason:?}}}}}}}"#
             );
-            finish(decode(raw.as_bytes(), 200)?, 200).map(|r| r.text)
+            finish(decode(raw.as_bytes(), 200)?, 200)
+                .map(|r| r.text)
+                .map_err(|e| e.message)
         };
         let text = "gateway fatal_session [gateway.policy_denied]: no";
         assert_eq!(denied("ceiling"), Err(format!("{CEILING_STOP}: {text}")));
         assert_eq!(denied("exhausted"), Err(text.into()));
         assert_eq!(denied("off"), Err(text.into()));
         let other = r#"{"status":"error","error":{"class":"fatal_session","code":"gateway.other","message":"no","budget":{"reason":"ceiling"}}}"#;
-        let error = finish(decode(other.as_bytes(), 200)?, 200).err();
+        let error = finish(decode(other.as_bytes(), 200)?, 200)
+            .err()
+            .map(|e| e.message);
         assert_eq!(
             error.as_deref(),
             Some("gateway fatal_session [gateway.other]: no")
@@ -786,7 +962,7 @@ mod tests {
 
     #[test]
     fn empty_endpoint_is_rejected_at_construction() {
-        if let Err(error) = Gateway::new(String::new(), "m".into(), "r".into()) {
+        if let Err(error) = Gateway::new(String::new(), "m".into()) {
             assert!(error.contains("no gateway endpoint"));
         } else {
             panic!("expected empty endpoint error");
@@ -799,7 +975,7 @@ mod tests {
         let error = finish(decode(raw.as_bytes(), 200)?, 200)
             .err()
             .ok_or("accepted")?;
-        assert!(error.contains("omitted cost numbers"));
+        assert!(error.message.contains("omitted cost numbers"));
         Ok(())
     }
 

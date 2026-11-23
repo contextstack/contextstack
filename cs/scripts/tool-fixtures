@@ -14,11 +14,11 @@ Case layout, tools/bin/<name>.fixtures/<case>/ (Plan.CS.v2.1 section 7; ):
                 where cs-sandbox's write_env lets a named state dir live), removed after the case.
                 Use it only to point a tool at a fake binary or a state dir; never for a real credential.
 
-Exec contract (internal/lab/run.go Tool.Run): argv is CS_TOOL_PREFIX's whitespace-split words (the cs-sandbox
+Exec contract: argv is CS_TOOL_PREFIX's whitespace-split words (the cs-sandbox
 wrapper the launcher sets; --prefix WORDS overrides, "" for none) then the tool path, or a runtime exe descriptor's
 bin and args (_sandbox_policy.tool_argv), cwd the workspace, stdin args.json,
 stdout and stderr combined, timeout max(descriptor timeout_seconds, 60) s, env the names in policy/env.json
-"always" (ops/bin/_env_policy.load_policy) with this process's values, LAB_TRIAL=1 when unset, plus env.json.
+"always" (ops/bin/_env_policy.load_policy) with this process's values, CS_TRIAL=1 when unset, plus env.json.
 --python P launches a python3 tool (descriptor "runtime", else the shebang) through P instead of the shebang
 (no manifest tool runs on Ruby since ), so an offline-installed interpreter can run the same fixtures. Tools are never imported.
 
@@ -43,8 +43,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 import _env_policy  # noqa: E402
 import _sandbox_policy  # noqa: E402
 
@@ -60,11 +60,11 @@ def manifest_tools(path):
 
 
 def fixture_tools():
-    return sorted(p.name[: -len(".fixtures")] for p in (LAB / "tools/bin").glob("*.fixtures") if p.is_dir())
+    return sorted(p.name[: -len(".fixtures")] for p in (CODE_ROOT / "tools/bin").glob("*.fixtures") if p.is_dir())
 
 
 def runtime_of(tool):
-    desc = LAB / "tools/bin" / (tool.name + ".json")
+    desc = CODE_ROOT / "tools/bin" / (tool.name + ".json")
     if desc.is_file():
         rt = json.loads(desc.read_text(encoding="utf-8")).get("runtime")
         if rt:
@@ -75,10 +75,10 @@ def runtime_of(tool):
 
 def child_env(extra):
     env = {}
-    for name in _env_policy.load_policy(LAB)["always"]:
+    for name in _env_policy.load_policy(CODE_ROOT)["always"]:
         if name in os.environ:
             env[name] = os.environ[name]
-    env.setdefault("LAB_TRIAL", "1")
+    env.setdefault("CS_TRIAL", "1")
     env.update(extra)
     return env
 
@@ -113,7 +113,7 @@ def run_case(tool, case, interp, prefix=()):
     args = (case / "args.json").read_bytes()
     runtime, desc = runtime_of(tool)
     timeout = max(int(json.loads(desc.read_text()).get("timeout_seconds", 0) or 0) if desc.is_file() else 0, 60)
-    argv = _sandbox_policy.tool_argv(LAB, tool.name)  # runtime exe: [bin, *args]; else [tool]
+    argv = _sandbox_policy.tool_argv(CODE_ROOT, tool.name)  # runtime exe: [bin, *args]; else [tool]
     if interp.get(runtime):
         argv = [interp[runtime]] + argv
     argv = list(prefix) + argv
@@ -137,7 +137,7 @@ def run_case(tool, case, interp, prefix=()):
                 v = v.replace("<state>", str(state)) if state else v
                 extra[k] = v.replace("<ws>", str(ws)).replace("<case>", str(case.resolve())).replace("<tmp>", str(tmp))
         before = snapshot(ws)
-        extra.setdefault("LAB_TOOL_TIMEOUT_SECONDS", str(timeout))
+        extra.setdefault("CS_TOOL_TIMEOUT_SECONDS", str(timeout))
         try:
             r = subprocess.run(argv, cwd=str(ws), input=args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                env=child_env(extra), timeout=timeout)
@@ -195,25 +195,25 @@ def main():
     a = ap.parse_args()
     interp = {"python3": a.python}
     prefix = (a.prefix if a.prefix is not None else os.environ.get("CS_TOOL_PREFIX", "")).split()  # as strings.Fields
-    manifest = LAB / "tools/manifest.json"
+    manifest = CODE_ROOT / "tools/manifest.json"
     tools = manifest_tools(manifest) if a.manifest and manifest.is_file() else fixture_tools()
     if a.tool:
         tools = a.tool
     total = failed = 0
     for tool in tools:
-        fixtures = LAB / "tools/bin" / (tool + ".fixtures")
+        fixtures = CODE_ROOT / "tools/bin" / (tool + ".fixtures")
         cases = sorted(p for p in fixtures.iterdir() if p.is_dir() and (p / "args.json").is_file()) if fixtures.is_dir() else []
         if not cases:
             total += 1; failed += 1
-            print("FAIL %s: no fixtures under %s" % (tool, fixtures.relative_to(LAB)))
+            print("FAIL %s: no fixtures under %s" % (tool, fixtures.relative_to(CODE_ROOT)))
             continue
-        if not Path(_sandbox_policy.tool_argv(LAB, tool)[0]).is_file():  # the file pair, or a runtime exe's bin
+        if not Path(_sandbox_policy.tool_argv(CODE_ROOT, tool)[0]).is_file():  # the file pair, or a runtime exe's bin
             total += 1; failed += 1
-            print("FAIL %s: fixtures without a tool (%s)" % (tool, _sandbox_policy.tool_argv(LAB, tool)[0]))
+            print("FAIL %s: fixtures without a tool (%s)" % (tool, _sandbox_policy.tool_argv(CODE_ROOT, tool)[0]))
             continue
         for case in cases:
             total += 1
-            name, problems = run_case(LAB / "tools/bin" / tool, case, interp, prefix)
+            name, problems = run_case(CODE_ROOT / "tools/bin" / tool, case, interp, prefix)
             if problems:
                 failed += 1
                 print("FAIL %s" % name)

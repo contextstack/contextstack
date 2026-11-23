@@ -198,9 +198,9 @@ def run(args):
         bundle.mkdir()
         install_archive(archive, bundle)
         meta = json.loads((bundle / "bundle.json").read_text())
-        if meta["release"] != version or meta["target"] != target or meta["lab_commit"] != commit:
+        if meta["release"] != version or meta["target"] != target or meta["code_commit"] != commit:
             raise ValueError("bundle metadata differs from channel manifest")
-        manifest.lookup(entries, version, meta["lab_commit"])
+        manifest.lookup(entries, version, meta["code_commit"])
         subprocess.run(["sh", str(bundle / "release/cs/scripts/node-install"), "install", str(bundle)] + (["--no-smoke"] if getattr(args, "no_smoke", False) else []), check=True)
     return 0
 

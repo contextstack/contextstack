@@ -3,7 +3,7 @@
   "stdout": "evidence_assert: quote is absent from cached and locally-derived bytes\n",
   "files": {
     "_evidence/assertions.jsonl": null,
-    ".lab-calls.jsonl": "{\"args\": {\"quote\": \"Never said this.\", \"source_url\": \"https://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"quote\": \"Never said this.\", \"source_url\": \"https://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
   },
   "untouched": true
 }

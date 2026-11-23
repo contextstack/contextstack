@@ -1,0 +1,9 @@
+id: fx-repo-view-guidance
+repo: sample
+repo_read_only: true
+model: fake
+system: prompts/coder-min.md
+tools: [exec, fs_read, fs_write, fs_edit]
+budget: {turns: 4, tool_calls: 15}
+tasks: [tasks/fx]
+trials: 1

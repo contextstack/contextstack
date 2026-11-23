@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-# Operator adapter: the gateway owns deployment admission and executor lifetime.
-from _node_env import node_env
-import json, os, sys, urllib.error, urllib.request
+"""Run and finish one CLI work order on the machine."""
+import sys
+from pathlib import Path
 
-payload = {"work_order": json.load(sys.stdin), "environment": {
-    key: os.environ[key] for key in ("LAB_JOB_ID", "LAB_TRIAL", "LAB_SCHEDULE_DATE",
-        "LAB_SCHEDULE_SLOT", "LAB_SCHEDULE_TIMEZONE", "LAB_VIDEO_MUTATION") if key in os.environ}}
-endpoint = os.environ.get("CSGATEWAY_LAB_ENDPOINT", "http://127.0.0.1:9200/v1/ai/lab-execute")
-headers = {"Content-Type": "application/json"}
-token = node_env().get("CSGATEWAY_AUTH_TOKEN")
-if token:
-    headers["Authorization"] = "Bearer " + token
-try:
-    with urllib.request.urlopen(urllib.request.Request(endpoint,
-            data=json.dumps(payload).encode(), headers=headers), timeout=11000) as response:
-        result = json.load(response)
-except (OSError, ValueError) as error:
-    detail = error.read().decode(errors="replace") if isinstance(error, urllib.error.HTTPError) else str(error)
-    raise SystemExit("executor: gateway refused or unavailable: " + detail)
-sys.stdout.write(result["stdout"])
-sys.stderr.write(result["stderr"])
-raise SystemExit(result["exit_code"])
+from _api_run import launch_cli
+from _runner import runner_path
+
+root = Path(__file__).resolve().parents[2]
+sys.exit(launch_cli(root, str(runner_path(root)), sys.stdin.read()))

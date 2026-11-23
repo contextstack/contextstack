@@ -71,6 +71,20 @@ fn domain_rule(domain: Domain) -> Result<Vec<SeccompRule>, seccompiler::BackendE
     let (op, family) = match domain {
         Domain::Any => return Ok(Vec::new()), // empty: the call always matches
         Domain::NotUnix => (SeccompCmpOp::Ne, libc::AF_UNIX),
+        Domain::NotIp => {
+            let conditions = [libc::AF_INET, libc::AF_INET6]
+                .into_iter()
+                .map(|family| {
+                    SeccompCondition::new(
+                        0,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Ne,
+                        u64::try_from(family).unwrap_or_default(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(vec![SeccompRule::new(conditions)?]);
+        }
         Domain::Vsock => (SeccompCmpOp::Eq, libc::AF_VSOCK),
     };
     let family = u64::try_from(family).unwrap_or_default();
@@ -210,6 +224,7 @@ pub fn run(bwrap: &Path, plan: &bwrap::Plan, call: &Call<'_>) -> Result<Ran, Fai
     }
     identity.extend_from_slice(&program);
     let mut command = Command::new(bwrap);
+    cs_child_signals::reset_on_exec(&mut command);
     command.args(&argv).current_dir(call.workspace);
     for (name, value) in call.env {
         command.env(name, value);
@@ -243,7 +258,9 @@ pub fn run(bwrap: &Path, plan: &bwrap::Plan, call: &Call<'_>) -> Result<Ran, Fai
 /// Whether this host lets bwrap create an unprivileged user namespace: the trivial sandbox
 /// `bwrap --unshare-user --ro-bind / / true`, run for real.
 pub fn userns_works(bwrap: &Path) -> bool {
-    Command::new(bwrap)
+    let mut command = Command::new(bwrap);
+    cs_child_signals::reset_on_exec(&mut command);
+    command
         .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -272,7 +289,7 @@ mod tests {
 
     #[test]
     fn every_listed_syscall_has_a_number_and_every_mode_compiles() -> Result<(), String> {
-        for net in [Net::None, Net::Gateway, Net::All] {
+        for net in [Net::None, Net::Gateway, Net::Loopback, Net::All] {
             for deny in seccomp::rules(net) {
                 assert!(syscall_number(deny.syscall).is_some(), "{}", deny.syscall);
             }

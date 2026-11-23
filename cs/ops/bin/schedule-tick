@@ -26,11 +26,11 @@ if str(HERE) not in sys.path:
 from _void import is_config_void, schedule_rows, repeated_failure
 from _grant import schedule_error
 
-LAB = HERE.parent.parent
-DEFAULT_SCHEDULES = state_dir(LAB) / "schedules.jsonl"
-DEFAULT_FIRES = state_dir(LAB) / "schedule-fires.jsonl"
-DEFAULT_DISPATCH = state_dir(LAB) / "dispatch.jsonl"
-LOCK = state_dir(LAB) / "schedule.lock"
+CODE_ROOT = HERE.parent.parent
+DEFAULT_SCHEDULES = state_dir(CODE_ROOT) / "schedules.jsonl"
+DEFAULT_FIRES = state_dir(CODE_ROOT) / "schedule-fires.jsonl"
+DEFAULT_DISPATCH = state_dir(CODE_ROOT) / "dispatch.jsonl"
+LOCK = state_dir(CODE_ROOT) / "schedule.lock"
 TERMINAL = {"done", "error", "operator_close", "cancelled"}
 SILENCE_SLOTS = 3
 MISSED_GRACE_MINUTES = 60
@@ -114,7 +114,7 @@ def schedule_metadata(schedule, slot):
 
 
 def spec_uses_local_coder(schedule):
-    path = LAB / str(schedule.get("spec") or "")
+    path = CODE_ROOT / str(schedule.get("spec") or "")
     if path.is_file():
         return bool(re.search(r"^model:\s*local-coder\s*$", path.read_text(encoding="utf-8"), re.M))
     return True
@@ -132,7 +132,7 @@ def prepare(schedule, slot=None, dispatch=None, ledger=None):
     if not source:
         return {"head": ""}
     payload = {"task": schedule["task"], "dest": source}
-    return call_op(LAB, "setup-refresh", payload, failure="setup refresh failed")
+    return call_op(CODE_ROOT, "setup-refresh", payload, failure="setup refresh failed")
 
 
 def enqueue(schedule, slot, prepared):
@@ -156,7 +156,7 @@ def enqueue(schedule, slot, prepared):
             payload["expected_head"] = prepared["head"]
         if schedule.get("reference_root"):
             payload["reference_root"] = schedule["reference_root"]
-    return call_op(LAB, "enqueue", payload)["id"]
+    return call_op(CODE_ROOT, "enqueue", payload)["id"]
 
 
 def stale_scan(rows, now):
@@ -168,7 +168,7 @@ def stale_scan(rows, now):
         if not root.is_dir():
             raise RuntimeError("stale root is not a directory: " + raw)
         result = subprocess.run(
-            tool_argv(LAB, "okf"), input=json.dumps({"action": "stale", "now": now.isoformat()}),
+            tool_argv(CODE_ROOT, "okf"), input=json.dumps({"action": "stale", "now": now.isoformat()}),
             text=True, capture_output=True, cwd=str(root),
         )
         if result.returncode != 0:
@@ -380,16 +380,16 @@ def record_deferral(fires, now, item):
 
 def node_dispatch(schedule, slot):
     """a schedule naming `node` is fired as a director job, never a local enqueue. The command is
-    LAB_DIRECTOR_DISPATCH (a JSON argv, e.g. ["php", "<director>/artisan", "director:node-dispatch"]); its
+    CS_DIRECTOR_DISPATCH (a JSON argv, e.g. ["php", "<director>/artisan", "director:node-dispatch"]); its
     last stdout line is the job's JSON. The slot's state then comes from the director estate's dispatch
-    shelf (LAB_DIRECTOR_ESTATE_ROOT), where each node's job_terminal row lands."""
-    raw = os.environ.get("LAB_DIRECTOR_DISPATCH") or ""
+    shelf (CS_DIRECTOR_ESTATE_ROOT), where each node's job_terminal row lands."""
+    raw = os.environ.get("CS_DIRECTOR_DISPATCH") or ""
     try:
         argv = json.loads(raw) if raw else None
     except ValueError:
         argv = None
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
-        raise NodeDispatchUnavailable("LAB_DIRECTOR_DISPATCH is not a JSON argv")
+        raise NodeDispatchUnavailable("CS_DIRECTOR_DISPATCH is not a JSON argv")
     argv = argv + [schedule["node"], schedule["spec"], "--schedule=" + schedule["id"], "--slot=" + slot]
     if schedule.get("task"):
         argv.append("--task=" + schedule["task"])
@@ -447,7 +447,7 @@ class NodeDispatchUnavailable(RuntimeError):
 
 
 def director_dispatch_rows():
-    root = os.environ.get("LAB_DIRECTOR_ESTATE_ROOT") or ""
+    root = os.environ.get("CS_DIRECTOR_ESTATE_ROOT") or ""
     shelf = Path(root) / "dispatch.jsonl" if root else None
     return read_jsonl(shelf) if shelf and shelf.is_file() else []
 
@@ -481,7 +481,7 @@ def main():
         dispatch_history = read_jsonl(dispatch_path) + director_dispatch_rows()
         dispatch = dispatch_by_job(dispatch_history)
         scheduled_dispatch = dispatch_by_schedule_slot(dispatch)
-        ledger_path = state_dir(LAB) / "ledger.jsonl"
+        ledger_path = state_dir(CODE_ROOT) / "ledger.jsonl"
         ledger_rows = read_jsonl(ledger_path) if ledger_path.is_file() else []
         admitted = []
         due = []

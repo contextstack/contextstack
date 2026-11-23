@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 
 TASK = Path(__file__).resolve().parent
-LAB = TASK.parents[2]
+CODE_ROOT = TASK.parents[2]
 # The Rust gateway scripts/check builds (the Go one is archived); $CSGATEWAY_BIN overrides it.
 GATEWAY = Path(os.environ.get('CSGATEWAY_BIN') or TASK.parents[3]/'target/release/cs-gateway')
 
@@ -133,19 +133,19 @@ with scratch_dir(prefix='estate-capacity-') as raw:
             output.seek(0)
             text = output.read()
             assert 'queue_wait_ms' in text and 'per_call_latency_ms' in text
-        # Instrument acceptance: one real Lab run, one ledger row, no wallet
+        # Instrument acceptance: one real ContextStack run, one ledger row, no wallet
         # charge, with the nonzero rate estimate and upstream request preserved.
-        runner = root/'lab-runner'
-        sys.path.append(str(LAB/'ops/bin'))
+        runner = root/'code_root-runner'
+        sys.path.append(str(CODE_ROOT/'ops/bin'))
         from _runner import built_runner  # the default Rust runner unless $CS_RUNNER_BIN
-        shutil.copy2(built_runner(LAB), runner)
-        estate = root/'lab'
+        shutil.copy2(built_runner(CODE_ROOT), runner)
+        estate = root/'code_root'
         ops, task = estate/'ops/bin', estate/'tasks/instrument'
         ops.mkdir(parents=True)
         task.mkdir(parents=True)
         (estate/'ESTATE').write_text('dev\n')
-        for name in ('capture-stimulus', 'finalize-run', 'publish-evidence', '_estate_io.py', '_lifecycle_evidence.py', '_env_policy.py', '_roots.py', '_errors.py'):
-            shutil.copy2(LAB/'ops/bin'/name, ops/name)
+        for name in ('capture-stimulus', 'finalize-run', 'publish-evidence', 'run-api', 'machine-finish', '_api_run.py', '_runner.py', '_estate_io.py', '_lifecycle_evidence.py', '_env_policy.py', '_roots.py', '_errors.py'):
+            shutil.copy2(CODE_ROOT/'ops/bin'/name, ops/name)
         (estate/'INVARIANTS.md').write_text('Isolated instrument fixture.\n')
         (estate/'prompts').mkdir()
         (estate/'prompts/test.md').write_text('Reply with the canned completion.\n')
@@ -153,8 +153,8 @@ with scratch_dir(prefix='estate-capacity-') as raw:
         (task/'check').write_text('#!/bin/sh\nexit 0\n')
         (task/'check').chmod(0o755)
         (estate/'spec.yaml').write_text('id: fixture-paid\nmodel: fake-paid\nsystem: prompts/test.md\ncontext: []\ntools: []\nmcp: []\nbudget: {turns: 1, tool_calls: 0, usd: 1, seconds: 15}\ntasks: [tasks/instrument]\ntrials: 1\nhypothesis: "fixture-1738: fake paid transport instrumentation."\n')
-        child_env = {**env, 'CSGATEWAY_ENDPOINT': gateways['dev']+'/v1/agent/model.call'}
-        result = subprocess.run([str(runner), 'run', 'spec.yaml'], cwd=estate, env=child_env, text=True, capture_output=True, timeout=30)
+        child_env = {**env, 'CSGATEWAY_ENDPOINT': gateways['dev']+'/v1/agent/model.call', 'CS_RUNNER_BIN': str(runner)}
+        result = subprocess.run([str(ops / 'run-api'), 'spec.yaml'], cwd=estate, env=child_env, text=True, capture_output=True, timeout=30)
         assert result.returncode == 0, (result.stdout, result.stderr)
         rows = [json.loads(line) for line in (estate/'ledger/ledger.jsonl').read_text().splitlines()]
         assert len(rows) == 1, rows
@@ -177,4 +177,4 @@ with scratch_dir(prefix='estate-capacity-') as raw:
                 process.wait()
         for output in outputs:
             output.close()
-print('check: two gateways obey estate shares; one Lab fake-paid run records api, rate estimate, zero wallet charge and its upstream call')
+print('check: two gateways obey estate shares; one ContextStack fake-paid run records api, rate estimate, zero wallet charge and its upstream call')

@@ -2,7 +2,7 @@
   "exit": 0,
   "stdout": "{\"action\": \"registered\", \"body_path\": \"_evidence/bodies/6b5a9c6e6bf4a6c40dec1a1d6a6a1e1e441439cf83d45f71406f6385c39d7c77.html\", \"derivation\": \"_evidence/derivations/da42c8aee903036c88e927031c997ac3a3d6bad5ea40d9884343afc080a7c88a.json\", \"derived_body_path\": \"_evidence/derived/ef9104de8a89ab3deeea4ec79bf45f7584e685b759c7ef9950fbe1325cc64d7e.defuddle.md\", \"ok\": true, \"source_url\": \"https://93.184.216.34/study\"}\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"quote\": \"The controlled trial enrolled **240 participants** across four sites.\", \"source_url\": \"https://93.184.216.34/study\"}, \"name\": \"evidence_assert\"}\n",
+    ".cs-calls.jsonl": "{\"args\": {\"quote\": \"The controlled trial enrolled **240 participants** across four sites.\", \"source_url\": \"https://93.184.216.34/study\"}, \"name\": \"evidence_assert\"}\n",
     "_evidence/assertions.jsonl": "{\"body_path\": \"_evidence/bodies/6b5a9c6e6bf4a6c40dec1a1d6a6a1e1e441439cf83d45f71406f6385c39d7c77.html\", \"derivation\": \"_evidence/derivations/da42c8aee903036c88e927031c997ac3a3d6bad5ea40d9884343afc080a7c88a.json\", \"derived_body_path\": \"_evidence/derived/ef9104de8a89ab3deeea4ec79bf45f7584e685b759c7ef9950fbe1325cc64d7e.defuddle.md\", \"quote\": \"The controlled trial enrolled **240 participants** across four sites.\", \"schema_version\": \"0.1\", \"source_url\": \"https://93.184.216.34/study\"}\n"
   },
   "untouched": true

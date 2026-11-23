@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-LAB = Path(__file__).resolve().parents[2]
+CODE_ROOT = Path(__file__).resolve().parents[2]
 STATE = Path.home() / ".contextstack"
 MAX_REQUEST = 64 * 1024
 MAX_TEXT = 5 * 1024 * 1024
@@ -437,7 +437,7 @@ def main():
     s.add_argument("--keychain", action="store_true", help="encrypt cookies with the OS keychain (not the default)")
     s.add_argument("--allow-no-chrome-sandbox", action="store_true",
                    help="if this host blocks Chrome's own sandbox, run Chrome with --no-sandbox (never the default)")
-    s.add_argument("--config", default=str(LAB / "policy/browser.json"))
+    s.add_argument("--config", default=str(CODE_ROOT / "policy/browser.json"))
     s.add_argument("--root", default=str(STATE / "browser"))
     s.add_argument("--chrome")
     args = parser.parse_args()

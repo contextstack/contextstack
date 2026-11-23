@@ -6,6 +6,7 @@
 mod admission;
 mod agentstream;
 mod catalog;
+mod clirun;
 mod connection;
 mod credentials;
 mod discovery;
@@ -13,13 +14,13 @@ mod errors;
 mod executables;
 mod gateway;
 mod inventory;
-mod labrun;
 mod log;
 mod pricing;
 mod protocol;
 mod server;
 mod settings;
 mod spend;
+mod trace;
 mod wire;
 mod workorder;
 
@@ -149,7 +150,7 @@ async fn serve() -> Result<(), String> {
 }
 
 /// The composition root: settings, host configuration, executables, discovery health, admission, the
-/// Lab executor, then the gateway and its first snapshot. Refusals match the contract suite's order and wording.
+/// CLI executor, then the gateway and its first snapshot. Refusals match the contract suite's order and wording.
 async fn compose() -> Result<Arc<Gateway>, String> {
     let settings =
         settings::Settings::load(settings::Env::load()).map_err(|e| format!("config: {e}"))?;
@@ -175,14 +176,14 @@ async fn compose() -> Result<Arc<Gateway>, String> {
     )
     .map_err(|e| format!("config: {e}"))?;
     let manager = admission::Manager::new(&host).map_err(|e| format!("gateway: {e}"))?;
-    let executor = if host.lab_executor.is_empty() {
+    let executor = if host.cli_executor.is_empty() {
         None
     } else {
         let python = exe
             .look_path("python3")
-            .map_err(|e| format!("gateway: lab executor interpreter: {e}"))?;
+            .map_err(|e| format!("gateway: CLI executor interpreter: {e}"))?;
         let ex =
-            workorder::Executor::new(&host.lab_executor, python, &settings, &exe.search_path())
+            workorder::Executor::new(&host.cli_executor, python, &settings, &exe.search_path())
                 .map_err(|e| format!("gateway: {e}"))?;
         Some(ex)
     };

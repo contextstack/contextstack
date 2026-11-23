@@ -15,10 +15,8 @@ def _(ctx):
     got = o.call("GET", "lead-node")
     ctx.expect(got.status == 200 and isinstance(got.json.get("node"), str) and got.json.get("source") in ("default", "set"),
                "GET lead-node answers node and source", got)
-    set_a = o.call("PUT", "lead-node", body={"node": home.name})
+    set_a = device(ctx).call("PUT", "lead-node", body={"node": home.name})
     ctx.expect(set_a.status == 200 and set_a.json.get("source") == "set", "owner sets lead node", set_a)
-    refused(ctx, device(ctx).call("PUT", "lead-node", body={"node": home.name}), 403, "owner_only",
-            "device cannot set lead node")
     refused(ctx, o.call("PUT", "lead-node", body={"node": "no-such-node"}), 422, "unknown_node", "unknown node")
 
 

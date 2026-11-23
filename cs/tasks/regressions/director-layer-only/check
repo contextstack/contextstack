@@ -72,7 +72,7 @@ def self_test():
                  "cs/tasks/regressions/x/goal.md": "Bot turns left the node.\n",
                  "cs/specs/archive/exp-1.yaml": "verdict: bot-turn retired\n",
                  "cs/tools/bin/topic": '("Bot / Crawler / Edge", {"bot-traffic"})\n',
-                 "cs/grants/g-director-messaging-x.yaml": "paths:\n  - app/Messaging/Lab/BotTurnAction.php\n"}
+                 "cs/grants/g-director-messaging-x.yaml": "paths:\n  - app/Messaging/ContextStack/BotTurnAction.php\n"}
         for rel, text in files.items():
             (repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (repo / rel).write_text(text)

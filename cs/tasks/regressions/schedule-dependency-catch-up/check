@@ -17,8 +17,8 @@ _clean_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_clean_env)
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 
 
 def write_jsonl(path, rows):
@@ -29,7 +29,7 @@ def tick(root, now, **extra):
     ops = root / "ops/bin"
     ops.mkdir(parents=True, exist_ok=True)
     for name in ("schedule-tick", "_grant.py", "_estate_io.py", "_void.py"):
-        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, ops / name)
     (root / "ESTATE").write_text("dev\n")
     (root / "grants").mkdir(exist_ok=True)
     (root / "grants/fixture.yaml").write_text(
@@ -48,7 +48,7 @@ def tick(root, now, **extra):
     }
     payload.update(extra)
     result = subprocess.run([str(ops / "schedule-tick")], input=json.dumps(payload),
-                            text=True, capture_output=True, cwd=LAB, env={**hermetic_env()})
+                            text=True, capture_output=True, cwd=CODE_ROOT, env={**hermetic_env()})
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -72,7 +72,7 @@ def schedule(schedule_id, hour, requires=None, accept_check_failure_from=None):
     return row
 
 
-loader = importlib.machinery.SourceFileLoader("schedule_tick_policy", str(LAB / "ops/bin/schedule-tick"))
+loader = importlib.machinery.SourceFileLoader("schedule_tick_policy", str(CODE_ROOT / "ops/bin/schedule-tick"))
 module_spec = importlib.util.spec_from_loader("schedule_tick_policy", loader)
 schedule_tick_policy = importlib.util.module_from_spec(module_spec)
 module_spec.loader.exec_module(schedule_tick_policy)
@@ -240,13 +240,13 @@ with scratch_dir(prefix="schedule-reboot-") as raw:
         "schedule_id": "after-reboot",
         "slot": "2026-09-02T14:00:00Z",
     }])
-    loader = importlib.machinery.SourceFileLoader("lab_tick", str(LAB / "ops/bin/tick"))
-    module_spec = importlib.util.spec_from_loader("lab_tick", loader)
-    lab_tick = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(lab_tick)
-    lab_tick.Q = dispatch
-    lab_tick.LOCK = root / "dispatch.lock"
-    assert lab_tick.recover_orphaned_jobs() == ["orphaned-job"]
+    loader = importlib.machinery.SourceFileLoader("tick_module", str(CODE_ROOT / "ops/bin/tick"))
+    module_spec = importlib.util.spec_from_loader("tick_module", loader)
+    tick_module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(tick_module)
+    tick_module.Q = dispatch
+    tick_module.LOCK = root / "dispatch.lock"
+    assert tick_module.recover_orphaned_jobs() == ["orphaned-job"]
     terminal = json.loads(dispatch.read_text().splitlines()[-1])
     assert terminal["state"] == "error" and terminal["verdict"] == "void"
     assert terminal["stop"] == "error: scheduler orphaned_running after restart"

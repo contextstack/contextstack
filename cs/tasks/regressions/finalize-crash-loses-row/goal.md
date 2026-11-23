@@ -12,7 +12,7 @@ Two claims, kept apart:
 - Detection. For dispatched cells `tick` already notices: it takes
   `ledger_size()` before the trial and `execution_row(rel, sid, before)`
   after it, and raises "trial produced no fresh matching execution row"
-  (ops/bin/tick:290, 303-305). A manual `lab run` has no such check: the
+  (ops/bin/tick:290, 303-305). A manual `cs-harness run` has no such check: the
   caller gets exit status -9, nothing else.
 - Recovery. Exists for neither. Nothing re-derives the row, the
   check result or the evidence record from what is on disk.
@@ -31,7 +31,7 @@ Run:
 Builds a temp estate (seeded with two prior rows, one for the same
 spec), a fake gateway scripted for the create-file task (fs_write then
 a final text turn, so the check passes), and the default Rust runner
-(`../target/release/cs-harness`) unless `CS_RUNNER_BIN` is set. Never touches lab/ledger.
+(`../target/release/cs-harness`) unless `CS_RUNNER_BIN` is set. Never touches cs/ledger.
 
 Since extraction 1 of phase 1b the runner writes `terminal.json` and
 calls `ops/bin/finalize-run`; the same kill now leaves `terminal.json`

@@ -46,12 +46,58 @@ def _(ctx):
     import cs_lead
     n, o = ctx.node2(), owner(ctx)
     pin_lead_node(o, n)
+    status = n.status([], agent_capabilities={
+        "templates": ["claude-code-sonnet"], "harness": True, "harness_models": ["local-coder"],
+    })
+    ctx.expect(status.status == 200, "node status recorded", status)
     a = o.call("POST", "conversations", body={"node": n.name, "spec": "hosted-lead", "model": "claude-code-sonnet"}, key=new_key("lead-first"))
     ctx.expect(a.status == 201, "lead created", a)
     t = post(ctx, o, a.json["conversation"], "Hello lead")
     ctx.expect(t["state"] == "running" and t["job_id"] in open_jobs(n), "first lead turn dispatches immediately", t)
     files = job_files(n, t["job_id"])
     ctx.expect(files["spec.yaml"] == cs_lead.bundle_files("claude-code-sonnet")["spec.yaml"], "Director and Python use the same spec", files["spec.yaml"])
+
+
+@case(C, "lead-conversation", "installed-lead-turn-with-capabilities")
+def _(ctx):
+    """A node with a capability report gets its hosted lead turn through GET work."""
+    from pathlib import Path
+    from shutil import copy2
+    from cases.conversations import post
+    from harness.run import Ctx
+    from harness.targets import RustTarget
+
+    repo = Path(__file__).resolve().parents[3]
+    release = ctx.target.tmp / "release"
+    (release / "bin").mkdir(parents=True)
+    binary = release / "bin/cs-director"
+    copy2(ctx.target.binary, binary)
+    kit = release / "cs"
+    kit.symlink_to(repo / "cs", target_is_directory=True)
+    installed = RustTarget(release, binary)
+    try:
+        installed.env["CS_CODE_ROOT"] = str(kit)
+        del installed.env["CS_LEAD_BUNDLE_DIR"]
+        installed.restart()
+        ctx = Ctx(ctx.id, target=installed)
+        n, o = ctx.node2(), owner(ctx)
+        pin_lead_node(o, n)
+        caps = {"templates": ["claude-code-sonnet", "codex"], "harness": False, "harness_models": []}
+        status = n.status([], agent_capabilities=caps)
+        ctx.expect(status.status == 200, "installed node status recorded", status)
+        before, _ = n.work(wait=0, timeout=3)
+        created = o.call("POST", "conversations",
+                         body={"spec": "hosted-lead", "model": "claude-code-sonnet"}, key=new_key("release-lead"))
+        ctx.expect(created.status == 201, "lead created from installed bundle", created)
+        turn = post(ctx, o, created.json["conversation"], "Call machines and give the node count.")
+        offer, _ = n.work(after=before.json["cursor"], wait=2, timeout=3)
+        job = o.call("GET", "jobs/" + turn["job_id"]).json
+        ctx.expect(offer.status == 200 and offer.json["changed"] and any(
+            (row["job_id"], row.get("turn_id")) == (turn["job_id"], turn["turn_id"])
+            for row in offer.json["jobs"]
+        ), "installed node sees the hosted turn offer", job.get("budget"))
+    finally:
+        installed.close()
 
 
 @case(C, "lead-conversation", "client-bundle-may-not-claim-lead")
@@ -105,7 +151,7 @@ def _(ctx):
 @case(C, "lead-conversation", "lead-wake-turn-recorded")
 def _(ctx):
     """The session host records a lane wake-up as a done turn (nudge plus reply, no job)."""
-    from cases.conversations import post, thread, reply
+    from cases.conversations import job_files, post, thread, reply
     from cases.client import lead
     n, o = ctx.node2(), owner(ctx)
     pin_lead_node(o, n)
@@ -120,6 +166,10 @@ def _(ctx):
     reply(ctx, n, t["job_id"], "I will report when it finishes.")
     settled = l.call("GET", "turns/%s" % t["turn_id"]).json
     ctx.expect(settled["state"] == "done", "queue is idle before wake", settled)
+    ctx.expect(o.call("POST", f"conversations/{conv['conversation_id']}/stop",
+                      key=new_key()).status == 202, "hold the queue for a wake")
+    queued = post(ctx, o, conv, "What finished?")
+    ctx.expect(queued["state"] == "queued", "person turn waits", queued)
     body = {
         "nudge": "Lane lane-2 job %s ended: done, verdict pass" % t["job_id"],
         "reply": "Lane lane-2 finished green.",
@@ -139,7 +189,14 @@ def _(ctx):
     other = o.call("POST", "conversations/%s/wake-turns" % conv["conversation_id"], body=body, key=new_key("wake-o"))
     ctx.expect(other.status == 403, "only the conversation's lead records wake turns", other)
     th = thread(l, conv)
-    ctx.expect(any(x.get("reply") == body["reply"] for x in th["turns"]), "thread shows wake reply", th)
+    ctx.expect([turn["turn_id"] for turn in th["turns"]] == [t["turn_id"], w["turn_id"], queued["turn_id"]],
+               "wake precedes the waiting person turn in the thread", th)
+    ctx.expect(o.call("POST", f"conversations/{conv['conversation_id']}/resume",
+                      key=new_key()).status == 200, "resume the queue")
+    running = l.call("GET", f"turns/{queued['turn_id']}").json
+    ctx.expect(running["state"] == "running", "waiting turn starts", running)
+    context = job_files(n, running["job_id"])["conversation/context.md"]
+    ctx.expect(body["reply"].encode() in context, "waiting turn receives the wake reply", context)
 
 @case(C, "lead-conversation", "lead-wake-turn-jobs-scope")
 def _(ctx):

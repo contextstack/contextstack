@@ -4,8 +4,8 @@ import os
 # Keep scripts/check's estate override cleanup in sync. Fixture-specific overrides
 # belong after hermetic_env(), so tests can still exercise relocated roots.
 ESTATE_OVERRIDES = frozenset({
-    "LAB_CODE_ROOT", "LAB_CONFIG_ROOT", "LAB_STATE_ROOT", "LAB_WORKSPACES_ROOT",
-    "CS_ROOT", "CS_INSTALL_ROOT", "CS_AGENTS_DIR", "CS_CODE_ROOT",
+    "CS_CODE_ROOT", "CS_CONFIG_ROOT", "CS_STATE_ROOT", "CS_WORKSPACES_ROOT",
+    "CS_ROOT", "CS_INSTALL_ROOT", "CS_AGENTS_DIR",
 })
 
 

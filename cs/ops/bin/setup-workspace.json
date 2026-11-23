@@ -7,7 +7,7 @@
       "setup": {"type": "string"},
       "workspace": {"type": "string"},
       "task": {"type": "string"},
-      "lab": {"type": "string"}
+      "code_root": {"type": "string"}
     },
     "additionalProperties": false
   }

@@ -15,15 +15,15 @@ _clean_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_clean_env)
 
-LAB = Path(__file__).resolve().parents[3]
-loader = importlib.machinery.SourceFileLoader("lab_tick_seat_test", str(LAB / "ops/bin/tick"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+loader = importlib.machinery.SourceFileLoader("code_tick_seat_test", str(CODE_ROOT / "ops/bin/tick"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 tick = importlib.util.module_from_spec(spec)
 loader.exec_module(tick)
 
 with scratch_dir(prefix="tick-terminal-seat-") as raw:
     tick.Q = Path(raw) / "dispatch.jsonl"
-    tick.lab_count = lambda: 0
+    tick.runner_count = lambda: 0
 
     def write(rows):
         tick.Q.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")

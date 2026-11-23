@@ -22,8 +22,8 @@ _fixture_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_fixture_env)
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / 'ops/bin'))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / 'ops/bin'))
 import _runner
 
 
@@ -37,22 +37,20 @@ def module(name, path):
 
 with scratch_dir(prefix='runner-selection-') as raw:
     root = Path(raw)
-    lab = root / 'lab'
-    lab.mkdir()
-    primary, legacy = root / 'target/debug/cs-harness', lab / 'lab'
-    primary.parent.mkdir(parents=True)
-    for p in (primary, legacy):
-        p.write_text('original')
-        p.chmod(0o755)
-    default = root / 'target/release/cs-harness'  # unset, the checkout's Rust runner; Go only when named
-    assert _runner.runner_path(lab, {}) == default
-    assert _runner.runner_path(lab, {'LAB_RUNNER_BIN': str(legacy)}) == legacy
-    chosen = {'CS_RUNNER_BIN': str(primary), 'LAB_RUNNER_BIN': str(legacy)}
-    assert _runner.runner_path(lab, chosen) == primary
-    assert _runner.runner_path(lab, {'CS_RUNNER_BIN': '../target/debug/cs-harness'}).resolve() == primary.resolve()
-    assert _runner.runner_path(lab, {'CS_RUNNER_BIN': '', 'LAB_RUNNER_BIN': str(legacy)}) == legacy
-    tick = module('selection_tick', LAB / 'ops/bin/tick')
-    tick.LAB = lab
+    code_root = root / 'cs'
+    code_root.mkdir()
+    primary = root / 'target/debug/cs-harness'
+    default = root / 'target/release/cs-harness'
+    for binary in (primary, default):
+        binary.parent.mkdir(parents=True)
+        binary.write_text('original')
+        binary.chmod(0o755)
+    assert _runner.runner_path(code_root, {}) == default
+    chosen = {'CS_RUNNER_BIN': str(primary)}
+    assert _runner.runner_path(code_root, chosen) == primary
+    assert _runner.runner_path(code_root, {'CS_RUNNER_BIN': '../target/debug/cs-harness'}).resolve() == primary.resolve()
+    tick = module('selection_tick', CODE_ROOT / 'ops/bin/tick')
+    tick.CODE_ROOT = code_root
     tick.Q = root / 'dispatch.jsonl'
     tick.Q.write_text(json.dumps({'id': 'job-1', 'schedule_date': '2026-11-09',
                                  'slot': 'morning', 'schedule_timezone': 'America/New_York'}) + '\n')
@@ -66,15 +64,15 @@ with scratch_dir(prefix='runner-selection-') as raw:
                     'SCHEDULE_DATE': '2026-11-09', 'SCHEDULE_SLOT': 'morning',
                     'SCHEDULE_TIMEZONE': 'America/New_York'}
         for suffix, value in expected.items():
-            assert env['LAB_' + suffix] == env['CS_' + suffix] == value, env
-        assert 'LAB_VIDEO_MUTATION' not in env and 'CS_VIDEO_MUTATION' not in env
+            assert env['CS_' + suffix] == value, env
+        assert 'CS_VIDEO_MUTATION' not in env
         granted = tick.child_env('job-1', ['youtube_playlist_mutation'], trial=3)
-        assert granted['LAB_VIDEO_MUTATION'] == granted['CS_VIDEO_MUTATION'] == '1'
+        assert granted['CS_VIDEO_MUTATION'] == '1'
         absent = tick.child_env()
         assert all('CS_' + suffix not in absent for suffix in suffixes if suffix != 'CHILD_ENV'), absent
         tick.POLICY_ENV = {'child_env': ['ONLY_ALLOWED']}
         env = tick.child_env('job-1', [], trial=4)
-        assert env['LAB_CHILD_ENV'] == env['CS_CHILD_ENV'] == 'ONLY_ALLOWED'
+        assert env['CS_CHILD_ENV'] == 'ONLY_ALLOWED'
     tick.child_env = lambda *args, **kwargs: {}
     calls = []
     def capture(argv, **kwargs):
@@ -82,29 +80,29 @@ with scratch_dir(prefix='runner-selection-') as raw:
         return subprocess.CompletedProcess(argv, 0, '', '')
     with patch.dict(os.environ, chosen, clear=True), patch.object(tick, 'run_teed', partial(tick.run_teed, run=capture)):
         assert tick.one_trial('specs/fx.yaml', 3, 'tasks/fx') == 0
-    assert calls[0][0] == [str(primary), 'run', '-task', 'tasks/fx', '-trial', '3', 'specs/fx.yaml']
+    assert calls[0][0] == [str(tick.HERE / 'run-api'), '-task', 'tasks/fx', '-trial', '3', 'specs/fx.yaml']
     calls.clear()
     with patch.dict(os.environ, {}, clear=True), patch.object(tick, 'run_teed', partial(tick.run_teed, run=capture)):
         tick.one_trial('specs/fx.yaml', 2)
-    assert calls[0][0][0] == str(default)
-    # Exact paths count; another estate and an unrelated process named lab do not.
-    ps = f'999991 {primary}\n999992 {legacy}\n999993 {root}/other/lab\n999994 /usr/bin/python3\n'
+    assert calls[0][0][0] == str(tick.HERE / 'run-api')
+    # Exact paths count; another estate and an unrelated process named cs-harness do not.
+    ps = f'999991 {primary}\n999992 {default}\n999993 {root}/other/cs-harness\n999994 /usr/bin/python3\n'
     with patch.dict(os.environ, chosen, clear=True), patch.object(_runner.subprocess, 'run',
             return_value=subprocess.CompletedProcess([], 0, ps, '')):
-        assert _runner.running_count(lab) == 2
+        assert _runner.running_count(code_root) == 2
     # Exercise this host's real process identity (native stand-ins, no runner work).
-    foreign = root / 'other/lab'
+    foreign = root / 'other/cs-harness'
     foreign.parent.mkdir()
     # Copied macOS system binaries can be killed by platform-signature enforcement.
     # Compile our own std-only native process instead of copying /bin/sleep (rustc: the toolchain check
-    # already needs; Go is archived).
+    # already needs).
     native_source, native_binary = root / 'native.rs', root / 'native-stand-in'
     native_source.write_text('fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n')
     subprocess.run(['rustc', '-o', str(native_binary), str(native_source)],
                    cwd=root, check=True, capture_output=True, text=True, timeout=120, env={**hermetic_env()})
     processes = []
     try:
-        for binary in (primary, legacy, foreign):
+        for binary in (primary, default, foreign):
             # A fresh inode avoids macOS cached code signatures from the text stand-in.
             binary.unlink(missing_ok=True)
             shutil.copyfile(native_binary, binary)
@@ -114,7 +112,7 @@ with scratch_dir(prefix='runner-selection-') as raw:
         # identities must be visible, including the unrelated estate we exclude.
         deadline = time.monotonic() + 5
         expected_paths = dict(zip((p.pid for p in processes),
-                                  (p.resolve() for p in (primary, legacy, foreign))))
+                                  (p.resolve() for p in (primary, default, foreign))))
         while True:
             observed = {}
             snapshot = subprocess.run(['ps', '-p', ','.join(map(str, expected_paths)), '-o', 'pid=,comm='],
@@ -136,13 +134,13 @@ with scratch_dir(prefix='runner-selection-') as raw:
                                     if line.strip().split(None, 1)[0] in {str(p.pid) for p in processes})
             return result
         with patch.dict(os.environ, chosen, clear=True), patch.object(_runner.subprocess, 'run', native_ps):
-            count = _runner.running_count(lab)
+            count = _runner.running_count(code_root)
             while count != 2 and time.monotonic() < deadline:
                 states = [p.poll() for p in processes]
                 assert all(state is None for state in states), ('native fixture exited', states, counted_snapshot)
                 time.sleep(0.02)
                 counted_snapshot.clear()
-                count = _runner.running_count(lab)
+                count = _runner.running_count(code_root)
             assert count == 2, (count, expected_paths, counted_snapshot)
     finally:
         for process in processes:
@@ -151,87 +149,75 @@ with scratch_dir(prefix='runner-selection-') as raw:
         for process in processes:
             process.wait(timeout=5)
         # Later fake builds/scripts also receive fresh inodes after native execution.
-        for binary in (primary, legacy):
+        for binary in (primary, default):
             binary.unlink(missing_ok=True)
             binary.write_text('original')
             binary.chmod(0o755)
-    (lab / 'cmd/lab').mkdir(parents=True)
-    (lab / 'cmd/lab/main.go').write_text('package main')
     (root / 'harness/src').mkdir(parents=True)
     (root / 'harness/src/main.rs').write_text('fn main() {}')
     (root / 'Cargo.toml').write_text('[workspace]')
-    os.utime(legacy, (1, 1)); os.utime(primary, (1, 1))
-    for selected in (legacy, primary):
+    os.utime(default, (1, 1)); os.utime(primary, (1, 1))
+    for selected in (default, primary):
         with patch.dict(os.environ, {'CS_RUNNER_BIN': str(selected)}, clear=True):
-            assert 'older than runner source' in _runner.freshness(lab)
+            assert 'older than runner source' in _runner.freshness(code_root)
     builds = []
     def build(argv, **kwargs):
         builds.append((argv, kwargs))
-        if argv[0] == 'go':
-            output = Path(argv[argv.index('-o') + 1])
-        else:
-            output = Path(argv[argv.index('--target-dir') + 1]) / ('release' if '--release' in argv else 'debug') / 'cs-harness'
-            assert output != _runner.runner_path(lab), 'cargo overwrites the selected executable before success'
+        output = Path(argv[argv.index('--target-dir') + 1]) / ('release' if '--release' in argv else 'debug') / 'cs-harness'
+        assert output != _runner.runner_path(code_root), 'cargo overwrites the selected executable before success'
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(argv[0]); output.chmod(0o755)
         return subprocess.CompletedProcess(argv, 0, 'built', '')
-    for selected, command in ((primary, 'cargo'), (legacy, 'go')):
-        with patch.dict(os.environ, {'CS_RUNNER_BIN': str(selected)}, clear=True), patch.object(_runner.subprocess, 'run', build):
-            assert _runner.rebuild(lab)['ok']
-            assert _runner.freshness(lab) is None
-        assert selected.read_text() == command
-        assert builds[-1][0][0] == command
-    # Unset, rebuild builds the checkout's Rust runner in release mode at the default path; Go only when named.
+    with patch.dict(os.environ, chosen, clear=True), patch.object(_runner.subprocess, 'run', build):
+        assert _runner.rebuild(code_root)['ok']
+        assert _runner.freshness(code_root) is None
+    assert primary.read_text() == 'cargo'
     with patch.dict(os.environ, {}, clear=True), patch.object(_runner.subprocess, 'run', build):
-        assert _runner.rebuild(lab)['implementation'] == 'rust'
+        assert _runner.rebuild(code_root)['implementation'] == 'rust'
         assert '--release' in builds[-1][0] and default.read_text() == 'cargo'
     # A failed build keeps the current executable intact.
     with patch.dict(os.environ, chosen, clear=True), patch.object(_runner.subprocess, 'run',
             return_value=subprocess.CompletedProcess([], 1, '', 'build failed')):
-        assert not _runner.rebuild(lab)['ok']
+        assert not _runner.rebuild(code_root)['ok']
         assert primary.read_text() == 'cargo'
-    # an installed release names its runners bin/cs-go and bin/cs-harness; tick's freshness must accept them.
-    for name, kind in (('cs-go', 'go'), ('cs-harness', 'rust')):
-        installed = root / 'release/bin' / name
-        installed.parent.mkdir(parents=True, exist_ok=True)
-        installed.write_text('#!/bin/sh\n'); installed.chmod(0o755)
-        assert _runner.runner_kind(lab, installed) == kind, name
-        with patch.dict(os.environ, {'CS_RUNNER_BIN': str(installed)}, clear=True):
-            assert _runner.freshness(lab) in (None, '%s is older than runner source — rebuild the configured runner' % installed)
-    custom = lab / 'custom-runner'
+    installed = root / 'release/bin/cs-harness'
+    installed.parent.mkdir(parents=True)
+    installed.write_text('#!/bin/sh\n'); installed.chmod(0o755)
+    assert _runner.runner_kind(code_root, installed) == 'rust'
+    with patch.dict(os.environ, {'CS_RUNNER_BIN': str(installed)}, clear=True):
+        assert _runner.freshness(code_root) is None
+    prebuilt = installed.with_name('cs-go')
+    shutil.copy2(installed, prebuilt)
+    assert _runner.runner_kind(code_root, prebuilt) == 'go'
+    with patch.dict(os.environ, {'CS_RUNNER_BIN': str(prebuilt)}, clear=True):
+        assert _runner.freshness(code_root) is None
+    custom = code_root / 'custom-runner'
     with patch.dict(os.environ, {'CS_RUNNER_BIN': str(custom)}, clear=True):
-        assert 'missing' in _runner.freshness(lab)
+        assert 'missing' in _runner.freshness(code_root)
         try:
-            _runner.rebuild(lab)
+            _runner.rebuild(code_root)
         except ValueError as error:
             assert 'unknown runner' in str(error)
         else:
             raise AssertionError('custom runner silently rebuilt as Go')
     # run-spec forwards the chosen path through an actual fake binary.
-    (lab / 'ops/bin').mkdir(parents=True)
-    for name in ('run-spec', '_env_policy.py', '_roots.py', '_sandbox_policy.py', '_runner.py'):
-        shutil.copy2(LAB / 'ops/bin' / name, lab / 'ops/bin' / name)
-    (lab / 'specs').mkdir()
-    (lab / 'specs/fx.yaml').write_text('id: fx\ntasks: [tasks/fx]\ntrials: 1\nhypothesis: fixture-1981 fixture\n')
-    primary.write_text('#!/bin/sh\nprintf "chosen-rust\\n"\n'); primary.chmod(0o755)
-    legacy.write_text('#!/bin/sh\nprintf "chosen-go\\n"\n'); legacy.chmod(0o755)
-    default.write_text('#!/bin/sh\nprintf "chosen-default-rust\\n"\n'); default.chmod(0o755)
-    # Configuration checks warn on the legacy selector; cell execution stays quiet.
-    for selection, warned in (({'LAB_RUNNER_BIN': str(legacy)}, True), (chosen, False), ({}, False)):
-        env = {k: v for k, v in hermetic_env().items() if k not in ('CS_RUNNER_BIN', 'LAB_RUNNER_BIN')}
-        checked = subprocess.run([sys.executable, str(lab / 'ops/bin/_runner.py')], cwd=lab,
-                                 env={**env, **selection}, capture_output=True, text=True)
-        assert checked.returncode == 0, checked.stderr
-        assert ('compatibility alias' in checked.stderr) == warned, checked.stderr
-    (lab / 'policy').mkdir()
-    (lab / 'policy/env.json').write_text(json.dumps({'version': 1, 'always': [], 'on_request': []}))
-    for binary in (primary, legacy, default):
+    (code_root / 'ops/bin').mkdir(parents=True)
+    for name in ('run-spec', 'run-api', '_api_run.py', '_estate_io.py', '_env_policy.py',
+                 '_node_env.py', '_roots.py', '_sandbox_policy.py', '_runner.py'):
+        shutil.copy2(CODE_ROOT / 'ops/bin' / name, code_root / 'ops/bin' / name)
+    (code_root / 'specs').mkdir()
+    (code_root / 'specs/fx.yaml').write_text('id: fx\ntasks: [tasks/fx]\ntrials: 1\nhypothesis: fixture-1981 fixture\n')
+    primary.write_text('#!/bin/sh\nprintf "chosen-rust\\n" > launcher-runner.txt\n'); primary.chmod(0o755)
+    default.write_text('#!/bin/sh\nprintf "chosen-default-rust\\n" > launcher-runner.txt\n'); default.chmod(0o755)
+    (code_root / 'policy').mkdir()
+    (code_root / 'policy/env.json').write_text(json.dumps({'version': 1, 'always': [], 'on_request': []}))
+    for binary in (primary, default):
         with binary.open('a') as stream:
-            stream.write('printf "%s\\n" "${LAB_CHILD_ENV-unset}" "${CS_CHILD_ENV-unset}" > launcher-env.txt\n')
-    for selection, expected in ((chosen, 'chosen-rust'), ({'LAB_RUNNER_BIN': str(legacy)}, 'chosen-go'), ({}, 'chosen-default-rust')):
-        env = {k: v for k, v in hermetic_env().items() if k not in ('CS_RUNNER_BIN', 'LAB_RUNNER_BIN')}
-        result = subprocess.run([str(lab / 'ops/bin/run-spec'), 'specs/fx.yaml'], cwd=lab,
-                                env={**env, **selection, 'CS_CHILD_ENV': 'SECRET LAB_VIDEO_MUTATION'}, capture_output=True, text=True)
-        assert result.returncode == 0 and expected in result.stdout, (result.stdout, result.stderr)
-        assert (lab / 'launcher-env.txt').read_text() == '\n\n', 'inherited alias bypassed empty policy'
+            stream.write('printf "%s\\n" "${CS_CHILD_ENV-unset}" > launcher-env.txt\nexit 2\n')
+    for selection, expected in ((chosen, 'chosen-rust'), ({}, 'chosen-default-rust')):
+        env = {k: v for k, v in hermetic_env().items() if k != 'CS_RUNNER_BIN'}
+        result = subprocess.run([str(code_root / 'ops/bin/run-spec'), 'specs/fx.yaml'], cwd=code_root,
+                                env={**env, **selection, 'CS_CHILD_ENV': 'SECRET CS_VIDEO_MUTATION'}, capture_output=True, text=True)
+        assert result.returncode == 1 and (code_root / 'launcher-runner.txt').read_text().strip() == expected, result
+        assert (code_root / 'launcher-env.txt').read_text() == '\n', 'inherited environment bypassed empty policy'
 print('check: runner selection, rollback, argv, process identity, rebuild and freshness pass')

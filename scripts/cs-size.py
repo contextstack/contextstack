@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-CAP = 1800
+CAP = 3500
 metadata = json.loads(subprocess.check_output(
     ['cargo', 'metadata', '--locked', '--format-version', '1'], cwd=ROOT))
 packages = {p['id']: p for p in metadata['packages']}

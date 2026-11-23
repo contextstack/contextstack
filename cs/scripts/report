@@ -46,8 +46,8 @@ def pending_merges(ledger_path):
             row = json.loads(line)
             if row.get('verdict') != 'pass' or 'tasks/work/' not in row.get('task', ''):
                 continue
-            lab_root = os.path.dirname(os.path.dirname(os.path.abspath(ledger_path)))
-            ws = os.path.join(lab_root, row.get('transcript', ''), 'workspace')
+            code_root = os.path.dirname(os.path.dirname(os.path.abspath(ledger_path)))
+            ws = os.path.join(code_root, row.get('transcript', ''), 'workspace')
             if not os.path.isdir(os.path.join(ws, '.git')):
                 continue
             notes = os.path.join(row['task'], 'notes.md')

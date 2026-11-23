@@ -54,7 +54,7 @@ publish is "skipped", not failed. The check and publish-evidence children
 inherit policy/env.json `always` (_env_policy.load_policy: the node policy,
 or the runner's compiled default DEFAULT_ENV when the file is absent). They are
 the node's children, not the spec's: no spec `env:` request applies, and
-LAB_CHILD_ENV is not consulted.
+CS_CHILD_ENV is not consulted.
 
 Exit 0 {"ok": true, "state": "finalized", ...}; exit 3 {"ok": false, "state":
 "pending", "reason"}, finalize.error holding the error unless another
@@ -68,12 +68,14 @@ import errno
 import fcntl
 import hashlib
 import json
+from contextlib import nullcontext
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from _estate_io import spec_intent, write_atomic
@@ -84,12 +86,12 @@ from _estate_io import estate_id
 from _roots import RootsError, ledger_path, outbox_dir, roots, runs_dir, sandbox_reports_dir, workspace_dir
 from _roots import run_dir as run_dir_of
 
-try:  # the four roots (_roots): a refused LAB_*_ROOT is a refused input, before anything is written
+try:  # the four roots (_roots): a refused CS_*_ROOT is a refused input, before anything is written
     ROOTS = roots()
 except RootsError as error:
     print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
     raise SystemExit(2)
-LAB, CONFIG = ROOTS["code"], ROOTS["config"]  # ops/bin and the policy, ESTATE
+CODE_ROOT, CONFIG = ROOTS["code"], ROOTS["config"]  # ops/bin and the policy, ESTATE
 RUNS = runs_dir().resolve()
 LEDGER = ledger_path()
 # The Go loop's format strings before extraction 4 (run.go), character for character.
@@ -107,7 +109,8 @@ CLIP = 8 << 10
 CRASH_AFTER = os.environ.get("FINALIZE_RUN_CRASH_AFTER", "")
 ENOSPC_BEFORE = os.environ.get("FINALIZE_RUN_ENOSPC_BEFORE", "")
 ROW_VERSION = 2
-ENVELOPE_FILES = ("terminal.json", "messages.jsonl", "events.jsonl", "check.json", "transcript.md", "stuck.md")
+ENVELOPE_FILES = ("terminal.json", "messages.jsonl", "events.jsonl", "cli-events.jsonl",
+                  "check.json", "transcript.md", "stuck.md", "trace.jsonl")
 ENVELOPE_DIRS = ("stimulus", "evidence", "sandbox")
 
 
@@ -188,13 +191,27 @@ def clip(raw):
     return raw.decode("utf-8", "replace")
 
 
+def harness_workspace(run_dir, term):
+    lane = term.get("harness_lane")
+    return Path(lane["path"]) if lane else workspace_dir(run_dir)
+
+
 def run_check(run_dir, term):
     """Port of the runner's check(): frozen check, cwd workspace, combined output."""
     window = int(term.get("check_window") or 60)
+    workspace = harness_workspace(run_dir, term)
+    env = child_env()
+    toolchain = nullcontext({})
+    if lane := term.get("harness_lane"):
+        from _lanes import assert_lane_git_pointer
+        from _toolchains import harness_lane_env
+        assert_lane_git_pointer(workspace, lane["main"], lane["lane"])
+        toolchain = harness_lane_env(workspace, env.get("PATH", ""))
     try:
-        done = subprocess.run([str(run_dir / "stimulus/check")], cwd=str(workspace_dir(run_dir)),
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              env=child_env(), timeout=window)
+        with toolchain as extra_env:
+            done = subprocess.run([str(run_dir / "stimulus/check")], cwd=workspace,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  env=dict(env, **extra_env), timeout=window)
         output, code = done.stdout, done.returncode
     except subprocess.TimeoutExpired as expired:
         output, code = expired.stdout or b"", -1
@@ -214,6 +231,8 @@ def step_check(run_dir, term, steps):
                           " fixture failure, not a rerun" % (ran, frozen))
         steps["check"] = "existing"
         return check
+    if "cli_row" in term:
+        raise Pending("CLI terminal requires the machine finisher’s check record")
     if term.get("verdict") == "void":
         write_json(path, {"verdict": "void", "exit_code": 0, "output": "", "skipped": True,
                           "window": int(term.get("check_window") or 60),
@@ -306,10 +325,17 @@ def step_publish(run_dir, term, check, steps):
     payload = {"run_dir": run_dir_text, "adapter": term.get("adapter") or "runner",  # the executor names itself
                "verdict": check["verdict"], "stop": term["stop"], "check_output": check["output"],
                "check_exit": check["exit_code"], "check_skipped": check["skipped"]}
-    if workspace_dir(run_dir) != run_dir / "workspace":  # a separate LAB_WORKSPACES_ROOT; the default payload is unchanged
+    if lane := term.get("harness_lane"):
+        payload.update(workspace=lane["path"], archive="changed_files", lane_git=lane)
+    elif "cli_row" in term:
+        payload["workspace"] = term["workspace"]
+        lane = term.get("cli_lane")
+        if lane:
+            payload.update(archive="changed_files", lane_git=lane)
+    elif workspace_dir(run_dir) != run_dir / "workspace":  # a separate CS_WORKSPACES_ROOT; the default payload is unchanged
         payload["workspace"] = str(workspace_dir(run_dir))
-    done = subprocess.run([str(LAB / "ops/bin/publish-evidence")], input=json.dumps(payload),
-                          text=True, capture_output=True, cwd=str(LAB), env=child_env())
+    done = subprocess.run([str(CODE_ROOT / "ops/bin/publish-evidence")], input=json.dumps(payload),
+                          text=True, capture_output=True, cwd=str(CODE_ROOT), env=child_env())
     if done.returncode == 0 and (run_dir / "evidence/manifest.json").is_file():
         steps["publish"] = "ok"
         return ""
@@ -338,9 +364,9 @@ def report_cells():
     return sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
 
 
-def step_sandbox(run_dir, events, steps):
+def step_sandbox(run_dir, term, events, steps):
     """5a: claim this run's reports (cwd = its workspace) into sandbox/; returns ({tool name: [report]}, reports)."""
-    dest, workspace, moved = run_dir / "sandbox", os.path.realpath(str(workspace_dir(run_dir))), 0
+    dest, workspace, moved = run_dir / "sandbox", os.path.realpath(harness_workspace(run_dir, term)), 0
     for cell in report_cells():
         for path in sorted(cell.glob("*.json")):
             report = load_report(path)
@@ -363,7 +389,7 @@ def step_sandbox(run_dir, events, steps):
     keys = {}
     for name in dict.fromkeys(e.get("name") for e in events if e.get("event") == "tool"):
         try:
-            argv = tool_argv(LAB, str(name))
+            argv = tool_argv(CODE_ROOT, str(name))
         except (OSError, ValueError):
             continue
         keys.setdefault(os.path.realpath(argv[0]), []).append((name, argv[1:]))
@@ -396,10 +422,6 @@ def executed_by(run_dir):
 
 
 def step_row(run_dir, term, check, steps, result, by_tool=None):
-    try:
-        ident = estate_id(CONFIG)
-    except (OSError, ValueError) as error:
-        raise Pending("ledger row requires the local ESTATE identity: %s" % error)
     transcript = term["transcript"]
     started, scanned, present = time.monotonic(), 0, False
     if LEDGER.is_file():
@@ -421,8 +443,24 @@ def step_row(run_dir, term, check, steps, result, by_tool=None):
     if present:
         steps["row"] = "existing"
         return
+    if "cli_row" in term:
+        row = term["cli_row"]
+        if (row.get("transcript"), row.get("verdict"), row.get("stop")) != (
+                transcript, term["verdict"], term["stop"]):
+            raise Pending("CLI row identity or verdict differs from terminal")
+        from _estate_io import estate_row
+        append_row(estate_row(LEDGER, row), steps, result)
+        return
+    try:
+        ident = estate_id(CONFIG)
+    except (OSError, ValueError) as error:
+        raise Pending("ledger row requires the local ESTATE identity: %s" % error)
     row = {key: term.get(key) for key in ROW_KEYS}
+    if "provider_reported_usd" in term:
+        row["provider_reported_usd"] = term["provider_reported_usd"]
     row.update(spec_intent(term))
+    if lane := term.get("harness_lane"):
+        row.update(lane=lane, branch=lane["branch"])
     row.update({"ts": now(), "verdict": check["verdict"], "estate": ident, "row_version": ROW_VERSION})
     events = events_of(run_dir)
     error = classify_stop(term["stop"], events)
@@ -436,6 +474,10 @@ def step_row(run_dir, term, check, steps, result, by_tool=None):
     executed = executed_by(run_dir)
     if executed:
         row["executed_by"] = executed
+    append_row(row, steps, result)
+
+
+def append_row(row, steps, result):
     result["row_line"] = go_json(row).encode("utf-8")
     with LEDGER.open("ab") as out:
         out.write(result["row_line"] + b"\n")
@@ -478,6 +520,8 @@ def envelope_usage(row, run_dir):
     for key in ("cache_read_tokens", "cache_creation_tokens", "reasoning_tokens"):
         if key in row:
             usage[key] = _count(row[key])
+    if (reported := _usd(row.get("provider_reported_usd"))) is not None and reported > 0:
+        usage["provider_reported_usd"] = reported
     if isinstance(row.get("reported_model"), str) and row["reported_model"]:
         usage["source"]["reported_model"] = row["reported_model"]
     if isinstance(row.get("allowance"), dict):
@@ -485,11 +529,69 @@ def envelope_usage(row, run_dir):
     return usage
 
 
+def finalize_trace(run_dir, term, verdict):
+    """Seal both closing records in one atomic write under the finalizer lock."""
+    harness = term.get("harness_trace")
+    trace = harness or term.get("observed_trace")
+    if not trace:
+        return
+    path = run_dir / "trace.jsonl"
+    records = path.read_bytes() if path.is_file() else b""
+    if trace.get("identity", {}).get("execution_id"):
+        # A receipt run may already have a provisional harness root from the transport.
+        # Keep a sealed trace byte-identical on replay.
+        lines = records.splitlines(keepends=True)
+        spans = [(index, json.loads(line)) for index, line in enumerate(lines) if line.strip()]
+        if any(record["kind"] == "run" and record["span_id"] == "run" for _, record in spans):
+            return
+        for index, record in spans:
+            if record["kind"] == "run" and record["span_id"] == "harness-cli":
+                record.update(kind="cli_work_order", parent_id="run")
+                record["attributes"]["machine"] = trace["machine"]
+                lines[index] = (json.dumps(record) + "\n").encode("utf-8")
+        records = b"".join(lines)
+        if records and not records.endswith(b"\n"):
+            records += b"\n"
+    elif records.endswith(b"\n") and json.loads(records.rstrip(b"\n").rpartition(b"\n")[2])["kind"] == "run":
+        return
+    evidence = run_dir / "evidence/manifest.json"
+    evidence_id = json.loads(evidence.read_bytes()).get("evidence_sha") if evidence.is_file() else None
+    end = datetime.now(timezone.utc)
+    end_stamp = end.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    end_tick = time.monotonic_ns()
+
+    def closing_span(kind, parent, start, outcome, attributes):
+        if harness:
+            start_stamp = start
+            start_time = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            duration_ms = (end - start_time).total_seconds() * 1000
+        else:
+            start_stamp, start_tick = start
+            duration_ms = (end_tick - start_tick) / 1_000_000
+        return {"trace_id": run_dir.name, "span_id": kind, "parent_id": parent, "kind": kind,
+                "name": "finalize-run" if harness and kind == "finalization" else kind,
+                "start": start_stamp, "end": end_stamp, "duration_ms": max(0, duration_ms),
+                "outcome": outcome, "attributes": {"machine": trace["machine"], **attributes}}
+
+    finalization = closing_span("finalization", "run", trace["finalization_started"], "completed",
+                                {"verdict": verdict, "evidence_id": evidence_id})
+    root = closing_span("run", None, trace["started"], "finalized", trace["identity"])
+    write_atomic(path, records + (json.dumps(finalization) + "\n" + json.dumps(root) + "\n").encode("utf-8"))
+
+
 def step_envelope(run_dir, steps, result, sandbox=None):
     """S1: the run's envelope in the outbox, written once (temp+fsync+rename, then the dir).
     finalized.json is outside it (it names the envelope); a differing recompute is pending."""
+    outbox = outbox_dir()
+    prior_path = next((p for p in (outbox / (run_dir.name + ".json"),
+                                  outbox / "acked" / (run_dir.name + ".json")) if p.is_file()), None)
+    prior = json.loads(prior_path.read_text(encoding="utf-8")) if prior_path else None
     files = []
     for name in ENVELOPE_FILES:
+        # A replay must retain the original file set for envelopes from older finalizers.
+        if name == "trace.jsonl" and prior is not None and not any(
+                f["path"] == name for f in prior.get("files", [])):
+            continue
         if (run_dir / name).is_file():
             files.append(run_dir / name)
     for name in ENVELOPE_DIRS:
@@ -512,19 +614,32 @@ def step_envelope(run_dir, steps, result, sandbox=None):
     if sandbox:
         envelope["sandbox"] = sandbox
     result["error_class"] = envelope["error_class"]
-    outbox = outbox_dir()
-    for prior_path in (outbox / (run_dir.name + ".json"), outbox / "acked" / (run_dir.name + ".json")):
-        if prior_path.is_file():
-            prior = json.loads(prior_path.read_text(encoding="utf-8"))
-            if prior.get("envelope_sha256") != envelope["envelope_sha256"]:
-                raise Pending('envelope %s envelope_sha256 "%s" differs from the recomputed "%s": not overwritten'
-                              % (prior_path, prior.get("envelope_sha256"), envelope["envelope_sha256"]))
-            steps["envelope"] = "existing"
-            return
+    if prior is not None:
+        if prior.get("envelope_sha256") != envelope["envelope_sha256"]:
+            raise Pending('envelope %s envelope_sha256 "%s" differs from the recomputed "%s": not overwritten'
+                          % (prior_path, prior.get("envelope_sha256"), envelope["envelope_sha256"]))
+        steps["envelope"] = "existing"
+        return
     outbox.mkdir(parents=True, exist_ok=True)
     write_json(outbox / (run_dir.name + ".json"), envelope)
     fsync_path(outbox)
     steps["envelope"] = "written"
+
+
+def commit_harness_lane(run_dir, term, check, steps):
+    lane = term.get("harness_lane")
+    if not lane or check["verdict"] != "pass":
+        return
+    from functools import partial
+    from _lanes import commit_lane, lane_git
+    from _machine_finish import committed_effect
+
+    ws = Path(lane["path"])
+    message = "lane %s: %s (%s)" % (lane["lane"], Path(term["task"]).name, run_dir.name)
+    git = partial(lane_git, lane["main"], lane["lane"], ws)
+    lane["commit"] = committed_effect(run_dir, git, message, recover=True) or commit_lane(
+        ws, message, main=lane["main"], lane=lane["lane"])
+    steps["commit"] = "recorded"
 
 
 def finalize(run_dir, term):
@@ -536,8 +651,11 @@ def finalize(run_dir, term):
     crash_after("transcript")
     publish_error = step_publish(run_dir, term, check, steps)
     crash_after("publish")
+    if term.get("harness_lane") and publish_error:
+        raise Pending(publish_error)
+    commit_harness_lane(run_dir, term, check, steps)
     events = events_of(run_dir)
-    by_tool, reports = step_sandbox(run_dir, events, steps)
+    by_tool, reports = step_sandbox(run_dir, term, events, steps)
     tools = sandbox_tools(events, term["stop"], term.get("turns"), by_tool)
     result["sandbox_tools"] = tools
     enospc_before("row")
@@ -546,13 +664,15 @@ def finalize(run_dir, term):
     if publish_error:
         raise Pending(publish_error)
     enospc_before("envelope")
+    finalize_trace(run_dir, term, check["verdict"])
     step_envelope(run_dir, steps, result, sandbox_summary(reports, tools))
     crash_after("envelope")
     result.pop("row_line", None)
     result.pop("sandbox_tools", None)
-    result.update({"ts": now(), "steps": steps, "verdict": check["verdict"], "stop": term["stop"]})
+    verdict = term["verdict"] if "cli_row" in term else check["verdict"]
+    result.update({"ts": now(), "steps": steps, "verdict": verdict, "stop": term["stop"]})
     write_json(run_dir / "finalized.json", result)
-    return {"ok": True, "state": "finalized", "verdict": check["verdict"], "stop": term["stop"],
+    return {"ok": True, "state": "finalized", "verdict": verdict, "stop": term["stop"],
             "row_appended": steps["row"] == "appended", "publish": steps["publish"]}
 
 

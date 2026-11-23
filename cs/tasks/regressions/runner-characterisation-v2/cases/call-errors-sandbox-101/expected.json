@@ -78,10 +78,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 4.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-sandbox-101-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -92,12 +91,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-call-errors-sandbox-101",
+        "run_id": "<RUNSTAMP>-fx-call-errors-sandbox-101-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 1,
         "tool_schema": [
           {
             "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
@@ -130,10 +130,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 3.",
             "role": "system"
           },
           {
@@ -163,12 +162,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-call-errors-sandbox-101",
+        "run_id": "<RUNSTAMP>-fx-call-errors-sandbox-101-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 2,
         "tool_schema": [
           {
             "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
@@ -231,12 +231,15 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "messages.jsonl",
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -259,8 +262,33 @@
           "trial": 1
         },
         {
+          "event": "prompt",
+          "from": 0,
+          "messages": [
+            {
+              "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+              "role": "system"
+            },
+            {
+              "content": "Create hello.txt containing exactly: hello\n",
+              "role": "user"
+            }
+          ],
+          "turn": 1,
+          "turn_guidance": "Turns remaining (including this turn): 4.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-call-errors-sandbox-101-fx-t1/workspace"
+        },
+        {
           "event": "turn",
           "text": "a call the wrapper cannot confine",
+          "tool_calls": [
+            {
+              "args": {
+                "mode": "echo"
+              },
+              "id": "1",
+              "name": "fx_tool"
+            }
+          ],
           "turn": 1
         },
         {
@@ -274,8 +302,36 @@
           "turn": 1
         },
         {
+          "event": "prompt",
+          "from": 2,
+          "messages": [
+            {
+              "content": "a call the wrapper cannot confine",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "args": {
+                    "mode": "echo"
+                  },
+                  "id": "1",
+                  "name": "fx_tool"
+                }
+              ]
+            },
+            {
+              "content": "[fx_tool {\"mode\":\"echo\"}] ERROR\ncs-sandbox: cannot enforce policy: fixture has no sandbox\n\nexit: exit status 101",
+              "is_error": true,
+              "role": "tool",
+              "tool_call_id": "1"
+            }
+          ],
+          "turn": 2,
+          "turn_guidance": "Turns remaining (including this turn): 3."
+        },
+        {
           "event": "turn",
           "text": "done",
+          "tool_calls": [],
           "turn": 2
         }
       ],

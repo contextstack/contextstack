@@ -23,9 +23,11 @@ Director: a conversation turn on that path ended as an error.
 - Live output works on both. The runner reads streamed replies, and a
   finished streamed turn is identical to a non-streamed one. The executor
   passes each agent output line on as it arrives.
-- Cancel works on both. The gateway stops a coding-agent run by its
-  execution ID or by the job's `LAB_JOB_ID`, and the run ends `cancelled`
-  with the output so far.
+- Cancel works on both. The node signals the machine launcher, which
+  forwards to the harness. In CLI work-order mode the harness asks the
+  gateway to stop the coding-agent process tree by execution ID. The
+  launcher hands the receipt to machine-finish after the harness exits.
+  The run ends `cancelled` with the output so far.
 - Usage is recorded on both. Coding-agent runs record the tokens and
   allowance the agent reports, and `null` where it reports nothing.
 - The Director doesn't need to know which path ran a job.

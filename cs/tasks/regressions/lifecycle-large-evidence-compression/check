@@ -12,14 +12,14 @@ import sys
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
-CAPTURE = LAB / "ops/bin/capture-stimulus"
-PUBLISH = LAB / "ops/bin/publish-evidence"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+CAPTURE = CODE_ROOT / "ops/bin/capture-stimulus"
+PUBLISH = CODE_ROOT / "ops/bin/publish-evidence"
 
 def op(binary, payload):
     result = subprocess.run(
         [str(binary)], input=json.dumps(payload), text=True,
-        capture_output=True, cwd=str(LAB),
+        capture_output=True, cwd=str(CODE_ROOT),
         env={**hermetic_env()},
     )
     if result.returncode:
@@ -80,7 +80,7 @@ try:
     assert len(source) == meta["source_bytes"] and marker.encode() in source
     assert (run_dir / "ready_for_inspection").is_file()
 
-    sys.path.insert(0, str(LAB / "ops/bin"))
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
     from _lifecycle_evidence import verify, read_gzip  # noqa: E402
     data, err = verify(run_dir)
     assert err is None and data, err

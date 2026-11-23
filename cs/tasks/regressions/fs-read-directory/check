@@ -4,14 +4,14 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
 from scratch import scratch_dir
+from hermetic_env import hermetic_env
 
-import json, os, subprocess, sys, tempfile
-from pathlib import Path
+import json, os, subprocess, unittest
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 import _sandbox_policy  # noqa: E402
-ARGV = _sandbox_policy.tool_argv(LAB, "fs_read")  # cs-tools fs_read
+ARGV = _sandbox_policy.tool_argv(CODE_ROOT, "fs_read")  # cs-tools fs_read
 
 
 def run(cwd, payload):
@@ -45,3 +45,79 @@ with scratch_dir(prefix="fs-read-dir-") as tmp:
     assert r.returncode != 0 and "not a file" in (r.stderr or r.stdout)
 
 print("check: fs_read lists directories; files unchanged")
+
+class ToolPaths(unittest.TestCase):
+    def setUp(self):
+        scratch = scratch_dir(prefix="tool-paths-")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name).resolve()
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+
+    def tool(self, name, args, **overrides):
+        env = hermetic_env()
+        env.pop("CS_REPO_VIEW", None)
+        env.update(HOME=str(self.root), **overrides)
+        return subprocess.run(
+            _sandbox_policy.tool_argv(CODE_ROOT, name),
+            cwd=self.workspace, env=env, input=json.dumps(args),
+            capture_output=True, text=True, timeout=10,
+        )
+
+    def test_absolute_workspace_paths(self):
+        path = self.workspace / "nested" / "answer.txt"
+        path.parent.mkdir()
+        path.write_text("before")
+        for name, args, expected in (
+            ("fs_read", {"path": str(path)}, "before"),
+            ("fs_edit", {"path": str(path), "edits": [{"oldText": "before", "newText": "after"}]}, "answer.txt"),
+            ("fs_write", {"path": str(self.workspace / "new" / "answer.txt"), "content": "new"}, "bytes"),
+            ("exec", {"cmd": ["cat", str(path)]}, "after"),
+        ):
+            with self.subTest(tool=name):
+                result = self.tool(name, args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(expected, result.stdout)
+
+    def test_directory_symlink_and_special_file(self):
+        directory = self.workspace / "directory"
+        directory.mkdir()
+        (directory / "entry.txt").touch()
+        (self.workspace / "alias").symlink_to(directory)
+        result = self.tool("fs_read", {"path": "alias"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["entry.txt"])
+        os.mkfifo(self.workspace / "pipe")
+        (self.workspace / "linked-pipe").symlink_to("pipe")
+        result = self.tool("fs_read", {"path": "linked-pipe"})
+        self.assertTrue(result.stderr.startswith("not a file: linked-pipe"), result.stderr)
+
+    def test_repo_view_alias_and_order(self):
+        canonical = self.root / "snapshot"
+        canonical.mkdir()
+        for name in ("z.txt", "a.txt", "m.txt"):
+            (canonical / name).write_text(name)
+        alias = self.root / "alias"
+        alias.symlink_to(canonical)
+        for requested in (alias, canonical):
+            with self.subTest(requested=requested):
+                result = self.tool("repo_search", {"mode": "files", "query": ".txt", "path": str(requested)},
+                                   CS_REPO_VIEW=str(alias))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                paths = result.stdout.splitlines()
+                self.assertEqual(paths, [str(canonical / name) for name in ("a.txt", "m.txt", "z.txt")])
+
+    def test_read_accepts_canonical_path_from_aliased_repo_view(self):
+        canonical = self.root / "snapshot"
+        canonical.mkdir()
+        (canonical / "a.txt").write_text("a.txt")
+        alias = self.root / "alias"
+        alias.symlink_to(canonical)
+        for path in (canonical / "a.txt", alias / "a.txt"):
+            with self.subTest(path=path):
+                result = self.tool("fs_read", {"path": str(path)}, CS_REPO_VIEW=str(alias))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "a.txt")
+
+
+unittest.main()

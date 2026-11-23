@@ -14,7 +14,7 @@ state under its own root) runs director jobs through the real tick, the configur
   tamper    an object that does not hash to its name: the job is neither materialised nor accepted
   grant     a job carrying a grant for this node runs with that copy frozen; an expired one is closed
             at once (grant: ..., node_config) and the director learns it; schedule meta rides the row
-  schedule  schedule-tick fires a node schedule through LAB_DIRECTOR_DISPATCH, not enqueue, and reads
+  schedule  schedule-tick fires a node schedule through CS_DIRECTOR_DISPATCH, not enqueue, and reads
             the slot's state from the director estate's dispatch shelf (claimed, then done)
   shape     after all of it the node's code root still has no ledger/, specs/ or tasks/
 """
@@ -29,12 +29,12 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
+CODE_ROOT = HERE.parents[2]
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation-v2"))
+sys.path.insert(0, str(CODE_ROOT / "tasks/regressions/runner-characterisation-v2"))
 from _fake_director import FakeDirector  # noqa: E402
 from _fake_gateway import FakeGateway  # noqa: E402
-sys.path.append(str(LAB / "ops/bin"))
+sys.path.append(str(CODE_ROOT / "ops/bin"))
 from _runner import built_runner  # noqa: E402 the default Rust runner unless $CS_RUNNER_BIN
 
 FAILED = []
@@ -63,12 +63,12 @@ def build_node(root):
     """A code root as phase 6 ships it: no ledger/, specs/, tasks/, prompts/."""
     for d in ("ops/bin", "policy", "tools/bin", "hooks/bin", "scripts", "home", "tmp"):
         (root / d).mkdir(parents=True, exist_ok=True)
-    for p in (LAB / "ops/bin").iterdir():
+    for p in (CODE_ROOT / "ops/bin").iterdir():
         if p.is_file():
             shutil.copy2(p, root / "ops/bin" / p.name)
-    shutil.copy2(LAB / "INVARIANTS.md", root / "INVARIANTS.md")
-    shutil.copy2(LAB / "policy/env.json", root / "policy/env.json")
-    shutil.copy2(LAB / "scripts/checklib.sh", root / "scripts/checklib.sh")
+    shutil.copy2(CODE_ROOT / "INVARIANTS.md", root / "INVARIANTS.md")
+    shutil.copy2(CODE_ROOT / "policy/env.json", root / "policy/env.json")
+    shutil.copy2(CODE_ROOT / "scripts/checklib.sh", root / "scripts/checklib.sh")
     (root / "ESTATE").write_text("node-fx\n", encoding="utf-8")
 
 
@@ -90,10 +90,10 @@ def schedule_case(scratch):
     host = scratch / "host"
     for d in ("ops/bin", "grants", "ledger", "home"):
         (host / d).mkdir(parents=True)
-    for p in (LAB / "ops/bin").iterdir():
+    for p in (CODE_ROOT / "ops/bin").iterdir():
         if p.is_file():
             shutil.copy2(p, host / "ops/bin" / p.name)
-    shutil.copy2(LAB / "INVARIANTS.md", host / "INVARIANTS.md")
+    shutil.copy2(CODE_ROOT / "INVARIANTS.md", host / "INVARIANTS.md")
     (host / "ESTATE").write_text("dev\n")
     (host / "grants/g-fx-node.yaml").write_bytes(grant_yaml("g-fx-node", "node-fx", "2099-01-01T00:00:00Z"))
     estate, calls = scratch / "director-estate", scratch / "dispatch-calls.jsonl"
@@ -106,7 +106,7 @@ def schedule_case(scratch):
                                  "timezone": "UTC", "spec": "specs/fx.yaml", "task": "tasks/fx", "lane": "production",
                                  "grant": "g-fx-node", "node": "node-fx", "ts": "2026-11-10T00:00:00Z"}) + "\n")
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host / "home"),
-           "LAB_DIRECTOR_DISPATCH": json.dumps([str(fake)]), "LAB_DIRECTOR_ESTATE_ROOT": str(estate)}
+           "CS_DIRECTOR_DISPATCH": json.dumps([str(fake)]), "CS_DIRECTOR_ESTATE_ROOT": str(estate)}
 
     def tick_at(now):
         args = {"now": now, "schedules": str(sched), "fires": str(host / "ledger/fires.jsonl"),
@@ -155,9 +155,9 @@ def main():
         (node / "node.env").write_text("export CS_FX_TOKEN=%s\n" % TOKEN)
         (node / "node.env").chmod(0o600)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(node / "home"), "TMPDIR": str(node / "tmp"),
-               "LANG": os.environ.get("LANG", "en_US.UTF-8"), "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(node),
+               "LANG": os.environ.get("LANG", "en_US.UTF-8"), "CS_STATE_ROOT": str(state), "CS_CONFIG_ROOT": str(node),
                "CSGATEWAY_ENDPOINT": gateway.endpoint, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
-               "CS_RUNNER_BIN": str(built_runner(LAB))}
+               "CS_RUNNER_BIN": str(built_runner(CODE_ROOT))}
 
         def op(name, payload=None, **kw):
             r = subprocess.run([sys.executable, str(node / "ops/bin" / name)], input=json.dumps(payload or {}),

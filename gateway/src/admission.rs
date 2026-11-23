@@ -1,4 +1,4 @@
-//! Deployment admission: model calls and Lab work orders share capacity declared in
+//! Deployment admission: model calls and CLI work orders share capacity declared in
 //! models.json. A [`Permit`] is owned by the request it admits and released exactly once, on drop, on
 //! every path: success, error, panic, cancellation by a dropped request, a stream's end. A queued
 //! caller holds a [`QueueSlot`] that leaves the queue when dropped, so a disconnect while queued frees
@@ -51,9 +51,9 @@ pub struct Config {
     /// This node's estate.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub estate: String,
-    /// The Lab work-order script.
+    /// The CLI work-order script.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub lab_executor: String,
+    pub cli_executor: String,
     /// Host-configured executable locations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executables: Option<BTreeMap<String, String>>,
@@ -439,8 +439,8 @@ impl Manager {
 pub enum Scope {
     /// A model call or stream.
     ModelCall,
-    /// A Lab work order.
-    LabWorkOrder,
+    /// A CLI work order.
+    CliWorkOrder,
 }
 
 /// A place in a deployment's queue; dropping it leaves the queue.
@@ -501,7 +501,7 @@ impl Drop for Permit {
         let elapsed = self.admitted.elapsed().as_secs_f64() * 1000.0;
         let (scope, latency_key) = match self.scope {
             Scope::ModelCall => ("model_call", "per_call_latency_ms"),
-            Scope::LabWorkOrder => ("lab_work_order", "work_order_latency_ms"),
+            Scope::CliWorkOrder => ("cli_work_order", "work_order_latency_ms"),
         };
         let mut row = serde_json::json!({
             "event": "admission_timing",

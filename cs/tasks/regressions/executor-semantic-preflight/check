@@ -9,20 +9,21 @@ from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 ROOT = Path(__file__).resolve().parents[3]
 with scratch_dir(prefix="executor-preflight-") as raw:
-    lab = Path(raw) / "lab"
-    ops, task, setup, ledger = (lab / "ops/bin", lab / "tasks/fixture",
-                                lab / "tasks/fixture/setup", lab / "ledger")
+    code_root = Path(raw) / "code_root"
+    ops, task, setup, ledger = (code_root / "ops/bin", code_root / "tasks/fixture",
+                                code_root / "tasks/fixture/setup", code_root / "ledger")
     for path in (ops, task, setup, ledger): path.mkdir(parents=True, exist_ok=True)
-    for name in ('_stuck.py', '_provider_limits.py', '_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "capture-stimulus", "_est.py", "_grant.py",
-                 "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "publish-evidence",
+    for name in ('_stuck.py', '_provider_limits.py', '_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_muse_adapter.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_process_group.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "capture-stimulus", "_est.py", "_grant.py",
+                 "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "publish-evidence",
                  "_run_record.py", "_env_policy.py", "_errors.py", "finalize-run"):
         shutil.copy2(ROOT / "ops/bin" / name, ops / name)
     from native_runtime import stage_native_runtime
     stage_native_runtime(ops)
-    (lab / "ESTATE").write_text("dev\n")  # finalize-run's node identity
+    (code_root / "ESTATE").write_text("dev\n")  # finalize-run's node identity
     (ops / "_executor.py").chmod(0o755)
     (ops / "capture-stimulus").chmod(0o755)
     fixture_home = Path(raw) / "home"
@@ -42,11 +43,13 @@ with scratch_dir(prefix="executor-preflight-") as raw:
     preflight = task / "preflight"
     preflight.write_text('#!/bin/sh\necho \'{"run":false,"reason":"rank is not escalated"}\'\nexit 3\n')
     preflight.chmod(0o755)
-    result = subprocess.run([str(ops / "_executor.py")], input=json.dumps({
+    result = subprocess.run(cli_command(ops / "_executor.py"), input=json.dumps({
         "executor": "fake-opus", "task": "tasks/fixture",
         "exp": "task-fixture", "trial": 1, "timeout_s": 60}),
-        cwd=lab, text=True, capture_output=True, timeout=15, env={**hermetic_env(), "HOME": str(fixture_home)})
-    assert result.returncode == 0, result.stderr or result.stdout
+        cwd=code_root, text=True, capture_output=True, timeout=15, env={**hermetic_env(), "HOME": str(fixture_home), "CS_TOOLS_BIN": str(ROOT.parent / "target/release/cs-tools")})
+    assert result.returncode == 0, "\n".join([
+        result.stderr, result.stdout, *((path.read_text() for path in (ledger / "runs").glob("*/check.json"))),
+    ])
     receipt = json.loads(result.stdout.splitlines()[-1])
     assert receipt["verdict"] == "pass" and receipt["stop"] == "preflight_skip"
     assert receipt["cli_invoked"] is False
@@ -57,22 +60,22 @@ with scratch_dir(prefix="executor-preflight-") as raw:
     assert len(rows) == 1 and rows[0]["cli_invoked"] is False
     assert "intent" not in rows[0] and "exp" not in rows[0]
     assert "intent" not in json.loads(next((ledger / "runs").glob("*/terminal.json")).read_text())
-    spec = lab / "spec.yaml"
+    spec = code_root / "spec.yaml"
     base = "id: fixture\nmodel: fake-opus\ntrials: 1\n"
     intent = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     spec.write_text(base + "intent: " + intent + "\n")
     payload = {"executor": "fake-opus", "task": "tasks/fixture", "spec": "spec.yaml", "trial": 1, "timeout_s": 60}
-    linked = subprocess.run([str(ops / "_executor.py")], input=json.dumps(payload),
-        cwd=lab, text=True, capture_output=True, timeout=15, env={**hermetic_env(), "HOME": str(fixture_home)})
+    linked = subprocess.run(cli_command(ops / "_executor.py"), input=json.dumps(payload),
+        cwd=code_root, text=True, capture_output=True, timeout=15, env={**hermetic_env(), "HOME": str(fixture_home), "CS_TOOLS_BIN": str(ROOT.parent / "target/release/cs-tools")})
     assert linked.returncode == 0, linked.stderr or linked.stdout
     rows = [json.loads(line) for line in (ledger / "ledger.jsonl").read_text().splitlines()]
     assert rows[-1]["intent"] == intent and "exp" not in rows[-1]
-    terminal = lab / rows[-1]["transcript"] / "terminal.json"
+    terminal = code_root / rows[-1]["transcript"] / "terminal.json"
     assert json.loads(terminal.read_text())["intent"] == intent
     for retired in ("INT-" + "0001", "EXP-" + "1"):
         spec.write_text(base + "intent: " + retired + "\n")
-        refused = subprocess.run([str(ops / "_executor.py")], input=json.dumps(payload),
-            cwd=lab, text=True, capture_output=True, timeout=15, env={**hermetic_env(), "HOME": str(fixture_home)})
+        refused = subprocess.run(cli_command(ops / "_executor.py"), input=json.dumps(payload),
+            cwd=code_root, text=True, capture_output=True, timeout=15, env={**hermetic_env(), "HOME": str(fixture_home), "CS_TOOLS_BIN": str(ROOT.parent / "target/release/cs-tools")})
         assert refused.returncode != 0 and "retired format" in refused.stdout + refused.stderr
 
 print("check: deterministic no-work preflight skips subscription CLI before launch")

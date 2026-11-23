@@ -16,17 +16,23 @@
 //! Administrative commands work on the data directory directly, with the service up or down.
 
 mod access;
+mod action_approvals;
+mod backlog;
+mod backup_crypto;
 mod budget;
+mod capabilities;
 mod chief_of_staff;
 mod client_api;
 mod context_windows;
 mod control;
 mod conversations;
+mod decision_log;
 mod envelope;
 mod events;
 mod failure;
 mod fleet;
 mod gateway;
+mod heartbeat;
 mod jobs;
 mod land;
 mod lane;
@@ -53,6 +59,7 @@ mod ui_auth;
 mod usage;
 mod util;
 mod work;
+mod work_trace;
 
 use serde_json::{Value, json};
 use settings::{Args, Settings};
@@ -60,7 +67,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use store::Store;
 
-const USAGE: &str = "usage: cs-director serve | node register NAME | node revoke NAME | \
+const USAGE: &str = "usage: cs-director --schema-version | serve | node register NAME | node revoke NAME | \
 job create --node NAME --bundle DIR | ui-link [--listen ADDR] | pair NAME | credential list | credential revoke ID | installation \
 (all take --data-dir DIR)";
 
@@ -81,6 +88,15 @@ fn print(value: &Value) {
 }
 
 fn run(raw: &[String]) -> Result<(), String> {
+    if raw == ["--schema-version"] {
+        println!("{}", store::SCHEMA_VERSION);
+        return Ok(());
+    }
+    if let [command, mode] = raw
+        && command == "backup-crypto"
+    {
+        return backup_crypto::run(mode).map_err(|error| error.to_string());
+    }
     let args = Args::parse(raw)?;
     let words: Vec<&str> = args.words.iter().map(String::as_str).collect();
     if args.has("help") || words.is_empty() {
@@ -127,12 +143,12 @@ fn run(raw: &[String]) -> Result<(), String> {
         }
         ["job", "create"] => print(&jobs::create(&store, &new_job(&args)?)?),
         ["pair", name] => {
-            let (code, expires_at) = access::issue_pairing(&store, name)?;
+            let (code, expires_at) = access::issue_pairing(&store, name, &local_actor(&store)?)?;
             print(&json!({"name": name, "code": code, "expires_at": expires_at}));
         }
-        ["credential", "list"] => print(&json!({"credentials": access::credentials(&store)?})),
+        ["credential", "list"] => print(&access::credentials(&store)?),
         ["credential", "revoke", id] => {
-            access::revoke_credential(&store, id)?;
+            access::revoke_credential(&store, id, &local_actor(&store)?)?;
             print(&json!({"id": id, "revoked": true}));
         }
         ["ui-link"] => println!("{}", ui::link(&store, &args)?),
@@ -140,6 +156,14 @@ fn run(raw: &[String]) -> Result<(), String> {
         _ => return Err(USAGE.into()),
     }
     Ok(())
+}
+
+fn local_actor(store: &Store) -> Result<String, String> {
+    let token =
+        std::fs::read_to_string(access::local_credential_path(store)).map_err(|e| e.to_string())?;
+    access::client(store, token.trim())?
+        .map(|client| client.id)
+        .ok_or_else(|| "local credential is unavailable".to_string())
 }
 
 fn new_job(args: &Args) -> Result<jobs::NewJob, String> {
@@ -193,3 +217,6 @@ fn serve(args: &Args) -> Result<(), String> {
         hub,
     })))
 }
+
+#[cfg(test)]
+mod review_regressions;

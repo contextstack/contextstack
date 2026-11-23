@@ -5,7 +5,7 @@ Rust is the working line). Nothing picks the Go runner by default, and every
 run records what executed it.
 
 1. The selector (`ops/bin/_runner.py`): with neither `CS_RUNNER_BIN` nor
-   `LAB_RUNNER_BIN` set, the runner is the checkout's Rust build,
+   `CS_RUNNER_BIN` set, the runner is the checkout's Rust build,
    `<repo>/target/release/cs-harness` (scripts/check builds it). An installed
    release selects `rust` (`bin/cs-harness`) unless `select --runner go`.
 2. The record: the Rust runner passes the endpoint it posts to as
@@ -25,4 +25,4 @@ Run: `tasks/regressions/runner-identity/check`. A temp code root, the built
 Rust runner copied to where the default looks, a fake gateway whose health
 names itself, no selector or roots in the environment; one `run-spec` cell,
 then the row and `run-identity` are checked. Never touches the real state
-root or `lab/ledger`.
+root or `cs/ledger`.

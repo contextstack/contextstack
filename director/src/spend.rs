@@ -244,13 +244,13 @@ fn usage(state: &State, call: &Call, client: &Client) -> Reply {
     }
 }
 
-/// Only the owner (the local credential) sets source budgets.
+/// Only owner credentials may set source budgets.
 fn not_owner(client: &Client) -> Option<Reply> {
-    (client.kind != crate::access::Kind::Local).then(|| {
+    (!client.is_owner()).then(|| {
         refusal(
             403,
             "owner_only",
-            "only the local credential may set source budgets",
+            "only an owner credential may set source budgets",
             Value::Null,
         )
     })

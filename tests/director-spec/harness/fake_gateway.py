@@ -1,5 +1,5 @@
-"""A stand-in model gateway for the client cases: only `GET /v1/budgets` and `PUT /v1/budgets` (WIRE.md, budgets
-lines), on a free loopback port, in this process. It never calls a model and holds no keys.
+"""A loopback stand-in gateway for budgets, model discovery and scripted action reviews.
+It holds no keys and makes no external calls.
 
 PUT needs `X-ContextStack-Owner-Token` equal to the token it was given (the Director reads it from the temp file
 the target writes); the document replaces its limits. The report follows the gateway's: `sources."*"` is the shared
@@ -28,6 +28,8 @@ class FakeGateway:
         self.spent = {}
         self.seen = []
         self.after_get = None
+        self.review_responses = {}
+        self.review_calls = []
         gateway = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -45,13 +47,28 @@ class FakeGateway:
             def do_GET(self):
                 if self.path.startswith("/v1/models"):
                     gateway.seen.append(("GET", self.headers.get("X-ContextStack-Owner-Token")))
-                    return self.answer(200, {"models": MODELS, "last_refresh": "2026-11-12T00:00:00Z", "providers_active": []})
+                    models = [*MODELS, *(
+                        {"name": model, "available": True, "provider": provider, "cost_class": "api"}
+                        for model, (provider, _) in gateway.review_responses.items()
+                    )]
+                    return self.answer(200, {"models": models, "last_refresh": "2026-11-12T00:00:00Z", "providers_active": []})
                 if self.path != "/v1/budgets":
                     return self.answer(404, {"error": "not found"})
                 gateway.seen.append(("GET", self.headers.get("X-ContextStack-Owner-Token")))
                 self.answer(200, gateway.report())
                 if gateway.after_get:
                     gateway.after_get()
+
+            def do_POST(self):
+                if self.path != "/v1/agent/model.call" or not gateway.review_responses:
+                    return self.answer(404, {"error": "not found"})
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                gateway.review_calls.append(body)
+                model = body["capability"]["model_tier_hint"]
+                response = gateway.review_responses.get(model)
+                if response is None:
+                    return self.answer(404, {"error": {"code": "gateway.model_unavailable"}})
+                self.answer(200, response[1])
 
             def do_PUT(self):
                 if self.path != "/v1/budgets":

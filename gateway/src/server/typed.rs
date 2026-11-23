@@ -126,7 +126,7 @@ pub async fn handle(gw: &Arc<Gateway>, req: Request<Incoming>) -> Response<Body>
     }
     let rates = typesafe_rates(entry.default_cost_per_1k);
     let est = crate::spend::estimate(rates, body.len(), 0);
-    let hold = match gw.spend.admit(SOURCE, &max_usd, est) {
+    let hold = match gw.spend.admit_async(SOURCE, &max_usd, est).await {
         Ok(h) => h,
         Err(d) => return refuse(402, &WireError::budget(d)),
     };
@@ -151,7 +151,7 @@ pub async fn handle(gw: &Arc<Gateway>, req: Request<Incoming>) -> Response<Body>
         0.0
     };
     let over = charged > hold.reservation_usd() + 1e-9;
-    hold.settle(charged, over);
+    let _ = tokio::task::spawn_blocking(move || hold.settle(charged, over)).await;
     crate::log::line(&format!(
         "USAGE provider={SOURCE} model={model} in={} out={} cost={charged:.9} class=api req={request_id} rev={} status={}",
         answer.input_tokens.unwrap_or(0),

@@ -23,7 +23,7 @@ Two claims, kept apart:
   every write probe, symlinks included) and allows every read. Its argv
   check (`cat /abs` refused) is a string test that `sh -c "cat /abs"`
   walks past, so the child reads any absolute path, `../`, and $HOME.
-  The tool itself runs unconfined: its `.lab-out` spill follows a
+  The tool itself runs unconfined: its `.cs-out` spill follows a
   symlinked dir out of the workspace.
 
 The boundary is the symlink (or `sh -c`), not the string. A model
@@ -37,14 +37,14 @@ Run:
     tasks/regressions/tool-escapes-workspace/check
 
 Builds the sentinel layout in temp dirs (`outside/sentinel.txt`,
-`outside/doc.md`, a `$HOME/.lab-escape-probe-<r>/` it creates and
+`outside/doc.md`, a `$HOME/.cs-escape-probe-<r>/` it creates and
 removes), symlinks inside a fresh workspace per tool, and execs each
 tool exactly as scripts/tool-fixtures does. One line per probe:
 `FAIL` = the sentinel crossed the boundary, `ok` = the tool or the OS
 refused, `ERR` = inconclusive. Cleans up in `finally`.
 
 Verdict, two-sided. With `CS_TOOL_PREFIX` set to the wrapper's words
-(`<repo>/target/release/cs-sandbox --policy <lab>/policy/sandbox.json --`)
+(`<repo>/target/release/cs-sandbox --policy <code-root>/policy/sandbox.json --`)
 it exits 0 only when every probe is `ok`: the acceptance for CS phase 3a,
 green since 2026-11-09 (notes.md). Unset, the tools run unconfined, the
 escapes are expected and it exits 1 with the final line

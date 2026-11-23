@@ -4,18 +4,18 @@
 import json, os, subprocess, sys
 from pathlib import Path
 
-from _estate_io import hardened_git_env, git, lab_path, state_dir
+from _estate_io import hardened_git_env, git, code_path, state_dir
 
 from _workspace_setup import metadata, seed_installs
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 
 
 a = json.load(sys.stdin)
 task = Path(str(a.get("task", "")))
 if not task.is_absolute():
-    task = LAB / task
+    task = CODE_ROOT / task
 if not (task / "goal.md").is_file():
     sys.exit("setup-refresh: task missing goal.md")
 raw = str(a.get("dest") or "").strip()
@@ -32,7 +32,7 @@ if dirty.returncode != 0 or staged.returncode != 0:
     sys.exit("setup-refresh: dest has tracked changes; commit or stash first")
 setup_raw = str(a.get("setup") or meta.get("setup") or "").strip()
 setup = Path(setup_raw) if setup_raw else task / "setup"
-setup = lab_path(LAB, setup)
+setup = code_path(CODE_ROOT, setup)
 setup.mkdir(parents=True, exist_ok=True)
 r = subprocess.run(
     ["rsync", "-a", "--delete",
@@ -40,7 +40,7 @@ r = subprocess.run(
      "--exclude", "vendor", "--exclude", "vendor/**",
      "--exclude", "node_modules", "--exclude", "node_modules/**",
      "--exclude", "bootstrap/cache/config.php", "--exclude", "storage/*.key",
-     "--exclude", ".lab-*", "--exclude", ".lab-*/**",
+     "--exclude", ".cs-*", "--exclude", ".cs-*/**",
      "--delete-excluded",
      str(dest) + "/", str(setup) + "/"],
     capture_output=True, text=True,
@@ -48,10 +48,10 @@ r = subprocess.run(
 if r.returncode != 0:
     sys.exit((r.stderr or r.stdout or "rsync failed").strip())
 head = git(dest, "rev-parse", "HEAD", env=hardened_git_env(), errors="strict").stdout.strip()
-ref = git(setup, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "update-ref", "refs/lab/base", head, env=hardened_git_env(), errors="strict")
+ref = git(setup, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "update-ref", "refs/cs/base", head, env=hardened_git_env(), errors="strict")
 if ref.returncode != 0:
     sys.exit((ref.stderr or ref.stdout or "failed to stamp setup base").strip())
-seed_installs(dest, LAB)
+seed_installs(dest, CODE_ROOT)
 # Also remove stale private files left by a pre-contract setup refresh.
 for private in list(setup.glob('.env*')) + list((setup / 'storage').glob('*.key')) + [setup / 'bootstrap/cache/config.php']:
     if private.name != '.env.example' and private.is_file():
@@ -61,7 +61,7 @@ if meta.get('repair_run'):
     run_id = meta['repair_run']
     if Path(run_id).name != run_id:
         sys.exit('setup-refresh: repair run must be one ledger run id')
-    run = state_dir(LAB) / 'runs' / run_id
+    run = state_dir(CODE_ROOT) / 'runs' / run_id
     evidence, error = require(run)
     if error or evidence['evidence_sha'] != meta.get('repair_evidence_sha'):
         sys.exit('setup-refresh: ' + (error or 'repair evidence mismatch'))

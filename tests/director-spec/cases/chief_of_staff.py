@@ -16,7 +16,8 @@ def _(ctx):
     try:
         s.until(lambda name, _: name == "hello")
         key = new_key()
-        a = o.call("PUT", "chief-of-staff", body={"enabled": True, "name": " Chief "}, key=key)
+        paired = device(ctx)
+        a = paired.call("PUT", "chief-of-staff", body={"enabled": True, "name": " Chief "}, key=key)
         ctx.expect(a.status == 200, "enable", a)
         slot = a.json["chief_of_staff"]
         cid = slot["conversation_id"]
@@ -31,18 +32,16 @@ def _(ctx):
             again = o.call("PUT", "chief-of-staff", body={"enabled": True, "name": " Chief "}, key=k)
             ctx.expect(again.json == a.json, "enable is idempotent", again)
         ctx.expect(device(ctx).call("GET", "chief-of-staff").json == a.json, "device reads slot")
-        refused(ctx, device(ctx).call("PUT", "chief-of-staff", body={"enabled": False}, key=new_key()), 403, "owner_only", "device write")
         for method, suffix in (("POST", "/archive"), ("DELETE", "")):
             refused(ctx, o.call(method, path + suffix, body={}, key=new_key()), 409, "chief_of_staff", "protected chief")
         token = home.call("POST", path + "/lead-credential").json["token"]
         lead = Client(ctx.target, token)
         for method in ("GET", "PUT"):
             refused(ctx, lead.call(method, "chief-of-staff", body={} if method == "PUT" else None, key=new_key()), 403, "owner_only", "lead slot access")
-        refused(ctx, device(ctx).call("PATCH", path, body={"title": "Other"}, key=new_key()), 403, "owner_only", "device rename")
         refused(ctx, lead.call("PATCH", path, body={"title": "Other"}, key=new_key()), 403, "owner_only", "lead rename")
         refused(ctx, o.call("PATCH", path, body={"title": "x" * 201}, key=new_key()), 422, "invalid_request", "long title")
         refused(ctx, o.call("PATCH", path, body={"title": "  "}, key=new_key()), 422, "invalid_request", "empty title")
-        renamed = o.call("PATCH", path, body={"title": " Renamed "}, key=new_key())
+        renamed = paired.call("PATCH", path, body={"title": " Renamed "}, key=new_key())
         ctx.expect(renamed.status == 200 and renamed.json["conversation"]["title"] == "Renamed"
                    and renamed.json["conversation"]["revision"] > conv["revision"], "rename bumps revision", renamed)
         ctx.expect(o.call("GET", "chief-of-staff").json["chief_of_staff"]["name"] == "Renamed", "slot follows rename")

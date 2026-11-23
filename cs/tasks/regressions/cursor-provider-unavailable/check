@@ -13,13 +13,14 @@ from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 sys.dont_write_bytecode = True
-LAB = Path(__file__).resolve().parents[3]
-OPS = LAB / "ops/bin"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+OPS = CODE_ROOT / "ops/bin"
 FILES = (
-    "_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py",
-    "_yaml.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_cli_native.py",
+    "_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_muse_adapter.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py",
+    "_yaml.py", "_grant.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_cli_native.py",
     "_harness_usage.py", "_provider_limits.py", "_run_record.py", "_env_policy.py", "_errors.py", "_job_reason.py",
     "_stuck.py", "_cli_budget.py",
     "capture-stimulus", "publish-evidence", "harvest", "finalize-run",
@@ -51,8 +52,8 @@ def make_spec(path, task, hypothesis, stuck):
     )
 
 
-def run_case(lab, mode, task, spec):
-    (lab / "mode.txt").write_text(mode + "\n", encoding="utf-8")
+def run_case(code_root, mode, task, spec):
+    (code_root / "mode.txt").write_text(mode + "\n", encoding="utf-8")
     payload = {
         "executor": "fake-cursor",
         "task": "tasks/%s" % task,
@@ -63,19 +64,19 @@ def run_case(lab, mode, task, spec):
     }
     started = time.monotonic()
     done = subprocess.run(
-        [sys.executable, str(lab / "ops/bin/_executor.py")],
-        cwd=lab,
+        cli_command(sys.executable, code_root / "ops/bin/_executor.py"),
+        cwd=code_root,
         input=json.dumps(payload),
         text=True,
         capture_output=True,
         timeout=40,
-        env={**hermetic_env(), "HOME": str(lab / "home"), "GIT_CONFIG_GLOBAL": str(lab / "home/.gitconfig"), "CS_TOOLS_BIN": os.environ.get("CS_TOOLS_BIN", str(LAB.parent / "target/release/cs-tools"))},
+        env={**hermetic_env(), "HOME": str(code_root / "home"), "GIT_CONFIG_GLOBAL": str(code_root / "home/.gitconfig"), "CS_TOOLS_BIN": os.environ.get("CS_TOOLS_BIN", str(CODE_ROOT.parent / "target/release/cs-tools"))},
     )
     assert done.stdout.strip(), (mode, done.stderr)
     result = json.loads(done.stdout.strip().splitlines()[-1])
     run = Path("ledger/runs") / result["run_id"]
-    row = json.loads((lab / "ledger/ledger.jsonl").read_text(encoding="utf-8").splitlines()[-1])
-    return done, result, row, lab / run, round(time.monotonic() - started, 2)
+    row = json.loads((code_root / "ledger/ledger.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    return done, result, row, code_root / run, round(time.monotonic() - started, 2)
 
 
 
@@ -86,7 +87,7 @@ from _errors import classify_stop, row_error
 FAKE = r'''#!/usr/bin/env python3
 import json, sys, time
 from pathlib import Path
-mode = (Path(__file__).parent / "lab/mode.txt").read_text().strip()
+mode = (Path(__file__).parent / "code_root/mode.txt").read_text().strip()
 def emit(v):
     v["session_id"] = "fixture"
     print(json.dumps(v), flush=True)
@@ -130,30 +131,30 @@ assert classify_stop("provider_unavailable")["retryable"] is True
 
 with scratch_dir(prefix="cursor-provider-unavailable-") as raw:
     root = Path(raw)
-    lab = root / "lab"
-    ops = lab / "ops/bin"
-    for path in (ops, lab / "tasks/work", lab / "specs", lab / "prompts",
-                 lab / "home/Library/Keychains", lab / "ledger"):
+    code_root = root / "code_root"
+    ops = code_root / "ops/bin"
+    for path in (ops, code_root / "tasks/work", code_root / "specs", code_root / "prompts",
+                 code_root / "home/Library/Keychains", code_root / "ledger"):
         path.mkdir(parents=True, exist_ok=True)
     for name in FILES:
         shutil.copy2(OPS / name, ops / name)
     from native_runtime import stage_native_runtime
     stage_native_runtime(ops)
-    (lab / "home/.gitconfig").write_text("[user]\n name = Fixture\n email = fixture@example.invalid\n")
+    (code_root / "home/.gitconfig").write_text("[user]\n name = Fixture\n email = fixture@example.invalid\n")
     binary = root / "cursor-agent"
     binary.write_text(FAKE)
     binary.chmod(0o755)
     (ops / "executor-templates.json").write_text(json.dumps({"fake-cursor": {
         "binary": str(binary), "args": ["{{prompt}}"], "cost_class": "subscription",
         "cost_usd": 0, "cost_per_1k": .01, "auth": "subscription"}}))
-    (lab / "ESTATE").write_text("dev\n")
-    (lab / "prompts/system.md").write_text("Fixture\n")
-    (lab / "tasks/work/goal.md").write_text("Do work\n")
-    (lab / "tasks/work/check").write_text("#!/bin/sh\nexit 0\n")
-    (lab / "tasks/work/check").chmod(0o755)
-    make_spec(lab / "specs/work.yaml", "work", "fixture cursor unavailability", "off")
+    (code_root / "ESTATE").write_text("dev\n")
+    (code_root / "prompts/system.md").write_text("Fixture\n")
+    (code_root / "tasks/work/goal.md").write_text("Do work\n")
+    (code_root / "tasks/work/check").write_text("#!/bin/sh\nexit 0\n")
+    (code_root / "tasks/work/check").chmod(0o755)
+    make_spec(code_root / "specs/work.yaml", "work", "fixture cursor unavailability", "off")
     for mode in ("forever", "exit", "healthy"):
-        done, result, row, run_dir, seconds = run_case(lab, mode, "work", "work")
+        done, result, row, run_dir, seconds = run_case(code_root, mode, "work", "work")
         assert seconds < 15, (mode, seconds)
         if mode == "healthy":
             assert done.returncode == 0 and row["stop"] == "done", (result, done.stderr)

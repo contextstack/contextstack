@@ -79,10 +79,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 4.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -93,12 +92,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-tool-exe-dispatch",
+        "run_id": "<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 1,
         "tool_schema": [
           {
             "description": "Fixture-only runtime exe tool. Args: any object; echoed back with the argv it ran under.",
@@ -143,10 +143,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 3.",
             "role": "system"
           },
           {
@@ -187,12 +186,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-tool-exe-dispatch",
+        "run_id": "<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 2,
         "tool_schema": [
           {
             "description": "Fixture-only runtime exe tool. Args: any object; echoed back with the argv it ran under.",
@@ -258,12 +258,15 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "messages.jsonl",
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -286,8 +289,40 @@
           "trial": 1
         },
         {
+          "event": "prompt",
+          "from": 0,
+          "messages": [
+            {
+              "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+              "role": "system"
+            },
+            {
+              "content": "Create hello.txt containing exactly: hello\n",
+              "role": "user"
+            }
+          ],
+          "turn": 1,
+          "turn_guidance": "Turns remaining (including this turn): 4.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-tool-exe-dispatch-fx-t1/workspace"
+        },
+        {
           "event": "turn",
           "text": "an exe tool and a file pair, both under the prefix",
+          "tool_calls": [
+            {
+              "args": {
+                "k": "v w"
+              },
+              "id": "c1",
+              "name": "fx_exe"
+            },
+            {
+              "args": {
+                "mode": "both"
+              },
+              "id": "c2",
+              "name": "fx_tool"
+            }
+          ],
           "turn": 1
         },
         {
@@ -311,8 +346,47 @@
           "turn": 1
         },
         {
+          "event": "prompt",
+          "from": 2,
+          "messages": [
+            {
+              "content": "an exe tool and a file pair, both under the prefix",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "args": {
+                    "k": "v w"
+                  },
+                  "id": "c1",
+                  "name": "fx_exe"
+                },
+                {
+                  "args": {
+                    "mode": "both"
+                  },
+                  "id": "c2",
+                  "name": "fx_tool"
+                }
+              ]
+            },
+            {
+              "content": "[fx_exe {\"k\":\"v w\"}]\nfx_prefix --tag t1 -- <ESTATE>/fixture/fx_exe_bin | --fixed | two words\n{\"args\": [\"--fixed\", \"two words\"], \"argv0\": \"fx_exe_bin\", \"cwd_base\": \"workspace\", \"stdin\": {\"k\": \"v w\"}}\n",
+              "role": "tool",
+              "tool_call_id": "c1"
+            },
+            {
+              "content": "[fx_tool {\"mode\":\"both\"}]\nfx_prefix --tag t1 -- <ESTATE>/tools/bin/fx_tool\nout-line\nerr-line\n",
+              "role": "tool",
+              "tool_call_id": "c2"
+            }
+          ],
+          "turn": 2,
+          "turn_guidance": "Turns remaining (including this turn): 3."
+        },
+        {
           "event": "turn",
           "text": "done",
+          "tool_calls": [],
           "turn": 2
         }
       ],

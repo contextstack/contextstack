@@ -76,10 +76,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 4.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-deadline-remaining-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -90,12 +89,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-deadline-remaining",
+        "run_id": "<RUNSTAMP>-fx-deadline-remaining-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 1,
         "tool_schema": [
           {
             "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
@@ -128,10 +128,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 3.",
             "role": "system"
           },
           {
@@ -152,7 +151,7 @@
             ]
           },
           {
-            "content": "[fx_tool {\"mode\":\"echo\"}]\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
+            "content": "[fx_tool {\"mode\":\"echo\"}]\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"CS_TOOL_TIMEOUT_SECONDS\", \"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
             "role": "tool",
             "tool_call_id": "1"
           }
@@ -160,12 +159,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-deadline-remaining",
+        "run_id": "<RUNSTAMP>-fx-deadline-remaining-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 2,
         "tool_schema": [
           {
             "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
@@ -219,12 +219,15 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "messages.jsonl",
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -232,7 +235,7 @@
         "check": "#!/bin/sh\nexit 0\n",
         "goal.md": "Create hello.txt containing exactly: hello\n"
       },
-      "transcript": "# fx-deadline-remaining · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 30s\n\n### turn 1\n\none call\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n### turn 2\n\ndone\n\n---\nstop done · verdict **pass** · turns 2 · tools 1 · cost $0.0200\n",
+      "transcript": "# fx-deadline-remaining · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 30s\n\n### turn 1\n\none call\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"CS_TOOL_TIMEOUT_SECONDS\", \"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n### turn 2\n\ndone\n\n---\nstop done · verdict **pass** · turns 2 · tools 1 · cost $0.0200\n",
       "workspace": {}
     }
   ],

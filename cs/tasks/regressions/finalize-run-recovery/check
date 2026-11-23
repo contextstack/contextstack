@@ -44,7 +44,7 @@ alert and the tick seam:
 Template: one real run dir, produced by the runner (default Rust) with a stub
 finalize-run that exits 3 (terminal.json and messages.jsonl on disk, no
 transcript.md: the op renders it, nothing finalized). Every test copies the template estate. Isolated
-estates only; lab/ledger is never written. $CS_RUNNER_BIN overrides the
+estates only; cs/ledger is never written. $CS_RUNNER_BIN overrides the
 default Rust runner.
 """
 import hashlib
@@ -52,6 +52,7 @@ import json
 import threading
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -64,16 +65,15 @@ from scratch import clone_tree
 from hermetic_env import hermetic_env
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-CHAR = LAB / "tasks/regressions/runner-characterisation-v2"  # the fake gateway that speaks the current wire
+CODE_ROOT = HERE.parents[2]
+CHAR = CODE_ROOT / "tasks/regressions/runner-characterisation-v2"  # the fake gateway that speaks the current wire
 sys.path.insert(0, str(CHAR))
 from _fake_gateway import FakeGateway  # noqa: E402
-sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation"))
 from _harness import install_exe  # noqa: E402 runtime exe tools
 
 REAL_TOOLS = ("fs_read", "fs_write", "exec", "_calllog.py")
-REAL_OPS = ("setup-workspace", "capture-stimulus", "publish-evidence", "finalize-run")
-OP_HELPERS = ("_estate_io.py", "_roots.py", "_lifecycle_evidence.py", "_harvest_git.py", "_setup_workspace.py", "_corpus_contract.py", "_workspace_setup.py", "_env_policy.py", "_runner.py", "_errors.py")
+REAL_OPS = ("setup-workspace", "capture-stimulus", "publish-evidence", "finalize-run", "machine-finish", "run-api", "run-spec")
+OP_HELPERS = ("_estate_io.py", "_roots.py", "_lifecycle_evidence.py", "_harvest_git.py", "_setup_workspace.py", "_workspace_setup.py", "_env_policy.py", "_runner.py", "_errors.py", "_api_run.py", "_sandbox_policy.py")
 ROW_KEYS = {"ts", "spec", "spec_sha", "task_sha", "env_sha", "stimulus_sha", "model", "task",
             "trial", "verdict", "stop", "cost_usd", "est_usd", "est_basis", "cost_class", "turns",
             "tool_calls", "seconds", "transcript", "estate", "row_version", "executed_by"}  # execution identity
@@ -111,14 +111,14 @@ FAKE_LAB = """#!/usr/bin/env python3
 # publisher fails, so the row lands and finalized.json does not (by design).
 import json, shutil, subprocess, sys
 from pathlib import Path
-estate = Path(__file__).resolve().parent
+estate = Path(__file__).resolve().parents[2]
 src = next((estate / "fixture/template-runs").iterdir())
 dst = estate / "ledger/runs" / src.name
 shutil.copytree(src, dst)
 if __FINALIZE__:
     subprocess.run([str(estate / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(dst)}),
                    text=True, capture_output=True, cwd=str(estate))
-sys.stderr.write("lab: finalization pending: %s\\n" % dst)
+sys.stderr.write("cs: finalization pending: %s\\n" % dst)
 sys.exit(3)
 """
 PRIOR_ROWS = [
@@ -150,9 +150,9 @@ def copy_exec(src, dst):
 
 def runner_binary(scratch):
     """$CS_RUNNER_BIN if set, else the default Rust runner (_runner.built_runner)."""
-    sys.path.insert(0, str(LAB / "ops/bin"))
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
     from _runner import built_runner
-    return built_runner(LAB).resolve()
+    return built_runner(CODE_ROOT).resolve()
 
 
 def clean_env(estate, **extra):
@@ -170,18 +170,18 @@ def build_template(scratch, binary):
         (estate / d).mkdir(parents=True)
     (estate / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
     (estate / "ESTATE").write_text("dev\n", encoding="utf-8")
-    shutil.copy2(LAB / "prompts/coder-min.md", estate / "prompts/coder-min.md")
+    shutil.copy2(CODE_ROOT / "prompts/coder-min.md", estate / "prompts/coder-min.md")
     for name in REAL_TOOLS:
-        if not (LAB / "tools/bin" / name).is_file() and (LAB / "tools/bin" / (name + ".json")).is_file():
-            install_exe(LAB / "tools/bin" / (name + ".json"), LAB, estate)
+        if not (CODE_ROOT / "tools/bin" / name).is_file() and (CODE_ROOT / "tools/bin" / (name + ".json")).is_file():
+            install_exe(CODE_ROOT / "tools/bin" / (name + ".json"), CODE_ROOT, estate)
             continue
-        copy_exec(LAB / "tools/bin" / name, estate / "tools/bin" / name)
-        if (LAB / "tools/bin" / (name + ".json")).is_file():
-            shutil.copy2(LAB / "tools/bin" / (name + ".json"), estate / "tools/bin" / (name + ".json"))
+        copy_exec(CODE_ROOT / "tools/bin" / name, estate / "tools/bin" / name)
+        if (CODE_ROOT / "tools/bin" / (name + ".json")).is_file():
+            shutil.copy2(CODE_ROOT / "tools/bin" / (name + ".json"), estate / "tools/bin" / (name + ".json"))
     for name in REAL_OPS + OP_HELPERS:
-        copy_exec(LAB / "ops/bin" / name, estate / "ops/bin" / name)
+        copy_exec(CODE_ROOT / "ops/bin" / name, estate / "ops/bin" / name)
     (estate / "ops/bin/finalize-run").write_text(STUB_FINALIZE, encoding="utf-8")
-    shutil.copytree(LAB / TASK_REL, estate / TASK_REL)
+    shutil.copytree(CODE_ROOT / TASK_REL, estate / TASK_REL)
     (estate / TASK_REL / "check").chmod(0o755)
     (estate / "specs/fx.yaml").write_text(SPEC, encoding="utf-8")
     with open(estate / "ledger/ledger.jsonl", "w", encoding="utf-8") as f:
@@ -189,12 +189,17 @@ def build_template(scratch, binary):
             f.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
     gateway = FakeGateway(GATEWAY, estate)
     try:
-        proc = subprocess.run([str(binary), "run", "specs/fx.yaml"], cwd=str(estate),
-                              env=clean_env(estate, CSGATEWAY_ENDPOINT=gateway.endpoint),
+        proc = subprocess.run([str(estate / "ops/bin/run-spec"), "specs/fx.yaml"], cwd=str(estate),
+                              env=clean_env(estate, CSGATEWAY_ENDPOINT=gateway.endpoint, CS_RUNNER_BIN=str(binary)),
                               text=True, capture_output=True, timeout=120)
     finally:
         gateway.stop.set()
         gateway.close()
+    assert proc.stdout.splitlines() == [
+        "fx-recovery: 1 task(s) x 1 trial(s)",
+        f"  {TASK_REL:<30} t1       stop=done turns=2 tools=1 $0.0200",
+        "  TOTAL 0/1 pass — rows in ledger/ledger.jsonl",
+    ], proc.stdout
     runs = sorted((estate / "ledger/runs").iterdir())
     if proc.returncode != 3 or len(runs) != 1 or not (runs[0] / "terminal.json").is_file():
         raise SystemExit("check: template run did not stop at terminal.json: rc=%d stdout=%r stderr=%r"
@@ -204,7 +209,7 @@ def build_template(scratch, binary):
     if not (runs[0] / "messages.jsonl").is_file() or (runs[0] / "transcript.md").exists():
         raise SystemExit("check: the runner must leave messages.jsonl and no transcript.md: %s"
                          % sorted(e.name for e in runs[0].iterdir()))
-    copy_exec(LAB / "ops/bin/finalize-run", estate / "ops/bin/finalize-run")
+    copy_exec(CODE_ROOT / "ops/bin/finalize-run", estate / "ops/bin/finalize-run")
     return estate
 
 
@@ -298,8 +303,9 @@ def test_happy(rep, fx):
     rep.expect(ev.get("check", {}).get("verdict") == "pass" and (run_dir / "ready_for_inspection").is_file()
                and ev.get("transcript", {}).get("bytes") == len(text.encode()),
                "happy: evidence record binds the check result and the footered transcript", ev.get("transcript"))
-    rep.expect(entries(run_dir) == ["check.json", "evidence", "finalize.lock", "finalized.json", "messages.jsonl",
-                                    "ready_for_inspection", "stimulus", "terminal.json", "transcript.md", "workspace"],
+    rep.expect(entries(run_dir) == ["check.json", "evidence", "execution-receipt.json", "execution.lock",
+                                    "finalize.lock", "finalized.json", "messages.jsonl",
+                                    "ready_for_inspection", "stimulus", "terminal.json", "trace.jsonl", "transcript.md", "workspace"],
                "happy: run-dir entries", entries(run_dir))
     rc2, out2, _ = finalize(estate)
     rep.expect(rc2 == 0 and out2.get("state") == "finalized" and out2.get("row_appended") is False
@@ -328,7 +334,7 @@ def test_envelope(rep, fx):
                and env.get("run_id") == run_dir.name and env.get("transcript") == "ledger/runs/" + run_dir.name
                and env.get("row_sha256") == hashlib.sha256(line).hexdigest() and env.get("row_version") == 2
                and env.get("error_class") is None, "envelope: outbox/<run_id>.json binds the event, the row bytes", env)
-    want = {"terminal.json", "messages.jsonl", "check.json", "transcript.md", "stimulus/manifest.json",
+    want = {"terminal.json", "messages.jsonl", "check.json", "transcript.md", "trace.jsonl", "stimulus/manifest.json",
             "evidence/manifest.json"}
     rep.expect(want <= set(paths) and paths == sorted(paths) and not any(
                    x.startswith(("workspace/", "finalized.json", "finalize.")) for x in paths)
@@ -336,6 +342,11 @@ def test_envelope(rep, fx):
                        and (run_dir / f["path"]).stat().st_size == f["bytes"] for f in env["files"]),
                "envelope: files cover the record, stimulus and evidence by size and sha256; never workspace or finalized.json",
                paths)
+    trace = run_dir / "trace.jsonl"
+    spans = [json.loads(line) for line in trace.read_bytes().splitlines()] if trace.is_file() else []
+    rep.expect([span["kind"] for span in spans[-2:]] == ["finalization", "run"]
+               and spans[-2]["attributes"]["verdict"] == "pass" and spans[-1]["outcome"] == "finalized",
+               "envelope: trace ends with the finalization span and finalized root")
     row = json.loads(line)
     usage = env.get("usage") or {}
     rep.expect(set(usage) == {"input_tokens", "output_tokens", "est_usd", "est_basis", "charged_usd", "source"}
@@ -353,11 +364,13 @@ def test_envelope(rep, fx):
     rep.expect(rc == 137 and path.is_file() and not (run_dir / "finalized.json").exists(),
                "kill after envelope: the envelope is on disk, no finalized.json", entries(run_dir))
     good = path.read_bytes()
+    trace = run_dir / "trace.jsonl"
+    sealed = trace.read_bytes()
     rc2, out2, _ = finalize(estate)
     done = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8")) if rc2 == 0 else {}
     rep.expect(rc2 == 0 and done.get("steps", {}).get("envelope") == "existing" and path.read_bytes() == good
-               and len(rows_of(estate)) == len(PRIOR_ROWS) + 1,
-               "kill after envelope: the retry reuses it (existing), one row, finalized", done.get("steps"))
+               and len(rows_of(estate)) == len(PRIOR_ROWS) + 1 and trace.read_bytes() == sealed,
+               "kill after envelope: the retry reuses the envelope and trace, one row, finalized", done.get("steps"))
     (run_dir / "finalized.json").unlink()
     path.write_text(json.dumps({**json.loads(good), "envelope_sha256": "0" * 64}), encoding="utf-8")
     tampered = path.read_bytes()
@@ -670,20 +683,19 @@ def test_tick(rep, fx, mode):
         (ops / "publish-evidence").write_text(FAILING_PUBLISH, encoding="utf-8")
     else:
         (estate / "ESTATE").unlink()  # the first finalize attempt must refuse the row
-    for source in (LAB / "ops/bin").iterdir():
+    for source in (CODE_ROOT / "ops/bin").iterdir():
         if source.is_file() and not (ops / source.name).exists():
             shutil.copy2(source, ops / source.name)
-    for name in ("estate-commit", "corpus-audit", "void-watch"):
+    for name in ("corpus-audit", "void-watch"):
         (ops / name).write_text("#!/bin/sh\necho '{\"ok\":true,\"skip\":\"fixture\"}'\n", encoding="utf-8")
         (ops / name).chmod(0o755)
     (ops / "local-model-ready").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (ops / "local-model-ready").chmod(0o755)
     (estate / "grants").mkdir()
-    (estate / "lab").write_text(FAKE_LAB.replace("__FINALIZE__", repr(publish)), encoding="utf-8")
-    (estate / "lab").chmod(0o755)
+    (ops / "run-api").write_text(FAKE_LAB.replace("__FINALIZE__", repr(publish)), encoding="utf-8")
+    (ops / "run-api").chmod(0o755)
 
-    # The stub runner is named, not found: the default is the Rust runner beside the code root.
-    git_env = clean_env(estate, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", CS_RUNNER_BIN=str(estate / "lab"))
+    git_env = clean_env(estate, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
     subprocess.run(["git", "init", "-q", str(estate)], check=True, env=git_env)
     subprocess.run(["git", "-C", str(estate), "-c", "user.name=Fixture", "-c", "user.email=f@example.invalid",
                     "commit", "--allow-empty", "-qm", "fixture"], check=True, env=git_env)
@@ -770,6 +782,85 @@ def test_orphan_sweep(rep, estate, finalized_run, op):
                "orphan sweep: the old unclaimed dir is gone; young, claimed and torn remain", left)
 
 
+def test_receipt_handoff(rep, fx, binary):
+    """Exercise the real launcher and kill it before the machine reads its receipt."""
+    estate = fx.fresh("receipt-handoff")
+    shutil.rmtree(run_dir_of(estate))
+    ops = estate / "ops/bin"
+    for source in (CODE_ROOT / "ops/bin").iterdir():
+        if source.is_file() and not (ops / source.name).exists():
+            shutil.copy2(source, ops / source.name)
+    runner = estate / "fixture/harness"
+    runner.write_text(
+        '#!/bin/sh\necho "$$" > fixture/harness.pid\nexec ' + shlex.quote(str(binary)) + ' "$@"\n')
+    runner.chmod(0o755)
+    check = estate / TASK_REL / "check"
+    check.write_text(
+        '#!/bin/sh\nread -r pid < ' + shlex.quote(str(estate / "fixture/harness.pid"))
+        + '\nif kill -0 "$pid" 2>/dev/null; then exit 1; fi\nprintf "check\\n" >> checks\n'
+        + 'test "$(cat hello.txt)" = hello\n')
+    run_spec = estate / "specs/fx.yaml"
+    run_spec.write_text(SPEC.replace("tool_calls: 10", "tool_calls: 1"))
+    env = clean_env(estate, CS_RUNNER_BIN=str(runner))
+
+    def dispatch():
+        gateway = FakeGateway(GATEWAY[:1], estate)
+        try:
+            return subprocess.run([str(ops / "run-spec"), "specs/fx.yaml"], cwd=estate,
+                                  env=dict(env, CSGATEWAY_ENDPOINT=gateway.endpoint),
+                                  text=True, capture_output=True, timeout=30)
+        finally:
+            gateway.stop.set()
+            gateway.close()
+
+    done = dispatch()
+    rep.expect(done.returncode == 0 and done.stdout.splitlines() == [
+        "fx-recovery: 1 task(s) x 1 trial(s)",
+        f"  {TASK_REL:<30} t1  pass stop=budget:tool_calls turns=1 tools=1 $0.0100",
+        "  TOTAL 1/1 pass — rows in ledger/ledger.jsonl",
+    ], "receipt: run-spec summary and budget verdict are unchanged", (done.stdout, done.stderr))
+    first = run_dir_of(estate)
+    count = first / "workspace/checks"
+    rep.expect(count.read_text() == "check\n", "receipt: the frozen check ran once, after the harness exited")
+
+    real = ops / "machine-finish"
+    backup = ops / "machine-finish.real"
+    real.rename(backup)
+    real.write_text("""#!/usr/bin/env python3
+import json, os, signal, sys
+from pathlib import Path
+request = json.load(sys.stdin)
+run = Path(request["run_dir"])
+assert request["receipt"]["adapter"] == "harness"
+assert not (run / "terminal.json").exists() and not (run / "check.json").exists()
+os.kill(os.getppid(), signal.SIGKILL)
+""")
+    real.chmod(0o755)
+    interrupted = dispatch()
+    backup.replace(real)
+    run = next(path for path in (estate / "ledger/runs").iterdir() if path != first)
+    receipt = run / "execution-receipt.json"
+    rep.expect(interrupted.returncode == 1 and receipt.is_file() and not (run / "terminal.json").exists(),
+               "receipt: launcher killed after the harness exited, before terminal or check",
+               (interrupted.stdout, interrupted.stderr))
+    old = time.time() - 120
+    os.utime(receipt, (old, old))
+
+    sweep = ("import json, runpy; "
+             "print(json.dumps(runpy.run_path('ops/bin/tick')['finalize_sweep']()))")
+    first_sweep, second_sweep = [
+        json.loads(subprocess.check_output([sys.executable, "-c", sweep], cwd=estate, env=env, text=True))
+        for _ in range(2)
+    ]
+    rows = [json.loads(line) for line in rows_of(estate)][len(PRIOR_ROWS):]
+    comparable = ("spec", "model", "trial", "verdict", "stop", "turns", "tool_calls", "cost_usd", "row_version")
+    rep.expect(first_sweep == {"attempted": 1, "finalized": 1, "pending": 0}
+               and second_sweep == {"attempted": 0, "finalized": 0, "pending": 0}
+               and (run / "workspace/checks").read_text() == "check\n" and len(rows) == 2
+               and all(rows[0][key] == rows[1][key] for key in comparable),
+               "receipt: sweep finalizes once and writes the same budget row", (first_sweep, second_sweep, rows))
+
+
 def main():
     keep = "--keep" in sys.argv[1:]
     scratch = Path(tempfile.mkdtemp(prefix="finalize-run-recovery-", suffix=".noindex"))
@@ -778,8 +869,8 @@ def main():
     try:
         binary = runner_binary(scratch)
         template = build_template(scratch, binary)
-        if LAB == template.resolve() or LAB in template.resolve().parents:
-            raise SystemExit("check: refusing live lab root")
+        if CODE_ROOT == template.resolve() or CODE_ROOT in template.resolve().parents:
+            raise SystemExit("check: refusing live code_root root")
         fx = Fixture(scratch, template)
         test_happy(rep, fx)
         test_durable_entry(rep, fx)
@@ -793,6 +884,7 @@ def main():
         test_stimulus_mismatch(rep, fx)
         test_refusals(rep, fx)
         test_env(rep, fx)
+        test_receipt_handoff(rep, fx, binary)
         test_tick(rep, fx, "estate")
         test_tick(rep, fx, "publish")
         if keep:

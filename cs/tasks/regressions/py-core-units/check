@@ -66,7 +66,7 @@ def main():
     env = {**hermetic_env(), "PYTHONDONTWRITEBYTECODE": "1",
            "COVERAGE_FILE": str(HERE / ".coverage")}
     for name in (
-        "LAB_STATE_ROOT", "LAB_CONFIG_ROOT", "LAB_CODE_ROOT", "CS_TOOLCHAINS_FILE",
+        "CS_STATE_ROOT", "CS_CONFIG_ROOT", "CS_CODE_ROOT", "CS_TOOLCHAINS_FILE",
         "CS_REPOS_FILE", "RUSTUP_HOME", "CARGO_HOME",
     ):
         env.pop(name, None)

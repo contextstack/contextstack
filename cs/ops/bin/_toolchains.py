@@ -1,4 +1,5 @@
 """Node-owned, read-only toolchain directories, resolved once at job start."""
+from contextlib import contextmanager
 from functools import cache
 import json
 import os
@@ -6,6 +7,69 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
+
+
+TOOLCHAIN_BINARIES = ("php", "node", "npm", "composer", "cargo", "go", "python3", "uv", "rustc")
+LOGIN_LOOKUP = ";".join("command -v %s || :" % name for name in TOOLCHAIN_BINARIES)
+LOGIN_TIMEOUT = 5
+
+
+def login_toolchain_additions(path, service_path):
+    """Read the current entries and plan additions from the owner's login shell."""
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        existing = []
+    if not isinstance(existing, list):
+        raise ValueError("toolchains.json must be a list")
+
+    shell = os.environ.get("SHELL")
+    if not shell:
+        raise ValueError("login shell lookup failed (SHELL is unset)")
+    try:
+        result = subprocess.run([shell, "-lc", LOGIN_LOOKUP], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                text=True, errors="replace", timeout=LOGIN_TIMEOUT, start_new_session=True)
+    except subprocess.TimeoutExpired:
+        raise ValueError("login shell lookup failed (timed out)") from None
+    except OSError:
+        raise ValueError("login shell lookup failed (could not start shell)") from None
+    if result.returncode != 0:
+        raise ValueError("login shell lookup failed (exit %s)" % result.returncode)
+
+    found = {}
+    for line in result.stdout.splitlines():
+        binary = Path(line)
+        if (binary.is_absolute() and binary.name in TOOLCHAIN_BINARIES
+                and binary.is_file() and os.access(binary, os.X_OK)):
+            found.setdefault(binary.name, binary)
+
+    configured = {entry["name"] for entry in existing
+                  if isinstance(entry, dict) and isinstance(entry.get("name"), str)}
+    added = []
+    for name, binary in found.items():
+        if name in configured:
+            continue
+        service_binary = shutil.which(name, path=service_path)
+        if name != "uv" and service_binary and Path(service_binary).resolve() == binary.resolve():
+            continue
+        bindir = binary.parent.resolve()
+        if not _grantable(bindir) or not _grantable(binary.resolve().parent):
+            continue
+        entry = {"name": name, "bin": str(bindir)}
+        if name == "uv":
+            python = uv_python_dir(binary)
+            if python is None or not _grantable(python):
+                continue
+            entry["python"] = str(python)
+        elif name == "cargo":
+            paths = cargo_toolchain_paths(binary, rustc=found.get("rustc"))
+            if not paths or not all(path.is_dir() and _grantable(path) for path in paths.values()):
+                continue
+            entry.update({key: str(value) for key, value in paths.items()})
+        added.append(entry)
+    return existing, added
 
 
 def config_file():
@@ -92,7 +156,9 @@ def uv_python_dir(uv_binary):
     try:
         done = subprocess.run(
             [str(uv_binary), "python", "dir"], capture_output=True, text=True,
-            timeout=15, stdin=subprocess.DEVNULL, env={"HOME": str(Path.home()), "PATH": os.environ.get("PATH", "")},
+            timeout=15, stdin=subprocess.DEVNULL,
+            env={key: os.environ[key] for key in ("HOME", "PATH", "XDG_DATA_HOME", "UV_PYTHON_INSTALL_DIR")
+                 if key in os.environ},
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -102,15 +168,15 @@ def uv_python_dir(uv_binary):
     if not line:
         return None
     directory = Path(line[0].strip())
-    return directory.resolve() if directory.is_dir() else None
+    return directory.resolve() if directory.is_absolute() and directory.is_dir() else None
 
 
-def cargo_toolchain_paths(cargo_binary):
+def cargo_toolchain_paths(cargo_binary, *, rustc=None):
     """Active rustc sysroot, rustup home, and host registry dir for lane grants."""
     home = Path.home()
     rustup = Path(os.environ.get("RUSTUP_HOME", home / ".rustup"))
     cargo_home = Path(os.environ.get("CARGO_HOME", home / ".cargo"))
-    rustc = Path(cargo_binary).resolve().parent / "rustc"
+    rustc = rustc or Path(cargo_binary).parent / "rustc"
     if not rustc.is_file():
         found = shutil.which("rustc")
         rustc = Path(found) if found else None
@@ -127,7 +193,7 @@ def cargo_toolchain_paths(cargo_binary):
     if done.returncode != 0:
         return None
     toolchain = Path((done.stdout or "").strip())
-    if not toolchain.is_dir():
+    if not toolchain.is_absolute() or not toolchain.is_dir():
         return None
     rustup = rustup.resolve()
     registry = (cargo_home / "registry").resolve()
@@ -137,10 +203,17 @@ def cargo_toolchain_paths(cargo_binary):
     return out
 
 
+def _cargo_bins(entries):
+    return {entry["bin"] for entry in entries if isinstance(entry, dict)
+            and entry.get("name") == "cargo" and isinstance(entry.get("bin"), str)}
+
+
 @cache
 def discover():
     roots = []
-    for entry in _entries():
+    entries = _entries()
+    cargo_bins = _cargo_bins(entries)
+    for entry in entries:
         _validate_entry(entry)
         name, directory = entry["name"], Path(entry["bin"])
         if name == "uv":
@@ -160,6 +233,8 @@ def discover():
             if _grantable(rustup):
                 roots.append(rustup)
             continue
+        if name == "rustc" and entry["bin"] in cargo_bins:
+            continue
         roots.extend((directory, directory.resolve()))
         roots.extend(binary_roots(directory / name))
     return tuple(dict.fromkeys(str(root) for root in roots if _grantable(Path(root))))
@@ -169,11 +244,13 @@ def discover():
 def discover_path_dirs():
     """Directories prepended to PATH; uv's parent is listed but not granted as a read subtree."""
     dirs = []
-    for entry in _entries():
+    entries = _entries()
+    cargo_bins = _cargo_bins(entries)
+    for entry in entries:
         _validate_entry(entry)
         name, directory = entry["name"], Path(entry["bin"])
         dirs.append(str(directory.resolve()))
-        if name in ("uv", "cargo"):
+        if name in ("uv", "cargo") or (name == "rustc" and entry["bin"] in cargo_bins):
             continue
         for root in binary_roots(directory / name):
             if _grantable(root):
@@ -213,12 +290,27 @@ def has_cargo_toolchain():
 
 def toolchain_lane_env(tmpdir, workspace=None):
     """uv/cargo lane variables merged into executor and native CLI child env."""
-    env = {}
-    if has_uv_toolchain():
-        env.update(uv_lane_env(tmpdir))
+    env = uv_lane_env(tmpdir)
     if has_cargo_toolchain():
         env.update(cargo_lane_env(tmpdir, workspace))
     return env
+
+
+def lane_path(path):
+    fallback = (Path.home() / ".local/bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin"))
+    return os.pathsep.join((*discover_path_dirs(), path, *(str(p) for p in fallback if p.is_dir())))
+
+
+@contextmanager
+def harness_lane_env(workspace, path, *, sandboxed=False):
+    """Give a harness lane the CLI toolchain environment with private scratch."""
+    scratch_parent = workspace if sandboxed else None
+    with tempfile.TemporaryDirectory(prefix=".cs-toolchains-", dir=scratch_parent) as scratch:
+        env = toolchain_lane_env(scratch, workspace)
+        env.update(PATH=lane_path(path),
+                   GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
+                   GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_PAGER="cat")
+        yield env
 
 
 def uv_lane_env(tmpdir):
@@ -227,6 +319,8 @@ def uv_lane_env(tmpdir):
     env = {
         "UV_CACHE_DIR": str(root / "uv-cache"),
         "UV_NO_CONFIG": "1",
+        "UV_OFFLINE": "1",
+        "UV_PYTHON_INSTALL_DIR": str(root / "uv-python"),
         "UV_PYTHON_DOWNLOADS": "never",
     }
     for entry in _entries():
@@ -293,23 +387,33 @@ def doctor_findings(path=None):
         check = "toolchain %s" % name if names.count(name) == 1 else "toolchain %s (%s)" % (name, bindir)
         if not binary.is_file():
             out.append({"check": check, "ok": False, "detail": "%s not found" % binary,
-                        "fix": "run cs init to refresh toolchains, or edit %s" % path})
+                        "fix": "edit %s to correct the configured toolchain" % path})
         elif name == "uv":
             python = entry.get("python")
             if not isinstance(python, str) or not Path(python).is_dir():
                 out.append({"check": check, "ok": False, "detail": "python directory missing for uv",
-                            "fix": "run cs init to refresh toolchains, or edit %s" % path})
+                            "fix": "edit %s to correct the configured toolchain" % path})
         elif name == "cargo":
             for field, label in (("rustup", "rustup home"), ("toolchain", "toolchain directory")):
                 value = entry.get(field)
                 if not isinstance(value, str) or not Path(value).is_dir():
                     out.append({"check": check, "ok": False, "detail": "%s missing for cargo" % label,
-                                "fix": "run cs init to refresh toolchains, or edit %s" % path})
+                                "fix": "edit %s to correct the configured toolchain" % path})
             registry = entry.get("registry")
             if isinstance(registry, str) and not Path(registry).is_dir():
                 out.append({"check": check, "ok": False, "detail": "registry directory missing for cargo",
-                            "fix": "run cs init to refresh toolchains, or edit %s" % path})
+                            "fix": "edit %s to correct the configured toolchain" % path})
     return out
+
+
+def doctor_login_findings(path, service_path):
+    try:
+        _, added = login_toolchain_additions(path, service_path)
+    except (OSError, ValueError) as error:
+        return [{"check": "login shell toolchains", "ok": False, "warn": True,
+                 "detail": str(error), "fix": "check the login shell and toolchain configuration"}]
+    return [{"check": "toolchain " + entry["name"], "ok": True, "info": True,
+             "detail": entry["bin"] + " (run cs init to add)"} for entry in added]
 
 
 def _grantable(root):

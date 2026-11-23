@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 #[serde(default, deny_unknown_fields)]
 pub struct Spec {
     pub intent: Option<String>,
+    pub repo: Option<String>,
+    pub lane: Option<String>,
+    #[serde(deserialize_with = "default_on_null")]
+    pub repo_read_only: bool,
     #[serde(deserialize_with = "default_on_null")]
     pub id: String,
     #[serde(deserialize_with = "default_on_null")]
@@ -74,17 +78,16 @@ fn string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>
 pub fn load(path: &str) -> Result<Spec, String> {
     let raw = std::fs::read(path)
         .map_err(|error| format!("open {path}: {}", crate::process::io_error(&error)))?;
+    let eof = || format!("{path}: EOF (unknown fields are refused — SCHEMA.md)");
     if String::from_utf8_lossy(&raw)
         .lines()
         .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
     {
-        return Err(format!(
-            "{path}: EOF (unknown fields are refused — SCHEMA.md)"
-        ));
+        return Err(eof());
     }
     let document = serde_yaml::Deserializer::from_slice(&raw)
         .next()
-        .ok_or_else(|| format!("{path}: EOF (unknown fields are refused — SCHEMA.md)"))?;
+        .ok_or_else(eof)?;
     let mut spec: Spec = default_on_null(document).map_err(|error| {
         let text = error.to_string();
         let diagnostic = if text.contains("unknown field `") {
@@ -96,7 +99,7 @@ pub fn load(path: &str) -> Result<Spec, String> {
                 "Spec"
             };
             format!(
-                "yaml: unmarshal errors:\n  line {line}: field {field} not found in type lab.{kind}"
+                "yaml: unmarshal errors:\n  line {line}: field {field} not found in type {kind}"
             )
         } else {
             format!("yaml: {text}")
@@ -140,7 +143,7 @@ pub fn load(path: &str) -> Result<Spec, String> {
     if !bad.is_empty() {
         return Err(format!("{path}: invalid: {}", bad.join(", ")));
     }
-    spec.sha = format!("{:x}", Sha256::digest(&raw));
+    spec.sha = hex::encode(Sha256::digest(&raw));
     path.clone_into(&mut spec.path);
     Ok(spec)
 }
@@ -164,7 +167,7 @@ mod tests {
         let error = load_text(&format!("{VALID}surprise: field\n"))
             .err()
             .ok_or("unknown field accepted")?;
-        assert!(error.ends_with("yaml: unmarshal errors:\n  line 7: field surprise not found in type lab.Spec (unknown fields are refused — SCHEMA.md)"), "{error}");
+        assert!(error.ends_with("yaml: unmarshal errors:\n  line 7: field surprise not found in type Spec (unknown fields are refused — SCHEMA.md)"), "{error}");
         Ok(())
     }
 
@@ -220,7 +223,10 @@ budget: {turns: 1}
     fn load_first_document_and_hash_original_bytes() -> Result<(), String> {
         let text = format!("{VALID}---\nunknown: ignored second document\n");
         let spec = load_text(&text)?;
-        assert_eq!(spec.sha, format!("{:x}", Sha256::digest(text.as_bytes())));
+        assert_eq!(
+            spec.sha,
+            "d6ec339ce43e57f1933e4ce197eecea049a7daf06f0fbd2a95180ecdee64e7da"
+        );
         assert_eq!(spec.id, "x");
         Ok(())
     }

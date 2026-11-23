@@ -17,9 +17,9 @@ _clean_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_clean_env)
 
-LAB = Path(__file__).resolve().parents[3]
-if str(LAB / "ops/bin") not in sys.path:
-    sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+if str(CODE_ROOT / "ops/bin") not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 from _void import hold_schedule, is_config_void
 
 
@@ -31,7 +31,7 @@ def tick(root, now, **extra):
     ops = root / "ops/bin"
     ops.mkdir(parents=True, exist_ok=True)
     for name in ("schedule-tick", "_grant.py", "_estate_io.py", "_void.py"):
-        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, ops / name)
     (root / "ESTATE").write_text("dev\n")
     (root / "grants").mkdir(exist_ok=True)
     (root / "grants/fixture.yaml").write_text(
@@ -50,7 +50,7 @@ def tick(root, now, **extra):
     }
     payload.update(extra)
     result = subprocess.run([str(ops / "schedule-tick")], input=json.dumps(payload),
-                            text=True, capture_output=True, cwd=LAB, env={**hermetic_env()})
+                            text=True, capture_output=True, cwd=CODE_ROOT, env={**hermetic_env()})
     assert result.returncode == 0, result.stderr
     if not result.stdout.strip():
         return {"admitted": [], "deferred": []}
@@ -132,13 +132,13 @@ with scratch_dir(prefix="config-void-run-spec-") as raw:
         "trials: 6\nhypothesis: \"fixture-003 pin arm\"\n",
         encoding="utf-8",
     )
-    loader = importlib.machinery.SourceFileLoader("lab_tick", str(LAB / "ops/bin/tick"))
-    module_spec = importlib.util.spec_from_loader("lab_tick", loader)
-    lab_tick = importlib.util.module_from_spec(module_spec)
-    loader.exec_module(lab_tick)
-    lab_tick.LAB = root
-    lab_tick.LEDGER = ledger
-    lab_tick.TEMPLATES = {}
+    loader = importlib.machinery.SourceFileLoader("tick_module", str(CODE_ROOT / "ops/bin/tick"))
+    module_spec = importlib.util.spec_from_loader("tick_module", loader)
+    tick_module = importlib.util.module_from_spec(module_spec)
+    loader.exec_module(tick_module)
+    tick_module.CODE_ROOT = root
+    tick_module.LEDGER = ledger
+    tick_module.TEMPLATES = {}
     calls = []
     held = []
 
@@ -154,9 +154,9 @@ with scratch_dir(prefix="config-void-run-spec-") as raw:
             output.write(json.dumps(row) + "\n")
         return 1
 
-    lab_tick.one_trial = fake_one_trial
-    lab_tick.hold_schedule = lambda sid, reason, **kw: held.append((sid, reason)) or True
-    rc, row = lab_tick.run_spec("fixture.yaml", schedule_id="probe-exp-003-h",
+    tick_module.one_trial = fake_one_trial
+    tick_module.hold_schedule = lambda sid, reason, **kw: held.append((sid, reason)) or True
+    rc, row = tick_module.run_spec("fixture.yaml", schedule_id="probe-exp-003-h",
                                 job_id="job-void-1")
     assert rc == 1 and row["verdict"] == "void"
     assert calls == [(1, "tasks/pipeline-verify", "job-void-1")], calls
@@ -168,8 +168,8 @@ assert is_config_void({"verdict": "void", "stop": UNSUPPORTED})
 assert not is_config_void({"verdict": "void", "stop": "error: gateway transport_failed"})
 assert not is_config_void({"verdict": "pass", "stop": CONFIG_STOP})
 
-tick_src = (LAB / "ops/bin/tick").read_text(encoding="utf-8")
+tick_src = (CODE_ROOT / "ops/bin/tick").read_text(encoding="utf-8")
 assert "hold_schedule" in tick_src and "is_config_void" in tick_src
-sched_src = (LAB / "ops/bin/schedule-tick").read_text(encoding="utf-8")
+sched_src = (CODE_ROOT / "ops/bin/schedule-tick").read_text(encoding="utf-8")
 assert "is_config_void" in sched_src
 print("check: config/credential voids hold the schedule and never retry")

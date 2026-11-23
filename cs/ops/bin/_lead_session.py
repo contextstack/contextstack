@@ -61,6 +61,16 @@ def prepare_runtime_home(runtime_home: Path, *, stage_login: bool = True) -> lis
     return stage_claude_login(runtime_home, Path.home()) if stage_login else []
 
 
+class SessionExited(RuntimeError):
+    def __init__(self, status: int):
+        super().__init__("CLI exited before result (code %s)" % status)
+        self.status = status
+
+
+class TurnCancelled(RuntimeError):
+    pass
+
+
 class SessionBackend(ABC):
     """Backend interface: Claude stream-json today; Codex app-server can subclass later."""
 
@@ -73,10 +83,10 @@ class SessionBackend(ABC):
     def send(self, text: str) -> None: ...
 
     @abstractmethod
-    def run_turn(self, text: str, timeout: float = 300) -> str: ...
+    def run_turn(self, text: str, timeout: float = 300, *, on_event=None, cancelled=None) -> str: ...
 
     @abstractmethod
-    def collect_turn(self, timeout: float = 300) -> str: ...
+    def collect_turn(self, timeout: float = 300, *, on_event=None, cancelled=None) -> str: ...
 
     @abstractmethod
     def stop(self) -> int: ...
@@ -234,14 +244,21 @@ class ClaudeStreamSession(SessionBackend):
             }
         )
 
-    def collect_turn(self, timeout: float = 300) -> str:
+    def collect_turn(self, timeout: float = 300, *, on_event=None, cancelled=None) -> str:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            wait = max(0.1, deadline - time.monotonic())
+            if cancelled is not None:
+                if cancelled():
+                    raise TurnCancelled("turn cancelled")
+                wait = min(wait, 0.1)
             try:
-                msg = self.events.get(timeout=max(0.1, deadline - time.monotonic()))
+                msg = self.events.get(timeout=wait)
             except queue.Empty:
                 continue
             typ = msg.get("type")
+            if on_event is not None and typ != "_eof":
+                on_event(msg)
             if typ == "control_request" and msg.get("request", {}).get("subtype") == "can_use_tool":
                 request = msg.get("request", {})
                 if allowed_tool(str(request.get("tool_name") or "")):
@@ -259,14 +276,14 @@ class ClaudeStreamSession(SessionBackend):
                     raise RuntimeError(str(msg.get("result") or msg.get("subtype") or "turn error"))
                 return str(msg.get("result") or "").strip()
             elif typ == "_eof":
-                raise RuntimeError("CLI exited before result (code %s)" % msg.get("returncode"))
+                raise SessionExited(msg["returncode"])
         raise TimeoutError("turn timed out after %ss" % timeout)
 
-    def run_turn(self, text: str, timeout: float = 300) -> str:
+    def run_turn(self, text: str, timeout: float = 300, *, on_event=None, cancelled=None) -> str:
         if not self.alive:
             self.start()
         self.send(text)
-        return self.collect_turn(timeout=timeout)
+        return self.collect_turn(timeout=timeout, on_event=on_event, cancelled=cancelled)
 
     def _write(self, msg: dict) -> None:
         self._log("in", msg)

@@ -11,25 +11,23 @@ name = "cs-gateway"
 path = "src/main.rs"
 
 [dependencies]
+cs-child-signals.workspace = true
 bytes = "1"
 chrono.workspace = true
+cs-http-client.workspace = true
 futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "tokio"] }
-# Native roots as well as webpki: SSL_CERT_FILE is honoured (the contract suite's TLS intercept), and the
-# platform trust store serves production exactly as Go's crypto/x509 does.
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
-rustix = { version = "1.1", features = ["fs", "process"] }
+reqwest.workspace = true
+rustix = { version = "1.1", features = ["fs", "process", "system"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror = "2"
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tokio-util.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

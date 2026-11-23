@@ -1,5 +1,5 @@
 [workspace]
-members = ["director", "gateway", "harness", "sandbox", "tools"]
+members = ["director", "gateway", "harness", "harness/http-client", "sandbox", "sandbox/child-signals", "tools"]
 resolver = "2"
 
 [workspace.package]
@@ -9,13 +9,16 @@ version = "0.1.0"
 publish = false
 
 [workspace.dependencies]
+cs-child-signals = { path = "sandbox/child-signals" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cs-http-client = { path = "harness/http-client" }
+hex = "0.4"
 libyaml-safer = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "process", "signal", "time", "net", "io-util", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }

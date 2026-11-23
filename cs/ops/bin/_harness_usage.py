@@ -8,7 +8,7 @@ must not modify. Auth file contents are never read here.
 
 `unmetered` means the CLI can spend (an API key behind the login) and does not promise a
 dollar figure before it runs. A work order with budget.usd > 0 is refused first. A reported
-dollar amount is kept; a missing one is not stored as 0.
+dollar amount is kept. Missing usage yields a zero estimate with an unmetered basis.
 """
 import json
 from pathlib import Path
@@ -67,7 +67,7 @@ def settle_cost(row, cost_usd, unmetered, cost_class):
         row["cost_usd"] = row["est_usd"]
         return row["est_usd"]
     if row.get("est_basis") != "api_list":
-        row["est_usd"] = None
+        row["est_usd"] = 0
         row["est_basis"] = "unmetered"
     row["cost_usd"] = cost_usd
     return cost_usd

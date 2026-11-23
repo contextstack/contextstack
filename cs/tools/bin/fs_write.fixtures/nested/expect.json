@@ -3,7 +3,7 @@
   "stdout": "wrote new/dir/c.txt (6 bytes)",
   "files": {
     "new/dir/c.txt": "hello\n",
-    ".lab-calls.jsonl": "{\"args\": {\"content\": \"hello\\n\", \"path\": \"new/dir/c.txt\"}, \"name\": \"fs_write\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"content\": \"hello\\n\", \"path\": \"new/dir/c.txt\"}, \"name\": \"fs_write\"}\n"
   },
   "untouched": true
 }

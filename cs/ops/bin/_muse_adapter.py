@@ -9,7 +9,6 @@ import json
 import os
 import re
 import stat
-import signal
 import subprocess
 import sys
 import time
@@ -28,6 +27,14 @@ BUNDLE = ("_executor.py", "executor-templates.json", "_muse.py", "_muse_adapter.
 SOURCES = {(p, s) for p in ("defaults", "policy")
            for s in ("system_file", "macos_managed_preferences")}
 
+
+
+def goal_with_context(stimulus):
+    goal = (stimulus / "goal.md").read_text(encoding="utf-8").strip()
+    context = stimulus / "context/decision-log.md"
+    if context.is_file():
+        goal += "\n\n---\n\nJob context (`context/decision-log.md`):\n\n" + context.read_text(encoding="utf-8")
+    return goal
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -48,7 +55,7 @@ def load_profile(path):
 
 
 def stage_home(ws, real_home, profile):
-    home = ws / ".lab-tmp" / "muse"
+    home = ws / ".cs-tmp" / "muse"
     if home.exists() or not home.resolve().is_relative_to(ws):
         raise ValueError("reserved Muse home is not a fresh workspace path")
     overrides = {"HOME": home, "XDG_CONFIG_HOME": home / "config",
@@ -223,11 +230,11 @@ def load_frozen(folder):
     return sys.modules["_muse_adapter"]
 
 
-def execute(folder, ws, real_home, binary, env, protected, identity, prompt, timeout, on_started=None, extra=(), memory_cap_mb=None, on_evidence=None):
+def execute(folder, ws, real_home, binary, env, protected, identity, prompt, timeout, on_started=None, extra=(), memory_cap_mb=None, on_evidence=None, trace=None):
     """Called from the frozen module; the model invocation uses its bytes."""
     if identity.get("provider") != "meta":
         from _cli_adapter import execute as execute_profile
-        return execute_profile(folder, ws, real_home, binary, env, protected, identity, prompt, timeout, on_started, extra, memory_cap_mb, on_evidence)
+        return execute_profile(folder, ws, real_home, binary, env, protected, identity, prompt, timeout, on_started, extra, memory_cap_mb, on_evidence, trace=trace)
     profile = load_profile(folder / "muse-profile.json")
     from _cli_pins import load_pins
     entry = load_pins(os.environ).get("muse-code") or {}
@@ -238,7 +245,7 @@ def execute(folder, ws, real_home, binary, env, protected, identity, prompt, tim
     for path, digest in identity["config_files"].items():
         if sha(ws / path) != digest:
             raise ValueError("staged Muse configuration changed")
-    keychain = ws / ".lab-tmp/muse/Library/Keychains"
+    keychain = ws / ".cs-tmp/muse/Library/Keychains"
     if (not keychain.is_symlink() or str(keychain.readlink()) != identity.get("keychain_link")
             or identity.get("keychain_link") != str(real_home / "Library/Keychains")):
         raise ValueError("Keychain link changed after capture")
@@ -249,6 +256,9 @@ def execute(folder, ws, real_home, binary, env, protected, identity, prompt, tim
                "--no-session-log", "--approval-mode", "never", "--approval-judge", "off",
                "--disable-web-tools", "--disable-sandbox", prompt]
     bounded = _muse.sandbox_command(command, ws, real_home, protected, extra=extra)
+    if trace is not None:
+        return _run_record.run_observed(bounded, ws, env, timeout, trace=trace, on_started=on_started,
+                                        memory_cap_mb=memory_cap_mb, on_evidence=on_evidence)
     return _muse.run_process(bounded, ws, env, timeout, on_started=on_started, memory_cap_mb=memory_cap_mb, on_evidence=on_evidence)
 
 
@@ -277,7 +287,6 @@ def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None)
 
 
 def run(c):
-    started = time.monotonic()
     started_wall = time.time()
     ws, run_dir, here = c["ws"].resolve(), c["run_dir"], c["HERE"]
     def process_evidence(rows):
@@ -285,9 +294,13 @@ def run(c):
         for evidence in rows:
             append(run_dir / "process-evidence.jsonl", evidence)
     real_home = c["HOME"].resolve()
+    # Callers that run the adapter directly (regressions, older paths) get their own observed trace.
+    trace = c.get("trace") or _run_record.ObservedTrace(run_dir, c["CODE_ROOT"], str(c["task"]), int(c.get("trial") or 1),
+                                                        _run_record.trace_clock())
     name = c["name"]
     muse = name == "muse-code"
     lane = c.get("lane")
+    repo_view = c.get("repo_view")
     from _estate_io import native_caller
     sandbox_extra = {}
     if lane:
@@ -300,17 +313,21 @@ def run(c):
         common = _lanes.git_common_dir(Path(lane["main"]))
         grants += [dict(path=str(p), access="metadata") for p in common.resolve().parents
                    if p.is_relative_to(real_home)]
+    if repo_view:
+        grants += [dict(path=str(repo_view), access="read"),
+                   dict(path=str(repo_view.parent), access="metadata")]
+        sandbox_extra["deny_write_roots"] = [*c["repo_denies"], str(ws / ".git")]
     sandbox_extra["caller_grants"] = grants
     c = {**c, "sandbox_extra": sandbox_extra}
     bundle = BUNDLE + ("_cli_profile.py",) if muse else ("_executor.py", "executor-templates.json", "_muse.py", "_muse_adapter.py",
                                  "_cli_adapter.py", "_cli_pins.py", "_cli_profile.py", "_cli_terminal.py", "cli-profiles.json")
     row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "spec": c["spec_rel"], "spec_sha": c["spec_sha"](c["spec_path"]),
-           "task": task_label(c["task"], c["LAB"]), "trial": c["trial"],
+           "task": task_label(c["task"], c["CODE_ROOT"]), "trial": c["trial"],
            "model": name, "cost_class": c["cost_class"], "cost_usd": 0.0,
            "auth": c["auth"], "auth_source": "unverified", "auth_verified": False,
            "auth_verification": "metadata_only; paid entitlement not asserted",
-           "est_usd": None, "est_basis": "chars", "est_rate_known": False,
+           "est_usd": 0, "est_basis": "unpriced", "est_rate_known": False,
            "estimated_input_chars": 0, "note": "unpriced estimated-cost shadow; no published rate pinned",
            "turns": 0, "tool_calls": 0, "cli_invoked": False, "native_probe_count": 0,
            "base_sha": c["base"], "transcript": transcript_id(c["run_id"])}
@@ -332,29 +349,34 @@ def run(c):
 
     def freeze(identity):
         nonlocal captured
-        result, error = c["run_op"](c["LAB"], "capture-stimulus", {**capture, "executor_identity": identity})
+        result, error = c["run_op"](c["CODE_ROOT"], "capture-stimulus", {**capture, "executor_identity": identity})
         if error:
             raise ValueError("capture-stimulus: " + error)
         row.update({k: result[k] for k in ("task_sha", "env_sha", "stimulus_sha")})
         captured = True
 
-    def finish(verdict, stop, stdout="", stderr="", check=None, detect_provider=False):
-        # Completion owns the same durable record and outbox envelope as the standard executor.
-        signal.signal(signal.SIGTERM, lambda *_: None)
+    def finish(verdict, stop, stdout="", stderr="", detect_provider=False):
+        if trace.status is not None:
+            from _est import parse_usage
+            native = row.get("native_usage") or {}
+            reported = bool(row.get("native_usage_records") or native.get("usage") or native.get("modelUsage")
+                            or native.get("messages") or "total_cost_usd" in native or "total_cost_usd_ticks" in native
+                            or any("tokens" in step or "cost" in step for step in native.get("steps", [])))
+            trace.report_usage(name + "_native", parse_usage(stdout, "", 0), reported)
         if detect_provider:
             hit = detect_limit(name, name, stdout, stderr, row.get("allowance"))
             if hit:
                 stop = "provider_limit"
                 row.update(allowance=enrich_allowance(row.get("allowance"), hit), reason=hit["message"])
                 try:
-                    record_limit(state_dir(c["LAB"]), name, hit)
+                    record_limit(state_dir(c["CODE_ROOT"]), name, hit)
                 except OSError:
                     pass
         # The Keychain link and staged DB copies serve the CLI only; evidence and harvest never keep them.
-        keychain = ws / ".lab-tmp/muse/Library/Keychains"
+        keychain = ws / ".cs-tmp/muse/Library/Keychains"
         if keychain.is_symlink():
             keychain.unlink()
-        for db_file in (ws / ".lab-tmp").glob("*/data/opencode/opencode.db*"):
+        for db_file in (ws / ".cs-tmp").glob("*/data/opencode/opencode.db*"):
             if db_file.is_file() or db_file.is_symlink():
                 db_file.unlink()
         if not captured:
@@ -365,49 +387,20 @@ def run(c):
         log = "stdout:\n%s\nstderr:\n%s\nstop=%s\n" % (stdout, stderr, stop)
         persist_output(run_dir / "cli.log", log)
         persist_output(run_dir / "transcript.md", log)
-        _run_record.footer(run_dir, stop, verdict, row)
-        result, error = c["run_op"](c["LAB"], "publish-evidence", {
-            "run_dir": str(run_dir), "adapter": "executor", "workspace": str(ws), "verdict": verdict, "stop": stop,
-            "check_skipped": check is None, "check_exit": check.returncode if check else None,
-            "check_output": redact(((check.stdout or "") + (check.stderr or "")) if check else stderr),
-            **({"archive": "changed_files", "lane_git": {"main": lane["main"], "lane": lane["lane"]}} if lane else {})})
-        if error:
-            verdict, stop = "fail", "publish_evidence"
-            row["note"] += "; " + error
-        else:
-            row.update({k: result[k] for k in ("evidence_sha", "capture_state")})
-        if verdict == "pass" and row.get("capture_state") != "complete":
-            verdict, stop = "fail", "evidence_incomplete"
-        if verdict == "pass" and lane:
-            try:
-                row["lane"]["commit"] = _lanes.commit_lane(
-                    ws, "lane %s: %s (%s)" % (lane["lane"], c["task"].name, c["run_id"]),
-                    main=lane["main"], lane=lane["lane"])
-                row["branch"] = lane["branch"]
-            except _lanes.LaneError as error:
-                verdict, stop = "fail", "harvest"
-                row["note"] += "; " + str(error)
-        elif verdict == "pass":
-            result, error = c["run_op"](c["LAB"], "harvest", {"workspace": str(ws),
-                "slug": re.sub(r"[^a-z0-9-]", "", c["task"].name.lower()), "run_id": c["run_id"]})
-            if error:
-                verdict, stop = "fail", "harvest"
-                row["note"] += "; " + error
-            else:
-                row["branch"] = result["branch"]
-        row.update(verdict=verdict, stop=stop, seconds=time.monotonic() - started)
-        c["append_ledger"](row)
-        window = c.get("check_window", 60)
-        _run_record.check_json(run_dir, row.get("stimulus_sha"), window,
-                               check.returncode if check is not None else None,
-                               ((check.stdout or "") + (check.stderr or "")) if check is not None else "",
-                               verdict=verdict)
-        _run_record.terminal(run_dir, ws, row, c["run_id"], c["spec_rel"], str(c["task"]), started_wall, window)
-        finalized = _run_record.finalize(c["LAB"], run_dir,
-            {k: v for k, v in os.environ.items() if not c["CRED_ENV"].search(k)})
-        state = finalized.get("state") or "pending"
-        print(json.dumps({"ok": verdict == "pass", "run_id": c["run_id"], **row, "finalize": state}))
-        raise SystemExit(3 if state != "finalized" else 0 if verdict == "pass" else 1)
+        if not captured:
+            raise ValueError("profiled executor could not freeze its stimulus")
+        row["profiled_timeout"] = c["timeout"]
+        if verdict is not None:
+            row["profiled_diagnostic"] = redact(stderr)
+        from _machine_finish import execution_receipt
+        receipt = execution_receipt(
+            run_dir, ws, row, c["spec_rel"], str(c["task"]), c["task"].name, started_wall,
+            c["check_window"], "profiled", stop, verdict, None, trace, lane, bool(repo_view),
+            c["grant_paths"], c["CODE_ROOT"] / "policy/sandbox.json", sandbox_extra, protected if verdict is None else (),
+            None, (c.get("tmpl") or {}).get("env_drop") or [], memory_cap_mb, c["child_env"],
+            execution_id=c["execution_id"],
+        )
+        c["send_receipt"](receipt)
 
     def finish_resource(result):
         meta = result.forced_meta
@@ -425,7 +418,7 @@ def run(c):
             binary = resolve_binary(profile["binary"], real_home)
             overrides, protected = stage_home(ws, real_home, profile)
             row.update(auth_source="oauth_keychain", auth_metadata_verified=True)
-            env = {k: v for k, v in c["allowlist_env"]([], ws / ".lab-tmp", ws).items()
+            env = {k: v for k, v in c["allowlist_env"]([], ws / ".cs-tmp", ws).items()
                    if not k.startswith(("MUSE_", "TBH_", "META_", "XDG_"))}
             env.update(overrides)
             from _cli_native import stage_git
@@ -454,14 +447,16 @@ def run(c):
             binary, env, protected, identity = prepare({**c, "on_probe": lambda: row.update(native_probe_count=1)})
             row.update(auth_source=identity["auth_source"], auth_metadata_verified=True)
             if c["cost_class"] == "free_local":
-                row.update(est_usd=0.0, est_rate_known=True, note="local backend; zero wallet and estimated cost")
+                row.update(est_usd=0.0, est_basis="local", est_rate_known=True, note="local backend; zero wallet and estimated cost")
         freeze(identity)
         folder = run_dir / "stimulus/executor/ops/bin"
         if any(sha(folder / name) != value for name, value in source_hashes.items()):
             raise ValueError("executor bundle changed during preparation")
         frozen = load_frozen(folder)
-        goal = (run_dir / "stimulus/goal.md").read_text().strip()
+        goal = goal_with_context(run_dir / "stimulus")
         prompt = "Implement the task in the current working directory. Do not leave this directory. Do not commit unless asked.\n\n" + goal
+        if repo_view:
+            prompt = c["research_prompt"](repo_view, goal)
         row["estimated_input_chars"] = len(prompt)
         row["muse_identity" if muse else "cli_identity"] = identity
     except _muse.ForcedStop as error:
@@ -473,7 +468,7 @@ def run(c):
     try:
         call_started = time.monotonic()
         cli = frozen.execute(folder, ws, real_home, binary, env, protected, identity, prompt, c["timeout"],
-                             on_started=lambda: row.update(cli_invoked=True), extra=sandbox_extra, memory_cap_mb=memory_cap_mb, on_evidence=process_evidence)
+                             on_started=lambda: row.update(cli_invoked=True), extra=sandbox_extra, memory_cap_mb=memory_cap_mb, on_evidence=process_evidence, trace=trace)
         row["per_call_latency_ms"] = (time.monotonic() - call_started) * 1000
         row["cli_exit"] = cli.returncode
         row["builtin_skills_status"] = ("disabled_by_sandbox" if
@@ -505,20 +500,4 @@ def run(c):
             "native command completed with its own %s login; paid entitlement not asserted" % c["auth"]))
     except (ValueError, TypeError, KeyError, AttributeError) as error:
         finish("fail", "muse_terminal" if muse else "cli_terminal", cli.stdout, cli.stderr + "\n" + str(error), detect_provider=True)
-    try:
-        check_cmd = check_command(run_dir / "stimulus/check", ws, real_home, protected,
-                                  sandbox_extra, c["child_env"]["TMPDIR"])
-        check = _muse.run_process(check_cmd, ws, c["child_env"], c["timeout"], memory_cap_mb=memory_cap_mb, on_evidence=process_evidence)
-    except (_muse.Cancelled, sys.modules["_muse"].Cancelled) as error:
-        finish("fail", "cancelled", cli.stdout, cli.stderr + "\n" + str(error))
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-        finish("fail", "check_timeout" if isinstance(error, subprocess.TimeoutExpired) else "check_error", cli.stdout, cli.stderr + "\n" + str(error))
-    if getattr(check, "forced_meta", None):
-        finish_resource(check)
-    if check.returncode:
-        finish("fail", "check", cli.stdout, cli.stderr, check)
-    if c["grant_paths"]:
-        bad = [p for p in c["changed_paths"](ws, c["base"], lane) if not c["under_grant"](p, c["grant_paths"])]
-        if bad:
-            finish("fail", "grant_paths", cli.stdout, "out-of-grant paths: " + ", ".join(bad), check)
-    finish("pass", "done", cli.stdout, cli.stderr, check)
+    finish(None, "done", cli.stdout, cli.stderr)

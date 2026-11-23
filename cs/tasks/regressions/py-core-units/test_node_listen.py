@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import unittest
@@ -16,15 +17,46 @@ OPS = HERE.parents[2] / 'ops/bin'
 sys.path[:0] = [str(HERE.parent / '_lib'), str(OPS)]
 from hermetic_env import hermetic_env
 from scratch import scratch_dir
+from _director_client import Client, FALLBACK, OPENER, ProtocolRefused
+import _node_control as control
 
 
 def load_listener(config):
     loader = importlib.machinery.SourceFileLoader('unit_node_listen', str(OPS / 'node-listen'))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(os.environ, {**hermetic_env(), 'LAB_CONFIG_ROOT': str(config)}, clear=True):
+    with patch.dict(os.environ, {**hermetic_env(), 'CS_CONFIG_ROOT': str(config)}, clear=True):
         loader.exec_module(module)
     return module
+
+
+class NodeCancelOwnershipTests(unittest.TestCase):
+    def test_recycled_group_is_not_signalled_after_term(self):
+        identities = {10: 100, 11: 101}
+        rows = {11: (10, 11)}
+        sent = []
+
+        def send(pid, birth, sig):
+            if identities.get(pid) != birth:
+                return False
+            sent.append((pid, sig))
+            if sig == signal.SIGTERM:
+                identities[11] = 102  # group ID and leader PID now belong to an unrelated process
+                rows[11] = (1, 11)
+            return True
+
+        with patch.object(control, "process_rows", side_effect=lambda: dict(rows)), \
+             patch.object(control, "_pid_identity", side_effect=identities.get), \
+             patch.object(control, "_signal_pid", side_effect=send), patch.object(control, "GRACE_S", 0):
+            control.stop_children(10, 100)
+        self.assertEqual(sent, [(11, signal.SIGTERM)])
+
+    def test_escalation_uses_live_member_to_verify_new_fork_after_leader_exits(self):
+        rows = {12: (1, 11), 13: (12, 11)}
+        with patch.object(control, "process_rows", return_value=rows), \
+             patch.object(control, "_pid_identity", side_effect={12: 102, 13: 103}.get):
+            self.assertEqual(control.escalation_members(11, {11: 101, 12: 102}),
+                             {11: 101, 12: 102, 13: 103})
 
 
 class ListenerTests(unittest.TestCase):
@@ -50,6 +82,17 @@ class ListenerTests(unittest.TestCase):
         self.assertTrue(self.listener.speaks2(now=lambda: 700))
         self.assertIsNone(self.listener.downgraded_at)
         self.assertTrue(self.listener.speaks2(now=lambda: 701))
+
+    def test_downgrade_between_duty_check_and_request(self):
+        client = Client({'url': 'http://127.0.0.1:1'}, token='fixture')
+        self.listener.client = client
+        self.assertTrue(self.listener.speaks2())
+        client.protocol = FALLBACK
+        with patch.object(OPENER, 'open') as send:
+            for path in ('status', 'schedules'):
+                with self.subTest(path=path), self.assertRaises(ProtocolRefused):
+                    client.call('POST', path, {})
+            send.assert_not_called()
 
     def test_op_result_and_failures(self):
         run = Mock(return_value=subprocess.CompletedProcess([], 1, 'progress\n{"ok": false}\n', 'failed'))
@@ -230,7 +273,7 @@ class ListenerTests(unittest.TestCase):
         self.assertTrue((self.root / 'node/schedules-reported.json').is_file())
 
     def test_main_config_variations(self):
-        env = {**hermetic_env(), 'LAB_STATE_ROOT': str(self.root)}
+        env = {**hermetic_env(), 'CS_STATE_ROOT': str(self.root)}
         with patch.object(sys, 'stdin', io.StringIO('{}')):
             self.assertEqual(self.m.main(config_root=self.root, env=env), 0)
         policy = self.root / 'policy'

@@ -94,9 +94,9 @@ def env_keys_ignored(t):
 def env_keys_not_inherited_by_children(t):
     """Stripped keys never reach work-order children."""
     import json as _json
-    cfg = t.run.config(deployments=[{"id": "cli-spec", "provider": "cli", "models": ["fake-cli"], "max_concurrent": 1, "max_queued": 0, "max_wait_ms": 0}], lab_executor=True)
+    cfg = t.run.config(deployments=[{"id": "cli-spec", "provider": "cli", "models": ["fake-cli"], "max_concurrent": 1, "max_queued": 0, "max_wait_ms": 0}], cli_executor=True)
     gw = t.gateway("cred-child", cfg, env={"OPENAI_API_KEY": "sk-env-FAKE"})
-    rep = _json.loads(gw.post("/v1/ai/lab-execute", {"work_order": {"executor": "fake-cli", "timeout_s": 5, "fake": {}}}).json["stdout"])
+    rep = _json.loads(gw.post("/v1/agent/cli.run", {"work_order": {"executor": "fake-cli", "timeout_s": 5, "fake": {}}}).json["stdout"])
     eq([n for n in rep["env_names"] if n.endswith("_API_KEY")], [], "child *_API_KEY names")
 
 

@@ -159,8 +159,8 @@ fn thread_of(db: &Connection, id: &str) -> rusqlite::Result<Value> {
     let Some(conversation) = records::one(db, Record::Conversation, id)? else {
         return Ok(Value::Null);
     };
-    let turns = records::select(db, Record::Turn, "t.conversation_id = ?1", &id)?;
-    let summaries = records::select(db, Record::Summary, "s.conversation_id = ?1", &id)?;
+    let turns = records::thread_rows(db, Record::Turn, id)?;
+    let summaries = records::thread_rows(db, Record::Summary, id)?;
     Ok(json!({"conversation": conversation, "turns": turns, "summaries": summaries}))
 }
 
@@ -732,12 +732,12 @@ fn post_wake_turn(state: &State, call: &Call, client: &Client, id: &str) -> Repl
         let now = now_utc();
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
         require_unarchived(&tx, id)?;
+        let seq = make_room_for_wake(&tx, id).map_err(|e| No::internal(&e))?;
         tx.execute(
             "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at, reply, finished_at,
                                 origin, detail)
-             VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?2), '',
-                     'done', ?3, ?4, ?5, ?4, 'wake', ?6)",
-            params![turn, id, client.id, now, reply, detail],
+             VALUES (?1, ?2, ?7, '', 'done', ?3, ?4, ?5, ?4, 'wake', ?6)",
+            params![turn, id, client.id, now, reply, detail, seq],
         )
         .map_err(|e| No::internal(&e))?;
         touch(&tx, Record::Turn, &turn).map_err(|e| No::internal(&e))?;
@@ -750,6 +750,39 @@ fn post_wake_turn(state: &State, call: &Call, client: &Client, id: &str) -> Repl
         Ok(turn) => reply_with(201, turn_answer(&db, &turn), false),
         Err(e) => e.reply(),
     }
+}
+
+// Put the completed reply before pending messages so those turns can use it as context.
+fn make_room_for_wake(db: &Connection, id: &str) -> rusqlite::Result<i64> {
+    let seq = db.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?1
+         AND state NOT IN ('queued', 'summarising')",
+        [id],
+        |r| r.get::<_, i64>(0),
+    )?;
+    let pending = db
+        .prepare(
+            "SELECT turn_id, seq, ROW_NUMBER() OVER (ORDER BY seq) FROM turns
+         WHERE conversation_id = ?1 AND state IN ('queued', 'summarising') ORDER BY seq DESC",
+        )?
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Move highest first to preserve the unique (conversation_id, seq) constraint.
+    for (turn, old_seq, position) in pending {
+        let next = (old_seq + 1).max(seq + position);
+        db.execute(
+            "UPDATE turns SET seq = ?2 WHERE turn_id = ?1",
+            params![turn, next],
+        )?;
+        touch(db, Record::Turn, &turn)?;
+    }
+    Ok(seq)
 }
 
 /// `POST conversations/{id}/turns`: queue a message. It starts at once when nothing runs and the queue is not held.
@@ -776,23 +809,15 @@ fn post_turn(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         return *r;
     }
     let made = (|| -> Result<String, No> {
-        let turn = format!(
-            "trn_{}",
-            util::ulid().map_err(|e| No::internal(&e))?.to_lowercase()
-        );
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
         require_unarchived(&tx, id)?;
         clear_attention_cols(&tx, id).map_err(|e| No::internal(&e))?;
-        tx.execute(
-            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at)
-             VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?2), ?3,
-                     'queued', ?4, ?5)",
-            params![turn, id, message, client.id, now_utc()],
-        )
-        .map_err(|e| No::internal(&e))?;
-        touch(&tx, Record::Turn, &turn).map_err(|e| No::internal(&e))?;
-        touch(&tx, Record::Conversation, id).map_err(|e| No::internal(&e))?;
-        crate::turns::advance(&state.store, &tx, id).map_err(|e| No::internal(&e))?;
+        if client.kind != Kind::Lead {
+            crate::work_trace::on_attention_clear(&tx, id, &client.id)
+                .map_err(|e| No::internal(&e))?;
+        }
+        let turn = crate::turns::enqueue(&state.store, &tx, id, message, &client.id, "person")
+            .map_err(|e| No::internal(&e))?;
         remember(&tx, &key, &sha, Record::Turn, &turn, client).map_err(|e| No::internal(&e))?;
         tx.commit().map_err(|e| No::internal(&e))?;
         Ok(turn)
@@ -854,6 +879,7 @@ fn set_attention(state: &State, call: &Call, client: &Client, id: &str) -> Reply
         )
         .map_err(|e| e.to_string())?;
         touch(&tx, Record::Conversation, id).map_err(|e| e.to_string())?;
+        crate::work_trace::on_attention_set(&tx, id, job_id, &now, &client.id)?;
         tx.commit().map_err(|e| e.to_string())
     })();
     match done {
@@ -883,6 +909,7 @@ fn clear_attention(state: &State, client: &Client, id: &str) -> Reply {
         let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
         clear_attention_cols(&tx, id).map_err(|e| e.to_string())?;
         if had {
+            crate::work_trace::on_attention_clear(&tx, id, &client.id)?;
             touch(&tx, Record::Conversation, id).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
@@ -1121,9 +1148,11 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         sql(
             "DELETE FROM lead_objects WHERE credential_id IN (SELECT id FROM credentials WHERE conversation_id = ?1 AND kind = 'lead')",
         )?;
-        sql(
-            "UPDATE credentials SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), conversation_id = NULL WHERE conversation_id = ?1",
-        )?;
+        tx.execute(
+            "UPDATE credentials SET revoked_by = CASE WHEN revoked_at IS NULL THEN ?2 ELSE revoked_by END,
+             revoked_at = COALESCE(revoked_at, ?3), conversation_id = NULL WHERE conversation_id = ?1",
+            params![id, client.id, now_utc()],
+        ).map_err(|e| No::internal(&e))?;
         let jobs = tx.prepare("SELECT job_id FROM turns WHERE conversation_id = ?1 AND job_id IS NOT NULL UNION SELECT job_id FROM summaries WHERE conversation_id = ?1 UNION SELECT job_id FROM jobs WHERE intent_id IN (SELECT intent_id FROM intents WHERE conversation_id = ?1 OR lead_conversation_id = ?1)").and_then(|mut s| s.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| No::internal(&e))?;
         for job in jobs {
             touch(&tx, Record::Job, &job).map_err(|e| No::internal(&e))?;
@@ -1131,7 +1160,17 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         sql("DELETE FROM conversation_files WHERE conversation_id = ?1")?;
         sql("DELETE FROM turns WHERE conversation_id = ?1")?;
         sql("DELETE FROM summaries WHERE conversation_id = ?1")?;
-        let intents = tx.prepare("SELECT intent_id FROM intents WHERE conversation_id = ?1 OR lead_conversation_id = ?1").and_then(|mut s| s.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| No::internal(&e))?;
+        let intents = tx
+            .prepare(
+                "SELECT intent_id FROM intents WHERE conversation_id = ?1 OR lead_conversation_id = ?1
+                 UNION
+                 SELECT intent_id FROM conversations WHERE conversation_id = ?1 AND intent_id IS NOT NULL",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|e| No::internal(&e))?;
         sql(
             "UPDATE intents SET conversation_id = CASE WHEN conversation_id = ?1 THEN NULL ELSE conversation_id END, lead_conversation_id = CASE WHEN lead_conversation_id = ?1 THEN NULL ELSE lead_conversation_id END WHERE conversation_id = ?1 OR lead_conversation_id = ?1",
         )?;
@@ -1141,6 +1180,7 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         sql("UPDATE job_budgets SET conversation_id = NULL WHERE conversation_id = ?1")?;
         sql("DELETE FROM budgets WHERE scope = 'conversation' AND scope_id = ?1")?;
         touch(&tx, Record::Conversation, id).map_err(|e| No::internal(&e))?;
+        crate::work_trace::on_attention_clear(&tx, id, &client.id).map_err(|e| No::internal(&e))?;
         sql("DELETE FROM conversations WHERE conversation_id = ?1")?;
         remember(&tx, &key, &sha, Record::Conversation, id, client)
             .map_err(|e| No::internal(&e))?;

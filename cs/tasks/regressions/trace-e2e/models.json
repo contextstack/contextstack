@@ -1,0 +1,53 @@
+{
+  "estate": "dev",
+  "models": [
+    {
+      "name": "local-coder",
+      "provider": "vllm",
+      "tier": 1,
+      "capability": "coding",
+      "cost_class": "free_local",
+      "preferred": true
+    },
+    {
+      "name": "fake-paid",
+      "provider": "vllm",
+      "tier": 3,
+      "capability": "general",
+      "cost_per_1k": 0.01,
+      "cost_class": "api"
+    },
+    {
+      "name": "fake-sub",
+      "provider": "vllm",
+      "tier": 3,
+      "capability": "general",
+      "cost_per_1k": 0.02,
+      "cost_class": "subscription"
+    },
+    {
+      "name": "box-model",
+      "provider": "spec-box",
+      "tier": 2,
+      "capability": "general"
+    }
+  ],
+  "deployments": [
+    {
+      "id": "trace-e2e",
+      "provider": "vllm",
+      "endpoint": "http://127.0.0.1:0/v1",
+      "models": [
+        "local-coder",
+        "fake-paid",
+        "fake-sub"
+      ],
+      "max_concurrent": 4,
+      "max_queued": 0,
+      "max_wait_ms": 0,
+      "capacity": {
+        "dev": 4
+      }
+    }
+  ]
+}

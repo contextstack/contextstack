@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,107 @@ while True:
     sys.stdout.flush()
     time.sleep(0.1)
 """
+
+
+class JobOwnershipTest(unittest.TestCase):
+    def test_same_timestamp_replacement_loses_cached_marker(self):
+        import _job_identity as identity
+
+        pid, marker = 123, "reused-pid"
+        self.addCleanup(identity.forget_marker, marker)
+        deadline = time.monotonic() + 2
+
+        def procinfo(_pid, flavor, _arg, buf, size):
+            struct.pack_into("=QQ", buf, 120, 100, 1)
+            if flavor == 18:
+                struct.pack_into("=QQI", buf, 152, unique_id, 0, 1)
+            return size
+
+        unique_id = 200
+        with patch.object(identity.platform, "system", return_value="Darwin"), \
+             patch.object(identity, "_darwin_lib") as lib, \
+             patch.object(identity, "_darwin_pids", return_value=[pid]), \
+             patch.object(identity, "_darwin_environment", return_value=[b"CS_JOB_MARKER=reused-pid"]) as env:
+            lib.return_value.proc_pidinfo.side_effect = procinfo
+            owned = identity._marked_pids(marker, deadline)
+            self.assertIn(pid, owned)
+            unique_id += 1
+            env.return_value = []
+            self.assertEqual(identity._marked_pids(marker, deadline), {})
+            self.assertFalse(identity._signal_pid(pid, owned[pid], signal.SIGKILL))
+
+    def test_reused_responsibility_anchor_excludes_older_process(self):
+        import _job_darwin as darwin
+
+        births = {11: (100, 1, 200), 12: (100, 1, 199), 13: (100, 1, 201)}
+        with patch.object(darwin, "_pid_identity", side_effect=births.get), \
+             patch.object(darwin, "_darwin_pids", return_value=list(births)), \
+             patch.object(darwin, "responsible_pid", return_value=11):
+            self.assertEqual(darwin.owned_pids(11, births[11], time.monotonic() + 2),
+                             {11: births[11], 13: births[13]})
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin audit-token signals")
+    def test_kernel_rejects_replacement_between_identity_check_and_signal(self):
+        import _job_identity as identity
+
+        with subprocess.Popen(["/bin/sleep", "30"], start_new_session=True) as decoy:
+            try:
+                birth, version = identity._darwin_identity(decoy.pid)
+                # Model a checked PID being recycled in the interval between
+                # userspace lookup and the kernel signal syscall.
+                with patch.object(identity, "_darwin_identity", side_effect=[(birth, version ^ 1), (birth, version)]):
+                    self.assertFalse(identity._signal_pid(decoy.pid, birth, signal.SIGKILL))
+                self.assertIsNone(decoy.poll())
+                self.assertTrue(identity._signal_pid(decoy.pid, birth, signal.SIGTERM))
+                self.assertEqual(decoy.wait(timeout=5), -signal.SIGTERM)
+            finally:
+                if decoy.poll() is None:
+                    decoy.kill()
+
+    def test_group_lookup_failure_cannot_authorize_a_bare_pid(self):
+        import _job_memory as jobs
+
+        with patch.object(jobs, "_run", return_value=""), \
+             patch.object(jobs, "_pid_identity", return_value=100), \
+             patch.object(jobs, "_signal_pid") as send:
+            jobs.terminate_process_group(123, 100, grace_s=0)
+            send.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin responsibility")
+    def test_same_uid_sibling_spawned_during_finish_survives(self):
+        import _job_darwin as darwin
+
+        command, env = darwin.prepare(
+            ["/bin/sh", "-c", "echo $$; exec /bin/sleep 30"], dict(os.environ))
+        decoys = []
+        send = darwin._signal_pid
+
+        def signal_with_decoy(pid, birth, sig):
+            if sig == signal.SIGTERM:
+                decoys.append(subprocess.Popen(["/bin/sleep", "30"], start_new_session=True))
+            return send(pid, birth, sig)
+
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE) as supervisor:
+            try:
+                child_pid = int(supervisor.stdout.readline())
+                birth = darwin._pid_identity(supervisor.pid)
+                child_birth = darwin._pid_identity(child_pid)
+                self.assertIsNotNone(child_birth)
+                deadline = time.monotonic() + 5
+                with patch.object(darwin, "_signal_pid", side_effect=signal_with_decoy):
+                    darwin.finish(supervisor.pid, birth, deadline)
+                self.assertNotEqual(darwin._pid_identity(child_pid), child_birth)
+                self.assertEqual(len(decoys), 1)
+                self.assertNotEqual(darwin.responsible_pid(decoys[0].pid), supervisor.pid)
+                self.assertIsNone(decoys[0].poll())
+                self.assertIsNotNone(supervisor.wait(timeout=max(0, deadline - time.monotonic())))
+            finally:
+                if supervisor.poll() is None:
+                    supervisor.terminate()
+                for decoy in decoys:
+                    if decoy.poll() is None:
+                        decoy.kill()
+                    decoy.wait()
 
 
 class JobMemoryTest(unittest.TestCase):

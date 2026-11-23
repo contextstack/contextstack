@@ -455,7 +455,7 @@ def main():
         env = {
             k: v
             for k, v in hermetic_env().items()
-            if k not in ("LAB_STATE_ROOT", "LAB_CONFIG_ROOT", "CSGATEWAY_ENDPOINT")
+            if k not in ("CS_STATE_ROOT", "CS_CONFIG_ROOT", "CSGATEWAY_ENDPOINT")
         }
         env["HOME"] = str(home)
 

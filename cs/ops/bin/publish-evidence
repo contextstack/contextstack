@@ -8,7 +8,7 @@ reference — then publishes a versioned `ready_for_inspection` marker.
 
 An ordinary `git diff` against current HEAD is not enough: the 2026-09-05 audit
 found harvest had already committed the workspace, so the diff read empty while
-`git diff refs/lab/base HEAD` showed five files. Missing output never becomes a
+`git diff refs/cs/base HEAD` showed five files. Missing output never becomes a
 usable empty tree; incomplete capture is recorded as incomplete.
 """
 from _estate_io import digest, hardened_git_env, sha256_bytes
@@ -24,7 +24,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parent.parent.parent
+CODE_ROOT = Path(__file__).resolve().parent.parent.parent
 CONTRACT = "lifecycle-v1"
 MAX_BLOB = 4 << 20
 MAX_ARCHIVE_BLOB = 64 << 20
@@ -33,7 +33,7 @@ MAX_ARCHIVE_SOURCE = 256 << 20
 
 
 # Host git hardened against the workspace's own config; a repo lane pins its git dir through _lanes
-# (imported only then, so plain workspaces and fixture labs don't need it).
+# (imported only then, so plain workspaces and fixture checkouts don't need it).
 _HARDEN = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
 
 
@@ -58,7 +58,7 @@ def gzip_bytes(raw):
 def manifest_diff(ws, base):
     """Candidate change against an explicit non-Git baseline manifest.
 
-    Many lab tasks copy plain files into a workspace with no repository. The
+    Many code_root tasks copy plain files into a workspace with no repository. The
     baseline recorded at capture is the comparison; an absent baseline is
     unsupported evidence, never an empty successful diff.
     """
@@ -72,7 +72,7 @@ def manifest_diff(ws, base):
         if f.is_symlink() or not f.is_file():
             continue
         rel = f.relative_to(ws).as_posix()
-        if rel.startswith(".lab-") or "/.lab-" in rel:
+        if rel.startswith(".cs-") or "/.cs-" in rel:
             continue
         now[rel] = sha256_bytes(f.read_bytes())
     files, lines = [], []
@@ -141,7 +141,7 @@ def candidate_diff(ws, base, lane_git=None):
 
         try:
             indexed("read-tree", ref)
-            indexed("add", "-A", "--", ".", ":(exclude).lab-*", ":(exclude).lab-*/**")
+            indexed("add", "-A", "--", ".", ":(exclude).cs-*", ":(exclude).cs-*/**")
             diff = indexed("diff", "--cached", "--binary", "-M", ref)
             names = indexed("diff", "--cached", "--name-status", "-z", "-M", ref)
             files = []
@@ -249,7 +249,7 @@ def main():
                          sort_keys=True))
         return
 
-    # finalize-run names the workspace under LAB_WORKSPACES_ROOT (_roots.workspace_dir); other callers keep it in the run dir.
+    # finalize-run names the workspace under CS_WORKSPACES_ROOT (_roots.workspace_dir); other callers keep it in the run dir.
     ws = Path(str(args.get("workspace") or run_dir / "workspace"))
     lane_git = args.get("lane_git")
     if not (isinstance(lane_git, dict) and lane_git.get("main") and lane_git.get("lane")):

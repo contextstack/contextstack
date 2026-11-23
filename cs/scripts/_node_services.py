@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+from _atomic_write import write_atomic
+
 HOME = Path(os.environ["HOME"])
 ROOT = HOME / ".contextstack"
 CURRENT, CONFIG = ROOT / "current", ROOT / "config"
@@ -22,8 +24,9 @@ GATEWAY_LABEL, NODE_LABEL = "com.contextstack.csgateway-socket", "com.contextsta
 LISTEN_LABEL = "com.contextstack.node-listen"
 DIRECTOR_RS_LABEL = "com.contextstack.director-rs"
 CLIENT_WEB_LABEL = "com.contextstack.client-web"
+BACKUP_LABEL = "com.contextstack.backup"
 LARAVEL_LABELS = ("com.contextstack.director", "com.contextstack.director-schedule", "com.contextstack.director-queue")
-ALL_LABELS = (GATEWAY_LABEL, NODE_LABEL, LISTEN_LABEL) + LARAVEL_LABELS + (DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL)
+ALL_LABELS = (GATEWAY_LABEL, NODE_LABEL, LISTEN_LABEL) + LARAVEL_LABELS + (DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL, BACKUP_LABEL)
 DIRECTOR_RS_DATA = ROOT / "state/director"
 DIRECTOR_RS_LISTEN = "127.0.0.1:8780"
 CLIENT_WEB, CLIENT_WEB_ENV = "client-web", CONFIG / "client-web/client-web.env"
@@ -41,8 +44,8 @@ def release_bin(current, new):
 
 SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 MODELS = ROOT / "gateway/models.json"
-ROOTS_ENV = {"LANG": "en_US.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "LAB_CONFIG_ROOT": str(CONFIG),
-             "LAB_STATE_ROOT": str(ROOT / "state"), "LAB_WORKSPACES_ROOT": str(ROOT / "workspaces")}
+ROOTS_ENV = {"LANG": "en_US.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "CS_CONFIG_ROOT": str(CONFIG),
+             "CS_STATE_ROOT": str(ROOT / "state"), "CS_WORKSPACES_ROOT": str(ROOT / "workspaces")}
 CREDENTIALS = {"off": "off", "file": str(ROOT / "credentials"), "keychain": "keychain"}
 # Unquoted words (systemd.syntax(7)). `%` is a specifier (systemd.unit(5)), so it is never left bare.
 _SAFE = re.compile(r"^[A-Za-z0-9_./:@+=-]+$")
@@ -226,12 +229,14 @@ def render_unit(svc):
     # Quoting keeps the prefix inside the first word: systemd strips it after unquoting.
     args = [":" + str(svc.args[0]), *svc.args[1:]]
     lines.append("ExecStart=" + " ".join(systemd_quote(a, "ExecStart") for a in args))
-    lines.append("Restart=on-failure")
+    lines.append("Type=oneshot" if svc.label == BACKUP_LABEL else "Restart=on-failure")
     lines.append("StandardOutput=append:%s" % systemd_scalar(
         ROOT / "logs" / (svc.logs + ".out.log"), "StandardOutput"))
     lines.append("StandardError=append:%s" % systemd_scalar(
         ROOT / "logs" / (svc.logs + ".err.log"), "StandardError"))
-    lines.extend(("", "[Install]", "WantedBy=default.target", ""))
+    if svc.label != BACKUP_LABEL:
+        lines.extend(("", "[Install]", "WantedBy=default.target"))
+    lines.append("")
     return "\n".join(lines).encode()
 
 
@@ -317,10 +322,11 @@ def need_systemctl():
 
 def load_agent(label, path, changed, restart):
     if host_platform() == "linux":
-        r = systemctl("enable", "--now", unit_name(label))
+        unit = label + ".timer" if label == BACKUP_LABEL else unit_name(label)
+        r = systemctl("enable", "--now", unit)
         if r.returncode != 0:
             raise Refused("systemctl --user enable --now %s failed: %s (the files are written; rerun to load)"
-                          % (unit_name(label), (r.stderr or r.stdout).strip()))
+                          % (unit, (r.stderr or r.stdout).strip()))
         if restart:
             systemctl("restart", unit_name(label))
             return "restarted"
@@ -343,9 +349,14 @@ def load_agent(label, path, changed, restart):
     return "loaded"
 
 
-def unload_agent(label):
+def unload_agent(label, *, require_stopped=False):
     if host_platform() == "linux":
-        systemctl("disable", "--now", unit_name(label))
+        unit = label + ".timer" if label == BACKUP_LABEL else unit_name(label)
+        stopped = systemctl("disable", "--now", unit)
+        if require_stopped and stopped.returncode != 0:
+            raise Refused(f"could not stop {label}: {(stopped.stderr or stopped.stdout).strip()}")
+        if label == BACKUP_LABEL:
+            systemctl("stop", unit_name(label))
         return
     target = "gui/%d/%s" % (os.getuid(), label)
     launchctl("bootout", target)
@@ -353,6 +364,8 @@ def unload_agent(label):
         if launchctl("print", target).returncode != 0:
             return
         time.sleep(0.5)
+    if require_stopped:
+        raise Refused(f"could not stop {label}")
 
 
 def reload_units():
@@ -360,3 +373,39 @@ def reload_units():
     r = systemctl("daemon-reload")
     if r.returncode != 0:
         raise Refused("systemctl --user daemon-reload failed: %s" % (r.stderr or r.stdout).strip())
+
+
+def backup_timer_path():
+    return agents_dir() / (BACKUP_LABEL + ".timer")
+
+
+def backup_timer():
+    return ("[Unit]\nDescription=Nightly ContextStack backup\n"
+            "[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\n"
+            "[Install]\nWantedBy=timers.target\n").encode()
+
+
+def install_backup_schedule(no_load):
+    plan_agents([BACKUP_LABEL], [])
+    linux = host_platform() == "linux"
+    timer = backup_timer_path() if linux else None
+    if timer and timer.exists() and timer.read_bytes() != backup_timer():
+        raise Refused("refusing to replace an existing backup timer")
+    if linux and not no_load:
+        need_systemctl()
+    kit = CURRENT / "cs"
+    svc = Service(BACKUP_LABEL, [str(kit / ".venv/bin/python3"), "-I", str(kit / "scripts/cs"), "backup", "run"],
+                  {"PATH": SYSTEM_PATH, **ROOTS_ENV}, str(ROOT), "backup",
+                  StartCalendarInterval={"Hour": 3, "Minute": 0})
+    path = agent_path(BACKUP_LABEL)
+    (ROOT / "logs").mkdir(parents=True, exist_ok=True)
+    content = render_agent(svc)
+    changed = not path.is_file() or path.read_bytes() != content
+    if changed:
+        write_atomic(path, content, mode=0o644)
+    if timer and not timer.exists():
+        write_atomic(timer, backup_timer(), mode=0o644)
+    if not no_load:
+        if linux:
+            reload_units()
+        load_agent(BACKUP_LABEL, path, changed, False)

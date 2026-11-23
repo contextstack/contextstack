@@ -55,7 +55,7 @@ pub async fn post(
             .body(body)
             .send()
             .await
-            .map_err(|e| transport("Post", &url, &e))?;
+            .map_err(|e| transport("Post", &url, &e, false))?;
         let status = resp.status().as_u16();
         let content_type = resp
             .headers()
@@ -63,15 +63,7 @@ pub async fn post(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| super::transport_after_response("Post", &url, &e))?;
-        if body.len() > MAX_ANSWER {
-            return Err(CallError::transport_local(format!(
-                "Post {url:?}: answer over {MAX_ANSWER} bytes"
-            )));
-        }
+        let body = super::bounded_body(resp, "Post", &url, MAX_ANSWER).await?;
         let (input_tokens, output_tokens) = if (200..300).contains(&status) {
             usage(&body)
         } else {
@@ -99,5 +91,43 @@ mod tests {
         assert_eq!(usage(ok), (Some(120), Some(3)));
         assert_eq!(usage(br#"{"usage":{"input_tokens":-1}}"#), (None, None));
         assert_eq!(usage(b"not json"), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod response_limit_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn rejects_oversized_body_without_waiting_for_its_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await?;
+            socket
+                .write_all(b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 16000000\r\n\r\n")
+                .await?;
+            socket.write_all(&vec![b'x'; MAX_ANSWER + 1]).await?;
+            let _ = socket.read(&mut request).await?;
+            Ok::<_, std::io::Error>(())
+        });
+        let http = Http::new()?;
+        let result = post(
+            &http,
+            &base,
+            "fake",
+            Bytes::new(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        server.abort();
+        assert!(matches!(result, Err(e) if e.to_string().contains("exceeds")));
+        Ok(())
     }
 }

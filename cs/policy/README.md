@@ -5,14 +5,14 @@ Rules tier (`scripts/estate_classify.py`): a change lands only in a green-check 
 
 `env.json` — what a child of the runner (tool, hook, op) inherits from its environment.
 - `always`: inherited by every child. Equals the list the runner compiled in before
-  2026-11-08, which it keeps as its only fallback (`defaultChildEnv`, internal/lab/run.go);
+  2026-11-08, which it keeps as its only fallback (`defaultChildEnv`, internal/cs/run.go);
   `tasks/regressions/env-policy` keeps file, Go literal and `_env_policy.DEFAULT` equal.
 - `on_request`: names a spec may ask for with `env: [NAME]`. The launcher (`ops/bin/tick`,
   `ops/bin/run-spec`, via `ops/bin/_env_policy.py` `resolve`) resolves `always` ∪ (`env` ∩ `on_request`)
-  into `LAB_CHILD_ENV` for the runner; any other request is refused by name before a cell
-  runs. A direct `lab run` has no launcher: the default list, no request honoured. An empty
+  into `CS_CHILD_ENV` for the runner; any other request is refused by name before a cell
+  runs. A direct `cs-harness run` has no launcher: the default list, no request honoured. An empty
   resolution (`always: []`, nothing requested) is an empty child environment, not the default.
-- To admit a name: a rules commit adding it here. tick owns which `LAB_*` values are set; this
+- To admit a name: a rules commit adding it here. tick owns which `CS_*` values are set; this
   file owns which reach children. `finalize-run` gives its own children `always` only.
 
 `sandbox.json` — what `cs-sandbox` lets every tool reach (CS phase 3a).
@@ -30,7 +30,7 @@ Rules tier (`scripts/estate_classify.py`): a change lands only in a green-check 
   (`none` | `gateway` | `all`); anything else narrows to `none`. The wrapper intersects this
   with the descriptor request and gives each call a private TMPDIR outside the workspace.
 - `write_env` {VAR: [roots]}: write targets named by variables are confined to the host's state
-  root, `~/.contextstack` (launcher default `LAB_BROWSER_STATE` = `~/.contextstack/lab/browser-state`).
+  root, `~/.contextstack` (launcher default `CS_BROWSER_STATE` = `~/.contextstack/state/browser-state`).
 - `profiles` {browser: {read}}: listing `browser` lets a descriptor's `"profile": "browser"` run headless
   Chromium (gstack, Playwright cache); the wrapper then turns Chromium's own sandbox off and is the
   browser's only sandbox (`sandbox/README.md`). Unlisted: narrowed, the tool fails.

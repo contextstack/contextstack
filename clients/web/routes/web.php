@@ -33,6 +33,12 @@ Route::middleware(RequireDirectorConnection::class)->group(function (): void {
     Route::livewire('conversations/{conversation}', 'pages::client.conversation')->name('conversations.show');
     Route::livewire('projects', 'pages::client.projects')->name('projects.index');
     Route::livewire('projects/{project}', 'pages::client.project')->name('projects.show');
+    Route::livewire('projects/{project}/decisions', 'pages::client.decision-log')->name('decisions.index');
+    Route::livewire('projects/{project}/decisions/{entry}', 'pages::client.decision')->name('decisions.show');
+    Route::livewire('projects/{project}/backlog', 'pages::client.backlog')->name('backlog.index');
+    Route::livewire('projects/{project}/backlog/{item}', 'pages::client.backlog-item')->name('backlog.show');
+    Route::livewire('approvals', 'pages::client.approvals')->name('approvals');
+    Route::livewire('devices', 'pages::client.devices')->name('devices');
     Route::livewire('usage', 'pages::client.usage')->name('usage');
     Route::livewire('sources', 'pages::client.sources')->name('sources');
     Route::get('stream', EventStreamController::class)->name('stream');

@@ -115,7 +115,7 @@ pub fn scoped_prior(
                 return Err(No(
                     403,
                     "owner_only",
-                    "only the local credential may do this".into(),
+                    "only an owner credential may do this".into(),
                     Value::Null,
                 ));
             }
@@ -328,7 +328,7 @@ fn prepare_lane(
             Err(r) => return Err(Box::new(r.reply())),
         }
     }
-    if let Err(e) = crate::lane::expand(state, m) {
+    if let Err(e) = crate::lane::expand(state, client, m) {
         return Err(Box::new(e.reply()));
     }
     Ok(builtin_sha)
@@ -345,10 +345,94 @@ fn dispatch_body(call: &Call) -> Result<(String, Map<String, Value>), No> {
     Ok((key, m))
 }
 
+struct IntentInsert<'a> {
+    intent_id: &'a str,
+    plan: &'a Plan,
+    want: &'a Value,
+    client: &'a Client,
+    project: Option<&'a str>,
+    conversation: &'a Option<String>,
+    lead_conversation: &'a Option<String>,
+    origin: &'a crate::work_trace::Origin,
+    key: &'a str,
+    sha: &'a str,
+}
+
+fn insert_intent_record(
+    db: &mut Connection,
+    store: &crate::store::Store,
+    row: &IntentInsert<'_>,
+) -> Result<(), String> {
+    let IntentInsert {
+        intent_id,
+        plan,
+        want,
+        client,
+        project,
+        conversation,
+        lead_conversation,
+        origin,
+        key,
+        sha,
+    } = *row;
+    let tx = crate::store::write_tx(db).map_err(|e| e.to_string())?;
+    let s = |f: &str| want[f].as_str().unwrap_or_default();
+    tx.execute(
+        "INSERT INTO intents (intent_id, title, node, spec, task, trials, grant_id, meta, bundle_sha256,
+                              created_by, created_at, project_id, conversation_id, lead_conversation_id,
+                              origin_kind, origin_conversation_id, origin_turn_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![intent_id, want["title"].as_str(), s("node"), s("spec"), s("task"),
+                want["trials"].as_i64(), want["grant"].as_str(), json!(plan.meta()).to_string(),
+                plan.digest, client.id, now_utc(), project, conversation, lead_conversation,
+                origin.kind, origin.conversation_id, origin.turn_id],
+    )
+    .map_err(|e| e.to_string())?;
+    plan.insert(store, &tx, Some(intent_id))?;
+    touch(&tx, Record::Intent, intent_id).map_err(|e| e.to_string())?;
+    remember(&tx, key, sha, Record::Intent, intent_id, client).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn intent_origin_fields(
+    db: &Connection,
+    origin: crate::work_trace::Origin,
+    client: &Client,
+    from_job: Option<&str>,
+) -> Result<crate::work_trace::Origin, No> {
+    crate::work_trace::resolve_origin(db, origin, client, from_job)
+}
+
+fn submit_conversation(
+    db: &Connection,
+    client: &Client,
+    from_job: Option<&str>,
+) -> Result<Option<String>, String> {
+    if client.kind == crate::access::Kind::Lead {
+        return Ok(client.conversation_id.clone());
+    }
+    let Some(job) = from_job else {
+        return Ok(None);
+    };
+    db.query_row(
+        "SELECT COALESCE((SELECT conversation_id FROM turns WHERE job_id = ?1),
+                         (SELECT i.conversation_id FROM jobs j JOIN intents i
+                          ON i.intent_id = j.intent_id WHERE j.job_id = ?1))",
+        params![job],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// `POST intents`: record the intent and the one job it names, offered to its node.
 pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
     let (key, mut m) = match dispatch_body(call) {
         Ok(pair) => pair,
+        Err(no) => return no.reply(),
+    };
+    let origin = match crate::work_trace::parse_origin(&m) {
+        Ok(o) => o,
         Err(no) => return no.reply(),
     };
     let builtin_sha = match prepare_lane(state, client, &key, &mut m) {
@@ -401,26 +485,19 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
     let lead_conversation = (client.kind == crate::access::Kind::Lead)
         .then(|| client.conversation_id.clone())
         .flatten();
-    let conversation = if client.kind == crate::access::Kind::Lead {
-        client.conversation_id.clone()
-    } else if let Some(job) = want["source"]["from_job"].as_str() {
-        match db.query_row(
-            "SELECT COALESCE((SELECT conversation_id FROM turns WHERE job_id = ?1),
-                             (SELECT i.conversation_id FROM jobs j JOIN intents i
-                              ON i.intent_id = j.intent_id WHERE j.job_id = ?1))",
-            params![job],
-            |r| r.get::<_, Option<String>>(0),
-        ) {
-            Ok(c) => c,
-            Err(e) => return internal(&e),
-        }
-    } else {
-        None
+    let conversation = match submit_conversation(&db, client, want["source"]["from_job"].as_str()) {
+        Ok(c) => c,
+        Err(e) => return internal(&e),
     };
     let intent_id = match util::ulid() {
         Ok(id) => id,
         Err(e) => return internal(&e),
     };
+    let origin =
+        match intent_origin_fields(&db, origin, client, want["source"]["from_job"].as_str()) {
+            Ok(o) => o,
+            Err(no) => return no.reply(),
+        };
     match plan.stamp(&state.store, &intent_id, stamped_before.as_deref()) {
         Ok(()) => {}
         Err(crate::stamp::Refused::Mismatch(m)) => {
@@ -428,37 +505,32 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
         }
         Err(crate::stamp::Refused::Invalid(m)) => return invalid(&m),
     }
-    let made = (|| -> Result<String, String> {
-        let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO intents (intent_id, title, node, spec, task, trials, grant_id, meta, bundle_sha256,
-                                  created_by, created_at, project_id, conversation_id, lead_conversation_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![intent_id, want["title"].as_str(), s("node"), s("spec"), s("task"),
-                    want["trials"].as_i64(), want["grant"].as_str(), json!(plan.meta()).to_string(),
-                    plan.digest, client.id, now_utc(), project, conversation, lead_conversation],
-        )
-        .map_err(|e| e.to_string())?;
-        plan.insert(&state.store, &tx, Some(&intent_id))?;
-        touch(&tx, Record::Intent, &intent_id).map_err(|e| e.to_string())?;
-        remember(&tx, &key, &sha, Record::Intent, &intent_id, client).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(intent_id)
-    })();
-    match made {
-        Ok(id) => render(&db, 201, Record::Intent, &id, false),
+    if let Err(e) = plan.refuse_if_node_lacks_capability(&state.store, &db, &s("node")) {
+        return invalid(&e);
+    }
+    match insert_intent_record(
+        &mut db,
+        &state.store,
+        &IntentInsert {
+            intent_id: &intent_id,
+            plan: &plan,
+            want: &want,
+            client,
+            project,
+            conversation: &conversation,
+            lead_conversation: &lead_conversation,
+            origin: &origin,
+            key: &key,
+            sha: &sha,
+        },
+    ) {
+        Ok(()) => render(&db, 201, Record::Intent, &intent_id, false),
         Err(e) => internal(&e),
     }
 }
 
 /// `POST intents/{id}/jobs`: one further attempt, retaining the task's identity and node.
 pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> Reply {
-    if !matches!(
-        client.kind,
-        crate::access::Kind::Local | crate::access::Kind::Lead
-    ) {
-        return crate::lead::denied();
-    }
     let (key, m) = match (key(call), body(call)) {
         (Ok(k), Ok(m)) => (k, m),
         (Err(r), _) | (_, Err(r)) => return r.reply(),
@@ -516,7 +588,7 @@ pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> 
     ) {
         Ok(p) => p.under(crate::reservations::JobScope {
             project: intent["project_id"].as_str().map(String::from),
-            conversation: intent["conversation_id"].as_str().map(String::from),
+            conversation: None,
         }),
         Err(e) => return invalid(&e),
     };
@@ -527,6 +599,16 @@ pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> 
     }
     if let Err(e) = plan.stamp(&state.store, intent_id, stamped.as_deref()) {
         return invalid(&format!("{e:?}"));
+    }
+    if let Err(e) = crate::work_trace::stamp_job_reason(&mut plan, &db, intent_id, client) {
+        return internal(&e);
+    }
+    if let Err(e) = plan.refuse_if_node_lacks_capability(
+        &state.store,
+        &db,
+        intent["node"].as_str().unwrap_or_default(),
+    ) {
+        return invalid(&e);
     }
     let made = (|| -> Result<String, String> {
         let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;

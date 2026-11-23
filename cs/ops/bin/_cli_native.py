@@ -39,7 +39,7 @@ CLAUDE_LOGIN_PATH = ".claude/.credentials.json"
 HOSTED_PATHS = (
     ".contextstack/director-db-backup",
     ".contextstack/browser",
-    ".contextstack/lab/browser-state",
+    ".contextstack/state/browser-state",
     ".contextstack/config/lead-credential",
     ".contextstack/config/hosted-lead.json",
     ".contextstack/state/lead-sessions",
@@ -243,12 +243,16 @@ def verify_login_files(tmpl, real_home, snapshot=None):
         raise ValueError("; ".join(errors))
 
 
-def _credential_read(path):
-    """Read one owned regular inode without following any untrusted path component."""
+def _credential_read(path, *, trusted_directory=None):
+    """Read one owned regular inode without following links below a trusted directory."""
     path = Path(path)
-    directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("invalid credential path")
+    anchor = Path(trusted_directory or path.anchor)
+    parts = path.relative_to(anchor).parts
+    directory = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        for part in path.parts[1:-1]:
+        for part in parts[:-1]:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
             os.close(directory)
             directory = child
@@ -579,6 +583,8 @@ def stage_git(tmp, home=None, *, run=None, env=None, home_dir=None):
     host.setdefault('PATH', '/usr/bin:/bin')
     host['HOME'] = str(home)
     host['GIT_CONFIG_NOSYSTEM'] = '1'
+    # A global setting lookup needs no repository discovery above the staging directory.
+    host['GIT_CEILING_DIRECTORIES'] = str(tmp.parent)
 
     def read(key, path=False):
         args = ['git', 'config', '--global'] + (['--path'] if path else []) + ['--get', key]

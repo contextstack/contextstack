@@ -16,7 +16,7 @@ os.environ.update(_clean_env)
 
 REAL_LAB = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REAL_LAB / "ops/bin"))
-loader = importlib.machinery.SourceFileLoader("lab_tick_multitask", str(REAL_LAB / "ops/bin/tick"))
+loader = importlib.machinery.SourceFileLoader("code_tick_multitask", str(REAL_LAB / "ops/bin/tick"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 tick = importlib.util.module_from_spec(spec)
 loader.exec_module(tick)
@@ -32,7 +32,7 @@ with scratch_dir(prefix="tick-multitask-") as raw:
     for name in ("rank1", "rank2"):
         (root / "ledger/runs" / name / "workspace/.git").mkdir(parents=True)
     calls = []
-    tick.LAB = root
+    tick.CODE_ROOT = root
     tick.TEMPLATES = {"fake-cli": {}}
     tick.one_executor_trial = lambda rel, text, task, trial, job, effects=None: (calls.append(task) or 0)
     tick.ledger_size = lambda: 0

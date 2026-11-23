@@ -5,6 +5,7 @@
 use crate::store::Record;
 use rusqlite::{Connection, Row, ToSql, params};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// A node not heard from for this long is shown as stale (`serve --stale-after`).
@@ -21,11 +22,11 @@ pub fn stale_after() -> i64 {
 }
 
 /// A record kind: its select, the column it is found by, and how a row becomes JSON.
-struct View {
-    select: &'static str,
-    key: &'static str,
-    order: &'static str,
-    shape: fn(&Connection, &Row) -> rusqlite::Result<Value>,
+pub(crate) struct View {
+    pub(crate) select: &'static str,
+    pub(crate) key: &'static str,
+    pub(crate) order: &'static str,
+    pub(crate) shape: fn(&Connection, &Row) -> rusqlite::Result<Value>,
 }
 
 fn parse(s: Option<String>) -> Option<Value> {
@@ -391,6 +392,17 @@ const CONVERSATIONS: View = View {
         };
         let model: String = r.get(5)?;
         let budget = crate::thread::budget(&model, r.get(11)?, r.get(12)?);
+        let attention = conversation_attention(r)?;
+        let attention = if attention.is_null() {
+            crate::action_approvals::attention(db, &id)?
+        } else {
+            attention
+        };
+        let attention = if attention.is_null() && r.get::<_, bool>(19)? {
+            crate::backlog::attention(db, &id)?
+        } else {
+            attention
+        };
         Ok(json!({"conversation_id": id, "title": r.get::<_, Option<String>>(1)?, "node": r.get::<_, String>(2)?,
                   "spec": r.get::<_, String>(3)?, "spec_version": r.get::<_, String>(4)?, "model": model,
                   "intent_id": r.get::<_, Option<String>>(6)?, "held": held, "state": state,
@@ -400,7 +412,7 @@ const CONVERSATIONS: View = View {
                                  "threshold_tokens": budget.threshold, "keep_tokens": budget.keep},
                   "created_by": r.get::<_, String>(8)?, "created_at": r.get::<_, String>(9)?,
                   "project_id": r.get::<_, Option<String>>(13)?,
-                  "attention": conversation_attention(r)?,
+                  "attention": attention,
                   "budget": crate::scopes::scope_view(db, "conversation", &id)?,
                   "lead": r.get::<_, i64>(19)? != 0,
                   "archived_at": r.get::<_, Option<String>>(20)?,
@@ -488,6 +500,9 @@ fn view(kind: Record) -> &'static View {
         Record::Turn => &TURNS,
         Record::Summary => &SUMMARIES,
         Record::Project => &PROJECTS,
+        Record::BacklogItem => &crate::backlog::VIEW,
+        Record::DecisionLog => &crate::decision_log::VIEW,
+        Record::ActionApproval => &crate::action_approvals::VIEW,
     }
 }
 
@@ -502,6 +517,43 @@ pub fn select(
     let sql = format!("{} WHERE {filter} ORDER BY {} LIMIT 500", v.select, v.order);
     let mut stmt = db.prepare(&sql)?;
     stmt.query_map([arg], |r| (v.shape)(db, r))?.collect()
+}
+
+/// The complete conversation thread, including turns covered by summaries.
+pub fn thread_rows(db: &Connection, kind: Record, id: &str) -> rusqlite::Result<Vec<Value>> {
+    let (v, alias) = match kind {
+        Record::Turn => (&TURNS, "t"),
+        Record::Summary => (&SUMMARIES, "s"),
+        _ => unreachable!("threads contain turns and summaries"),
+    };
+    let sql = format!(
+        "{} WHERE {alias}.conversation_id = ?1 ORDER BY {}",
+        v.select, v.order
+    );
+    db.prepare(&sql)?
+        .query_map([id], |r| (v.shape)(db, r))?
+        .collect()
+}
+
+/// Jobs and runs visible to this client, with the scope applied before the cap.
+pub fn list_work(
+    db: &Connection,
+    kind: Record,
+    node: Option<&str>,
+    client: &crate::access::Client,
+) -> rusqlite::Result<Vec<Value>> {
+    let v = view(kind);
+    let mut sql = format!("{} WHERE (?1 IS NULL OR n.name = ?1)", v.select);
+    let mut bind = vec![node.map(String::from).into()];
+    match kind {
+        Record::Job => crate::lead::push_job_scope(client, "j.job_id", &mut sql, &mut bind),
+        Record::Run => crate::lead::push_run_scope(client, &mut sql, &mut bind),
+        _ => unreachable!("work list requires jobs or runs"),
+    }
+    let _ = write!(sql, " ORDER BY {} LIMIT {MAX_INTENTS}", v.order);
+    db.prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(bind), |r| (v.shape)(db, r))?
+        .collect()
 }
 
 /// One record by its id.
@@ -525,6 +577,7 @@ pub fn list_intents(
     lanes: bool,
     project: Option<&str>,
     limit: u32,
+    client: Option<&crate::access::Client>,
 ) -> rusqlite::Result<Vec<Value>> {
     const FILTER: &str =
         "(?1 IS NULL OR i.node = ?1) AND (?2 IS NULL OR i.lead_conversation_id = ?2)
@@ -533,13 +586,21 @@ pub fn list_intents(
                OR json_extract(i.meta, '$.lane') IS NOT NULL
              ELSE 0 END) AND (?4 IS NULL OR i.project_id = ?4)";
     let v = view(Record::Intent);
-    let sql = format!("{} WHERE {FILTER} ORDER BY {} LIMIT ?5", v.select, v.order);
-    let mut stmt = db.prepare(&sql)?;
-    let limit = limit.clamp(1, MAX_INTENTS);
-    stmt.query_map(params![node, conversation, lanes, project, limit], |r| {
-        (v.shape)(db, r)
-    })?
-    .collect()
+    let mut sql = format!("{} WHERE {FILTER}", v.select);
+    let mut bind = vec![
+        node.map(String::from).into(),
+        conversation.map(String::from).into(),
+        lanes.into(),
+        project.map(String::from).into(),
+    ];
+    if let Some(client) = client {
+        crate::lead::push_intent_scope(client, &mut sql, &mut bind);
+    }
+    let _ = write!(sql, " ORDER BY {} LIMIT ?", v.order);
+    bind.push(limit.clamp(1, MAX_INTENTS).into());
+    db.prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(bind), |r| (v.shape)(db, r))?
+        .collect()
 }
 
 /// Conversations, optionally filtered by node, intent, hosted-lead marker, and/or project, newest first by
@@ -601,9 +662,13 @@ pub fn list(db: &Connection, kind: Record, node: Option<&str>) -> rusqlite::Resu
         Record::Conversation => "(?1 IS NULL OR c.node = ?1)",
         Record::Turn => "(?1 IS NULL OR t.conversation_id = ?1)",
         Record::Summary => "(?1 IS NULL OR s.conversation_id = ?1)",
-        Record::Decision | Record::Land | Record::Cancel | Record::Project => {
-            "(?1 IS NULL OR ?1 IS NOT NULL)"
-        }
+        Record::Decision
+        | Record::Land
+        | Record::Cancel
+        | Record::Project
+        | Record::ActionApproval
+        | Record::BacklogItem
+        | Record::DecisionLog => "(?1 IS NULL OR ?1 IS NOT NULL)",
     };
     select(db, kind, filter, &node)
 }
@@ -676,15 +741,21 @@ mod tests {
         for i in 1..=5 {
             seed_intent(&db, &format!("i{i}"), None)?;
         }
-        let two = list_intents(&db, None, None, false, None, 2)?;
+        let two = list_intents(&db, None, None, false, None, 2, None)?;
         assert_eq!(ids(&two, "intent_id"), ["i5", "i4"]);
-        let all = list_intents(&db, None, None, false, None, MAX_INTENTS)?;
+        let all = list_intents(&db, None, None, false, None, MAX_INTENTS, None)?;
         assert_eq!(ids(&all, "intent_id"), ["i5", "i4", "i3", "i2", "i1"]);
         // Out-of-range limits are clamped rather than failing.
-        assert_eq!(list_intents(&db, None, None, false, None, 0)?.len(), 1);
-        assert_eq!(list_intents(&db, None, None, false, None, 10_000)?.len(), 5);
         assert_eq!(
-            list_intents(&db, Some("elsewhere"), None, false, None, MAX_INTENTS)?.len(),
+            list_intents(&db, None, None, false, None, 0, None)?.len(),
+            1
+        );
+        assert_eq!(
+            list_intents(&db, None, None, false, None, 10_000, None)?.len(),
+            5
+        );
+        assert_eq!(
+            list_intents(&db, Some("elsewhere"), None, false, None, MAX_INTENTS, None)?.len(),
             0
         );
         Ok(())
@@ -703,16 +774,16 @@ mod tests {
         seed_intent_meta(&db, "other", None, r#"{"source":"cs-cli"}"#)?;
         seed_intent_meta(&db, "plain", None, "{}")?;
         seed_intent_meta(&db, "not_object", None, "[1]")?;
-        let lanes = list_intents(&db, None, None, true, None, MAX_INTENTS)?;
+        let lanes = list_intents(&db, None, None, true, None, MAX_INTENTS, None)?;
         assert_eq!(
             ids(&lanes, "intent_id"),
             ["lane_false", "laned", "mcp", "web"]
         );
         // The limit applies after the lane filter.
-        let one = list_intents(&db, None, None, true, None, 1)?;
+        let one = list_intents(&db, None, None, true, None, 1, None)?;
         assert_eq!(ids(&one, "intent_id"), ["lane_false"]);
         assert_eq!(
-            list_intents(&db, None, None, false, None, MAX_INTENTS)?.len(),
+            list_intents(&db, None, None, false, None, MAX_INTENTS, None)?.len(),
             8
         );
         Ok(())
@@ -730,7 +801,7 @@ mod tests {
         seed_job(&db, "jb1", "b")?;
         seed_job(&db, "ja2", "a")?;
         seed_job(&db, "jc1", "c")?;
-        let listed = list_intents(&db, None, None, false, None, 2)?;
+        let listed = list_intents(&db, None, None, false, None, 2, None)?;
         let listed_ids: Vec<&str> = listed
             .iter()
             .filter_map(|i| i["intent_id"].as_str())
@@ -763,7 +834,7 @@ mod tests {
             panic!("owner_lane intent missing");
         };
         assert!(owner["lead_conversation_id"].is_null());
-        let filtered = list_intents(&db, None, Some("conv_a"), false, None, MAX_INTENTS)?;
+        let filtered = list_intents(&db, None, Some("conv_a"), false, None, MAX_INTENTS, None)?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["intent_id"].as_str(), Some("lead_lane"));
         Ok(())
@@ -807,7 +878,7 @@ mod tests {
         seed_intent_project(&db, "i_a", "p1")?;
         seed_intent_project(&db, "i_b", "p2")?;
         seed_intent_project(&db, "i_c", "p1")?;
-        let p1 = list_intents(&db, None, None, false, Some("p1"), MAX_INTENTS)?;
+        let p1 = list_intents(&db, None, None, false, Some("p1"), MAX_INTENTS, None)?;
         assert_eq!(ids(&p1, "intent_id"), ["i_c", "i_a"]);
         seed_conversation(&db, "c1", "2020-01-01T00:00:00Z", false, Some("p1"))?;
         seed_conversation(&db, "c2", "2021-01-01T00:00:00Z", true, None)?;

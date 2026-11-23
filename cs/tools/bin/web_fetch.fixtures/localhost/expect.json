@@ -2,7 +2,7 @@
   "exit": 1,
   "stdout": "web_fetch: URL host is not public\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"url\": \"https://localhost/\"}, \"name\": \"web_fetch\"}\n",
+    ".cs-calls.jsonl": "{\"args\": {\"url\": \"https://localhost/\"}, \"name\": \"web_fetch\"}\n",
     "_evidence/manifest.jsonl": null
   },
   "untouched": true

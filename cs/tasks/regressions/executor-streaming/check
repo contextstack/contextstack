@@ -4,6 +4,7 @@ replays canned output and blocks on a gate file, so lines are seen while the age
 import atexit
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -16,17 +17,18 @@ import hashlib
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command, finish_command, reserve
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[2] / "scripts"))
 from check_timeout import timeout
 subprocess.run([sys.executable, str(HERE / "verify_processes.py")], check=True)
-LAB_SRC = HERE.parents[2]
-OPS = LAB_SRC / "ops/bin"
-USAGE = LAB_SRC / "tasks/regressions/agent-usage/fixtures"
+CS_SRC = HERE.parents[2]
+OPS = CS_SRC / "ops/bin"
+USAGE = CS_SRC / "tasks/regressions/agent-usage/fixtures"
 TOKENS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "reasoning_tokens")
-COPY = ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py", "_yaml.py",
-        "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_provider_limits.py", "_stuck.py",
+COPY = ("_dispatch.py", "_muse_adapter.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py", "_yaml.py",
+        "_grant.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_provider_limits.py", "_stuck.py",
         "_run_record.py", "_env_policy.py", "_errors.py", "capture-stimulus", "publish-evidence", "harvest",
         "finalize-run")
 FAKE = """#!/usr/bin/env python3
@@ -62,13 +64,13 @@ def ev(seq, delta=None, discard=False, turn=1):
     return '{"kind":"model.output","payload":{%s},"seq":%d}' % (payload, seq)
 
 
-class Lab:
+class ContextStack:
     def __init__(self, root, name, binary, args, fixture_lines, gate_at=0, code=0, state=False):
-        self.root, self.lab = root, root / name
-        self.state = root / (name + "-state") if state else self.lab / "ledger"
+        self.root, self.code_root = root, root / name
+        self.state = root / (name + "-state") if state else self.code_root / "ledger"
         self.state.mkdir(parents=True, exist_ok=True)
-        ops, task, fake, home = self.lab / "ops/bin", self.lab / "tasks/fixture", root / (name + "-bin"), root / "home"
-        for path in (ops, task, self.lab / "ledger", fake, home / "Library/Keychains"):
+        ops, task, fake, home = self.code_root / "ops/bin", self.code_root / "tasks/fixture", root / (name + "-bin"), root / "home"
+        for path in (ops, task, self.code_root / "ledger", fake, home / "Library/Keychains"):
             path.mkdir(parents=True, exist_ok=True)
         for f in COPY:
             shutil.copy2(OPS / f, ops / f)
@@ -83,15 +85,15 @@ class Lab:
         (ops / "executor-templates.json").write_text(json.dumps({"fake": {
             "binary": str(exe), "args": args, "cost_class": "subscription", "cost_usd": 0, "cost_per_1k": 0.01,
             "auth": "subscription"}}))
-        (self.lab / "ESTATE").write_text("dev\n", encoding="utf-8")  # finalize-run's node identity
+        (self.code_root / "ESTATE").write_text("dev\n", encoding="utf-8")  # finalize-run's node identity
         (task / "goal.md").write_text("Do nothing.\n", encoding="utf-8")
         (task / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         (task / "check").chmod(0o755)
-        env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_", "CSGATEWAY_"))}
+        env = {k: v for k, v in hermetic_env().items() if not k.startswith(("CS_", "GIT_", "CSGATEWAY_"))}
         self.env = {**env, "HOME": str(home), "CODEX_HOME": str(root / "codex-home"),
-                    "CS_TOOLS_BIN": str(LAB_SRC.parent / "target/release/cs-tools")}  # the copied lab has no target/
+                    "CS_TOOLS_BIN": str(CS_SRC.parent / "target/release/cs-tools")}  # the copied code_root has no target/
         if state:  # the prod layout: the state root outside the code root
-            self.env["LAB_STATE_ROOT"] = str(self.state)
+            self.env["CS_STATE_ROOT"] = str(self.state)
         self.order = json.dumps({"executor": "fake", "task": "tasks/fixture", "exp": "task-fixture", "trial": 1,
                                  "timeout_s": int(timeout(60))})
 
@@ -101,14 +103,19 @@ class Lab:
 
     def events(self):
         d = self.run_dir()
-        return (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if d and (d / "events.jsonl").is_file() \
-            else []
+        if not d or not (d / "events.jsonl").is_file():
+            return []
+        # The existing runner fields retain their wire shape alongside tracing metadata.
+        return [re.sub(r'"at":"[^"]+",|,"timestamp_source":"[^"]+"', "", line)
+                for line in (d / "events.jsonl").read_text(encoding="utf-8").splitlines()]
 
     def owned(self):
-        """As the gateway runs it: --gateway-owned, the order on stdin which stays open, its own process group."""
-        proc = subprocess.Popen([sys.executable, str(self.lab / "ops/bin/_executor.py"), "--gateway-owned"],
-                                cwd=self.lab, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, process_group=0)
+        """Hold stdin open while the execution-only gateway child runs."""
+        _, env = reserve(self.code_root, self.env, json.loads(self.order))
+        proc = subprocess.Popen([sys.executable, str(self.code_root / "ops/bin/_executor.py"),
+                                 "--gateway-owned", "--execution-only"],
+                                cwd=self.code_root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, start_new_session=True)
         def cleanup():
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -123,6 +130,11 @@ class Lab:
         reader = threading.Thread(target=lambda: self.lines.extend(iter(proc.stdout.readline, b"")), daemon=True)
         reader.start()
         return proc, reader
+
+    def finish(self):
+        return subprocess.run(finish_command(self.code_root), cwd=self.code_root, env=self.env,
+                              input=json.dumps(str(self.run_dir())), text=True, capture_output=True,
+                              timeout=timeout(60))
 
     def row(self):
         rows = jsonl(self.state / "ledger.jsonl")
@@ -158,8 +170,8 @@ class Lab:
         from _lifecycle_evidence import verify
         data, why = verify(run)
         assert why is None and data["adapter"] == "executor", why
-        again = subprocess.run([str(self.lab / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(run)}),
-                               cwd=self.lab, env=self.env, text=True, capture_output=True, timeout=timeout(60))
+        again = subprocess.run([str(self.code_root / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(run)}),
+                               cwd=self.code_root, env=self.env, text=True, capture_output=True, timeout=timeout(60))
         assert json.loads(again.stdout)["row_appended"] is False and len(jsonl(self.state / "ledger.jsonl")) == 1
 
 
@@ -178,20 +190,20 @@ with scratch_dir(prefix="executor-streaming-") as raw:
     # 1. Under the gateway: each agent line reaches stdout and events.jsonl while the agent is blocked mid-run.
     #    A dispatched job on a host west of UTC: node-listen finds the run by its UTC name prefix against the job's
     #    UTC start and posts the first delta while the agent still runs (a local stamp hid it until the end).
-    lab = Lab(root, "claude", "claude", ["--print", "--output-format", "stream-json", "--verbose", "{{prompt}}"],
+    code_root = ContextStack(root, "claude", "claude", ["--print", "--output-format", "stream-json", "--verbose", "{{prompt}}"],
               claude, gate_at=1)
-    lab.env.update(TZ="Etc/GMT+5", LAB_JOB_ID="job-live")  # Etc/GMT+5 is UTC-5
-    (lab.state / "dispatch.jsonl").write_text(json.dumps({"id": "job-live", "director_job": "job-live",
+    code_root.env.update(TZ="Etc/GMT+5", CS_JOB_ID="job-live")  # Etc/GMT+5 is UTC-5
+    (code_root.state / "dispatch.jsonl").write_text(json.dumps({"id": "job-live", "director_job": "job-live",
                                                           "state": "running"}) + "\n", encoding="utf-8")
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    proc, reader = lab.owned()
+    proc, reader = code_root.owned()
     def first_line():
         if proc.poll() is not None:
-            raise AssertionError((proc.returncode, proc.stderr.read().decode(), lab.lines))
-        return len(lab.lines) >= 2 and lab.events()
+            raise AssertionError((proc.returncode, proc.stderr.read().decode(), code_root.lines))
+        return len(code_root.lines) >= 2 and code_root.events()
     wait(first_line, "the first live line")
-    assert proc.poll() is None and not lab.gate.exists(), "lines must arrive before the agent exits"
-    assert lab.events() == [ev(1, "Hello ")], lab.events()
+    assert proc.poll() is None and not code_root.gate.exists(), "lines must arrive before the agent exits"
+    assert code_root.events() == [ev(1, "Hello ")], code_root.events()
     sys.path.insert(0, str(OPS))
     from _node_events import live_runs, send as send_events
 
@@ -201,47 +213,54 @@ with scratch_dir(prefix="executor-streaming-") as raw:
         def call(self, method, path, body):
             self.calls.append((method, path, body))
             return {"confirmed": max(e["seq"] for e in body["events"])}
-    found = live_runs(lab.state, [{"job_id": "job-live", "state": "running", "started_at": started}])
-    assert found == {lab.run_dir().name: (lab.run_dir(), "job-live")}, (started, sorted(found), lab.run_dir())
-    assert send_events(Director(), lab.state, lab.run_dir(), "job-live") is False  # still running: not done
-    assert Director.calls == [("POST", "runs/%s/events" % lab.run_dir().name, {"job_id": "job-live", "events": [
-        {"seq": 1, "kind": "delta", "partial": True, "payload": {"text": "Hello ", "turn": 1}}]})], Director.calls
-    assert [json.loads(x) for x in lab.lines] == [json.loads(x) for x in claude[:2]], lab.lines
-    lab.gate.touch()
+    found = live_runs(code_root.state, [{"job_id": "job-live", "state": "running", "started_at": started}])
+    assert found == {code_root.run_dir().name: (code_root.run_dir(), "job-live")}, (started, sorted(found), code_root.run_dir())
+    assert send_events(Director(), code_root.state, code_root.run_dir(), "job-live") is False  # still running: not done
+    at = jsonl(code_root.run_dir() / "events.jsonl")[0]["at"]
+    first_trace = jsonl(code_root.run_dir() / "trace.jsonl")
+    assert len(first_trace) == 2 and all(span["kind"] == "cli_event" for span in first_trace)
+    assert first_trace[1]["start"] == at
+    assert Director.calls == [("POST", "runs/%s/events" % code_root.run_dir().name, {"job_id": "job-live", "events": [
+        {"seq": 1, "kind": "delta", "partial": True, "at": at, "timestamp_source": "adapter_receive",
+         "payload": {"text": "Hello ", "turn": 1}}]})], Director.calls
+    assert [json.loads(x) for x in code_root.lines] == [json.loads(x) for x in claude[:2]], code_root.lines
+    code_root.gate.touch()
     proc.wait(timeout(60))  # stdin stays open until the child exits, as the gateway holds it; EOF would mean cancel
     proc.stdin.close()
     reader.join(timeout(10))
     err = proc.stderr.read().decode()
-    assert proc.returncode == 0 and "Traceback" not in err, (proc.returncode, err, lab.lines[-1:])
-    out = [x.decode().rstrip("\n") for x in lab.lines]
-    assert [json.loads(x) for x in out[:-1]] == [json.loads(x) for x in claude], out
-    report = json.loads(out[-1])
+    assert proc.returncode == 0 and "Traceback" not in err, (proc.returncode, err, code_root.lines[-1:])
+    out = [x.decode().rstrip("\n") for x in code_root.lines]
+    assert [json.loads(x) for x in out] == [json.loads(x) for x in claude], out
+    finished = code_root.finish()
+    assert finished.returncode == 0, finished.stderr
+    report = json.loads(finished.stdout)
     assert report["verdict"] == "pass" and report["ok"] is True, report
-    run = lab.run_dir()
+    run = code_root.run_dir()
     # The runner's exact bytes: keys sorted, compact, raw UTF-8, U+2028 escaped.
-    assert lab.events() == [ev(1, "Hello "), ev(2, "world. "), ev(3)], lab.events()
+    assert code_root.events() == [ev(1, "Hello "), ev(2, "world. "), ev(3)], code_root.events()
     assert " " not in (run / "events.jsonl").read_text(encoding="utf-8")
     assert (run / "messages.jsonl").read_text(encoding="utf-8") == \
         '{"event":"turn","text":"world.\\u2028","turn":1}\n', (run / "messages.jsonl").read_text()
-    row = lab.row()
+    row = code_root.row()
     assert tuple(row.get(k) for k in TOKENS) == (4, 175, 28719, 12504, 40), row
     assert row["reported_model"] == "claude-sonnet-5-5" and row["est_basis"] == "api_list", row
     assert report["finalize"] == "finalized", report
-    lab.envelope("completed", {"event": "turn", "text": "world.\u2028", "turn": 1})
+    code_root.envelope("completed", {"event": "turn", "text": "world.\u2028", "turn": 1})
 
     # 2. Called directly (no gateway): stdout stays the one-line report; artifacts are the same shape.
     codex = (USAGE / "codex-exec.jsonl").read_text(encoding="utf-8").splitlines()
     codex.insert(2, json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Looking."}}))
-    lab = Lab(root, "codex", "codex", ["exec", "--json", "{{prompt}}"], codex, gate_at=-1, state=True)
-    done = subprocess.run([sys.executable, str(lab.lab / "ops/bin/_executor.py")], cwd=lab.lab, env=lab.env,
-                          input=lab.order, text=True, capture_output=True, timeout=timeout(60))
+    code_root = ContextStack(root, "codex", "codex", ["exec", "--json", "{{prompt}}"], codex, gate_at=-1, state=True)
+    done = subprocess.run(command(sys.executable, code_root.code_root / "ops/bin/_executor.py"), cwd=code_root.code_root, env=code_root.env,
+                          input=code_root.order, text=True, capture_output=True, timeout=timeout(60))
     assert done.returncode == 0 and len(done.stdout.splitlines()) == 1, (done.stdout, done.stderr)
     assert json.loads(done.stdout)["verdict"] == "pass"
-    assert lab.events() == [ev(1, "Looking."), ev(2, "<redacted>"), ev(3)], lab.events()
-    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "turn", "text": "<redacted>", "turn": 1}]
-    row = lab.row()
+    assert code_root.events() == [ev(1, "Looking."), ev(2, "<redacted>"), ev(3)], code_root.events()
+    assert jsonl(code_root.run_dir() / "messages.jsonl") == [{"event": "turn", "text": "<redacted>", "turn": 1}]
+    row = code_root.row()
     assert tuple(row.get(k) for k in TOKENS) == (350, 513, 225408, None, 236), row
-    lab.envelope("completed", {"event": "turn", "text": "<redacted>", "turn": 1})
+    code_root.envelope("completed", {"event": "turn", "text": "<redacted>", "turn": 1})
 
     # 3. Gemini stream-json: assistant chunks are deltas, the reply is their text, usage from result.stats.
     gemini = [json.dumps(x) for x in (
@@ -253,49 +272,52 @@ with scratch_dir(prefix="executor-streaming-") as raw:
         {"type": "result", "status": "success", "stats": {"total_tokens": 13206, "input_tokens": 12993,
                                                          "output_tokens": 213, "cached": 40, "input": 12953,
                                                          "duration_ms": 900, "tool_calls": 1}})]
-    lab = Lab(root, "gemini", "gemini", ["--output-format", "stream-json", "--prompt", "{{prompt}}"], gemini, -1)
-    done = subprocess.run([sys.executable, str(lab.lab / "ops/bin/_executor.py")], cwd=lab.lab, env=lab.env,
-                          input=lab.order, text=True, capture_output=True, timeout=timeout(60))
+    code_root = ContextStack(root, "gemini", "gemini", ["--output-format", "stream-json", "--prompt", "{{prompt}}"], gemini, -1)
+    done = subprocess.run(command(sys.executable, code_root.code_root / "ops/bin/_executor.py"), cwd=code_root.code_root, env=code_root.env,
+                          input=code_root.order, text=True, capture_output=True, timeout=timeout(60))
     assert done.returncode == 0, (done.stdout, done.stderr)
-    assert lab.events() == [ev(1, "Hel"), ev(2, "lo"), ev(3)], lab.events()
-    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "turn", "text": "Hello", "turn": 1}]
-    row = lab.row()
+    assert code_root.events() == [ev(1, "Hel"), ev(2, "lo"), ev(3)], code_root.events()
+    assert jsonl(code_root.run_dir() / "messages.jsonl") == [{"event": "turn", "text": "Hello", "turn": 1}]
+    row = code_root.row()
     assert tuple(row.get(k) for k in TOKENS) == (12953, 213, 40, None, None), row
     assert row["reported_model"] == "gemini-3-flash-preview" and row["est_basis"] == "rate", row
 
     # 4. A failed attempt voids its partial text: discard, then an error event, never a turn.
-    lab = Lab(root, "codex-fail", "codex", ["exec", "--json", "{{prompt}}"], codex[:3], gate_at=-1, code=1)
-    done = subprocess.run([sys.executable, str(lab.lab / "ops/bin/_executor.py")], cwd=lab.lab, env=lab.env,
-                          input=lab.order, text=True, capture_output=True, timeout=timeout(60))
+    code_root = ContextStack(root, "codex-fail", "codex", ["exec", "--json", "{{prompt}}"], codex[:3], gate_at=-1, code=1)
+    done = subprocess.run(command(sys.executable, code_root.code_root / "ops/bin/_executor.py"), cwd=code_root.code_root, env=code_root.env,
+                          input=code_root.order, text=True, capture_output=True, timeout=timeout(60))
     assert done.returncode == 1 and json.loads(done.stdout)["stop"] == "executor_exit_1", done.stdout
-    assert lab.events() == [ev(1, "Looking."), ev(2, discard=True)], lab.events()
-    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "error", "error": "task exited 1", "turn": 1}]
-    lab.envelope("completed", {"event": "error", "error": "task exited 1", "turn": 1})
+    assert code_root.events() == [ev(1, "Looking."), ev(2, discard=True)], code_root.events()
+    assert jsonl(code_root.run_dir() / "messages.jsonl") == [{"event": "error", "error": "task exited 1", "turn": 1}]
+    code_root.envelope("completed", {"event": "error", "error": "task exited 1", "turn": 1})
 
     # 5. Cancel mid-run, as the gateway does (TERM the executor's group): the agent dies, the turn closes with
     #    discard, messages.jsonl says why, and the row's terminal stop is cancelled.
-    lab = Lab(root, "cancel", "claude", ["--print", "--output-format", "stream-json", "--verbose", "{{prompt}}"],
+    code_root = ContextStack(root, "cancel", "claude", ["--print", "--output-format", "stream-json", "--verbose", "{{prompt}}"],
               claude, gate_at=1)
-    proc, reader = lab.owned()
-    wait(lambda: lab.events(), "the first live line before cancel")
-    pid = int((lab.run_dir() / "workspace/agent.pid").read_text())
+    proc, reader = code_root.owned()
+    wait(lambda: code_root.events(), "the first live line before cancel")
+    pid = int((code_root.run_dir() / "workspace/agent.pid").read_text())
     os.killpg(proc.pid, signal.SIGTERM)
     proc.wait(timeout(30))
     reader.join(timeout(10))
-    assert proc.returncode == 1, (proc.returncode, proc.stderr.read())
+    assert proc.returncode == 0, (proc.returncode, proc.stderr.read())
+    finished = code_root.finish()
+    assert finished.returncode == 1, finished.stderr
     try:
         os.kill(pid, 0)
         raise AssertionError("the agent outlived the cancel")
     except ProcessLookupError:
         pass
-    assert lab.events() == [ev(1, "Hello "), ev(2, discard=True)], lab.events()
-    assert jsonl(lab.run_dir() / "messages.jsonl") == [{"event": "error", "error": "task cancelled", "turn": 1}]
-    row = lab.row()
+    assert code_root.events() == [ev(1, "Hello "), ev(2, discard=True)], code_root.events()
+    assert jsonl(code_root.run_dir() / "messages.jsonl") == [{"event": "error", "error": "task cancelled", "turn": 1}]
+    row = code_root.row()
     assert row["stop"] == "cancelled" and row["verdict"] == "fail", row
-    assert json.loads(lab.lines[-1])["stop"] == "cancelled", lab.lines
-    lab.envelope("cancelled", {"event": "error", "error": "task cancelled", "turn": 1})
+    assert json.loads(finished.stdout)["stop"] == "cancelled", finished.stdout
+    code_root.envelope("cancelled", {"event": "error", "error": "task cancelled", "turn": 1})
     # Independent verification 2026-11-11: setsid escapes killpg and can rewrite a lane after evidence.
     # Reuse its fork/setsid attack, closing inherited pipes so the root exits normally.
+    from _job_identity import _pid_identity
     from _muse import run_process
     from _agent_stream import run_streaming
     for streaming in (False, True):
@@ -337,11 +359,7 @@ if mode != "normal":
                         assert done.returncode == 0, done
                 (ws / "allow-write").touch()
                 escaped = int((ws / "escaped.pid").read_text())
-                status = subprocess.run(["ps", "-o", "stat=", "-p", str(escaped)],
-                                        capture_output=True, text=True, timeout=timeout(10))
-                assert status.returncode in (0, 1), status.stderr
-                assert not status.stdout.strip() or status.stdout.strip().startswith("Z"), \
-                    "setsid child survived cleanup: " + status.stdout
+                assert _pid_identity(escaped) is None, f"setsid child {escaped} survived cleanup"
                 assert not (ws / "late-write").exists(), "setsid child outlived evidence capture boundary"
             finally:
                 # Clean up even when the boundary under test fails to own the escape.

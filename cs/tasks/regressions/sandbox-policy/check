@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sandbox-policy regression (goal.md). Isolated estates only; lab/ledger is never written."""
+"""sandbox-policy regression (goal.md). Isolated estates only; cs/ledger is never written."""
 import io
 import json
 import os
@@ -19,16 +19,16 @@ os.environ.clear()
 os.environ.update(_fixture_env)
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
+CODE_ROOT = HERE.parents[2]
 V2 = HERE.parent / "runner-characterisation-v2"
-sys.path[:0] = [str(LAB / "ops/bin"), str(HERE.parent / "runner-characterisation")]
+sys.path[:0] = [str(CODE_ROOT / "ops/bin"), str(V2)]
 import _env_policy  # noqa: E402
 import _harness  # noqa: E402
 import _sandbox_policy as sp  # noqa: E402
 
 FAILED = []
 FAKE = HERE / "fake-cs-sandbox"
-REAL = LAB.parent / "target/release/cs-sandbox"
+REAL = CODE_ROOT.parent / "target/release/cs-sandbox"
 GOOD = {"version": 1, "runtime_read": ["$CODE_ROOT", "/usr"], "allow_net": ["none", "all"]}
 SPEC = (HERE / "cell/spec.yaml").read_text()
 
@@ -50,23 +50,24 @@ def refused(fn, what, needle):
 def estate(root, name, policy=GOOD, build=None):
     """A stub estate: the real ops/bin, a policy, a stub runner that records CS_TOOL_PREFIX.
     `build`: a fake wrapper at <estate parent>/target/<build>/cs-sandbox (the repo-relative lookup)."""
-    e = root / name / "lab"
+    e = root / name / "code_root"
     for d in ("ops/bin", "ledger", "specs", "tasks/fx", "policy", "home"):
         (e / d).mkdir(parents=True)
-    for p in (LAB / "ops/bin").iterdir():
+    for p in (CODE_ROOT / "ops/bin").iterdir():
         if p.is_file():
             shutil.copy2(p, e / "ops/bin" / p.name)
     (e / "ESTATE").write_text("dev\n")
     (e / "INVARIANTS.md").write_text("# fixture\n")
     shutil.copytree(HERE / "cell/task", e / "tasks/fx", dirs_exist_ok=True)
-    shutil.copy2(LAB / "policy/env.json", e / "policy/env.json")
+    shutil.copy2(CODE_ROOT / "policy/env.json", e / "policy/env.json")
     if policy is not None:
         (e / "policy/sandbox.json").write_text(policy if isinstance(policy, str) else json.dumps(policy))
     (e / "specs/ok.yaml").write_text(SPEC)
-    (e / "lab").write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+    (e / "code_root").write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
                            "open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launched.json'), 'a').write("
-                           "json.dumps({k: os.environ.get(k) for k in ('CS_TOOL_PREFIX', 'LAB_BROWSER_STATE')}) + '\\n')\n")
-    (e / "lab").chmod(0o755)
+                           "json.dumps({k: os.environ.get(k) for k in ('CS_TOOL_PREFIX', 'CS_BROWSER_STATE')}) + '\\n')\n"
+                           "sys.exit(2)\n")
+    (e / "code_root").chmod(0o755)
     if build:
         (e.parent / "target" / build).mkdir(parents=True)
         shutil.copy2(FAKE, e.parent / "target" / build / "cs-sandbox")
@@ -74,7 +75,7 @@ def estate(root, name, policy=GOOD, build=None):
 
 
 def cell_of(prefix, wrapper, e):
-    """A launcher-built prefix: wrapper --policy <lab>/policy/sandbox.json --report-dir <state>/sandbox-reports/<cell> --."""
+    """A launcher-built prefix: wrapper --policy <code-root>/policy/sandbox.json --report-dir <state>/sandbox-reports/<cell> --."""
     head = "%s --policy %s --report-dir %s/" % (wrapper, e.resolve() / sp.POLICY, e.resolve() / "ledger/sandbox-reports")
     m = re.fullmatch(re.escape(head) + r"(\d+-\d+-[0-9a-f]{8}) --", prefix or "")
     return m.group(1) if m else None
@@ -93,7 +94,7 @@ def clean_env(**extra):
 
 def run_spec(e, **extra):
     return subprocess.run([str(e / "ops/bin/run-spec"), "specs/ok.yaml"], cwd=str(e), text=True, capture_output=True,
-                          env=clean_env(LAB_RUNNER_BIN=str(e / "lab"), **extra), timeout=60)
+                          env=clean_env(CS_RUNNER_BIN=str(e / "code_root"), **extra), timeout=60)
 
 
 def real_wrapper_cell(scratch):
@@ -128,7 +129,7 @@ def real_wrapper_cell(scratch):
 
     _harness.build_estate = with_release_wrapper  # restored below; the harness has no other hook
     try:
-        status, actual, root = _harness.run_case(cell, binary, LAB, V2, _harness.load_gateway(V2), scratch, True)
+        status, actual, root = _harness.run_case(cell, binary, CODE_ROOT, V2, _harness.load_gateway(V2), scratch, True)
     finally:
         _harness.build_estate = real_build
     verdicts = [r.get("verdict") for r in actual.get("rows", [])]
@@ -177,7 +178,7 @@ def sweep_claims(scratch):
     (run / "workspace").mkdir(parents=True)
     other_ws = scratch / "other-ws"
     other_ws.mkdir()
-    tool = os.path.realpath(sp.tool_argv(LAB, "fs_write")[0])
+    tool = os.path.realpath(sp.tool_argv(CODE_ROOT, "fs_write")[0])
     events = [{"event": "header", "spec": "fx-sweep", "exp": "fixture", "task": "tasks/fx", "trial": 1, "model": "fake",
                "budget": {"turns": 1, "tool_calls": 1, "usd": 1, "seconds": 0}},
               {"event": "tool", "turn": 1, "name": "fs_write", "args": {"path": "/etc/hosts", "content": "x"}, "error": True,
@@ -197,9 +198,9 @@ def sweep_claims(scratch):
     report("cell-other", other_ws, 2)
     report("cell-mixed", run / "workspace", 3)
     report("cell-mixed", other_ws, 4)
-    env = clean_env(LAB_STATE_ROOT=str(state))
-    r = subprocess.run([str(LAB / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(run)}), text=True,
-                       capture_output=True, env=env, cwd=str(LAB), timeout=60)
+    env = clean_env(CS_STATE_ROOT=str(state))
+    r = subprocess.run([str(CODE_ROOT / "ops/bin/finalize-run")], input=json.dumps({"run_dir": str(run)}), text=True,
+                       capture_output=True, env=env, cwd=str(CODE_ROOT), timeout=60)
     rows = [json.loads(l) for l in (state / "ledger.jsonl").read_text().splitlines()] if (state / "ledger.jsonl").is_file() else []
     left = sorted("%s/%s" % (p.parent.name, p.name) for p in (state / "sandbox-reports").rglob("*.json"))
     claimed = sorted(p.name for p in (run / "sandbox").glob("*.json")) if (run / "sandbox").is_dir() else []
@@ -229,7 +230,7 @@ def concurrent_cells(scratch):
     (cell / "gateway.json").write_text(json.dumps([{"ok": {"text": "calls", "tool_calls": calls}}] * 2
                                                   + [{"ok": {"text": "done", "tool_calls": []}}]))
     binary = _harness.current_runner()
-    status, actual, root = _harness.run_case(cell, binary, LAB, V2, _harness.load_gateway(V2), scratch, True)
+    status, actual, root = _harness.run_case(cell, binary, CODE_ROOT, V2, _harness.load_gateway(V2), scratch, True)
     runs = sorted((root / "estate/ledger/runs").iterdir())
     seen = []
     for run in runs:
@@ -252,19 +253,19 @@ def exe_descriptors(scratch):
     multi = e / "fixture/multi"  # inside $CODE_ROOT: a script's interpreter must read it under the policy
     multi.write_text('#!/bin/sh\necho "multi $*"\n')
     multi.chmod(0o755)
-    descs = {"r": {"runtime": "exe", "bin": "lab/fixture/multi", "args": ["r", "two words"], "sandbox": {"net": "all"}},
+    descs = {"r": {"runtime": "exe", "bin": "code_root/fixture/multi", "args": ["r", "two words"], "sandbox": {"net": "all"}},
              "n": {"runtime": "exe", "bin": str(multi), "args": ["n"]},
              "py": {"runtime": "python3", "sandbox": {"net": "all"}}}
     for name, d in descs.items():
         (e / "tools/bin" / (name + ".json")).write_text(json.dumps(d))
-    expect(sp.tool_argv(e, "r") == [str(e.resolve().parent / "lab/fixture/multi"), "r", "two words"],
+    expect(sp.tool_argv(e, "r") == [str(e.resolve().parent / "code_root/fixture/multi"), "r", "two words"],
            "exe: tool_argv = bin (relative to the repo holding the code root) + args", sp.tool_argv(e, "r"))
     expect(sp.tool_argv(e, "n") == [str(multi), "n"] and sp.tool_argv(e, "py") == [str(e / "tools/bin/py")],
            "exe: an absolute bin is kept; any other runtime is the file pair", (sp.tool_argv(e, "n"), sp.tool_argv(e, "py")))
     if not REAL.is_file():
         print("skip exe real wrapper: %s is not built" % REAL)
         return
-    shutil.copy2(LAB / "policy/sandbox.json", e / "policy/sandbox.json")
+    shutil.copy2(CODE_ROOT / "policy/sandbox.json", e / "policy/sandbox.json")
     ws, reports = scratch / "exe-ws", scratch / "exe-reports"
     ws.mkdir()
 
@@ -289,21 +290,21 @@ def exe_descriptors(scratch):
 
 def main():
     # 1. One list: the two switches reach every child (equality of the three lists is env-policy's).
-    rust = re.search(r'const DEFAULT_ENV: &str = "([^"]+)";', (LAB.parent / "harness/src/process.rs").read_text()).group(1).split()
-    always = json.loads((LAB / "policy/env.json").read_text())["always"]
-    for name in ("CS_TOOL_PREFIX", "CS_SANDBOX_BIN", "LAB_BROWSER_STATE"):
+    rust = re.search(r'const DEFAULT_ENV: &str = "([^"]+)";', (CODE_ROOT.parent / "harness/src/process.rs").read_text()).group(1).split()
+    always = json.loads((CODE_ROOT / "policy/env.json").read_text())["always"]
+    for name in ("CS_TOOL_PREFIX", "CS_SANDBOX_BIN", "CS_BROWSER_STATE"):
         expect(name in rust and name in always and name in _env_policy.DEFAULT_ENV, "env: %s in process.rs DEFAULT_ENV, always, _env_policy.DEFAULT_ENV" % name)
-    # 2. The committed policy and the twelve requests.
-    committed = sp.load_policy(LAB)
+    # 2. The committed policy and the fourteen requests (request_action joined 2026-11-21).
+    committed = sp.load_policy(CODE_ROOT)
     expect(committed is not None and "tmp_in_workspace" not in committed, "policy: committed sandbox.json loads (no tmp key: tmp is per call)", committed)
-    tools = [t["name"] for t in json.loads((LAB / "tools/manifest.json").read_text())["tools"]]
-    reqs = {t: json.loads((LAB / "tools/bin" / (t + ".json")).read_text()).get("sandbox") for t in tools}
-    expect(len(tools) == 12 and all(isinstance(r, dict) and r.get("net") in sp.NETS for r in reqs.values()),
+    tools = [t["name"] for t in json.loads((CODE_ROOT / "tools/manifest.json").read_text())["tools"]]
+    reqs = {t: json.loads((CODE_ROOT / "tools/bin" / (t + ".json")).read_text()).get("sandbox") for t in tools}
+    expect(len(tools) == 14 and all(isinstance(r, dict) and r.get("net") in sp.NETS for r in reqs.values()),
            "descriptors: every manifest tool requests a sandbox net", reqs)
     env_requests = {t: r["write_env"] for t, r in reqs.items() if "write_env" in r}
-    expect(env_requests == {"browser_fetch": ["LAB_BROWSER_STATE"]}
-           and committed.get("write_env") == {"LAB_BROWSER_STATE": ["$HOME/.contextstack"]},
-           "write_env: only browser_fetch requests LAB_BROWSER_STATE; the host confines it to $HOME/.contextstack",
+    expect(env_requests == {"browser_fetch": ["CS_BROWSER_STATE"]}
+           and committed.get("write_env") == {"CS_BROWSER_STATE": ["$HOME/.contextstack"]},
+           "write_env: only browser_fetch requests CS_BROWSER_STATE; the host confines it to $HOME/.contextstack",
            (env_requests, committed.get("write_env")))
     profile_requests = {t: r["profile"] for t, r in reqs.items() if "profile" in r}
     expect(profile_requests == {"browser_fetch": "browser"} and set(committed.get("profiles", {})) == {"browser", "cli-executor"},
@@ -319,9 +320,9 @@ def main():
         bad = [("version 2", dict(GOOD, version=2), "version 1"), ("missing key", {k: v for k, v in GOOD.items() if k != "allow_net"}, "want exactly"),
                ("extra key", dict(GOOD, limits={}), "want exactly"), ("runtime_read scalar", dict(GOOD, runtime_read="/usr"), "runtime_read"),
                ("runtime_read relative", dict(GOOD, runtime_read=["usr"]), "runtime_read"), ("allow_net unknown", dict(GOOD, allow_net=["lan"]), "allow_net"),
-               ("removed tmp_in_workspace", dict(GOOD, tmp_in_workspace=".lab-tmp"), "want exactly"), ("not json", "{", "policy/sandbox.json: "),
-               ("write_env list", dict(GOOD, write_env=["LAB_X"]), "write_env"), ("write_env root relative", dict(GOOD, write_env={"LAB_X": ["state"]}), "write_env"),
-               ("write_env no roots", dict(GOOD, write_env={"LAB_X": []}), "write_env"), ("write_env bad name", dict(GOOD, write_env={"lab-x": ["/s"]}), "write_env"),
+               ("removed tmp_in_workspace", dict(GOOD, tmp_in_workspace=".cs-tmp"), "want exactly"), ("not json", "{", "policy/sandbox.json: "),
+               ("write_env list", dict(GOOD, write_env=["CS_X"]), "write_env"), ("write_env root relative", dict(GOOD, write_env={"CS_X": ["state"]}), "write_env"),
+               ("write_env no roots", dict(GOOD, write_env={"CS_X": []}), "write_env"), ("write_env bad name", dict(GOOD, write_env={"code_root-x": ["/s"]}), "write_env"),
                ("runtime_read unknown OS", dict(GOOD, runtime_read={"windows": ["/x"]}), "runtime_read"),
                ("runtime_read per-OS relative", dict(GOOD, runtime_read={"linux": ["usr"]}), "runtime_read"),
                ("runtime_read per-OS empty", dict(GOOD, runtime_read={}), "runtime_read"),
@@ -331,7 +332,7 @@ def main():
                ("sockets list", dict(GOOD, sockets=["/s.sock"]), "sockets"),
                ("sockets bad name", dict(GOOD, sockets={"Browser_X": "/s.sock"}), "sockets"),
                ("sockets relative", dict(GOOD, sockets={"browser-public": "s.sock"}), "sockets"),
-               ("write_env $TOOL_PYTHON", dict(GOOD, write_env={"LAB_X": ["$TOOL_PYTHON"]}), "write_env"),
+               ("write_env $TOOL_PYTHON", dict(GOOD, write_env={"CS_X": ["$TOOL_PYTHON"]}), "write_env"),
                ("sockets $TOOL_PYTHON", dict(GOOD, sockets={"browser-public": "$TOOL_PYTHON/s.sock"}), "sockets")]
         for i, (label, pol, needle) in enumerate(bad):
             e = estate(scratch, "bad%d" % i, pol)
@@ -352,9 +353,14 @@ def main():
                "policy: macOS runtime_read names the repo's target/ build trees for runtime exe tools", committed["runtime_read"]["macos"])
         expect(all("$CODE_ROOT/tools" in committed["runtime_read"][os_] for os_ in ("macos", "linux")),
                "policy: runtime_read includes $CODE_ROOT/tools (defuddle_extract's tools/defuddle/node_modules lives there)")
+        for os_ in ("macos", "linux"):
+            reads = committed["runtime_read"][os_]
+            expect({"$HOME/.local/bin/uv", "$HOME/.local/share/uv/python"} <= set(reads)
+                   and "$HOME/.local/bin" not in reads and not any(path.endswith(("/.cache/uv", "/Library/Caches/uv")) for path in reads),
+                   "policy: %s reads uv and its Python without granting its bin directory or host cache" % os_)
         tool_py = dict(GOOD, runtime_read=["$CODE_ROOT", "$TOOL_PYTHON"])
         expect(sp.load_policy(estate(scratch, "tool-python", tool_py)) == tool_py, "shape: $TOOL_PYTHON loads in a read list (only)")
-        with_env = dict(GOOD, write_env={"LAB_X": ["$HOME/.contextstack", "/srv/state"]})
+        with_env = dict(GOOD, write_env={"CS_X": ["$HOME/.contextstack", "/srv/state"]})
         expect(sp.load_policy(estate(scratch, "write-env", with_env)) == with_env, "shape: optional write_env {VAR: [roots]} loads")
         with_profile = dict(GOOD, profiles={"browser": {"read": {"macos": ["$HOME/b"], "linux": ["/opt/b"]}}})
         expect(sp.load_policy(estate(scratch, "profiles", with_profile)) == with_profile, "shape: optional profiles {browser: {read}} loads")
@@ -386,27 +392,27 @@ def main():
         err = io.StringIO()
         expect(sp.tool_prefix_value(estate(scratch, "nopol", None), {}, stderr=err) is None and not err.getvalue(),
                "rule: no policy file -> unset, silent")
-        listed = estate(scratch, "browser-state", dict(GOOD, write_env={"LAB_BROWSER_STATE": ["$HOME/.contextstack"]}))
-        expect(sp.browser_state_value(listed, {"HOME": "/h"}) == "/h/.contextstack/lab/browser-state"
-               and sp.browser_state_value(listed, {"HOME": "/h", "LAB_BROWSER_STATE": "/s"}) == "/s",
-               "rule: policy lists LAB_BROWSER_STATE -> default under $HOME/.contextstack, a set value passes through")
+        listed = estate(scratch, "browser-state", dict(GOOD, write_env={"CS_BROWSER_STATE": ["$HOME/.contextstack"]}))
+        expect(sp.browser_state_value(listed, {"HOME": "/h"}) == "/h/.contextstack/state/browser-state"
+               and sp.browser_state_value(listed, {"HOME": "/h", "CS_BROWSER_STATE": "/s"}) == "/s",
+               "rule: policy lists CS_BROWSER_STATE -> default under $HOME/.contextstack, a set value passes through")
         expect(sp.browser_state_value(e, {"HOME": "/h"}) is None and sp.browser_state_value(estate(scratch, "nostate", None), {"HOME": "/h"}) is None,
-               "rule: policy without that write_env, or no policy -> LAB_BROWSER_STATE not set")
+               "rule: policy without that write_env, or no policy -> CS_BROWSER_STATE not set")
         # 5. run-spec: the launcher sets the prefix; the runner inherits it.
-        e = estate(scratch, "run-spec", dict(GOOD, write_env={"LAB_BROWSER_STATE": ["$HOME/.contextstack"]}))
+        e = estate(scratch, "run-spec", dict(GOOD, write_env={"CS_BROWSER_STATE": ["$HOME/.contextstack"]}))
         r = run_spec(e, CS_SANDBOX_BIN=str(FAKE))
         first = cell_of(launches(e)[-1]["CS_TOOL_PREFIX"], FAKE, e) if launches(e) else None
-        expect(r.returncode == 0 and first,
-               "run-spec: the runner inherits CS_TOOL_PREFIX = wrapper --policy <lab>/policy/sandbox.json --report-dir <state>/sandbox-reports/<cell> --",
+        expect(r.returncode == 1 and first,
+               "run-spec: the runner inherits CS_TOOL_PREFIX = wrapper --policy <code-root>/policy/sandbox.json --report-dir <state>/sandbox-reports/<cell> --",
                (r.returncode, launches(e), r.stderr))
         run_spec(e, CS_SANDBOX_BIN=str(FAKE))
         second = cell_of(launches(e)[-1]["CS_TOOL_PREFIX"], FAKE, e)
         expect(second and second != first, "run-spec: each cell gets its own report dir", (first, second))
         home = clean_env()["HOME"]
-        expect(launches(e)[-1]["LAB_BROWSER_STATE"] == home + "/.contextstack/lab/browser-state",
-               "run-spec: the runner inherits the LAB_BROWSER_STATE default", launches(e)[-1])
-        run_spec(e, CS_SANDBOX_BIN=str(FAKE), LAB_BROWSER_STATE="/preset/state")
-        expect(launches(e)[-1]["LAB_BROWSER_STATE"] == "/preset/state", "run-spec: a set LAB_BROWSER_STATE passes through")
+        expect(launches(e)[-1]["CS_BROWSER_STATE"] == home + "/.contextstack/state/browser-state",
+               "run-spec: the runner inherits the CS_BROWSER_STATE default", launches(e)[-1])
+        run_spec(e, CS_SANDBOX_BIN=str(FAKE), CS_BROWSER_STATE="/preset/state")
+        expect(launches(e)[-1]["CS_BROWSER_STATE"] == "/preset/state", "run-spec: a set CS_BROWSER_STATE passes through")
         n_launch = len(launches(e))
         r = run_spec(e, CS_SANDBOX_BIN=str(scratch / "missing"))
         expect(r.returncode == 2 and sp.UNBUILT in r.stderr and len(launches(e)) == n_launch,
@@ -420,11 +426,11 @@ def main():
         r = run_spec(e, CS_SANDBOX_BIN=str(FAKE))
         expect(r.returncode == 2 and "run-spec: policy/sandbox.json: " in r.stderr and not launches(e), "run-spec: malformed policy exits 2, no cell", r.stderr)
         # 6. tick: run_spec from the estate (never the live tick).
-        e = estate(scratch, "tick", dict(GOOD, write_env={"LAB_BROWSER_STATE": ["$HOME/.contextstack"]}))
+        e = estate(scratch, "tick", dict(GOOD, write_env={"CS_BROWSER_STATE": ["$HOME/.contextstack"]}))
         sys.path.insert(0, str(e / "ops/bin"))
         os.environ.pop("CS_TOOL_PREFIX", None)
-        os.environ.pop("LAB_RUNNER_BIN", None)  # _runner: the estate's stub, named (the default is the Rust runner)
-        os.environ["CS_RUNNER_BIN"] = str(e / "lab")
+        os.environ.pop("CS_RUNNER_BIN", None)  # _runner: the estate's stub, named (the default is the Rust runner)
+        os.environ["CS_RUNNER_BIN"] = str(e / "code_root")
         os.environ["CS_SANDBOX_BIN"] = str(FAKE)
         tick = runpy.run_path(str(e / "ops/bin/tick"))
         try:  # the stub runner leaves no ledger row, so run_spec ends in its no-row error after launching
@@ -434,8 +440,8 @@ def main():
         expect(launches(e) and cell_of(launches(e)[-1]["CS_TOOL_PREFIX"], FAKE, e),
                "tick.run_spec: the runner inherits the prefix with its own report dir", launches(e))
         want_state = tick["browser_state_value"](e, os.environ)
-        expect(want_state is not None and launches(e)[-1]["LAB_BROWSER_STATE"] == want_state,
-               "tick.run_spec: the runner inherits LAB_BROWSER_STATE", launches(e))
+        expect(want_state is not None and launches(e)[-1]["CS_BROWSER_STATE"] == want_state,
+               "tick.run_spec: the runner inherits CS_BROWSER_STATE", launches(e))
         (e / "policy/sandbox.json").write_text("{")
         rc, row = tick["run_spec"]("specs/ok.yaml")
         expect(rc == 1 and row.get("verdict") == "void" and row.get("stop", "").startswith("sandbox_policy: policy/sandbox.json: ")
@@ -448,12 +454,12 @@ def main():
         shutil.copytree(HERE / "cell", cell)
         (cell / "case.json").write_text(json.dumps({"entry": "run-spec", "sandbox": True, "env": {"CS_SANDBOX_BIN": str(FAKE)}}))
         binary = _harness.current_runner()
-        status, actual, root = _harness.run_case(cell, binary, LAB, V2, _harness.load_gateway(V2), scratch, True)
+        status, actual, root = _harness.run_case(cell, binary, CODE_ROOT, V2, _harness.load_gateway(V2), scratch, True)
         est = root / "estate"
         log = (est / "home/fake-cs-sandbox.log").read_text().splitlines() if (est / "home/fake-cs-sandbox.log").is_file() else []
         log = [l.replace(str(est.resolve()), "<ESTATE>").replace(str(est), "<ESTATE>") for l in log]
         # fs_read is a runtime exe tool so the wrapper sees its bin (the harness makes it absolute) + args.
-        tools = {t: " ".join(sp.tool_argv(LAB, t)) if t == "fs_read" else "<ESTATE>/tools/bin/" + t for t in ("fs_write", "fs_read", "exec")}
+        tools = {t: " ".join(sp.tool_argv(CODE_ROOT, t)) if t == "fs_read" else "<ESTATE>/tools/bin/" + t for t in ("fs_write", "fs_read", "exec")}
         calls = ["--policy <ESTATE>/policy/sandbox.json --report-dir <ESTATE>/ledger/sandbox-reports/<CELL> -- " + tools[t]
                  for t in ("fs_write", "fs_read", "exec")]
         verdicts = [r.get("verdict") for r in actual.get("rows", [])]
@@ -467,7 +473,7 @@ def main():
         cell_prefix_rules(scratch)
         sweep_claims(scratch)
         concurrent_cells(scratch)
-        # 8. End to end with the real wrapper, found as run-spec finds it (<repo>/target/release beside the lab).
+        # 8. End to end with the real wrapper, found as run-spec finds it (<repo>/target/release beside the code_root).
         if REAL.is_file():
             real_wrapper_cell(scratch)
         else:

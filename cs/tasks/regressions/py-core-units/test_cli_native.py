@@ -260,7 +260,8 @@ class NativeTests(unittest.TestCase):
         self.assertEqual((self.tmp/'gitconfig').stat().st_mode & 0o777, 0o600)
         self.assertEqual([args for args, _ in calls[:3]], [['git', 'config', '--global', '--get', 'user.name'],
                          ['git', 'config', '--global', '--get', 'user.email'], ['git', 'config', '--global', '--path', '--get', 'core.excludesFile']])
-        self.assertEqual(calls[0][1]['env'], {'LANG': 'C', 'PATH': '/usr/bin:/bin', 'HOME': str(self.home), 'GIT_CONFIG_NOSYSTEM': '1'})
+        self.assertEqual(calls[0][1]['env'], {'LANG': 'C', 'PATH': '/usr/bin:/bin', 'HOME': str(self.home),
+                                             'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CEILING_DIRECTORIES': str(self.tmp.parent)})
         self.assertEqual(calls[-1][0][-2:], ['core.excludesFile', str(self.tmp/'gitignore')])
         self.assertTrue(calls[-1][1]['check'])
         self.assertEqual(calls[0][1]['stdin'], subprocess.DEVNULL)
@@ -271,7 +272,8 @@ class NativeTests(unittest.TestCase):
              patch.dict(os.environ, {'PATH': '/fixture/bin', 'LC_ALL': 'C'}, clear=True):
             m.stage_git(self.tmp)
         self.assertEqual(fake.call_count, 3)
-        self.assertEqual(fake.call_args.kwargs['env'], {'PATH': '/fixture/bin', 'LC_ALL': 'C', 'HOME': str(self.home), 'GIT_CONFIG_NOSYSTEM': '1'})
+        self.assertEqual(fake.call_args.kwargs['env'], {'PATH': '/fixture/bin', 'LC_ALL': 'C', 'HOME': str(self.home),
+                                                        'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CEILING_DIRECTORIES': str(self.tmp.parent)})
         with self.assertRaisesRegex(ValueError, 'cannot read owner'):
             m.stage_git(self.tmp, self.home, env={}, run=Mock(return_value=subprocess.CompletedProcess([], 2, '', '')))
 

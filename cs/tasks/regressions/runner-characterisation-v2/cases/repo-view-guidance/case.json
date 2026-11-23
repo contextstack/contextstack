@@ -1,0 +1,7 @@
+{
+ "repo_view": true,
+ "env": {
+  "CS_HARNESS_LANE": "{\"repo\":\"sample\",\"read_only\":true,\"path\":\"<ESTATE>/snapshot\"}",
+  "CS_TOOL_PREFIX": "<ESTATE>/fixture/fx_repo_prefix --"
+ }
+}

@@ -39,12 +39,13 @@ class Node2(Node):
     def events(self, run_id, job_id, events):
         return self.call("POST", "runs/%s/events" % run_id, body={"job_id": job_id, "events": events})
 
-    def status(self, active, node_version="director-spec stand-in", vitals=None, held=None):
-        body = {"active": active, "node_version": node_version}
+    def status(self, active, node_version="director-spec stand-in", vitals=None, held=None, **extras):
+        body = {"active": active, "node_version": node_version, "release": {"id": "director-spec", "protocol": 2}}
         if vitals is not None:
             body["vitals"] = vitals
         if held is not None:
             body["held"] = held
+        body.update(extras)
         return self.call("POST", "status", body=body)
 
     def schedules(self, schedules, firings=()):

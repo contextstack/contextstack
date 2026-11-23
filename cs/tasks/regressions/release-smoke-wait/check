@@ -149,7 +149,7 @@ def layout(home, director_port):
 
 def load_init_smoke(home, director_port, gateway_port):
     os.environ["HOME"] = str(home)
-    os.environ["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % gateway_port
+    os.environ["CSGATEWAY_CLI_ENDPOINT"] = "http://127.0.0.1:%d/v1/agent/cli.run" % gateway_port
     for name in list(sys.modules):
         if name in ("cs_init", "cs_smoke"):
             del sys.modules[name]
@@ -198,7 +198,7 @@ def main():
             "gateway never began serving after the intentional delay",
         )
 
-        os.environ["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % CLOSED_PORT
+        os.environ["CSGATEWAY_CLI_ENDPOINT"] = "http://127.0.0.1:%d/v1/agent/cli.run" % CLOSED_PORT
         init = init_mod.Init(cs, SimpleNamespace(director_listen="127.0.0.1:%d" % director_port, verbose=False))
         t0 = time.monotonic()
         reason = smoke.service_wait(init, 3)
@@ -209,7 +209,7 @@ def main():
             "service_wait polls until gateway timeout (%.1fs)" % elapsed,
         )
 
-        os.environ["CSGATEWAY_LAB_ENDPOINT"] = "http://127.0.0.1:%d/v1/ai/lab-execute" % gw_port
+        os.environ["CSGATEWAY_CLI_ENDPOINT"] = "http://127.0.0.1:%d/v1/agent/cli.run" % gw_port
         init = init_mod.Init(cs, SimpleNamespace(director_listen="127.0.0.1:%d" % CLOSED_PORT, verbose=False))
         reason = smoke.service_wait(init, 3)
         expect(reason == "the Director never came up within 3s", "missing director reason: %r" % reason)

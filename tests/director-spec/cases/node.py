@@ -208,6 +208,20 @@ def _(ctx):
                == run["envelope"]["envelope_sha256"], "moved to acked/ with its ack")
 
 
+@case(N, "envelopes", "node-send-changed-trace")
+def _(ctx):
+    """A trace changed since listing stays pending and is rejected before upload."""
+    rig = ctx.rig
+    run_id = "nspec-changed-trace"
+    trace = b'{"kind":"run"}\n'
+    rig.spool_run(run_id, overrides={"trace.jsonl": trace})
+    (rig.state / "runs" / run_id / "trace.jsonl").write_bytes(trace + trace)
+    rc, out, _ = rig.op("spool-send")
+    ctx.expect(rc == 0 and out.get("pending") == 1 and "trace.jsonl sha256 differs" in json.dumps(out.get("failed")),
+               "changed trace stays pending with a hash diagnostic", out)
+    ctx.expect(not rig.calls("PUT", "objects/" + sha(trace)), "changed trace bytes were never uploaded")
+
+
 @case(N, "envelopes", "node-send-carries-usage")
 def _(ctx):
     """The envelope posted is the outbox's, usage included unchanged (NODE-PROTOCOL.md §7.2)."""

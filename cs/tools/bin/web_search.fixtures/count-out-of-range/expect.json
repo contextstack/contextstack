@@ -2,7 +2,7 @@
   "exit": 1,
   "stdout": "web_search: count must be between 1 and 10\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"count\": 11, \"query\": \"x\"}, \"name\": \"web_search\"}\n",
+    ".cs-calls.jsonl": "{\"args\": {\"count\": 11, \"query\": \"x\"}, \"name\": \"web_search\"}\n",
     "_evidence/manifest.jsonl": null
   },
   "untouched": true

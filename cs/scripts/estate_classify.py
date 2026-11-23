@@ -1,11 +1,5 @@
-"""Shared path classification for estate-commit and the check-red gate.
+"""Classify checkout paths for the check-red and ops-cap Git hooks."""
 
-Every non-ignored path under lab/ is facts or rules. classify never
-returns a third bucket. Hook `is_rules` is classify == rules, so
-estate-commit cannot --no-verify a hook-rules path. Automatic commits
-still skip .go / internal/ / cmd/ (human-gated) without calling them
-other.
-"""
 
 from functools import lru_cache
 import json
@@ -13,29 +7,29 @@ import os
 from pathlib import Path
 import re
 
-LAB = Path(os.environ.get("LAB_ESTATE_ROOT") or Path.cwd())
+CODE_ROOT = Path(os.environ.get("CS_ESTATE_ROOT") or Path.cwd())
 
 
-def receipted_paths(lab):
-    lab = Path(lab)
-    shelves = (lab / "ledger/director-delivery.jsonl", lab / "ledger/finalizations.jsonl",
-               lab / "ledger/dispatch.jsonl")
+def receipted_paths(code_root):
+    code_root = Path(code_root)
+    shelves = (code_root / "ledger/director-delivery.jsonl", code_root / "ledger/finalizations.jsonl",
+               code_root / "ledger/dispatch.jsonl")
     stamp = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else None for p in shelves)
-    return frozenset(name for name in _receipted_paths(str(lab), stamp)
-                     if not any((lab / part).is_symlink() for part in (Path(name), *Path(name).parents))
-                     and (not name.startswith("specs/archive/") or (lab / name).is_file()))
+    return frozenset(name for name in _receipted_paths(str(code_root), stamp)
+                     if not any((code_root / part).is_symlink() for part in (Path(name), *Path(name).parents))
+                     and (not name.startswith("specs/archive/") or (code_root / name).is_file()))
 
 
 @lru_cache(maxsize=8)
 def _receipted_paths(root, stamp):
-    lab = Path(root)
+    code_root = Path(root)
     import sys
-    sys.path.insert(0, str(lab / "ops/bin"))
+    sys.path.insert(0, str(code_root / "ops/bin"))
     from _estate_io import estate_dir  # an install's ESTATE is in its config root
-    estate_file = estate_dir(lab) / "ESTATE"
+    estate_file = estate_dir(code_root) / "ESTATE"
     estate = estate_file.read_text().strip() if estate_file.exists() else ""
     def rows(name):
-        path = lab / "ledger" / name
+        path = code_root / "ledger" / name
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
@@ -74,7 +68,7 @@ def _receipted_paths(root, stamp):
                 or not re.fullmatch(r"specs/[a-zA-Z0-9_-]+[.]yaml", source)):
             continue
         archive = "specs/archive/" + Path(source).name
-        if (lab / archive).is_file():
+        if (code_root / archive).is_file():
             paths.update((archive, source))
     # Earlier land versions expose provenance through the Director receipt.
     # Accept only its exact cell archive and a settled, prepared finalization.
@@ -127,7 +121,7 @@ def _norm(path):
 
 def classify(path):
     path = _norm(path)
-    if path in receipted_paths(LAB):
+    if path in receipted_paths(CODE_ROOT):
         return "facts"
     if path.startswith(FACTS_PREFIXES):
         return "facts"
@@ -140,8 +134,3 @@ def classify(path):
 
 def is_rules(path):
     return classify(path) == "rules"
-
-
-def skip_auto(path):
-    path = _norm(path)
-    return path.endswith(".go") or path.startswith(("internal/", "cmd/"))

@@ -9,7 +9,7 @@ workspace (or `sh -c` under exec) reaches any path the user can read, HOME inclu
 Layout, built fresh in temp dirs and removed afterwards:
   <tmp>/outside/sentinel.txt   a random sentinel string, outside every workspace
   <tmp>/outside/doc.md         a Markdown file holding the sentinel
-  $HOME/.lab-escape-probe-<r>/sentinel.txt   the same sentinel, created here, removed in finally
+  $HOME/.cs-escape-probe-<r>/sentinel.txt   the same sentinel, created here, removed in finally
   <ws>/link.txt -> outside/sentinel.txt   <ws>/linkdir -> outside/   <ws>/link.md -> outside/doc.md
 Never reads, prints or copies anything under ~/.ssh, ~/.aws or any real dotfile.
 
@@ -37,9 +37,9 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-BIN = LAB / "tools/bin"
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = HERE.parents[2]
+BIN = CODE_ROOT / "tools/bin"
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 import _env_policy  # noqa: E402
 import _sandbox_policy  # noqa: E402
 
@@ -57,14 +57,14 @@ RAN_NOTHING = ("cs-sandbox:", "env: '")  # the wrapper refused (101), or the hos
 
 
 def child_env(extra=None):
-    env = {n: os.environ[n] for n in _env_policy.load_policy(LAB)["always"] if n in os.environ}
-    env.setdefault("LAB_TRIAL", "1")
+    env = {n: os.environ[n] for n in _env_policy.load_policy(CODE_ROOT)["always"] if n in os.environ}
+    env.setdefault("CS_TRIAL", "1")
     env.update(extra or {})
     return env
 
 
 def run(tool, args, ws, extra=None):
-    r = subprocess.run(PREFIX + _sandbox_policy.tool_argv(LAB, tool), cwd=str(ws), input=json.dumps(args).encode(),
+    r = subprocess.run(PREFIX + _sandbox_policy.tool_argv(CODE_ROOT, tool), cwd=str(ws), input=json.dumps(args).encode(),
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=child_env(extra), timeout=90)
     return r.returncode, r.stdout.decode("utf-8", "replace")
 
@@ -101,7 +101,7 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="tool-escapes-workspace-", suffix=".noindex"))
     outside = tmp / "outside"
     outside.mkdir()
-    home_probe = Path(os.environ["HOME"]) / (".lab-escape-probe-" + secrets.token_hex(6))
+    home_probe = Path(os.environ["HOME"]) / (".cs-escape-probe-" + secrets.token_hex(6))
     try:
         reset(outside)
         home_probe.mkdir(mode=0o700)
@@ -169,10 +169,10 @@ def main():
         ws2 = tmp / "exec-labout"
         ws2.mkdir()
         (outside / "labout").mkdir()
-        (ws2 / ".lab-out").symlink_to(outside / "labout")
+        (ws2 / ".cs-out").symlink_to(outside / "labout")
         c, o = run("exec", {"cmd": ["sh", "-c", "seq 1 3000"]}, ws2)
         spilled = [p.name for p in (outside / "labout").iterdir()]
-        probe("exec", ".lab-out spill via dir symlink", bool(spilled), not spilled and esc(o),
+        probe("exec", ".cs-out spill via dir symlink", bool(spilled), not spilled and esc(o),
               o.split("\n", 1)[0] + " outside/labout=%s" % spilled)
 
         # fs_read was the carrier before moving to cs-tools, whose call log refuses a link out of the
@@ -184,11 +184,11 @@ def main():
                             else "fs_read call log (cs-tools, Rust)"))
             ws3 = tmp / ("calllog-" + tool)
             ws3.mkdir()
-            (ws3 / ".lab-calls.jsonl").symlink_to(outside / ("calls-%s.jsonl" % tool))
+            (ws3 / ".cs-calls.jsonl").symlink_to(outside / ("calls-%s.jsonl" % tool))
             c, o = run(tool, args, ws3)
             log = outside / ("calls-%s.jsonl" % tool)
             wrote = log.is_file()
-            probe(label, ".lab-calls.jsonl file symlink", wrote, not wrote and refusal in o,
+            probe(label, ".cs-calls.jsonl file symlink", wrote, not wrote and refusal in o,
                   "outside/%s=%r" % (log.name, log.read_text() if wrote else None))
 
         print("--- okf (cs-tools: root realpath-checked, a corpus file linking out refused)")

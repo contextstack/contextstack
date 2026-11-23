@@ -18,7 +18,7 @@ MCP_AUTH_TIMEOUT_S = 5.0
 class HostMCPBridge:
     """Serve a trusted host-built contextstack MCP command outside the CLI sandbox."""
 
-    def __init__(self, config, workspace, env=None, secret_dir=None):
+    def __init__(self, config, workspace, env=None, secret_dir=None, *, loopback=False):
         servers = config.get("mcpServers", {})
         if set(servers) != {"contextstack"}:
             raise ValueError("host MCP bridge requires only the contextstack server")
@@ -30,16 +30,21 @@ class HostMCPBridge:
             raise ValueError("invalid host MCP command")
         self.command = [command, *args]
         self.workspace, self.env = str(workspace), dict(os.environ if env is None else env)
-        self.root = Path(tempfile.mkdtemp(prefix="lead-mcp-", dir="/tmp"))
-        self.path, self.token = self.root / "mcp.sock", secrets.token_hex(32)
+        if loopback and secret_dir is None:
+            raise ValueError("loopback MCP requires a job-private capability directory")
+        self.root = None if loopback else Path(tempfile.mkdtemp(prefix="lead-mcp-", dir="/tmp"))
+        self.path = None if loopback else self.root / "mcp.sock"
+        self.token = secrets.token_hex(32)
         secret_root = Path(secret_dir) if secret_dir is not None else self.root
         secret_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, secret_path = tempfile.mkstemp(prefix="mcp-capability-", dir=secret_root)
+        prefix = "lane-mcp-capability-" if loopback else "mcp-capability-"
+        fd, secret_path = tempfile.mkstemp(prefix=prefix, dir=secret_root)
         self.secret_path = Path(secret_path)
         with os.fdopen(fd, "w") as stream:
             stream.write(self.token)
-        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.listener.bind(str(self.path))
+        self.listener = socket.socket(socket.AF_INET if loopback else socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0) if loopback else str(self.path))
+        endpoint = f"tcp:{self.listener.getsockname()[1]}" if loopback else str(self.path)
         self.listener.listen(min(MAX_MCP_CONNECTIONS, socket.SOMAXCONN))
         self.listener.settimeout(0.2)
         self.stopped = threading.Event()
@@ -48,7 +53,7 @@ class HostMCPBridge:
         self.config = copy.deepcopy(config)
         self.config["mcpServers"]["contextstack"] = {
             "command": sys.executable,
-            "args": [str(Path(__file__).resolve()), "proxy", str(self.path), str(self.secret_path)],
+            "args": [str(Path(__file__).resolve()), "proxy", endpoint, str(self.secret_path)],
         }
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
@@ -161,16 +166,21 @@ class HostMCPBridge:
         for handler in list(self.handlers):
             handler.join(timeout=3)
         self.secret_path.unlink(missing_ok=True)
-        try:
-            shutil.rmtree(self.root)
-        except FileNotFoundError:
-            pass
+        if self.root is not None:
+            try:
+                shutil.rmtree(self.root)
+            except FileNotFoundError:
+                pass
 
 
-def proxy(path, secret_path):
+def proxy(endpoint, secret_path):
     token = Path(secret_path).read_text()
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.connect(path)
+    if endpoint.startswith("tcp:"):
+        address, family = ("127.0.0.1", int(endpoint[4:])), socket.AF_INET
+    else:
+        address, family = endpoint, socket.AF_UNIX
+    with socket.socket(family, socket.SOCK_STREAM) as conn:
+        conn.connect(address)
         conn.sendall(token.encode() + b"\n")
 
         def feed():

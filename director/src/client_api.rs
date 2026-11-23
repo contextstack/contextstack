@@ -17,7 +17,7 @@
 //! | conversations, turns, summaries (`conversations.rs`; CLIENT-API.md §11) | any |
 //! | projects, budgets, usage, source budgets (`spend.rs`; CLIENT-API.md §12) | any; setting source budgets: owner |
 //! | `GET events[?conversation=]` (server-sent events) | any |
-//! | `GET credentials`, `POST pairings` `{"name"}`, `DELETE credentials/{id}` | owner (the local credential) |
+//! | `GET credentials`, `POST pairings` `{"name"}`, `DELETE credentials/{id}` | owner (local or paired) |
 //! | `POST /api/v1/pair` `{"code"}` → `{credential_id, name, token}` | holder of a live pairing code |
 //!
 //! Paths are under `/api/v1/client/` unless shown whole.
@@ -30,6 +30,22 @@ use crate::util;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+fn intent_route(
+    state: &Arc<State>,
+    call: &Call,
+    client: &access::Client,
+    id: &str,
+    rest: &[&str],
+) -> Option<Reply> {
+    match (call.method.as_str(), rest) {
+        ("GET", ["work-trace"]) => Some(crate::work_trace::get(state, id)),
+        ("PUT", ["owner-messages", msg, "mark"]) => {
+            Some(crate::work_trace::set_mark(state, call, client, id, msg))
+        }
+        _ => None,
+    }
+}
 
 const PREFIX: &str = "/api/v1/client/";
 
@@ -54,6 +70,7 @@ pub fn handle(state: &Arc<State>, call: &Call) -> Reply {
 }
 
 /// Dispatch for an already authenticated local UI session; never exposes a bearer to the browser.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client) -> Reply {
     let Some(rest) = call.path.strip_prefix(PREFIX) else {
         return not_found();
@@ -62,10 +79,13 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
     if let Some(no) = crate::lead::guard(state, call, client, &parts) {
         return no;
     }
-    let owner = client.kind == Kind::Local;
+    let owner = client.is_owner();
     let node = call.query("node");
     let db = || state.store.db();
     let found = match (call.method.as_str(), parts.as_slice()) {
+        (_, ["action-approvals", ..]) => {
+            return crate::action_approvals::client(state, call, client, &parts);
+        }
         ("GET", ["chief-of-staff"]) => return crate::chief_of_staff::get(state),
         ("PUT", ["chief-of-staff"]) => return crate::chief_of_staff::put(state, call, client),
         ("GET", ["me"]) => Ok(me_answer(client)),
@@ -88,6 +108,15 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
         ("GET", ["events"]) => {
             return crate::events::stream(state, client, call.query("conversation"));
         }
+        (_, ["projects", id, "backlog", rest @ ..]) => {
+            return crate::backlog::handle(state, call, client, id, rest);
+        }
+        (_, ["projects", id, "heartbeat"]) => {
+            return crate::heartbeat::handle(state, call, client, id);
+        }
+        (_, ["projects", id, "decision_log", rest @ ..]) => {
+            return crate::decision_log::handle(state, call, client, id, rest);
+        }
         (_, ["projects", ..] | ["usage" | "source-budgets"] | ["source-budgets", _])
         | ("PUT" | "DELETE", ["conversations", _, "budget"]) => {
             return crate::spend::handle(state, call, client, &parts);
@@ -98,21 +127,24 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
         ) => {
             return crate::conversations::handle(state, call, client, &parts);
         }
+        ("GET" | "PUT", ["intents", id, ..]) if parts.len() > 2 => {
+            return intent_route(state, call, client, id, &parts[2..]).unwrap_or_else(not_found);
+        }
         ("POST", ["intents", id, "jobs"]) => {
             return crate::work::add_job(state, call, client, id);
         }
         ("POST", ["intents"]) => return crate::work::submit(state, call, client),
         ("GET", ["intents"]) => return work_list(state, node, call, client),
-        ("GET", ["intents", id]) => records::intent_bundle(&db(), id)
+        ("GET", ["intents", id]) if parts.get(2).is_none() => records::intent_bundle(&db(), id)
             .map(Option::unwrap_or_default)
             .map_err(|e| e.to_string()),
-        ("GET", ["jobs"]) => list(state, Record::Job, node)
-            .and_then(|j| crate::lead::filter(&db(), client, Record::Job, j))
+        ("GET", ["jobs"]) => records::list_work(&db(), Record::Job, node, client)
+            .map_err(|e| e.to_string())
             .map(|j| json!({"jobs": j})),
         ("GET", ["jobs", id]) => one(state, Record::Job, id),
         ("POST", ["jobs", id, "cancel"]) => return crate::work::cancel(state, call, client, id),
-        ("GET", ["runs"]) => list(state, Record::Run, node)
-            .and_then(|r| crate::lead::filter(&db(), client, Record::Run, r))
+        ("GET", ["runs"]) => records::list_work(&db(), Record::Run, node, client)
+            .map_err(|e| e.to_string())
             .map(|r| json!({"runs": r})),
         ("GET", ["runs", id]) => one(state, Record::Run, id),
         ("POST", ["runs", id, "decision"]) => {
@@ -126,17 +158,20 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
         }
         ("GET", ["objects", sha]) => return object(state, sha),
         ("PUT", ["objects", sha]) => return upload(state, call, sha, client),
-        ("GET", ["credentials"]) if owner => {
-            access::credentials(&state.store).map(|c| json!({"credentials": c}))
-        }
-        ("POST", ["credentials", "lead"]) if owner => return mint_lead(state, call),
-        ("POST", ["pairings"]) if owner => return issue(state, call),
+        ("GET", ["credentials"]) if owner => access::credentials(&state.store),
+        ("POST", ["credentials", "lead"]) if owner => return mint_lead(state, call, client),
+        ("POST", ["pairings"]) if owner => return issue(state, call, client),
         ("DELETE", ["credentials", id]) if owner => {
-            return match access::revoke_credential(&state.store, id) {
-                Ok(()) => {
-                    state.hub.revoked(id);
-                    json(200, &json!({"id": id, "revoked": true}))
-                }
+            if client.kind == Kind::Device && client.id == *id {
+                return refusal(
+                    409,
+                    "self_revoke",
+                    "Use Forget this device to remove the credential locally.",
+                    Value::Null,
+                );
+            }
+            return match access::revoke_credential(&state.store, id, &client.id) {
+                Ok(()) => json(200, &json!({"id": id, "revoked": true})),
                 Err(e) => refusal(404, "not_found", &e, Value::Null),
             };
         }
@@ -144,7 +179,7 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
             return refusal(
                 403,
                 "owner_only",
-                "only the local credential may do this",
+                "only an owner credential may do this",
                 Value::Null,
             );
         }
@@ -239,12 +274,15 @@ fn work_list(state: &State, node: Option<&str>, call: &Call, client: &access::Cl
             Err(no) => return no.reply(),
         },
     };
-    let intents =
-        match records::list_intents(&db, node, call.query("conversation"), lanes, project, limit) {
-            Ok(rows) => rows,
-            Err(e) => return internal(&e),
-        };
-    let intents = match crate::lead::filter(&db, client, Record::Intent, intents) {
+    let intents = match records::list_intents(
+        &db,
+        node,
+        call.query("conversation"),
+        lanes,
+        project,
+        limit,
+        Some(client),
+    ) {
         Ok(rows) => rows,
         Err(e) => return internal(&e),
     };
@@ -380,14 +418,14 @@ fn not_found() -> Reply {
 }
 
 fn me_answer(client: &access::Client) -> Value {
-    let mut me = json!({"credential_id": client.id, "owner": client.kind == Kind::Local});
+    let mut me = json!({"credential_id": client.id, "owner": client.is_owner()});
     if let Some(c) = &client.conversation_id {
         me["conversation_id"] = json!(c);
     }
     me
 }
 
-fn issue(state: &State, call: &Call) -> Reply {
+fn issue(state: &State, call: &Call, client: &access::Client) -> Reply {
     let body: Value = serde_json::from_slice(&call.body).unwrap_or(Value::Null);
     let Some(name) = body.get("name").and_then(Value::as_str) else {
         return refusal(
@@ -397,7 +435,7 @@ fn issue(state: &State, call: &Call) -> Reply {
             Value::Null,
         );
     };
-    match access::issue_pairing(&state.store, name) {
+    match access::issue_pairing(&state.store, name, &client.id) {
         Ok((code, expires_at)) => json(
             200,
             &json!({"code": code, "name": name, "expires_at": expires_at}),
@@ -478,7 +516,7 @@ fn step5(
     }
 }
 
-fn mint_lead(state: &State, call: &Call) -> Reply {
+fn mint_lead(state: &State, call: &Call, client: &access::Client) -> Reply {
     let body: Value = serde_json::from_slice(&call.body).unwrap_or_default();
     let (Some(name), Some(conversation)) =
         (body["name"].as_str(), body["conversation_id"].as_str())
@@ -502,7 +540,7 @@ fn mint_lead(state: &State, call: &Call) -> Reply {
             );
         }
     };
-    match access::mint_lead(&state.store, name, conversation, intent) {
+    match access::mint_lead(&state.store, name, conversation, intent, &client.id) {
         Ok(v) => json(201, &v),
         Err(e) => refusal(422, "invalid_request", &e, Value::Null),
     }

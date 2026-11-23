@@ -77,10 +77,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 2.\nProduce the deliverable requested in the task goal now, then stop.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-hook-veto-budget-turns-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -91,12 +90,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-hook-veto-budget-turns",
+        "run_id": "<RUNSTAMP>-fx-hook-veto-budget-turns-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 1,
         "tool_schema": [
           {
             "description": "Write a file, creating parent dirs. Args: {path, content}.",
@@ -133,10 +133,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 1.\nProduce the deliverable requested in the task goal now, then stop.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-hook-veto-budget-turns-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -155,12 +154,19 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-hook-veto-budget-turns",
+        "run_id": "<RUNSTAMP>-fx-hook-veto-budget-turns-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 2,
+        "tool_choice": {
+          "function": {
+            "name": "fs_write"
+          },
+          "type": "function"
+        },
         "tool_schema": [
           {
             "description": "Write a file, creating parent dirs. Args: {path, content}.",
@@ -218,12 +224,15 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "messages.jsonl",
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],

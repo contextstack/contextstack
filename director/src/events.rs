@@ -99,6 +99,10 @@ impl Hub {
         let mut seen = HashSet::new();
         let mut events = Vec::new();
         for (seq, kind, id) in rows.iter().rev() {
+            if kind == "credential_revoked" {
+                self.revoked(id);
+                continue;
+            }
             if kind == "chief_of_staff" {
                 if seen.insert((Record::Conversation, "chief_of_staff"))
                     && let Ok(record) = crate::chief_of_staff::read(&db)
@@ -251,6 +255,9 @@ fn stream_inner(
     let only = conversation.map(String::from);
     let ours = move |e: &Value, record: bool| {
         only.as_ref().is_none_or(|c| {
+            if record && e["kind"] == "chief_of_staff" {
+                return false;
+            }
             let v = if record { &e["record"] } else { e };
             (record && e["kind"] == "conversation" && e["id"] == c.as_str())
                 || v.get("conversation_id").and_then(Value::as_str) == Some(c.as_str())
@@ -264,7 +271,7 @@ fn stream_inner(
                 crate::ui_auth::authenticate(&state.store, token).is_ok_and(|csrf| csrf.is_some())
             })
         };
-        if !session_live() {
+        if !session_live() || !live(&state.store, &me) {
             return;
         }
         let mut hello = json!({"revision": from, "replay": false, "credential_id": me});
@@ -340,7 +347,7 @@ fn stream_inner(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::server::{Call, Peer};
     use crate::settings::{Args, Settings};
@@ -348,9 +355,9 @@ mod tests {
 
     type Res = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    type Fixture = (tempfile::TempDir, Arc<State>, Client, String);
+    pub(crate) type Fixture = (tempfile::TempDir, Arc<State>, Client, String);
 
-    fn fixture() -> Result<Fixture, Box<dyn std::error::Error + Send + Sync>> {
+    pub(crate) fn fixture() -> Result<Fixture, Box<dyn std::error::Error + Send + Sync>> {
         let tmp = tempfile::tempdir()?;
         let store = Store::open(&tmp.path().join("data"))?;
         crate::access::ensure_local_credential(&store)?;
@@ -391,6 +398,60 @@ mod tests {
         assert!(matches(&json!({"conversation_id": "c1"}), "c1"));
         assert!(matches(&json!({"lead_conversation_id": "c1"}), "c1"));
         assert!(!matches(&json!({"lead_conversation_id": "c2"}), "c1"));
+    }
+
+    #[tokio::test]
+    async fn conversation_stream_skips_chief_of_staff_change() -> Res {
+        let (_tmp, state, client, _) = fixture()?;
+        let mut reply = stream(&state, &client, Some("c1"));
+        opened(&mut reply).await?;
+        let _ = state.hub.tx.send(Msg::Changes(
+            vec![
+                json!({"kind":"chief_of_staff", "record":{"conversation_id":"c1"}}),
+                json!({"kind":"conversation", "id":"c1", "record":{}}),
+            ]
+            .into(),
+        ));
+        let frame = tokio::time::timeout(Duration::from_secs(1), reply.body_mut().frame())
+            .await?
+            .ok_or("stream closed")??
+            .into_data()
+            .map_err(|_| "not data")?;
+        assert!(String::from_utf8_lossy(&frame).contains("\"kind\":\"conversation\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotating_lead_credential_closes_open_stream() -> Res {
+        let (_tmp, state, _client, _) = fixture()?;
+        crate::access::register_node(&state.store, "home")?;
+        let node = {
+            let db = state.store.db();
+            db.execute_batch(
+                "INSERT INTO conversations(conversation_id,node,spec,spec_version,model,
+                instructions_tokens,tools,created_by,created_at,lead)
+                VALUES('c1','home','s','v','m',0,0,'local','now',1);",
+            )?;
+            db.query_row("SELECT id FROM nodes WHERE name='home'", [], |r| r.get(0))?
+        };
+        let minted = crate::access::mint_lead(&state.store, "first", "c1", None, "cred_test")?;
+        let lead = Client {
+            id: minted["credential_id"].as_str().ok_or("missing id")?.into(),
+            kind: Kind::Lead,
+            conversation_id: Some("c1".into()),
+            intent_id: None,
+            node: Some("home".into()),
+        };
+        let mut reply = stream(&state, &lead, None);
+        opened(&mut reply).await?;
+        assert_eq!(
+            crate::lead_node::issue_credential(&state, node, "home", "c1").status(),
+            201
+        );
+        let body =
+            tokio::time::timeout(Duration::from_secs(1), reply.into_body().collect()).await??;
+        assert!(String::from_utf8_lossy(&body.to_bytes()).contains("event: revoked"));
+        Ok(())
     }
 
     #[test]

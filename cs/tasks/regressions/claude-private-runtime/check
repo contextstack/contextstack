@@ -3,18 +3,19 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
 from scratch import scratch_dir
+from cli_execution import command as cli_command
 
 import json,os,shutil,subprocess,sys,tempfile
 from pathlib import Path
-LAB=Path(__file__).resolve().parents[3]
+CODE_ROOT=Path(__file__).resolve().parents[3]
 # Metadata guards run independently of the host-only executor/Seatbelt fixture.
-sys.path.insert(0,str(LAB/'ops/bin'))
+sys.path.insert(0,str(CODE_ROOT/'ops/bin'))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '_lib'))
 from _cli_native import stage
 with scratch_dir(prefix='claude-login-identity-') as raw:
  root=Path(raw).resolve();home=root/'personal';credential=home/'.claude/.credentials.json'
  credential.parent.mkdir(parents=True);credential.write_text('fixture')
- templates=json.loads((LAB/'ops/bin/executor-templates.json').read_text())
+ templates=json.loads((CODE_ROOT/'ops/bin/executor-templates.json').read_text())
  expected={name for name in templates if name.startswith('claude-code') or name=='claude-auth-context-probe'}
  copied={name for name,template in templates.items() if '~/.claude/.credentials.json' in template.get('copies',{}).values()}
  assert expected <= copied, 'Claude templates still link owner credentials'
@@ -36,12 +37,12 @@ with scratch_dir(prefix='claude-login-identity-') as raw:
 print('PASS: Claude login metadata guards and parent-entry protections')
 if '--offline' in sys.argv:raise SystemExit(0)
 with scratch_dir(prefix='claude-private-runtime-') as raw:
- root=Path(raw).resolve();lab=root/'lab';ops=lab/'ops/bin';ops.mkdir(parents=True)
- for p in (LAB/'ops/bin').iterdir():
+ root=Path(raw).resolve();code_root=root/'code_root';ops=code_root/'ops/bin';ops.mkdir(parents=True)
+ for p in (CODE_ROOT/'ops/bin').iterdir():
   if p.is_file():shutil.copy2(p,ops/p.name)
  from native_runtime import stage_native_runtime
  stage_native_runtime(ops)
- (lab/'ESTATE').write_text('dev\n')  # finalize-run's node identity
+ (code_root/'ESTATE').write_text('dev\n')  # finalize-run's node identity
  home=root/'personal';bins=home/'.local/bin';bins.mkdir(parents=True)
  (home/'Library/Keychains').mkdir(parents=True);(home/'Library/Keychains/guard').write_text('unchanged')
  (home/'.claude').mkdir();(home/'.claude/guard').write_text('unchanged')
@@ -88,15 +89,15 @@ Path('result.json').write_text(json.dumps({'home':str(home),'user':os.environ.ge
 print(json.dumps({'type':'result','is_error':False,'result':'done'}))
 ''');fake.chmod(0o755)
  (ops/'executor-templates.json').write_text(json.dumps({'claude-fixture':{'binary':'claude','args':[],'cost_class':'subscription','auth':'subscription'}}))
- task=lab/'tasks/fixture';task.mkdir(parents=True)
+ task=code_root/'tasks/fixture';task.mkdir(parents=True)
  (task/'goal.md').write_text('Write result.json.\n')
  (task/'check').write_text('#!'+sys.executable+'\nfrom pathlib import Path\nassert Path("result.json").is_file()\n');(task/'check').chmod(0o755)
  env={k:v for k,v in os.environ.items() if k in ('PATH','USER','LANG','TMPDIR')}
  env['PATH']=str(selected)+os.pathsep+env.get('PATH','')
  env.update(HOME=str(home),OPENAI_API_KEY='fake-never-inherit',CLAUDE_CONFIG_DIR='/should-not-inherit')
- r=subprocess.run([sys.executable,str(ops/'_executor.py')],input=json.dumps({'executor':'claude-fixture','task':str(task),'exp':'task-1763','timeout_s':15}),env=env,cwd=lab,capture_output=True,text=True,timeout=30)
+ r=subprocess.run(cli_command(sys.executable, ops/'_executor.py'),input=json.dumps({'executor':'claude-fixture','task':str(task),'exp':'task-1763','timeout_s':15}),env=env,cwd=code_root,capture_output=True,text=True,timeout=30)
  assert r.stdout,(r.returncode,r.stderr)
- receipt=json.loads(r.stdout.splitlines()[-1]);run=lab/receipt['transcript'];ws=run/'workspace'
+ receipt=json.loads(r.stdout.splitlines()[-1]);run=code_root/receipt['transcript'];ws=run/'workspace'
  assert r.returncode==0,(r.stdout,r.stderr,(run/'cli.log').read_text())
  result=json.loads((ws/'result.json').read_text());runtime=Path(result['home'])
  assert runtime.is_relative_to(run/'tmp') and not runtime.is_relative_to(ws)
@@ -108,10 +109,10 @@ print(json.dumps({'type':'result','is_error':False,'result':'done'}))
  assert not any(p.is_symlink() for p in run.rglob('Keychains')), 'Keychain link left in run evidence'
  # File-backed HOME uses the real Claude template declarations.
  credentials=home/'.claude/.credentials.json';credentials.write_text(json.dumps({'claudeAiOauth':{'accountUuid':'owner-account','organizationUuid':'owner-org','refreshToken':'original-fixture'}}));credentials.chmod(0o600)
- template=json.loads((LAB/'ops/bin/executor-templates.json').read_text())['claude-code-sonnet']
+ template=json.loads((CODE_ROOT/'ops/bin/executor-templates.json').read_text())['claude-code-sonnet']
  template.update(binary='claude',args=[])
  (ops/'executor-templates.json').write_text(json.dumps({'claude-code-sonnet':template}))
- r=subprocess.run([sys.executable,str(ops/'_executor.py')],input=json.dumps({'executor':'claude-code-sonnet','task':str(task),'exp':'task-1763','trial':99,'timeout_s':15}),env=env,cwd=lab,capture_output=True,text=True,timeout=30)
+ r=subprocess.run(cli_command(sys.executable, ops/'_executor.py'),input=json.dumps({'executor':'claude-code-sonnet','task':str(task),'exp':'task-1763','trial':99,'timeout_s':15}),env=env,cwd=code_root,capture_output=True,text=True,timeout=30)
  assert r.returncode==0,(r.stdout,r.stderr)
  # Task-run copies are never written back (owner decision 2026-11-12); only the no-tools auth refresh writes back.
  assert json.loads(credentials.read_text())['claudeAiOauth']['refreshToken']=='original-fixture'
@@ -164,8 +165,8 @@ if sys.platform=='darwin':
 Path('result.json').write_text('{}')
 print(json.dumps({'type':'result','is_error':False,'result':'done'}))
 ''')
-  r=subprocess.run([sys.executable,str(ops/'_executor.py')],input=json.dumps({'executor':'claude-fixture','task':str(task),'exp':'task-1801','trial':trial,'timeout_s':15}),env=env,cwd=lab,capture_output=True,text=True,timeout=30)
-  row=json.loads(r.stdout.splitlines()[-1]);run=lab/row['transcript']
+  r=subprocess.run(cli_command(sys.executable, ops/'_executor.py'),input=json.dumps({'executor':'claude-fixture','task':str(task),'exp':'task-1801','trial':trial,'timeout_s':15}),env=env,cwd=code_root,capture_output=True,text=True,timeout=30)
+  row=json.loads(r.stdout.splitlines()[-1]);run=code_root/row['transcript']
   attempts=json.loads((run/'tmp/claude-home/attempts.json').read_text())
   expected=['task'] if message in ('Unrelated task failure','Invalid API key / Please run /login') else ['task','refresh']+(['task'] if success else [])
   assert attempts==expected,(message,attempts,expected)

@@ -124,14 +124,14 @@ mod tests {
             code_root: &fx.code,
             roots: &fx.roots,
         };
-        grant("LAB_X", value.map(|p| p.as_os_str().to_owned()), &bounds)
+        grant("CS_X", value.map(|p| p.as_os_str().to_owned()), &bounds)
     }
 
     #[test]
     fn a_directory_under_the_root_is_created_private_and_granted() -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let fx = layout()?;
-        let want = fx.roots[0].join("lab/browser-state");
+        let want = fx.roots[0].join("cs/browser-state");
         assert_eq!(try_grant(&fx, Some(&want)), Ok(want.clone()));
         assert!(want.is_dir());
         let mode = std::fs::metadata(&want)
@@ -145,10 +145,10 @@ mod tests {
     #[test]
     fn unset_relative_and_dotdot_are_narrowed() -> Result<(), String> {
         let fx = layout()?;
-        assert_eq!(try_grant(&fx, None), Err("LAB_X is unset".to_owned()));
+        assert_eq!(try_grant(&fx, None), Err("CS_X is unset".to_owned()));
         assert_eq!(
             try_grant(&fx, Some(Path::new(""))),
-            Err("LAB_X is unset".to_owned())
+            Err("CS_X is unset".to_owned())
         );
         for bad in ["rel/state", "/a/../b"] {
             let reason = try_grant(&fx, Some(Path::new(bad)))

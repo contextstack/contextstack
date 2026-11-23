@@ -112,6 +112,9 @@ def main():
     # touching installed state. Grok has no profile and must reach this failure/recording path.
     templates = json.loads((OPS / "executor-templates.json").read_text())
     expect(not templates["grok"].get("profile"), "grok uses standard executor")
+    from types import SimpleNamespace
+    from _machine_finish import execution_receipt
+
     tree = ast.parse((OPS / "_executor.py").read_text())
     main_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
     start = next(i for i, node in enumerate(main_fn.body) if isinstance(node, ast.Assign)
@@ -136,9 +139,22 @@ def main():
                            AUTH_EXPIRED=re.compile(r"never-match-fixture"), auth_text=stdout + stderr,
                            LOGIN_REFRESH_CLIS=("pi", "codex", "grok"), LOGIN_EXPIRED=re.compile(r"never-match-fixture"),
                            detect_limit=detect_limit, enrich_allowance=enrich_allowance,
-                           record_limit=record_limit, state_dir=lambda _: state, LAB=OPS.parents[1])
+                           record_limit=record_limit, state_dir=lambda _: state, CODE_ROOT=OPS.parents[1])
             exec(classify, context)
             expect(context["native_stop"] == expected, "grok executor: " + expected)
+            run = state / "runs" / "fixture"
+            run.mkdir(parents=True, exist_ok=True)
+            row.update(trial=1, stimulus_sha="a" * 64, cli_exit=code)
+            receipt = execution_receipt(
+                run, run / "workspace", row, "fixture", "tasks/fixture", "fixture", time.time(), 60,
+                "task", context["native_stop"], None, None, SimpleNamespace(terminal_fields=dict),
+                None, False, [], state / "policy.json", {}, (), None, [], None, {},
+            )
+            saved = json.loads((run / "execution-receipt.json").read_text())
+            expect(saved == receipt and saved["native"] == {"stop": expected, "exit": code},
+                   "grok: receipt carries the classified stop")
+            expect(saved["row"].get("allowance") == row.get("allowance"),
+                   "grok: receipt preserves allowance")
             active = active_templates(state)
             if expected == "provider_limit":
                 expect(row.get("allowance", {}).get("rejected") is True, "grok executor: allowance rejected")

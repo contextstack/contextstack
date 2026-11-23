@@ -14,5 +14,5 @@ A delivery that keeps failing is a void terminal on the dispatch shelf (the hist
 the row is disabled with a `hold` reason and a deferred entry, and later ticks do not retry it.
 A successful delivery records a pass on that shelf and resets the streak.
 
-Run: `env -u LAB_STATE_ROOT -u CSGATEWAY_ENDPOINT tasks/regressions/weekly-review-schedule/check`.
+Run: `env -u CS_STATE_ROOT -u CSGATEWAY_ENDPOINT tasks/regressions/weekly-review-schedule/check`.
 Fake clock, temp state root. Never `~/.contextstack`.

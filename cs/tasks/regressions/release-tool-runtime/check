@@ -19,8 +19,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "node-install-layout"))
 import _bundle  # noqa: E402
 
-LAB = _bundle.LAB
-REPO = LAB.parent
+CODE_ROOT = _bundle.CODE_ROOT
+REPO = CODE_ROOT.parent
 ID = "20990101-ttttttttt"
 BUILT = {"cs-harness": "cs-harness", "cs-sandbox": "cs-sandbox", "cs-tools": "cs-tools"}  # bin name -> target/release name
 SPEC = """id: release-tool-runtime
@@ -89,7 +89,7 @@ def install(tmp, uv, managed):
     _bundle.bundle(tmp / "bundle", uv, ID, bins)
     _bundle.seed_python(home, ID, managed)
     env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home)
-    r = subprocess.run(["sh", str(LAB / "scripts/node-install"), "install", str(tmp / "bundle"), "--node", "test-node",
+    r = subprocess.run(["sh", str(CODE_ROOT / "scripts/node-install"), "install", str(tmp / "bundle"), "--node", "test-node",
                         "--director", "http://127.0.0.1:9", "--installation", "inst-test", "--no-load"],
                        capture_output=True, text=True, env=env, cwd="/")
     rel = home / ".contextstack/releases" / ID
@@ -103,7 +103,7 @@ def run_smoke(tmp, home, node, task):
     (its spec frozen in <state>/jobs/<job>/, the task materialised beside it)."""
     spec = task.parent / "spec.yaml"
     (task.parent / "prompts").mkdir()
-    shutil.copy2(LAB / "prompts/coder-min.md", task.parent / "prompts/coder-min.md")
+    shutil.copy2(CODE_ROOT / "prompts/coder-min.md", task.parent / "prompts/coder-min.md")
     spec.write_text(SPEC.replace("TASK", str(task)))
     with ThreadingHTTPServer(("127.0.0.1", 0), Gateway) as server:
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -148,7 +148,7 @@ def control(tmp, rel):
     ws = tmp / "old/ws"
     ws.mkdir()
     venv = rel / "cs/.venv/bin"
-    env = {"PATH": "%s:/usr/bin:/bin" % venv, "HOME": str(tmp / "home"), "LAB_CODE_ROOT": str(rel / "cs"),
+    env = {"PATH": "%s:/usr/bin:/bin" % venv, "HOME": str(tmp / "home"), "CS_CODE_ROOT": str(rel / "cs"),
            "TMPDIR": str(tmp / "t"), "LANG": "C.UTF-8"}
     r = subprocess.run([str(rel / "bin/cs-sandbox"), "--policy", str(tmp / "old/policy/sandbox.json"), "--",
                         str(rel / "cs/tools/bin/fs_write")], input='{"path": "x.txt", "content": "x"}', cwd=ws,
@@ -172,7 +172,7 @@ def main():
         expect(os.path.realpath(rel / "cs/.venv/bin/python").startswith(str(base) + "/"),
                "layout: the venv's python links into releases/<id>/python/%s, outside the code root" % managed.name)
         task = home / ".contextstack/state/jobs/job-1/task"
-        shutil.copytree(LAB / "tasks/create-file", task)
+        shutil.copytree(CODE_ROOT / "tasks/create-file", task)
         r = run_smoke(tmp, home, node, task)
         expect(r.returncode == 0, "run-spec under the node plist's environment passes the create-file check",
                (r.returncode, r.stdout[-800:], r.stderr[-800:]))

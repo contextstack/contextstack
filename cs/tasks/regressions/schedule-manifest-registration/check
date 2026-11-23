@@ -6,7 +6,7 @@ from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
 HERE = Path(__file__).resolve().parent
-# Lab runs the frozen check from stimulus while the editable setup tree is the
+# ContextStack runs the frozen check from stimulus while the editable setup tree is the
 # process working directory. Direct regression runs exercise the live seam.
 CANDIDATE = Path.cwd() / "ops/bin/schedule-enable"
 
@@ -54,23 +54,23 @@ with scratch_dir(prefix="schedule-manifest-registration-") as raw:
     (root / "ops/bin/_estate_io.py").write_text('''
 import hashlib,json
 from pathlib import Path
-def state_dir(lab):
- return Path(lab)/"ledger"
+def state_dir(code_root):
+ return Path(code_root)/"ledger"
 def read_jsonl(path,strict=True):
  p=Path(path)
  return [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.is_file() else []
 def append_jsonl(path,row,**kw):
  with Path(path).open("a") as out: out.write(json.dumps(row,sort_keys=kw.get("sort_keys",False))+"\\n")
-def estate_id(lab): return (Path(lab)/"ESTATE").read_text().strip()
-def estate_matches(lab,value): return value==estate_id(lab)
+def estate_id(code_root): return (Path(code_root)/"ESTATE").read_text().strip()
+def estate_matches(code_root,value): return value==estate_id(code_root)
 ''')
     (root / "ops/bin/_grant.py").write_text('''
 from pathlib import Path
 from _estate_io import estate_id
-LAB=Path(__file__).resolve().parents[2]
+CODE_ROOT=Path(__file__).resolve().parents[2]
 def same_repo(a,b): return Path(str(a)).resolve()==Path(str(b)).resolve()
 def load(gid):
- p=LAB/"grants"/(str(gid)+".yaml")
+ p=CODE_ROOT/"grants"/(str(gid)+".yaml")
  if not p.is_file(): return None,"grant not found"
  values={}
  for line in p.read_text().splitlines():
@@ -80,14 +80,14 @@ def load(gid):
 def schedule_error(row):
  g,e=load(row.get("grant"))
  if e:return e
- if g.get("estate")!=estate_id(LAB):return "grant estate mismatch"
+ if g.get("estate")!=estate_id(CODE_ROOT):return "grant estate mismatch"
  if g.get("status")!="active":return "revoked"
  if g.get("repo")!=row.get("root",row.get("setup_root")):return "repo mismatch"
  return ""
 def cover(gid,repo=None,paths=None,**kw):
  g,e=load(gid)
  if e:return False,e,g or {}
- if g.get("estate")!=estate_id(LAB):return False,"grant estate mismatch",g
+ if g.get("estate")!=estate_id(CODE_ROOT):return False,"grant estate mismatch",g
  if repo and g.get("repo")!=str(repo):return False,"repo mismatch",g
  return True,"",g
 ''')

@@ -4,7 +4,7 @@
 # is not trapped by a stale log). Hook sees the workspace, not the runner.
 import os, sys
 
-LOG, MARK = ".lab-calls.jsonl", ".lab-doom-mark"
+LOG, MARK = ".cs-calls.jsonl", ".cs-doom-mark"
 
 rows = []
 if os.path.isfile(LOG):

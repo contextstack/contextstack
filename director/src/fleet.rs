@@ -60,6 +60,30 @@ fn opt_text(m: &Map<String, Value>, field: &str, max: usize) -> Result<Value, St
     }
 }
 
+fn release_body(m: &Map<String, Value>) -> Result<Value, String> {
+    match m.get("release") {
+        None | Some(Value::Null) => Ok(Value::Null),
+        Some(v) => {
+            let o = v
+                .as_object()
+                .ok_or_else(|| "release must be an object".to_string())?;
+            let id = o
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 128)
+                .ok_or_else(|| {
+                    "release.id must be a nonempty string of at most 128 bytes".to_string()
+                })?;
+            let protocol = o
+                .get("protocol")
+                .and_then(Value::as_u64)
+                .filter(|p| *p == 1 || *p == 2)
+                .ok_or_else(|| "release.protocol must be 1 or 2".to_string())?;
+            Ok(json!({"id": id, "protocol": protocol}))
+        }
+    }
+}
+
 fn opt_u64(v: Option<&Value>) -> Result<Value, String> {
     match v {
         None | Some(Value::Null) => Ok(Value::Null),
@@ -93,6 +117,13 @@ fn vitals_body(v: &Value) -> Result<Value, String> {
         Some(_) => {
             return Err("vitals.memory_pressure must be a string of at most 40 bytes".into());
         }
+    }
+    match m.get("backup_error") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s.len() <= 480 => {
+            out.insert("backup_error".into(), json!(s));
+        }
+        Some(_) => return Err("vitals.backup_error must be a string of at most 480 bytes".into()),
     }
     Ok(Value::Object(out))
 }
@@ -204,10 +235,27 @@ fn status_body(body: &[u8]) -> Result<Value, String> {
         {
             return Err("agent_capabilities.templates must contain template names".into());
         }
-        out.insert(
-            "agent_capabilities".into(),
-            json!({"templates": templates, "preferred": opt_text(caps, "preferred", 100)?}),
-        );
+        let harness = caps
+            .get("harness")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut reported = json!({"templates": templates, "preferred": opt_text(caps, "preferred", 100)?, "harness": harness});
+        if caps.contains_key("harness_models") {
+            let models = list(caps, "harness_models")?;
+            if models
+                .iter()
+                .any(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 100))
+            {
+                return Err(
+                    "agent_capabilities.harness_models must contain gateway model names".into(),
+                );
+            }
+            reported["harness_models"] = json!(models);
+        }
+        out.insert("agent_capabilities".into(), reported);
+    }
+    if m.contains_key("release") {
+        out.insert("release".into(), release_body(&m)?);
     }
     if m.contains_key("provider_limits") {
         out.insert("provider_limits".into(), provider_limits_body(&m)?);
@@ -233,7 +281,15 @@ pub fn post_status(state: &State, call: &Call, node_id: i64, name: &str) -> Repl
         tx.commit()
     })();
     match done {
-        Ok(()) => json(200, &json!({"recorded_at": stamp})),
+        Ok(()) => {
+            if let Ok(offered) =
+                crate::capabilities::offer_waiting(&state.store, &db, node_id, name)
+                && offered > 0
+            {
+                crate::logf!("node {name}: offered {offered} job(s) after a capability report");
+            }
+            json(200, &json!({"recorded_at": stamp}))
+        }
         Err(e) => internal(&e),
     }
 }
@@ -639,13 +695,14 @@ mod tests {
         assert!(status_body(br#"{"active":[{"state":"queued"}]}"#).is_err());
         let vitals = match status_body(
             br#"{"active":[],"vitals":{"memory_total_bytes":100,"memory_available_bytes":5,
-            "memory_pressure":"warn","disk_free_bytes":null},"held":{"reason":"memory_low"}}"#,
+            "memory_pressure":"warn","disk_free_bytes":null,"backup_error":"S3 PUT failed"},"held":{"reason":"memory_low"}}"#,
         ) {
             Ok(v) => v,
             Err(e) => panic!("vitals status: {e}"),
         };
         assert_eq!(vitals["held"]["reason"], "memory_low");
         assert_eq!(vitals["vitals"]["memory_pressure"], "warn");
+        assert_eq!(vitals["vitals"]["backup_error"], "S3 PUT failed");
         assert!(status_body(br#"{"active":[],"held":{}}"#).is_err());
         assert!(status_body(br#"{"active":[],"vitals":"x"}"#).is_err());
     }
@@ -658,6 +715,10 @@ mod tests {
             json!(["claude-code"])
         );
         assert_eq!(status["agent_capabilities"]["preferred"], "claude-code");
+        assert_eq!(status["agent_capabilities"]["harness"], false);
+        let harness = status_body(br#"{"active":[],"agent_capabilities":{"templates":[],"harness":true},"release":{"id":"dev","protocol":2}}"#)?;
+        assert_eq!(harness["agent_capabilities"]["harness"], true);
+        assert_eq!(harness["release"]["id"], "dev");
         for body in [
             br#"{"active":[],"agent_capabilities":[]}"#.as_slice(),
             br#"{"active":[],"agent_capabilities":{"templates":[3]}}"#.as_slice(),

@@ -104,51 +104,51 @@ def iter_jsonl(path, *, strict, errors, objects_only, with_bookkeeping=False):
             yield value
 
 
-def state_dir(lab):
-    """The state root for a lab checkout (CS phase 6 step 10): <lab>/ledger exactly as given
-    (byte for byte, no symlink resolution) unless LAB_STATE_ROOT is set, then _roots' validated rule.
+def state_dir(code_root):
+    """The state root for a ContextStack checkout (CS phase 6 step 10): <code-root>/ledger exactly as given
+    (byte for byte, no symlink resolution) unless CS_STATE_ROOT is set, then _roots' validated rule.
     Every reader of a state shelf goes through here, so a relocated state root moves all of them."""
-    if not os.environ.get("LAB_STATE_ROOT"):
-        return Path(lab) / "ledger"
+    if not os.environ.get("CS_STATE_ROOT"):
+        return Path(code_root) / "ledger"
     from _roots import roots
-    return roots(lab)["state"]
+    return roots(code_root)["state"]
 
 
-def lab_path(lab, path):
-    """A lab-relative or absolute path, lexically, with anything under <lab>/ledger/ mapped into the state root
+def code_path(code_root, path):
+    """A code-root-relative or absolute path, lexically, with anything under <code-root>/ledger/ mapped into the state root
     Paths such as "ledger/setups/x" and a task's ../../../ledger/... setup link keep working once the ledger has
     left the checkout. With the default state root the path is unchanged."""
-    lab, path = Path(lab), Path(path)
-    path = Path(os.path.normpath(path if path.is_absolute() else lab / path))
+    code_root, path = Path(code_root), Path(path)
+    path = Path(os.path.normpath(path if path.is_absolute() else code_root / path))
     try:
-        rest = path.relative_to(os.path.normpath(lab / "ledger"))
+        rest = path.relative_to(os.path.normpath(code_root / "ledger"))
     except ValueError:
         return path
-    return state_dir(lab) / rest
+    return state_dir(code_root) / rest
 
 
-def link_target(lab, link):
-    """Where a task's `setup` symlink points, through lab_path; a non-link is returned as is."""
+def link_target(code_root, link):
+    """Where a task's `setup` symlink points, through code_path; a non-link is returned as is."""
     link = Path(link)
     if not link.is_symlink():
         return link
     text = os.readlink(link)
-    return lab_path(lab, text if os.path.isabs(text) else link.parent / text)
+    return code_path(code_root, text if os.path.isabs(text) else link.parent / text)
 
 
-def estate_dir(lab):
-    """The directory whose ESTATE names this estate (P1): for a lab code root (INVARIANTS.md) the
-    config root when LAB_CONFIG_ROOT is set (an install: config/ESTATE; releases ship no ESTATE), else the
-    directory itself (a checkout's lab/, a config dir, a fixture), byte for byte as before."""
-    lab = Path(lab)
-    if os.environ.get("LAB_CONFIG_ROOT") and (lab / "INVARIANTS.md").is_file():
+def estate_dir(code_root):
+    """The directory whose ESTATE names this estate (P1): for a code_root code root (INVARIANTS.md) the
+    config root when CS_CONFIG_ROOT is set (an install: config/ESTATE; releases ship no ESTATE), else the
+    directory itself (a checkout's cs/, a config dir, a fixture), byte for byte as before."""
+    code_root = Path(code_root)
+    if os.environ.get("CS_CONFIG_ROOT") and (code_root / "INVARIANTS.md").is_file():
         from _roots import roots
-        return roots(lab)["config"]
-    return lab
+        return roots(code_root)["config"]
+    return code_root
 
 
-def estate_id(lab):
-    value = (estate_dir(lab) / "ESTATE").read_text().strip()
+def estate_id(code_root):
+    value = (estate_dir(code_root) / "ESTATE").read_text().strip()
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", value):
         raise ValueError("ESTATE must contain one short lowercase estate id")
     return value
@@ -167,30 +167,30 @@ def cutover_record(state):
     return record if isinstance(record, dict) and record.get("schema") == "estate-cutover-v2" else {}
 
 
-def estate_aliases(lab):
+def estate_aliases(code_root):
     """Earlier names this estate continues (D6: dev -> workstation): the v2 record's aliases when its estate is this one."""
-    record = cutover_record(state_dir(lab))
+    record = cutover_record(state_dir(code_root))
     try:
-        ident = estate_id(lab)
+        ident = estate_id(code_root)
     except (OSError, ValueError):
         return ()
     aliases = record.get("aliases") if record.get("estate") == ident else None
     return tuple(a for a in aliases or () if isinstance(a, str))
 
 
-def estate_matches(lab, value):
+def estate_matches(code_root, value):
     """True when `value` names this estate: its ESTATE or an alias the cutover record carries forward. Grants,
     cohort templates and schedules issued as dev stay valid on workstation without being rewritten."""
     try:
-        return value == estate_id(lab) or value in estate_aliases(lab)
+        return value == estate_id(code_root) or value in estate_aliases(code_root)
     except (OSError, ValueError):
         return False
 
 
 def relocated_estate(path):
-    """The config root holding ESTATE when `path` is a shelf directly in a relocated state root (LAB_STATE_ROOT),
-    so rows there are stamped exactly as rows in <lab>/ledger are; else None."""
-    if not os.environ.get("LAB_STATE_ROOT"):
+    """The config root holding ESTATE when `path` is a shelf directly in a relocated state root (CS_STATE_ROOT),
+    so rows there are stamped exactly as rows in <code-root>/ledger are; else None."""
+    if not os.environ.get("CS_STATE_ROOT"):
         return None
     try:
         from _roots import roots
@@ -210,7 +210,7 @@ def estate_row(path, row):
         ident = estate_id(config)
         record = cutover_record(path.parent)
         if record and record.get("estate") != ident:  # the dev checkout pointed at workstation's state root, or the reverse
-            raise ValueError("state root %s belongs to estate %s, this is %s: set LAB_STATE_ROOT to this estate's own"
+            raise ValueError("state root %s belongs to estate %s, this is %s: set CS_STATE_ROOT to this estate's own"
                              % (path.parent, record.get("estate"), ident))
         aliases = record.get("aliases") or () if record.get("estate") == ident else ()
         if row.get("estate", ident) != ident and row.get("estate") not in aliases:
@@ -274,9 +274,9 @@ def git(cwd, *args, env, errors):
                           text=True, env=env, errors=errors)
 
 
-def run_op(lab, name, payload, *, env=None):
-    result = subprocess.run([str(lab / "ops/bin" / name)], input=json.dumps(payload),
-                            capture_output=True, text=True, cwd=str(lab), env=env)
+def run_op(code_root, name, payload, *, env=None):
+    result = subprocess.run([str(code_root / "ops/bin" / name)], input=json.dumps(payload),
+                            capture_output=True, text=True, cwd=str(code_root), env=env)
     if result.returncode != 0:
         return None, (result.stderr or result.stdout or name + " failed").strip()
     text = (result.stdout or "").strip()
@@ -294,9 +294,22 @@ def digest(value):
     return sha256_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
-def call_op(lab, name, payload, *, failure=None):
-    result = subprocess.run([str(lab / "ops/bin" / name)], input=json.dumps(payload),
-                            text=True, capture_output=True, cwd=str(lab))
+def verify_frozen_stimulus(run_dir, stimulus):
+    if stimulus["manifest"] != "stimulus/manifest.json":
+        raise ValueError("invalid stimulus reference")
+    manifest = json.loads((run_dir / stimulus["manifest"]).read_text())
+    frozen_sha = manifest.pop("stimulus_sha")
+    if manifest["run_id"] != run_dir.name or stimulus["sha256"] != frozen_sha or digest(manifest) != frozen_sha:
+        raise ValueError("receipt does not bind the frozen stimulus manifest")
+    for item in manifest["inputs"]:
+        blob = (run_dir / "stimulus" / item["path"]).resolve()
+        if not blob.is_relative_to(run_dir / "stimulus") or sha256_bytes(blob.read_bytes()) != item["sha256"]:
+            raise ValueError("frozen stimulus input differs from its hash")
+
+
+def call_op(code_root, name, payload, *, failure=None):
+    result = subprocess.run([str(code_root / "ops/bin" / name)], input=json.dumps(payload),
+                            text=True, capture_output=True, cwd=str(code_root))
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout or failure or name + " failed").strip())
     return json.loads(result.stdout.splitlines()[-1])
@@ -367,7 +380,7 @@ def native_caller(template, home, run, workspace, tmpdir, lane=None):
 def native_sandbox_request(binary, workspace, tmpdir, home, *, protected=None, read_links=(),
                            login=None, read_roots=(), home_reads=(), env=None, caller=None):
     from _cli_native import declared_home_reads, _login_targets
-    from _toolchains import discover, discover_sandbox_links, has_cargo_toolchain
+    from _toolchains import discover, discover_sandbox_links, has_cargo_toolchain, has_uv_toolchain
     env = os.environ if env is None else env
     login = {} if login is None else login
     caller = {} if caller is None else caller
@@ -377,6 +390,16 @@ def native_sandbox_request(binary, workspace, tmpdir, home, *, protected=None, r
         found = shutil.which(binary, path=env.get("PATH", "")) or os.path.abspath(binary)
         binary = found
     roots, proxies = discover(), discover_sandbox_links()
+    uv_caches = []
+    if has_uv_toolchain():
+        uv_caches = [Path(home) / ".cache/uv", Path(home) / "Library/Caches/uv"]
+        if env.get("XDG_CACHE_HOME"):
+            uv_caches.append(Path(env["XDG_CACHE_HOME"]) / "uv")
+        if env.get("UV_CACHE_DIR"):
+            uv_caches.append(Path(env["UV_CACHE_DIR"]))
+        lane_cache = (Path(tmpdir) / "uv-cache").resolve()
+        uv_caches = list(dict.fromkeys(str(path.resolve()) for path in uv_caches
+                                      if path.is_absolute() and not lane_cache.is_relative_to(path.resolve())))
     return sandbox_request(
         workspace=workspace, tmpdir=tmpdir, home=home, executable=binary,
         lookup_path=[p for p in env.get("PATH", "").split(os.pathsep) if p],
@@ -390,13 +413,13 @@ def native_sandbox_request(binary, workspace, tmpdir, home, *, protected=None, r
         login_targets=[dict(path=str(path), allow_directory=allow_dir)
                        for path, allow_dir in _login_targets(login, home)],
         toolchains=dict(cargo_configured=has_cargo_toolchain(), read_roots=[str(p) for p in roots],
-                        proxy_paths=[str(p) for p in proxies]), **caller)
+                        proxy_paths=[str(p) for p in proxies], uv_cache_roots=uv_caches), **caller)
 
 
-def native_sandbox_binary(lab, *, env=None):
+def native_sandbox_binary(code_root, *, env=None):
     """Resolve only this release's binary, or an explicit test/development override."""
     env = os.environ if env is None else env
-    release = Path(lab).resolve().parent
+    release = Path(code_root).resolve().parent
     if env.get("CS_SANDBOX_BIN"):
         return Path(env["CS_SANDBOX_BIN"])
     installed = release / "bin/cs-sandbox"
@@ -405,13 +428,13 @@ def native_sandbox_binary(lab, *, env=None):
     return release / "target/release/cs-sandbox"
 
 
-def sandbox_runtime_lab():
+def sandbox_runtime_code_root():
     """Use the installed runtime even when Muse is loaded from a frozen bundle."""
     return Path(__file__).resolve().parents[2]
 
 
-def render_native_sandbox(lab, policy, request):
-    return render_sandbox_request(native_sandbox_binary(lab), policy, request)
+def render_native_sandbox(code_root, policy, request):
+    return render_sandbox_request(native_sandbox_binary(code_root), policy, request)
 
 
 def spec_intent(spec):

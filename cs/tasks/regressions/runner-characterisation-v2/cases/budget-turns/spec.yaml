@@ -2,7 +2,7 @@ id: fx-budget-turns
 model: fake
 system: prompts/coder-min.md
 context: []
-tools: [fx_tool]
+tools: [fx_tool, fs_write]
 post_turn: []
 mcp: []
 budget: {turns: 2, tool_calls: 10, usd: 1, seconds: 0}

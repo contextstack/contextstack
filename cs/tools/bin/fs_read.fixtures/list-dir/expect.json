@@ -1,8 +1,8 @@
 {
   "exit": 0,
-  "stdout": ".lab-calls.jsonl\na.txt\nsub/\n",
+  "stdout": ".cs-calls.jsonl\na.txt\nsub/\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"path\": \".\"}, \"name\": \"fs_read\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"path\": \".\"}, \"name\": \"fs_read\"}\n"
   },
   "untouched": true
 }

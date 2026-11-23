@@ -1,0 +1,1 @@
+Stop a Cursor run after two edit-tool permission refusals before any successful edit. Record the refused paths in the terminal record. A successful edit lets the run continue despite other refusals. The cs-mcp regression covers automatic retry on the next available profile fallback.

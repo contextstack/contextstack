@@ -4,9 +4,7 @@
 
 use super::history::validate_tool_history;
 use super::sse::Lines;
-use super::{
-    Call, Event, Http, Reply, Stop, error_body, request_id_header, trace, transport, until,
-};
+use super::{Call, Event, Http, Reply, Stop, error_body, request_id_header, until};
 use crate::errors::CallError;
 use crate::wire::{Message, ReplyToolCall, nullable};
 use serde::Deserialize;
@@ -119,6 +117,9 @@ impl OpenAi<'_> {
                 .collect();
             body["tools"] = Value::Array(tools);
         }
+        if let Some(choice) = &call.tool_choice {
+            body["tool_choice"] = choice.clone();
+        }
         Ok(body)
     }
 
@@ -149,27 +150,25 @@ impl OpenAi<'_> {
         call: &Call,
         url: &str,
         raw: Vec<u8>,
-        fields: &mut Value,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<reqwest::Response, CallError> {
         let mut req = http
             .client()
             .post(url)
-            .header("Content-Type", "application/json")
-            .body(raw);
+            .header("Content-Type", "application/json");
         if let Some(k) = key.filter(|k| !k.is_empty()) {
             req = req.header("Authorization", format!("Bearer {k}"));
         }
         if let Some(id) = request_id_header(&call.request_id) {
             req = req.header("X-Request-Id", id);
         }
-        let resp = req.send().await.map_err(|e| transport("Post", url, &e))?;
+        let resp = http.model_post(req, url, raw, trace).await?;
         let status = resp.status().as_u16();
-        fields["http_status"] = json!(status);
+        trace.headers(status);
         if status >= 300 {
             let retry_after_ms = crate::errors::parse_retry_after(resp.headers());
             let text = error_body(resp, 4096).await;
-            fields["upstream_error_bytes"] = json!(text.len());
-            fields["upstream_error_sha256"] = json!(crate::log::sha256_hex(text.as_bytes()));
+            trace.upstream_error_body(&text);
             return Err(CallError::upstream_http(
                 status,
                 self.name,
@@ -187,23 +186,21 @@ impl OpenAi<'_> {
         key: Option<&str>,
         call: &Call,
         deadline: Instant,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<Reply, CallError> {
         let (url, raw) = self.request(call, false)?;
-        let started = chrono::Utc::now();
+        trace.begin_attempt(self.name, &raw, false);
         let start = std::time::Instant::now();
         let mut fields = json!({});
         let result = until(deadline, "Post", &url, async {
-            let resp = self
-                .send(http, key, call, &url, raw.clone(), &mut fields)
-                .await?;
+            let resp = self.send(http, key, call, &url, raw, trace).await?;
             let latency = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
             let bytes = super::success_body(resp, "Post", &url).await?;
             let out: Out = first_value(&bytes).map_err(CallError::transport_local)?;
             reply(self.name, out, latency, &mut fields)
         })
         .await;
-        fields["failed"] = json!(result.is_err());
-        trace(&call.request_id, &raw, started, start.elapsed(), &fields);
+        trace.attempt_diagnostics(fields);
         result
     }
 
@@ -215,21 +212,17 @@ impl OpenAi<'_> {
         key: Option<&str>,
         call: &Call,
         deadline: Instant,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<Stream, CallError> {
         let (url, raw) = self.request(call, true)?;
-        let started = chrono::Utc::now();
-        let start = std::time::Instant::now();
-        let mut fields = json!({"stream": true});
-        let result = until(
+        trace.begin_attempt(self.name, &raw, true);
+        let resp = until(
             deadline,
             "Post",
             &url,
-            self.send(http, key, call, &url, raw.clone(), &mut fields),
+            self.send(http, key, call, &url, raw, trace),
         )
-        .await;
-        fields["failed"] = json!(result.is_err());
-        trace(&call.request_id, &raw, started, start.elapsed(), &fields);
-        let resp = result?;
+        .await?;
         let sse = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -301,13 +294,17 @@ fn reply(name: &str, out: Out, latency_ms: i64, fields: &mut Value) -> Result<Re
             stop = c.finish_reason;
         }
         for tc in c.message.tool_calls {
-            let args = native_args(tc.function.arguments).map_err(|e| {
-                CallError::ProviderFailed(format!("{name}: tool call {:?}: {e}", tc.function.name))
-            })?;
+            let parsed = native_args(tc.function.arguments);
+            let invalid_arguments = parsed.is_err();
+            // Keep a valid arguments object in the replayed assistant history.
+            let args = parsed
+                .or_else(|_| args_text(""))
+                .map_err(CallError::transport_local)?;
             tool_calls.push(ReplyToolCall {
                 id: tc.id,
                 name: tc.function.name,
                 args,
+                invalid_arguments,
             });
         }
     }
@@ -403,10 +400,22 @@ struct DeltaFunction {
 impl Stream {
     /// Tokens and charge accumulated from usage chunks so far.
     pub fn metered_usage(&self) -> super::MeteredUsage {
+        if let Some(Event::Stop(stop)) = self.queued.first() {
+            return super::MeteredUsage {
+                input_tokens: stop.input_tokens,
+                output_tokens: stop.output_tokens,
+                cache_read_tokens: stop.cache_read_tokens,
+                cache_write_tokens: stop.cache_write_tokens,
+                charged: stop.charged,
+            };
+        }
         let u = &self.acc.usage;
+        let (input_tokens, cache_read_tokens, output_tokens) = u.token_bill();
         super::MeteredUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens: 0,
             charged: u.cost,
         }
     }
@@ -547,8 +556,7 @@ pub fn first_value<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, St
 }
 
 /// Native arguments arrive as a JSON-encoded string (or, from some servers, a bare value). Absent, `""`
-/// or whitespace mean `{}`. Anything that is not then valid JSON is a provider protocol failure: the
-/// whole call fails, with no partial tool calls (WIRE clause 5).
+/// or whitespace mean `{}`. A parse failure is reported on the individual tool call.
 fn native_args(raw: Option<Box<RawValue>>) -> Result<Box<RawValue>, String> {
     match raw {
         None => args_text(""),
@@ -671,6 +679,7 @@ pub fn hermes_tool_calls(text: &str) -> Vec<ReplyToolCall> {
                 id: format!("xml-{}", out.len() + 1),
                 name: name.to_string(),
                 args,
+                invalid_arguments: false,
             });
         }
         at = text.len() - rest.len() + close + "</function>".len();
@@ -787,7 +796,11 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"n","arguments":"{nope"}}]}}]}"#,
             "[DONE]",
         ]);
-        assert!(matches!(bad, Err(CallError::ProviderFailed(_))));
+        let Ok(Event::Stop(bad)) = bad else {
+            panic!("expected a stop with the malformed call");
+        };
+        assert!(bad.tool_calls[0].invalid_arguments);
+        assert_eq!(bad.tool_calls[0].args.get(), "{}");
         let (_, whole) = feed(&[
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"a","function":{"name":"x","arguments":"{}"}},{"id":"b","function":{"name":"y","arguments":{"k":1}}}]},"finish_reason":"tool_calls"}]}"#,
             "[DONE]",
@@ -830,5 +843,29 @@ mod tests {
             native_args(raw(r#""{\"path\": ""#))
                 .is_err_and(|e| e.starts_with("arguments are not JSON"))
         );
+    }
+}
+
+#[cfg(test)]
+mod partial_meter_tests {
+    use super::*;
+
+    #[test]
+    fn partial_meter_excludes_cached_tokens_from_fresh_input() {
+        let stream = Stream {
+            lines: None,
+            acc: Accum {
+                usage: OutUsage {
+                    prompt_tokens: 23,
+                    prompt_tokens_details: PromptDetails { cached_tokens: 19 },
+                    ..OutUsage::default()
+                },
+                ..Accum::default()
+            },
+            queued: Vec::new(),
+            done: false,
+        };
+        assert_eq!(stream.metered_usage().input_tokens, 4);
+        assert_eq!(stream.metered_usage().cache_read_tokens, 19);
     }
 }

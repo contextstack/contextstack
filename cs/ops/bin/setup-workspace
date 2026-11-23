@@ -9,20 +9,20 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from _setup_workspace import materialize
 
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 
 
 def main():
     request = json.load(sys.stdin)
-    if set(request) - {"setup", "workspace", "task", "lab"}:
+    if set(request) - {"setup", "workspace", "task", "code_root"}:
         raise ValueError("unexpected setup-workspace request field")
     setup = Path(str(request.get("setup") or ""))
     workspace = Path(str(request.get("workspace") or ""))
     if not setup.is_dir() or not workspace.parent:
         raise ValueError("setup and workspace are required")
-    lab = Path(request["lab"]) if request.get("lab") else LAB
+    code_root = Path(request["code_root"]) if request.get("code_root") else CODE_ROOT
     task = Path(str(request["task"])) if request.get("task") else None
-    print(json.dumps(materialize(setup, workspace, task=task, lab=lab), sort_keys=True))
+    print(json.dumps(materialize(setup, workspace, task=task, code_root=code_root), sort_keys=True))
 
 
 if __name__ == "__main__":

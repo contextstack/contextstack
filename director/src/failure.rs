@@ -4,6 +4,12 @@ use serde_json::{Value, json};
 // code, actionable message, whether switching model may help, whether retrying may succeed.
 const KINDS: &[(&str, &str, bool, bool)] = &[
     (
+        "provider_edit_refused",
+        "Cursor's edit tools repeatedly refused writes. Use retry_task to try a fallback template.",
+        true,
+        true,
+    ),
+    (
         "provider_unavailable",
         "Try again when the model provider is available or choose another model.",
         true,

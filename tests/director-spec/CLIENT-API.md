@@ -31,15 +31,27 @@ Every request carries `Authorization: Bearer <token>`, including requests from t
 
 | Credential | How it is obtained | May |
 | --- | --- | --- |
-| local (`csl_…`) | created at install, in `<data>/local-credential` (0600) | everything; it is the **owner** |
-| device (`csd_…`) | pairing: the owner issues a one-time code, and the device sends it to `POST /api/v1/pair {"code"}` | everything except the owner-only calls |
+| local (`csl_…`) | created at install, in `<data>/local-credential` (0600) | owner access |
+| device (`csd_…`) | pairing: the owner issues a one-time code, and the device sends it to `POST /api/v1/pair {"code"}` | owner access, with self-revocation refused |
 | lead (`cslead_…`) | owner mints with `POST credentials/lead`, bound to a conversation and optionally an intent | the scoped lane operations below |
 | node (`csn_…`) | `director-rs node register` | nothing here (401) |
 
-Only the owner may make the owner-only calls: `GET credentials`, `POST pairings {"name"}` and
-`DELETE credentials/{id}`, plus `POST credentials/lead`. Any other credential gets 403 `owner_only`. A missing, unknown or revoked token gets
-401 `unauthenticated`. Revocation takes effect on the next request, and it ends the credential's open event
-streams (§8).
+The Director owns the installation and its records. The local credential and every paired device act for the
+owner, including when the Director runs on a separate host. `GET me` returns `owner: true` for these credentials.
+Leads receive 403 `owner_only` on owner routes. A missing, unknown or revoked token gets 401 `unauthenticated`.
+
+- `POST pairings {"name"}` (local or device) returns 200 `{code, name, expires_at}`. The code works once, for 10 minutes.
+- `GET credentials` (local or device) returns `{credentials, pairings}`. Credential rows contain
+  `id, kind, name, created_at, created_by, last_used_at, revoked_at, revoked_by, conversation_id, intent_id, node`.
+  A lead mint records its actor in `created_by`. Pairing rows contain
+  `name, issued_by, issued_at, expires_at, used_at, credential_id`, including codes awaiting exchange.
+  Revocations record the actor in `revoked_by`. Actor fields store credential IDs, or `node:<id>` for automatic
+  hosted-lead rotation. Historical actor fields may be null. The list exposes no codes, tokens or hashes.
+- `DELETE credentials/{id}` (local or device) returns 200 `{id, revoked: true}`. Revocation takes effect on the
+  next request and ends open event streams (§8). A device deleting its own credential gets 409 `self_revoke`.
+  Clients offer **Forget this device** to remove the saved credential locally.
+- On the Director host, `cs device list`, `cs device pair NAME` and `cs device revoke ID` provide recovery
+  using the installed Director's data directory.
 
 ### 2.1 Mint a hosted lead: `POST credentials/lead` (owner only)
 
@@ -54,20 +66,19 @@ answer 422 `invalid_request`. The binding is stored with the credential and surv
 **Answer:** 201 `{credential_id, kind: "lead", name, token, conversation_id, intent_id, node}`.
 The token is returned only by this mint response; only its hash is stored. This route takes no
 `Idempotency-Key`: another successful mint creates another credential. The owner can inspect the binding in
-`GET credentials` (`id, kind, name, created_at, last_used_at, revoked_at, conversation_id, intent_id, node`),
-which never returns tokens, and revoke it through `DELETE credentials/{id}`.
+`GET credentials` and revoke it through `DELETE credentials/{id}`. Both local and paired credentials may mint leads.
 
 
-### 2.3 Lead home node: `GET lead-node`, `PUT lead-node` (owner to set)
+### 2.3 Lead home node: `GET lead-node`, `PUT lead-node` (local or device)
 
-Hosted-lead conversations run on one **home machine** for task execution. Any client may read it; only the owner may
-change it.
+Hosted-lead conversations run on one **home machine** for task execution. Local and paired credentials may
+read and change it. Leads receive 403 `owner_only` for both calls.
 
 `GET lead-node` answers `{"node": "<name>", "source": "default" | "set"}`. The default is the first node registered on
 this Director (`local_node` in `meta`); after `PUT`, `source` is `set`.
 
 `PUT lead-node` `{"node": "<name>"}` (owner only) pins the home machine. An unknown or revoked node answers 422
-`unknown_node`. Any other credential gets 403 `owner_only`.
+`unknown_node`.
 
 ### 2.2 Lead access
 
@@ -93,12 +104,16 @@ survives restart. Idempotency replay cannot reveal an out-of-scope record. For a
 | `GET usage`, `GET events` | yes | yes | filtered to allowed work; bound conversation events also allowed |
 | `GET conversations/{id}` and `/thread`; read turns/summaries | yes | yes | bound conversation only |
 | `GET events?conversation=ID` | yes | yes | bound conversation only |
-| Pair, list/revoke credentials, mint lead credentials | yes | no | no |
+| Pair, list/revoke credentials, mint lead credentials | yes | yes, except self-revocation | no |
+| Read/write lead node and chief of staff, rename conversations | yes | yes | no |
+| Decide an action approval | yes | yes | no |
+| Add job attempts | yes | yes | scoped to own intents and descendants |
+| Mark owner messages or override an owner mark | yes | yes | scoped marks only, with local marks protected |
 | Create/list conversations; post turns; stop/resume; redo summaries | yes | yes | no |
 | Create/read projects, read source budgets, read/change schedules | yes | yes | no |
 | Write project/conversation budgets | yes | yes | no |
 | Set/clear conversation `attention` (§11.6) | yes | yes | bound conversation only |
-| Write source budgets | yes | no | no |
+| Write source budgets | yes | yes | no |
 | Land lanes (`cs land`) | local owner operation; **recorded** on the node API, readable here | no write | no |
 
 A lead cannot exchange a pairing code at `POST /api/v1/pair` using its bearer credential, even with a live code.
@@ -232,6 +247,13 @@ When the submitting credential is a hosted lead (§2), the Director sets the int
 credential's bound `conversation_id`. The value is taken from the credential only, never from request metadata or
 from provenance on `from_job`. An owner or device submission leaves `lead_conversation_id` null. Each job's
 `lead_conversation_id` is the value on its intent.
+
+Local and paired credentials can add an attempt with `POST intents/{id}/jobs`. Leads can add attempts on
+their own intents and descendants within their scope.
+
+Local and paired credentials can override a mark made with the local credential using
+`PUT intents/{id}/owner-messages/{message_id}/mark`. Leads can mark messages on their own intents
+and descendants within scope. A lead overriding a local mark receives 403 `owner_only`.
 
 ### 4.2 Read work
 
@@ -555,10 +577,11 @@ Browsers: `EventSource` cannot send an `Authorization` header, so a browser clie
 | Status | Code | When |
 | --- | --- | --- |
 | 401 | `unauthenticated` | no client credential, or an unknown, revoked or node token |
-| 403 | `owner_only` | a device calling an owner-only route |
+| 403 | `owner_only` | a lead calling an owner-only or out-of-scope route |
 | 403 | `origin_refused`, `transport_refused` | the browser-origin and transport rules (§2) |
 | 403 | `pairing_refused` | `POST /api/v1/pair` with no matching live code |
 | 404 | `not_found` | no such route or record |
+| 409 | `self_revoke` | a device attempts to revoke its own credential |
 | 409 | `idempotency_conflict` | the key was used for a different request |
 | 409 | `already_decided` | the run's result is already decided |
 | 409 | `already_landed` | the run's land record is already `landed` |
@@ -645,11 +668,12 @@ The bundle must not hold `conversation/context.md` or anything under `tasks/turn
 (`system`, the rest of `context`) must be in it. Otherwise 422 `invalid_request`. A conversation keeps its spec:
 `spec_version` is the bundle's `bundle_sha256`.
 
-**How context reaches a turn's job.** The turn's bundle is the conversation's bundle plus three generated files:
+**How context reaches a turn's job.** The turn's bundle is the conversation's bundle plus these generated files:
 
 | Path | What |
 | --- | --- |
 | `conversation/context.md` | the thread before this turn: a summary of an older portion if one is used, then earlier turns whole, each as the person's message and the reply (a turn that was stopped or failed says so instead of a reply). On the first turn it says so |
+| `conversation/decision-log.md` | a frozen snapshot of the active decisions for a hosted lead’s project, when there are any. If the Markdown exceeds 12,000 characters, the snapshot keeps whole entries in descending update order and reports how many were omitted. |
 | `tasks/turn/goal.md` | the person's message, byte for byte |
 | `tasks/turn/check` | `exit 0`, mode 0755: a turn has no check; its reply is its result |
 
@@ -728,6 +752,8 @@ A turn:
 - `failure` is the structured failure object described below when the state is `error`, otherwise null; `detail` keeps the raw reason.
 - `context` records what the turn was sent, set when it starts: the **conversation revision** it was assembled from,
   the **spec version** it used, the budget, and which summary and which whole turns went in.
+  When the bundle includes a decision log, `context.decision_log` records its `revision` (the latest
+  decision record revision in that project) and the `entry_count` included in the bundle.
 - `cancel` is its job's cancel (`{cancel_id, state, outcome}`), as on the job.
 
 A summary:
@@ -810,7 +836,9 @@ body; for a turn, the conversation and the message; for stop, resume and redo, t
 same key used to stop and then to resume is 409 `idempotency_conflict`. An unknown conversation is 404; an empty
 message, or one over 200,000 bytes, is 422. A hosted lead may `POST conversations/{id}/wake-turns` with
 `{nudge, reply, jobs?}`; every `jobs[]` id must be a job the lead may see, or the answer is 422 `invalid_request`
-naming that id.
+naming that id. A completed wake reply is ordered after started and terminal turns and ahead of pending
+person turns, so it appears in their context when they start. Pending turns retain their relative order and
+turn IDs, and their sequence numbers can change when a wake reply is recorded.
 
 ### 11.7 Attention (needs-you)
 
@@ -877,8 +905,9 @@ actual pay-as-you-go spending (outline §11):
 ```
 
 An intent (`POST intents`) and a conversation (`POST conversations`) may name a `project_id`, which must exist (422
-otherwise). A conversation attached to an intent takes the intent's project; naming another is 422. A request that
-leaves `project_id` out hashes as it did before (§7), so earlier keys still replay.
+otherwise). A lead may submit an intent with a null or omitted project, or with its conversation's project.
+Any other project receives 403 `owner_only`. A conversation attached to an intent takes the intent's project.
+Naming another project for that conversation is 422. A request that leaves `project_id` out hashes as it did before (§7), so earlier keys still replay.
 
 ### 12.2 Budgets, and how they are shown
 
@@ -1013,7 +1042,7 @@ reaches the gateway on its own machine only (`serve --gateway`, a loopback addre
 - `GET source-budgets` answers the gateway's `GET /v1/budgets` report as `budgets`, each source with a `shown` label:
   `off, set a budget to use` (state `off`), `active: $R left`, `budget used up until …` (state `exhausted`). `$R`
   is written as in §12.2: $0.20 with $0.0017 spent is `active: $0.198 left`.
-- `PUT source-budgets` (owner only; a device gets 403 `owner_only`) sends its body, the gateway's whole `limits.json`
+- `PUT source-budgets` (local or paired credential) sends its body, the gateway's whole `limits.json`
   document (at most 64 KiB), to the gateway's `PUT /v1/budgets`, with the gateway's owner token, which the Director
   reads from its file on the same machine (`serve --gateway-owner-token`, default
   `~/.contextstack/config/gateway/owner-token`; it must be readable by its owner only). The token is never logged,
@@ -1041,11 +1070,11 @@ reaches the gateway on its own machine only (`serve --gateway`, a loopback addre
 
 ### Chief of staff (one slot per Director)
 
-`GET chief-of-staff` is available to owner and device credentials; leads get 403 `owner_only`.
+`GET chief-of-staff` is available to local and paired credentials. Leads get 403 `owner_only`.
 It returns `{chief_of_staff: {enabled, name, conversation_id, revision}}`. Defaults are `false`,
 `"Chief of staff"`, `null`, and `0`. This state lives in the Director's meta table.
 
-`PUT chief-of-staff` takes `{enabled?, name?, conversation_id?}` (`conversation_id` adopts an existing hosted-lead conversation; anything else is 422) and requires an owner credential and an
+`PUT chief-of-staff` takes `{enabled?, name?, conversation_id?}` (`conversation_id` adopts an existing hosted-lead conversation; anything else is 422) and requires a local or paired credential and an
 `Idempotency-Key`. It returns the same shape (200). Names are trimmed, 1–200 Unicode characters;
 invalid names or nonboolean enabled values get 422 `invalid_request`. Omitted fields retain their values.
 Enabling creates a hosted-lead conversation on the effective lead node or unarchives the existing
@@ -1059,11 +1088,11 @@ replaced on the next enable.
 While enabled, archiving or deleting that conversation returns 409 `chief_of_staff`, with a
 message to turn the chief of staff off first.
 
-`PATCH conversations/{id}` takes `{title}` and requires an owner credential and an
+`PATCH conversations/{id}` takes `{title}` and requires a local or paired credential and an
 `Idempotency-Key`. Titles are trimmed, 1–200 Unicode characters; otherwise 422 `invalid_request`.
 It returns 200 `{conversation}`, bumps the conversation revision, and emits its normal change.
 When renaming the chief-of-staff conversation, its slot name follows, including while disabled.
-Device and lead credentials get 403 `owner_only`.
+Leads get 403 `owner_only`.
 
 Every slot change emits a normal SSE `change` event on the unfiltered owner/device event stream:
 `{kind: "chief_of_staff", id: "chief_of_staff", revision, record: {enabled, name, conversation_id, revision}}`.
@@ -1179,12 +1208,22 @@ The code root defaults to the executable's grandparent (the installed release,
 as with hosted-lead bundles); `CS_CODE_ROOT` explicitly selects another code root.
 The Director reads profiles itself so desktop, MCP and other clients share its
 installed defaults. Client-local `CS_AGENTS_DIR` does not alter Director defaults.
-MCP still chooses the model under provider limits and sends that chosen model.
+MCP sends an explicit model override when requested or when it selects a
+fallback for a provider limit. Otherwise the Director applies profile defaults
+and node capabilities.
 
 The Director creates `spec.yaml`, `prompts/system.md`, `tasks/<slug>/goal.md` and
 executable `tasks/<slug>/check`. A missing/empty check exits successfully; a check
 body without a shebang is prefixed with `#!/bin/sh`. The spec includes workspace
 repo/lane, one trial, budget and title hypothesis. The goal is preserved verbatim.
+
+Set the lane form's `model` to `harness:<gateway-model>` to run through the
+native harness, for example `harness:local-coder`. The Director checks the
+assigned node's reported gateway catalog and harness capability. The spec
+contains the gateway model name without the prefix. The MCP tools `start_task`
+and `retry_task` accept the same selector. Agent profiles can also use it in
+`model` and `fallback`. Native jobs can use scratch workspaces or repo lanes.
+Repo-only read views require a CLI executor.
 
 
 ### Agent profiles
@@ -1198,3 +1237,108 @@ its exact file bytes; the prompt body is not exposed.
 Both endpoints use the built-in lane parser and the Director's code root. These
 profiles govern lane prompts, checks, budgets and write policies. `cs mcp` uses
 this list and its model/fallback chain; `CS_AGENTS_DIR` does not affect MCP.
+
+## Action approvals
+
+- `GET action-approvals?status=needs_owner&job=JOB` lists the queue in
+  `action_approvals`. Both filters are optional. The list returns up to 500
+  visible approvals, with `needs_owner` first, then newest first by creation
+  time within each group. `GET action-approvals/ID` fetches one record. Read
+  access follows the job.
+- Show the exact `argv`, `needs`, absolute `write_paths`, requester model
+  and reason, job and run, reviewer model, verdict and review reason. An
+  absent reviewer model means no model was selected or called.
+- `POST action-approvals/ID/decide` with `{"decision":"approve"}` or
+  `{"decision":"deny"}` requires a local or paired credential. Leads get 403 `owner_only`.
+  Only `needs_owner` is decidable. The approval record includes the acting credential ID as `decided_by`
+  and decision time as `decided_at`. A competing or repeated decision returns 409.
+- The event stream sends a `change` with kind `action_approval` when a
+  pending approval is created, a reviewer model is selected, its status changes,
+  it is claimed, or its execution outcome is recorded. The event uses the approval ID as `id` and carries
+  `record: {id, job_id, revision}`. Fetch `GET action-approvals/ID` for the
+  latest state. Event visibility follows the job.
+- Task work traces include approval entries in `needs_you` with
+  `action_approval_id` and the escalation reason. Conversation `attention`
+  can also link an approval when it has no explicit attention question.
+- An approved action may be claimed once by the originating run. The
+  harness checks the same record if the model repeats the request. An
+  owner decision records authorization even if the original run has ended.
+  There is no execution on a finished job. A consumed claim with an unknown
+  outcome must be treated as potentially executed.
+
+### Project decision log
+
+Routes below are relative to `projects/{project_id}/decision_log`. The project
+belongs to the Director installation. Local and paired clients act for its
+owner. A hosted lead can use the log of the project on its conversation.
+
+| Method and path | Request and result |
+| --- | --- |
+| `GET /` | Optional `status=active\|superseded\|retired` and `q` (case-insensitive text, including alternatives). Returns `{entries, markdown}` in decision-number order. |
+| `GET /{entry_id}` | Returns `{entry, revisions, markdown}`. Revisions contain previous snapshots, oldest first. |
+| `POST /` | Requires `decision` (one line) and `why`. Optional arrays are `alternatives: [{option, why_not}]`, `reopen_when: [string]`, and `sources: [string]`. Returns the detail shape with an active entry and the next project number. |
+| `POST /{entry_id}/revise` | Supply the current `revision` and any fields from create that changed. Returns the detail shape. |
+| `POST /{entry_id}/supersede` | Supply `revision` and `superseded_by`, the ID of another active entry in this project. Returns the detail shape. |
+| `POST /{entry_id}/retire` | Supply `revision` to close an entry without a replacement. Returns the detail shape. |
+| `POST /import` | Supply `{markdown}` containing a single table with columns `# \| Decision \| Why \| Reopen when \| Source`. Returns `{entries, markdown}`. Preserves numbers and gaps, starts alternatives empty, and treats blank or dash cells for reopen conditions and sources as empty. Separate sources with a semicolon and a space. A duplicate number rolls back the whole import. |
+
+List and create use the base path without a trailing slash. Every POST takes
+`Idempotency-Key`. Create and import return 201. Other writes and replays
+return 200. A stale revision or a change to a closed entry returns 409.
+Entry IDs start with `dle_`. Entries include `project_id`, `number`, `status`,
+`superseded_by`, `created_at`, `created_by`, `updated_at`, `updated_by`, and
+`revision` alongside the content fields. Changed entries appear on the event
+stream with kind `decision_log`. There is no hard delete.
+
+`cs mcp` exposes `decision_log(project_id, status?, search?)` and
+`record_decision(project_id, action, ...)` with actions `create`, `revise`,
+`supersede`, and `retire`. Pass `context: ["decision_log"]` to `start_task` or
+as part of a built-in intent's `lane` object, together with the intent's
+`project_id`. The job bundle stores the current active log at
+`tasks/<slug>/context/decision-log.md` and adds one reference line to the goal.
+The node includes the file in the frozen run stimulus and passes its Markdown
+as task context to the worker. Replays and MCP retries use the original
+attachment.
+
+## Project backlog and heartbeat
+
+The Director installation owns its projects and backlog records. Paired devices share the owner's
+access. A lead credential can access the backlog and backlog events for its conversation's project.
+
+| Route under `projects/{project_id}` | Result |
+|---|---|
+| `GET backlog[?status=next]` | `200 {items}` in ascending priority order, then by item ID |
+| `GET backlog/{item_id}` | `200 {item, revisions}`, with previous snapshots in revision order |
+| `POST backlog` | `201 {item}` |
+| `POST backlog/{item_id}/update` | `200 {item}`. Pass the current `revision` and the fields to change. |
+| `POST backlog/reorder` | `200 {items}`. Pass `{items: [{item_id, revision, priority}, ...]}` for an atomic priority update. |
+| `GET backlog/next_unblocked` | `200 {item}`, where `item` is null when nothing is ready |
+| `GET backlog/needs_you` | `200 {items}` with all open items that have an owner blocker |
+| `GET heartbeat` | `200 {project_id, interval_seconds, conversation_id}` |
+| `PUT heartbeat` | `200` with the saved schedule. Enable with a positive integer `interval_seconds` and an unarchived hosted lead's `conversation_id` in the project. Send `{interval_seconds: null}` to turn it off. |
+
+Backlog writes take an `Idempotency-Key`. Create requires a non-empty `title`. `body` and
+`blocked_reason` are text and default to empty. `status` defaults to `next` and accepts
+`next`, `now`, `blocked`, `done` and `dropped`. `priority` is a signed integer and defaults
+to zero. `blocked_on` is an array of `{kind, ref}`; `kind` accepts `job`, `item`, `owner`,
+and `external`, and `ref` is a non-empty string. Links are arrays of IDs in `intent_ids`,
+`job_ids`, and `decision_log_entry_ids`. Arrays default to empty. `stop` defaults to false.
+Responses include `item_id`, `project_id`, `created_at`, `created_by`, `updated_at`,
+`updated_by`, and `revision`. Use `dropped` to retire an item and retain its history.
+
+Next selects among items with status `next`. Every blocker must clear. A job blocker clears when
+the same-project job finishes. An item blocker clears when the same-project item is done or dropped.
+Owner and external blockers clear when removed. A missing reference remains blocked.
+
+The global event stream sends `backlog_item` changes. Hosted conversation attention shows the
+first owner-blocked item when there is no conversation question or action approval taking precedence.
+Clients can use `backlog/needs_you` to show the entire project's needs-you list.
+
+The heartbeat defaults to off, with both schedule fields null. The Director waits one interval
+before the first turn, defers while the target conversation is held or busy, and never overlaps
+heartbeat turns in the same project. An open item with an owner blocker and `stop: true` pauses
+the project's heartbeat. Turns use the regular conversation records and events with
+`origin: "heartbeat"`. Disabling a schedule prevents future turns.
+
+Lead MCP tools are `backlog(project_id, action?, status?)`, where action is `list` or `next`,
+and `backlog_update(project_id, item_id?, revision?, ..., key?)`. Omit `item_id` to create an item.

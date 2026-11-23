@@ -1,0 +1,18 @@
+scripts/public-export/last-dry-run.md	lab-id: 529 -> 529	Recorded output from a historical export.
+scripts/public-export/last-dry-run.md	lab-vocabulary: 14 -> 14	Recorded output from a historical export.
+scripts/public-export/last-dry-run.md	and machine-context matches remain flagged conservatively, alongside lab IDs.	Recorded output from a historical export.
+scripts/public-export/README.md	File bytes are copied unchanged, including comments. Lab IDs in any text are	Documents how the exporter detects historical vocabulary.
+scripts/public-export/README.md	matches the retired three-letter product name and the phrase formed by `lab` followed by `estate`.	Documents how the exporter detects historical vocabulary.
+scripts/public-export/deny.txt	cs/CLAUDE.md | Private lab agent instructions	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	cs/INVARIANTS.md | Lab governance and experiment constraints	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	cs/OPERATOR.md | Private lab operator instructions	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	.githooks/* | Lab attribution and governance hooks	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	*/notes.md | Task history and lab evidence	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	docs/adr/0001-* | Private vault and lab governance provenance	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	docs/adr/0005-* | Lab runner comparison experiment history	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	docs/adr/0008-* | Lab state migration and historical evidence inventory	Explains historical exclusions in the public export policy.
+scripts/public-export/deny.txt	docs/adr/0015-* | Lab experiment and intent ID governance	Explains historical exclusions in the public export policy.
+scripts/public-export/export	# Deliberately explicit vocabulary; generic "lab", "estate", "intent" are not findings.	Historical vocabulary scanner and its diagnostics.
+scripts/git-hooks/commit-msg	# anywhere (the archived Go runner in lab/, the archived gateway) needs	Comment describing archived runner history.
+cs/scripts/check	bg_rule "lab/ holds more than the archived Go runner, or a live file names a moved path under lab/ (Director.Plan step 0b)" \	Historical layout check and retirement comment.
+cs/scripts/check	# 7. (Spec queue rule retired with the lab, 2026-11-13.)	Historical layout check and retirement comment.

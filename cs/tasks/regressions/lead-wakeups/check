@@ -50,7 +50,7 @@ def expect(ok: bool, msg: str, detail: str = "") -> None:
 
 
 def workspace_turn(root: Path, message: str, *, name: str = "turn-wake") -> Path:
-    ws = Path(os.environ["LAB_STATE_ROOT"]) / "jobs" / name
+    ws = Path(os.environ["CS_STATE_ROOT"]) / "jobs" / name
     if ws.exists():
         shutil.rmtree(ws)
     ws.mkdir(parents=True)
@@ -216,7 +216,7 @@ def start_fixture_env(root: Path, fake: FakeDirector) -> tuple[Path, Path, Path,
     write_config(cfg, fake.url)
     env = {
         **hermetic_env(),
-        "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(cfg), "LAB_CODE_ROOT": str(KIT),
+        "CS_STATE_ROOT": str(state), "CS_CONFIG_ROOT": str(cfg), "CS_CODE_ROOT": str(KIT),
         "LEAD_HOST_NO_SANDBOX": "1", "CS_EXECUTOR_ALLOW_UNSANDBOXED": "1",
         "LEAD_WAKE_DIRECTOR_URL": fake.url, "LEAD_HOST_WAKE": "1",
         "LEAD_WAKE_STALL_S": "3600", "LEAD_WAKE_BATCH_S": "0.15",

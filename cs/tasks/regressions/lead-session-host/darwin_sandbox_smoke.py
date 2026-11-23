@@ -127,9 +127,9 @@ def main() -> int:
         env = dict(
             os.environ,
             HOME=str(login_home),
-            LAB_STATE_ROOT=str(state),
-            LAB_CONFIG_ROOT=str(cs_root / "config"),
-            LAB_CODE_ROOT=str(KIT),
+            CS_STATE_ROOT=str(state),
+            CS_CONFIG_ROOT=str(cs_root / "config"),
+            CS_CODE_ROOT=str(KIT),
             LEAD_HOST_SERVE_READY_S=SERVE_READY_S,
             LEAD_HOST_IDLE_EXIT_S="120",
         )

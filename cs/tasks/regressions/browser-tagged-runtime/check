@@ -10,7 +10,7 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 
 with scratch_dir(prefix="browser-tagged-runtime-") as raw:
     root = Path(raw)
@@ -46,27 +46,27 @@ elif args[0] == "stop":
 
     def run_fetch(env):
         return subprocess.run(
-            [str(LAB / "tools/bin/browser_fetch")],
+            [str(CODE_ROOT / "tools/bin/browser_fetch")],
             input=json.dumps({"url": "https://example.com/"}), cwd=workspace,
             env=env, text=True, capture_output=True,
         )
 
     # Explicit PLAYWRIGHT_BROWSERS_PATH (launchd path).
-    env = {**hermetic_env(), "HOME": str(home), "LAB_BROWSE": str(browse),
+    env = {**hermetic_env(), "HOME": str(home), "CS_BROWSE": str(browse),
            "PLAYWRIGHT_BROWSERS_PATH": str(chromium.parents[1]),
            "EXPECTED_CHROMIUM": str(chromium), "EXPECTED_CACHE": str(chromium.parents[1]),
-           "LAB_BROWSER_ENGINE": "chromium", "LAB_BROWSER_STATE": str(root / "state")}
+           "CS_BROWSER_ENGINE": "chromium", "CS_BROWSER_STATE": str(root / "state")}
     result = run_fetch(env)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["preview"] == "rendered from tagged runtime\n"
 
     # Sandbox-stripped env: fall back to tagged estate runtime.
     stripped = {k: v for k, v in hermetic_env().items()
-                if k not in {"PLAYWRIGHT_BROWSERS_PATH", "LAB_BROWSE"}}
+                if k not in {"PLAYWRIGHT_BROWSERS_PATH", "CS_BROWSE"}}
     stripped.update({
-        "HOME": str(home), "LAB_ESTATE_RUNTIME": str(estate),
+        "HOME": str(home), "CS_ESTATE_RUNTIME": str(estate),
         "EXPECTED_CHROMIUM": str(chromium), "EXPECTED_CACHE": str(chromium.parents[1]),
-        "LAB_BROWSER_ENGINE": "chromium", "LAB_BROWSER_STATE": str(root / "state2"),
+        "CS_BROWSER_ENGINE": "chromium", "CS_BROWSER_STATE": str(root / "state2"),
     })
     result = run_fetch(stripped)
     assert result.returncode == 0, result.stderr

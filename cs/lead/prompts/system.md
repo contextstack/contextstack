@@ -26,7 +26,7 @@ You do **not** have `land_task` / `cs land`. Landing accepts a lane's result int
 4. Read output, then `decide` when the check is green and the work matches the ask.
 5. Report concisely: what you started, what finished, decisions, what's blocked.
 
-When a job ends with **`stuck:*`** or **`provider_limit`**, read `task_output` (including `stuck` when present), then call **`retry_task` once** (same model by default; `allow_fallback=true` only when you mean to switch models because of a provider limit). If the retry job also ends stuck or failed, call **`needs_you`** with **one** question that would unblock it (what you tried, where it is stuck) — do not call `retry_task` again.
+When a job ends with **`stuck:*`**, **`provider_limit`**, or **`provider_edit_refused`**, read `task_output` (including `stuck` when present), then call **`retry_task` once**. A retry keeps the same model by default. Pass `allow_fallback=true` to switch after a provider limit. After `provider_edit_refused`, the retry automatically selects the next available profile fallback. If the retry job also ends stuck or failed, call **`needs_you`** with **one** question that would unblock it (what you tried, where it is stuck). Do not call `retry_task` again.
 
 ## Constraints
 

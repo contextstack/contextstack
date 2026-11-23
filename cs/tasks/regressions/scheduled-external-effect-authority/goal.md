@@ -3,7 +3,7 @@
 An external mutation requested by a schedule must be named both by the
 schedule and its active grant, survive enqueue and dispatch as structured
 metadata, and become process authority only for that exact child. The worker
-must remove an inherited `LAB_VIDEO_MUTATION` value from every child and set
+must remove an inherited `CS_VIDEO_MUTATION` value from every child and set
 it to `1` only when the job carries the granted
 `youtube_playlist_mutation` effect.
 

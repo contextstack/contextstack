@@ -30,18 +30,18 @@ def cookie_import_for(requested_url, current_url):
     return browser, cookie_domain, profile
 
 
-def isolated_state_dir(raw, workspace, lab):
+def isolated_state_dir(raw, workspace, code_root):
     """Resolve browser state outside model-writable and harvestable trees."""
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         raise ValueError("browser state must be an absolute operator path")
     candidate = candidate.resolve()
     workspace = Path(workspace).resolve()
-    lab = Path(lab).resolve()
+    code_root = Path(code_root).resolve()
     if candidate == workspace or candidate.is_relative_to(workspace):
         raise ValueError("browser state cannot live inside the run workspace")
-    if candidate == lab or candidate.is_relative_to(lab):
-        raise ValueError("browser state cannot live inside the lab or task setup")
+    if candidate == code_root or candidate.is_relative_to(code_root):
+        raise ValueError("browser state cannot live inside the code_root or task setup")
     if "setup" in candidate.parts:
         raise ValueError("browser state cannot live inside a setup tree")
     return candidate

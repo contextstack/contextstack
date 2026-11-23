@@ -53,10 +53,10 @@ try:
     for item in patches:
         item.start()
     old = {k: os.environ.get(k) for k in (
-        "LEAD_HOST_NO_SANDBOX", "CS_EXECUTOR_ALLOW_UNSANDBOXED", "LAB_STATE_ROOT", "LAB_CONFIG_ROOT",
+        "LEAD_HOST_NO_SANDBOX", "CS_EXECUTOR_ALLOW_UNSANDBOXED", "CS_STATE_ROOT", "CS_CONFIG_ROOT",
         "LEAD_HOST_SERVE_READY_S")}
-    os.environ["LAB_STATE_ROOT"] = str(state)
-    os.environ["LAB_CONFIG_ROOT"] = str(cfg)
+    os.environ["CS_STATE_ROOT"] = str(state)
+    os.environ["CS_CONFIG_ROOT"] = str(cfg)
     os.environ["LEAD_HOST_SERVE_READY_S"] = "5"
     os.environ.pop("LEAD_HOST_NO_SANDBOX", None)
     os.environ.pop("CS_EXECUTOR_ALLOW_UNSANDBOXED", None)

@@ -195,7 +195,11 @@ def send_director(entry, runs, client):
         for sha in answer.get("missing") or []:
             if sha not in by_sha:
                 raise ValueError("%s: director asks for %s, which the envelope does not list" % (envelope["event_id"], sha))
-            client.call("PUT", "objects/" + sha, raw=(runs / envelope["run_id"] / by_sha[sha]).read_bytes())
+            path = by_sha[sha]
+            data = (run / path).read_bytes()
+            if hashlib.sha256(data).hexdigest() != sha:
+                raise ValueError("%s: %s sha256 differs from the envelope" % (envelope["event_id"], path))
+            client.call("PUT", "objects/" + sha, raw=data)
         answer = client.call("POST", "envelopes", body)
     ack = answer.get("ack") or {}
     if answer.get("status") != "acked" or ack.get("envelope_sha256") != envelope["envelope_sha256"] \

@@ -77,10 +77,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 4.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-error-hook-abort-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -91,12 +90,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-error-hook-abort",
+        "run_id": "<RUNSTAMP>-fx-error-hook-abort-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 1,
         "tool_schema": [
           {
             "description": "Write a file, creating parent dirs. Args: {path, content}.",
@@ -162,12 +162,15 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "messages.jsonl",
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -177,7 +180,7 @@
       },
       "transcript": "# fx-error-hook-abort · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nwriting\n\n`pre_tool`\n\n```\npre_tool fx_gate refused: fx_gate: abort at abort-hello.txt\n\n```\n\n---\nstop aborted · verdict **fail** · turns 1 · tools 0 · cost $0.0100\n",
       "workspace": {
-        ".lab-pretool.jsonl": "{\"LAB_CHECK\": \"<ESTATE>/ledger/runs/<RUNSTAMP>-fx-error-hook-abort-fx-t1/stimulus/check\", \"LAB_TOOL\": \"fs_write\", \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_CHECK\", \"LAB_TOOL\", \"LANG\", \"PATH\", \"TMPDIR\"], \"stdin\": {\"args\": {\"content\": \"hello\", \"path\": \"abort-hello.txt\"}, \"name\": \"fs_write\"}}\n"
+        ".cs-pretool.jsonl": "{\"CS_CHECK\": \"<ESTATE>/ledger/runs/<RUNSTAMP>-fx-error-hook-abort-fx-t1/stimulus/check\", \"CS_TOOL\": \"fs_write\", \"cwd_base\": \"workspace\", \"env_names\": [\"CS_CHECK\", \"CS_TOOL\", \"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"], \"stdin\": {\"args\": {\"content\": \"hello\", \"path\": \"abort-hello.txt\"}, \"name\": \"fs_write\"}}\n"
       }
     }
   ],

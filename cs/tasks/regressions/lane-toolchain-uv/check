@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """uv and its Python dir are readable in Seatbelt; writes and sibling ~/.local paths are denied."""
-import ast
 import json
 import re
 import os
@@ -16,9 +15,14 @@ from hermetic_env import hermetic_env
 import _executor
 import _toolchains
 
+sys.path.insert(0, str(HERE.parent / "node-install-layout"))
+from _bundle import host_python
+
 if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
     print("lane-toolchain-uv: SKIP (requires --darwin-probe on macOS)")
     raise SystemExit(0)
+
+host_uv, managed = host_python()
 
 with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
     root = Path(raw).resolve()
@@ -26,7 +30,8 @@ with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
     local_bin = home / ".local/bin"
     python_dir = home / ".local/share/uv/python"
     sibling = home / ".local/share/other/secret"
-    for directory in (local_bin, python_dir, sibling.parent, ws, tmp):
+    host_cache = home / "Library/Caches/uv"
+    for directory in (local_bin, python_dir, sibling.parent, host_cache, ws, tmp):
         directory.mkdir(parents=True)
     sibling.write_text("private")
     (python_dir / "cpython-test/bin").mkdir(parents=True)
@@ -59,10 +64,9 @@ with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
     assert str(uv.resolve()) in [str(p) for p in _toolchains.discover_sandbox_links()]
     env_probe = _toolchains.uv_lane_env(tmp)
     assert env_probe["UV_CACHE_DIR"].startswith(str(tmp))
-    assert env_probe["UV_NO_CONFIG"] == "1"
+    assert env_probe["UV_NO_CONFIG"] == env_probe["UV_OFFLINE"] == "1"
     assert env_probe["UV_PYTHON_INSTALL_DIR"] == str(python_dir.resolve()), env_probe
     assert env_probe["UV_PYTHON_DOWNLOADS"] == "never" and "UV_DATA_DIR" not in env_probe, env_probe
-    import _executor
     # The same pins the old source-extraction loader set, for the rest of this probe: the real helpers then read
     # this fixture HOME and a minimal allowlist instead of the machine's.
     _executor.HOME = home
@@ -74,12 +78,15 @@ with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
     child = {**hermetic_env(), **ns["allowlist_env"]([], tmp, ws)}
     assert child["UV_CACHE_DIR"] == str(tmp / "uv-cache")
     command = (
-        'uv version; uv cache dir; ! /bin/cat "$1"; ! /usr/bin/touch "$2/forbidden"; '
-        '! /bin/sh -c \'printf x >> "$4"\''
+        'uv version && uv cache dir && "$2/cpython-test/bin/python3" && '
+        '! /bin/cat "$1" && ! /usr/bin/touch "$2/forbidden" && '
+        '! /bin/sh -c \'printf x >> "$1"\' probe "$3" && '
+        '! /usr/bin/touch "$4/forbidden" && '
+        '/bin/mkdir "$UV_CACHE_DIR" && /usr/bin/touch "$UV_CACHE_DIR/allowed"'
     )
     cmd = ns["sandbox_cmd"](
         "/bin/sh",
-        ["-c", command, "probe", str(sibling), str(python_dir), str(local_bin), str(uv)],
+        ["-c", command, "probe", str(sibling), str(python_dir), str(uv), str(host_cache)],
         ws, tmp, tmp / "profile.sb",
     )
     profile_text = (tmp / "profile.sb").read_text()
@@ -89,6 +96,9 @@ with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
     assert result.returncode == 0 and "uv 0.0.0" in result.stdout, result
     cache_line = [line for line in result.stdout.splitlines() if str(tmp / "uv-cache") in line]
     assert cache_line, result.stdout
+    assert "PY_OK" in result.stdout
+    assert (tmp / "uv-cache/allowed").is_file()
+    assert not (host_cache / "forbidden").exists()
     assert sibling.read_text() == "private"
     assert not (python_dir / "forbidden").exists()
     # The fake home sits under /tmp, which lanes may write, so its .local/bin is writable here; the real
@@ -120,4 +130,20 @@ with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
     )
     check_result = subprocess.run(check_cmd, env=cli_env, cwd=ws, capture_output=True, text=True, timeout=30)
     assert check_result.returncode == 0 and "uv 0.0.0" in check_result.stdout, check_result
+    if host_uv is None:
+        print("lane-toolchain-uv: SKIP real uv probe (%s)" % managed)
+    else:
+        config.write_text(json.dumps([{"name": "uv", "bin": str(Path(host_uv).parent),
+                                       "python": str(managed.parent)}]))
+        _toolchains.discover.cache_clear()
+        _toolchains.discover_path_dirs.cache_clear()
+        _toolchains.discover_sandbox_links.cache_clear()
+        child = {**hermetic_env(), **_executor.allowlist_env([], tmp, ws)}
+        pinned = (KIT / ".python-version").read_text().strip()
+        cmd = _executor.sandbox_cmd(
+            "/bin/sh", ["-ec", 'uv run --python "$1" python -c "print(1)"', "probe", pinned],
+            ws, tmp, tmp / "real-uv.sb",
+        )
+        result = subprocess.run(cmd, env=child, cwd=ws, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0 and result.stdout.strip() == "1", result
 print("lane-toolchain-uv: PASS")

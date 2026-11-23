@@ -1,4 +1,4 @@
-//! Live output for streamed Lab work orders: the executor's stdout lines, read as the coding agent's
+//! Live output for streamed CLI work orders: the executor's stdout lines, read as the coding agent's
 //! own streaming output, mapped to delta text. Only text is mapped; every other event (tool use,
 //! usage, the agent's final result, the executor's own report) yields nothing, and the run's final
 //! reply still carries the whole stdout.

@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
+from scratch import scratch_dir
+from hermetic_env import hermetic_env
+
+CODE_ROOT = Path(__file__).resolve().parents[3]
+CHECK = CODE_ROOT / "scripts/check"
+
+
+def git_repo(path, tracked):
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "code_root@example.invalid"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "ContextStack"], cwd=path, check=True)
+    (path / tracked).write_text("spill\n")
+    subprocess.run(["git", "add", "-f", tracked], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "spill"], cwd=path, check=True)
+
+
+def spill_env(**extra):
+    env = {**hermetic_env(), "CS_SPILL_ONLY": "1", "CS_SPILL_PRUNE": "2026-09-04T15:05:00"}
+    env.update(extra)
+    # scripts/check scrubs GIT_* (including GIT_CONFIG_GLOBAL). Keep its git
+    # reads away from the owner's config, hooks and excludes, even in a sandbox.
+    home = Path(extra["CS_SPILL_DESTS"]).parent
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
+    return subprocess.run([str(CHECK)], cwd=CODE_ROOT, env=env, capture_output=True, text=True)
+
+
+with scratch_dir(prefix="spill-scope-") as raw:
+    root = Path(raw)
+    dest, runs = root / "dest", root / "runs"
+    git_repo(dest, ".cs-out")
+    old_ws = runs / "20200101-old" / "workspace"
+    new_ws = runs / "20260904-new" / "workspace"
+    git_repo(old_ws, ".cs-out")
+    git_repo(new_ws, ".cs-out")
+    subprocess.run(["touch", "-t", "202001011200", str(old_ws)], check=True)
+
+    planted = spill_env(CS_SPILL_DESTS=str(dest), CS_SPILL_RUNS_ROOT=str(runs))
+    text = (planted.stdout or "") + (planted.stderr or "")
+    assert planted.returncode != 0, text
+    assert "dest %s" % dest in text, text
+    assert str(new_ws) in text, text
+    assert str(old_ws) not in text, text
+
+    clean = root / "clean-dest"
+    clean.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=clean, check=True)
+    subprocess.run(["git", "config", "user.email", "code_root@example.invalid"], cwd=clean, check=True)
+    subprocess.run(["git", "config", "user.name", "ContextStack"], cwd=clean, check=True)
+    (clean / "ok.txt").write_text("ok\n")
+    subprocess.run(["git", "add", "ok.txt"], cwd=clean, check=True)
+    subprocess.run(["git", "commit", "-qm", "ok"], cwd=clean, check=True)
+    empty_runs = root / "empty-runs"
+    empty_runs.mkdir()
+    ok = spill_env(CS_SPILL_DESTS=str(clean), CS_SPILL_RUNS_ROOT=str(empty_runs))
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+
+print("check: spill scan refuses dest and fresh workspace, skips pre-prune runs")

@@ -207,6 +207,7 @@ class VitalsReadAndStatusTests(unittest.TestCase):
             config = root / "config"
             state.mkdir()
             config.mkdir()
+            (config / "agents.json").write_text("[]", encoding="utf-8")
             policy_dir = config / "policy"
             policy_dir.mkdir()
             (policy_dir / "resources.json").write_text(
@@ -223,6 +224,7 @@ class VitalsReadAndStatusTests(unittest.TestCase):
             state, config = root / "state", root / "config"
             state.mkdir()
             config.mkdir()
+            (config / "agents.json").write_text("[]", encoding="utf-8")
             (config / "policy").mkdir()
             (config / "policy" / "resources.json").write_text("{}", encoding="utf-8")
             calls = []
@@ -508,6 +510,7 @@ class VitalsEdgeAndRefreshTests(unittest.TestCase):
             state, config = root / "state", root / "config"
             state.mkdir()
             config.mkdir()
+            (config / "agents.json").write_text("[]", encoding="utf-8")
             (config / "policy").mkdir()
             (config / "policy" / "resources.json").write_text(
                 json.dumps({"min_available_memory_fraction": 0.10, "min_free_disk_bytes": 1000}),
@@ -891,6 +894,7 @@ class VitalsParserEdgeTests(unittest.TestCase):
             state, config = root / "state", root / "config"
             state.mkdir()
             config.mkdir()
+            (config / "agents.json").write_text("[]", encoding="utf-8")
             (config / "policy").mkdir()
             (config / "policy" / "resources.json").write_text("{}", encoding="utf-8")
             import _provider_limits

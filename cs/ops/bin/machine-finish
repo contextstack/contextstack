@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Finalize a completed execution receipt on its machine."""
+import json
+import sys
+from contextlib import nullcontext
+from pathlib import Path
+
+from _api_run import RECEIPT, finish_harness
+from _roots import runs_dir
+
+CODE_ROOT = Path(__file__).resolve().parents[2]
+
+try:
+    request = json.load(sys.stdin)
+    receipt = request["receipt"]
+    run_dir = Path(request["run_dir"])
+    harness = receipt["adapter"] == "harness"
+    lane = receipt["row"].get("harness_lane") if harness else receipt["finish"].get("lane")
+    lease = nullcontext()
+    if lane and not lane.get("read_only"):
+        # Only a machine-owned receipt may name a repository to lock.
+        run_dir = run_dir.resolve()
+        if (run_dir.parent != runs_dir(CODE_ROOT).resolve()
+                or receipt != json.loads((run_dir / RECEIPT).read_text())):
+            raise ValueError("receipt differs from the machine's execution record")
+        from _lanes import lane_execution, lane_owner
+        binding = request.get("lane_binding")
+        lease = (lane_execution(lane["main"], lane["lane"], binding) if binding
+                 else lane_owner(lane["main"], lane["lane"]))
+    with lease:
+        if harness:
+            output = finish_harness(CODE_ROOT, run_dir, receipt, foreground=request.get("foreground", False))
+            print(json.dumps(output), flush=True)
+            sys.exit(3 if output["state"] != "finalized" else int(output["verdict"] != "pass"))
+        from _machine_finish import finish_receipt, print_result
+
+        output = finish_receipt(CODE_ROOT, run_dir, receipt)
+except (KeyError, TypeError, ValueError, OSError) as error:
+    print(json.dumps({"ok": False, "error": str(error)}), flush=True)
+    sys.exit(2)
+print_result(output)

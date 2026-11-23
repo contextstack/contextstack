@@ -1,8 +1,8 @@
 {
   "exit": 1,
-  "stdout": "path escapes workspace: sub/../../escape.txt\n",
+  "stdout": "path escapes workspace: sub/../../escape.txt\nYour workspace is <ws>; write there or use a relative path such as escape.txt.\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"content\": \"h\", \"path\": \"sub/../../escape.txt\"}, \"name\": \"fs_write\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"content\": \"h\", \"path\": \"sub/../../escape.txt\"}, \"name\": \"fs_write\"}\n"
   },
   "untouched": true
 }

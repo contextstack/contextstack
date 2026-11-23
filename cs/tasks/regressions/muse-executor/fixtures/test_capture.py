@@ -27,13 +27,28 @@ with scratch_dir(dir=src, prefix='.capture-test-') as raw:
         args = {'run_dir':str(run), 'task':str(task), 'adapter':'executor'}
         args.update(extra or {})
         result = subprocess.run(['python3',str(ops/'capture-stimulus')], input=json.dumps(args),
-            text=True,capture_output=True,cwd=root,env={k:v for k,v in hermetic_env().items() if k!='LAB_JOB_ID'})
+            text=True,capture_output=True,cwd=root,env={k:v for k,v in hermetic_env().items() if k!='CS_JOB_ID'})
         return result,run
     plain,pr = capture()
     assert plain.returncode == 0, plain.stderr
     pm = json.loads((pr/'stimulus/manifest.json').read_text())
     assert pm['env_sha'] == hashlib.sha256(b'').hexdigest()
     assert 'executor_identity' not in pm
+    context = task / 'context/decision-log.md'
+    context.parent.mkdir()
+    original = b'# Decision log\n\n## D1 -- Freeze the job context\n'
+    context.write_bytes(original)
+    result, context_run = capture()
+    assert result.returncode == 0, result.stderr
+    frozen_context = context_run / 'stimulus/context/decision-log.md'
+    manifest = json.loads((context_run / 'stimulus/manifest.json').read_text())
+    item = next(i for i in manifest['inputs'] if i['role'] == 'context')
+    assert item['path'] == 'context/decision-log.md'
+    assert item['sha256'] == hashlib.sha256(original).hexdigest()
+    context.write_bytes(b'Revised later')
+    result, _ = capture(run=context_run)
+    assert result.returncode == 0 and frozen_context.read_bytes() == original
+    context.unlink()
     extra = {'executor_files':['ops/bin/muse-profile.json','ops/bin/helper'],
              'executor_identity':{'version':'1.0.3','binary_sha256':'a'*64}}
     a,ar = capture(extra); assert a.returncode == 0,a.stderr
@@ -63,7 +78,7 @@ with scratch_dir(dir=src, prefix='.capture-test-') as raw:
         r,run=capture({**extra,'executor_files':invalid})
         assert r.returncode!=0,invalid
         assert not (run/'stimulus/manifest.json').exists()
-    r,_=capture({**extra,'adapter':'lab'});assert r.returncode!=0
+    r,_=capture({**extra,'adapter':'code_root'});assert r.returncode!=0
     many = []
     for n in range(10):
         q=ops/('helper%d'%n); q.write_text('x'); many.append('ops/bin/'+q.name)

@@ -17,7 +17,7 @@ The main validation script is `cs/scripts/check`. It builds the workspace and ru
 Unset the dev ledger root so a local run does not write into a personal state directory:
 
 ```sh
-env -u LAB_STATE_ROOT cs/scripts/check
+env -u CS_STATE_ROOT cs/scripts/check
 ```
 
 ## Git hooks
@@ -32,7 +32,7 @@ Staged Go files require a `Demanded-by: <intent-id>` line in the commit message.
 
 ## Changes and tests
 
-Include tests when you change behavior that the check suite already covers, or add coverage when you introduce new behavior. A green `env -u LAB_STATE_ROOT cs/scripts/check` is the bar before you open a pull request.
+Include tests when you change behavior that the check suite already covers, or add coverage when you introduce new behavior. A green `env -u CS_STATE_ROOT cs/scripts/check` is the bar before you open a pull request.
 
 ## Issues and pull requests
 

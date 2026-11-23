@@ -23,13 +23,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 REAL = Path.home() / ".contextstack"
 NOW = "2026-11-11T12:30:00+00:00"
 FX = None
 FAILED = []
 SHELVES = ("ledger", "dispatch", "schedules", "schedule-fires", "finalizations",
-           "estate-commit", "director-delivery", "operator-dispatch",
+           "check-red", "director-delivery", "operator-dispatch",
            "workspace-pruned", "cli-provider-readiness")
 
 
@@ -103,12 +103,9 @@ def fixture_state(state):
             {"event": "finalize_outcome", "finalization_id": "f1", "run_id": "run-a", "state": "closed",
              "landing": "none", "contract_version": "lifecycle-v1", "evidence_sha": "e" * 64,
              "ts": "2026-11-09T07:00:02Z"}],
-        "estate-commit": [
-            {"event": "experiment_allocated", "id": "fixture-9002", "session": "fixture", "block": 1, "high": 9002,
-             "ok": True, "actor_id": "operator:fixture", "actor_kind": "human", "ts": "2026-11-09T05:00:00Z",
-             "estate": "dev"},
-            {"event": "estate_dirty_stale", "path": "specs/fx.yaml", "age_s": 4000, "reason": "dirty",
-             "state": "stale", "check_output": "", "ts": "2026-11-10T05:00:00Z"}],
+        "check-red": [
+            {"event": "check_red_rules_authorized", "files": ["specs/fx.yaml"], "reason": "check-red",
+             "state": "authorized", "check_output": "", "ts": "2026-11-10T05:00:00Z", "estate": "dev"}],
         "director-delivery": [
             {"event": "director_operation_refused", "operation": "enqueue", "operation_grant": "g-fixture",
              "reason": "fixture", "request_key": "k1", "ts": "2026-11-09T05:00:00Z", "estate": "dev"}],
@@ -137,12 +134,12 @@ def code_copy(dest):
     """The reader code as an install runs it: ops, scripts and the files they read, no tasks/."""
     dest.mkdir()
     for name in ("ops", "scripts", "tools", "grants", "schedules", "policy", "specs"):
-        if (LAB / name).is_dir():
-            shutil.copytree(LAB / name, dest / name, symlinks=True,
+        if (CODE_ROOT / name).is_dir():
+            shutil.copytree(CODE_ROOT / name, dest / name, symlinks=True,
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     for name in ("INVARIANTS.md", "PINNED.md"):
-        if (LAB / name).is_file():
-            shutil.copy2(LAB / name, dest / name)
+        if (CODE_ROOT / name).is_file():
+            shutil.copy2(CODE_ROOT / name, dest / name)
     (dest / "grants").mkdir(exist_ok=True)  # the code root may ship no grants/ (2026-11-13)
     (dest / "grants/g-fixture.yaml").write_text(
         "id: g-fixture\nestate: dev\nrepo: %s\npaths: [tasks, specs]\ngates: [\"true\"]\n"
@@ -170,7 +167,7 @@ class Root:
         code_copy(self.code)
         self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(scratch), "LANG": "C.UTF-8",
                     "TZ": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
-                    "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(config)}
+                    "CS_STATE_ROOT": str(state), "CS_CONFIG_ROOT": str(config)}
 
     def run(self, argv, payload=None):
         r = subprocess.run(argv, input=payload if isinstance(payload, str) else json.dumps(payload or {}), text=True,
@@ -272,7 +269,7 @@ def compare(cut, twin):
 
 
 def unit():
-    sys.path.insert(0, str(LAB / "ops/bin"))
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
     import _estate_io
     with scratch_dir(prefix="cutover-readers-unit-") as raw:
         path = Path(raw) / "x.jsonl"
@@ -301,16 +298,16 @@ def main(argv):
     try:
         state, config = scratch / "state", scratch / "config"
         config.mkdir()
-        if (LAB.parent / "target/release").is_dir():  # <code>/../target/release/cs-tools, as in a release; check builds it
-            (scratch / "target").symlink_to(LAB.parent / "target")
+        if (CODE_ROOT.parent / "target/release").is_dir():  # <code>/../target/release/cs-tools, as in a release; check builds it
+            (scratch / "target").symlink_to(CODE_ROOT.parent / "target")
         if given is None:
             state.mkdir()
             fixture_state(state)
             (config / "ESTATE").write_text("workstation\n")
-            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(scratch), "LAB_STATE_ROOT": str(state),
-                   "LAB_CONFIG_ROOT": str(config)}
-            r = subprocess.run([sys.executable, str(LAB / "ops/bin/estate-cutover")], text=True, capture_output=True,
-                               input=json.dumps({"estate": "workstation", "mode": "write"}), env=env, cwd=str(LAB))
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(scratch), "CS_STATE_ROOT": str(state),
+                   "CS_CONFIG_ROOT": str(config)}
+            r = subprocess.run([sys.executable, str(CODE_ROOT / "ops/bin/estate-cutover")], text=True, capture_output=True,
+                               input=json.dumps({"estate": "workstation", "mode": "write"}), env=env, cwd=str(CODE_ROOT))
             out = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}")
             expect(r.returncode == 0 and len(out.get("rows_appended", [])) == len(SHELVES),
                    "the real estate-cutover cut the fixture over dev -> workstation, one row on each shelf",

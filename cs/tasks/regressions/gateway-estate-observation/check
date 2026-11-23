@@ -1,4 +1,0 @@
-#!/bin/sh
-set -eu
-lab=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
-go -C "$lab/../modelgateway" test ./internal/gateway/server -run TestModelsReportsEffectiveEstateCapacity -count=1

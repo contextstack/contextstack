@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Incrementally back up retained lab evidence to the DGX."""
+"""Incrementally back up retained code_root evidence to the DGX."""
 import fcntl
 import json
 import os
@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 RETAINED_DIRS = ("stimulus", "evidence")
-# the post-1b run record (terminal.json, messages.jsonl, check.json, finalized.json) is evidence too.
+# the post-1b run record (terminal.json, messages.jsonl, cli-events.jsonl, trace.jsonl, check.json, finalized.json) is evidence too.
 
 
 def backup_policy():
@@ -30,8 +30,8 @@ def backup_policy():
 
 
 RETAINED_FILES = ("transcript.md", "transcript.jsonl", "check.out", "check.output",
-                  "ready_for_inspection", "terminal.json", "messages.jsonl", "check.json",
-                  "finalized.json")
+                  "ready_for_inspection", "terminal.json", "messages.jsonl", "cli-events.jsonl", "trace.jsonl", "check.json",
+                  "finalized.json", "execution-receipt.json")
 
 
 def fail(message):

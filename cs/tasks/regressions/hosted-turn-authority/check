@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 KIT = Path(__file__).resolve().parents[3]
 OPS = KIT / 'ops/bin'
@@ -46,7 +47,7 @@ with scratch_dir(prefix='hosted-authority-') as raw:
     root = Path(raw).resolve()
     for name in ('home', 'config', 'state', 'workspaces', 'tasks/turn'):
         (root / name).mkdir(parents=True)
-    env = {**hermetic_env(), 'HOME': str(root / 'home'), 'LAB_CONFIG_ROOT': str(root / 'config'), 'LAB_STATE_ROOT': str(root / 'state'), 'LAB_WORKSPACES_ROOT': str(root / 'workspaces'), 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}
+    env = {**hermetic_env(), 'HOME': str(root / 'home'), 'CS_CONFIG_ROOT': str(root / 'config'), 'CS_STATE_ROOT': str(root / 'state'), 'CS_WORKSPACES_ROOT': str(root / 'workspaces'), 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}
     (root / 'config/hosted-lead.json').write_text(json.dumps({'conversation_id': 'con_real'}))
     task = root / 'tasks/turn'
     (task / 'goal.md').write_text('fixture')
@@ -58,7 +59,7 @@ with scratch_dir(prefix='hosted-authority-') as raw:
     # a conversation the Director marks lead: true (many-leads-host covers that refusal).
     for identity in ({}, {'conversation_id': 'con_real'}, {'turn_id': 'turn_1'}):
         order = dict(executor='claude-code-sonnet', task=str(task), spec=str(spec_path), **identity)
-        done = subprocess.run([sys.executable, str(OPS / '_executor.py')], input=json.dumps(order),
+        done = subprocess.run(cli_command(sys.executable, OPS / '_executor.py'), input=json.dumps(order),
                               text=True, capture_output=True, env=env)
         assert done.returncode != 0 and "hosted_turn_refused" in done.stdout + done.stderr, (identity, done)
         assert not list((root / 'workspaces').iterdir()), 'refuse before setup'
@@ -68,7 +69,7 @@ with scratch_dir(prefix='hosted-authority-') as raw:
     spec_path.write_text('id: ordinary\nmodel: claude-code-sonnet\ntrials: 1\n')
     for identity in ({}, {'conversation_id': 'con_real', 'turn_id': 'turn_1'},
                      {'conversation_id': 'con_other', 'turn_id': 'turn_2'}):
-        done = subprocess.run([sys.executable, str(OPS / '_executor.py')],
+        done = subprocess.run(cli_command(sys.executable, OPS / '_executor.py'),
                               input=json.dumps(dict(executor='claude-code-sonnet', task=str(task),
                                                     spec=str(spec_path), **identity)),
                               text=True, capture_output=True, timeout=120,
@@ -93,7 +94,11 @@ with scratch_dir(prefix='hosted-authority-') as raw:
     source = (OPS / '_lead_host.py').read_text()
     hook = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == 'run_hosted_lead_turn')
     text = ast.unparse(hook)
-    assert "globals_dict['run_check_sandboxed']()" in text
+    assert "globals_dict['hosted_finish']()" in text
+    executor = (OPS / "_executor.py").read_text()
+    assert 'complete("hosted", "done")' in executor
+    finisher = (OPS / "_machine_finish.py").read_text()
+    assert "partial(sandboxed_check" in finisher and 'hosted=mode == "hosted"' in finisher
     assert 'run_process(' not in text
     (root / 'config/lead-credential').write_text('fixture-not-a-credential')
     # Credential selection stays on the host; never staged or reopened for the CLI.

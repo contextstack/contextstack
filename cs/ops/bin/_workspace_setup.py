@@ -83,10 +83,10 @@ def _copy_install(src, dst):
     shutil.copytree(src, dst, symlinks=True)
 
 
-def seed_installs(source, lab):
+def seed_installs(source, code_root):
     """Copy dest vendor/node_modules into a frozen lock-hash cache."""
     tag = install_tag(source)
-    cache = state_dir(lab) / "setups/installs" / tag
+    cache = state_dir(code_root) / "setups/installs" / tag
     for name in INSTALLS:
         src, dst = Path(source) / name, cache / name
         if not src.is_dir():

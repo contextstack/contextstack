@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -148,7 +149,7 @@ def disk_free_bytes(path):
 
 def read_vitals(state_root=None, config_root=None, *, disk_free=None):
     """Snapshot vitals for the state root; every field is a number, a string label, or null."""
-    state_root = Path(state_root or os.environ.get("LAB_STATE_ROOT") or HERE.parent.parent / "ledger")
+    state_root = Path(state_root or os.environ.get("CS_STATE_ROOT") or HERE.parent.parent / "ledger")
     out = {
         "memory_total_bytes": None,
         "memory_available_bytes": None,
@@ -201,7 +202,7 @@ def read_vitals(state_root=None, config_root=None, *, disk_free=None):
 
 
 def load_resources_policy(config_root=None):
-    config_root = Path(config_root or os.environ.get("LAB_CONFIG_ROOT") or HERE.parent.parent)
+    config_root = Path(config_root or os.environ.get("CS_CONFIG_ROOT") or HERE.parent.parent)
     path = config_root / "policy/resources.json"
     defaults = {
         "min_available_memory_fraction": 0.10,
@@ -321,10 +322,100 @@ def resource_held(vitals, policy=None):
     return None
 
 
-def agent_capabilities(config_root):
-    """Report init's sign-in checks, filtering binaries removed since setup."""
+
+def installed_release(config_root):
+    """The active release id, or `dev` for a checkout."""
+    root = Path(config_root).resolve().parent
+    marker = root / ".complete"
+    if marker.is_file():
+        return root.name
+    current = Path.home() / ".contextstack" / "current"
+    if current.is_symlink():
+        return os.readlink(current).rstrip("/").rsplit("/", 1)[-1]
+    return "dev"
+
+
+def harness_available(code_root):
+    """Whether the native Rust harness runner is present and executable."""
+    from _runner import runner_path
+    # An installed kit sits next to bin/, whereas a checkout uses target/release/.
+    paths = (Path(code_root).parent / "bin/cs-harness", runner_path(code_root))
+    return any(path.name == "cs-harness" and path.is_file() and os.access(path, os.X_OK)
+               for path in paths)
+
+def gateway_models(config_root, *, available_only=False):
+    from urllib.parse import urlsplit, urlunsplit
+    from urllib.request import ProxyHandler, Request, build_opener
+    from _node_env import node_env
+
+    try:
+        settings = node_env(Path(config_root) / "node.env")
+        endpoint = os.environ.get("CSGATEWAY_ENDPOINT") or settings.get("CSGATEWAY_ENDPOINT", "")
+        url = urlsplit(endpoint)
+        if url.scheme not in ("http", "https") or not url.netloc:
+            return None
+        query = "" if available_only else "available_only=false"
+        catalog = urlunsplit((url.scheme, url.netloc, "/v1/models", query, ""))
+        token = settings.get("CSGATEWAY_AUTH_TOKEN")
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        with build_opener(ProxyHandler({})).open(Request(catalog, headers=headers), timeout=1) as reply:
+            rows = json.load(reply)["models"]
+        return sorted({row["name"] for row in rows if row.get("executor") != "cli"
+                       and isinstance(row.get("name"), str) and 0 < len(row["name"]) <= 100})
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+_GATEWAY_CATALOG_CACHE = {}
+_AGENT_DISCOVERY_CACHE = {}
+_AGENT_DISCOVERY_PENDING = set()
+_AGENT_DISCOVERY_LOCK = threading.Lock()
+_AGENT_DISCOVERY_TTL = 300
+
+
+def _discover_agents():
+    try:
+        from _agent_discovery import discover_node_agents
+
+        return discover_node_agents()
+    except Exception:
+        # A failed probe cannot establish a capability list.
+        return None
+
+
+def _refresh_agent_discovery(key):
+    agents = _discover_agents()
+    with _AGENT_DISCOVERY_LOCK:
+        _AGENT_DISCOVERY_CACHE[key] = (time.monotonic(), agents)
+        _AGENT_DISCOVERY_PENDING.remove(key)
+
+
+def _cached_agent_discovery(key):
+    with _AGENT_DISCOVERY_LOCK:
+        cached_at, agents = _AGENT_DISCOVERY_CACHE.get(key, (None, None))
+        if key not in _AGENT_DISCOVERY_PENDING and (
+            cached_at is None or time.monotonic() - cached_at >= _AGENT_DISCOVERY_TTL
+        ):
+            _AGENT_DISCOVERY_PENDING.add(key)
+            try:
+                threading.Thread(target=_refresh_agent_discovery, args=(key,), daemon=True).start()
+            except RuntimeError:
+                _AGENT_DISCOVERY_PENDING.remove(key)
+        return agents
+
+
+def agent_capabilities(config_root, *, cache_ttl=0, background_discovery=False):
+    """Report saved or discovered sign-in checks, filtering removed binaries."""
+    key = str(config_root)
     try:
         agents = json.loads((Path(config_root) / "agents.json").read_text())
+    except FileNotFoundError:
+        agents = _cached_agent_discovery(key) if background_discovery else _discover_agents()
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(agents, list) or any(not isinstance(a, dict) for a in agents):
+        return {}
+    try:
         templates = json.loads((HERE / "executor-templates.json").read_text())
     except (OSError, ValueError):
         return {}
@@ -334,17 +425,29 @@ def agent_capabilities(config_root):
         install = {}
     ready = {a["name"] for a in agents if a.get("signed_in") is True and a.get("path")
              and shutil.which(a["path"])}
-    return {"agent_capabilities": {"templates": [name for name, template in templates.items()
-            if Path(template.get("binary") or "").name in ready], "preferred": install.get("default_model")}}
+    out = {"templates": sorted(name for name, template in templates.items()
+            if Path(template.get("binary") or "").name in ready), "preferred": install.get("default_model"),
+           "harness": harness_available(HERE.parents[1])}
+    if out["harness"]:
+        now = time.monotonic()
+        cached_at, models = _GATEWAY_CATALOG_CACHE.get(key, (0, None))
+        if now - cached_at >= cache_ttl:
+            models = gateway_models(config_root)
+            if cache_ttl:
+                _GATEWAY_CATALOG_CACHE[key] = (now, models)
+        if models is not None:
+            out["harness_models"] = models
+    return {"agent_capabilities": out}
 
 
 def status_extras(state_root=None, config_root=None, *, cache_ttl=0, disk_free=None):
     """Fields for POST status: vitals always; held when under pressure.
 
     cache_ttl: reuse a vitals snapshot for this many seconds (node-listen); 0 = always fresh.
+    Without agents.json, status uses the most recent background discovery result.
     """
-    state_root = Path(state_root or os.environ.get("LAB_STATE_ROOT") or HERE.parent.parent / "ledger")
-    config_root = Path(config_root or os.environ.get("LAB_CONFIG_ROOT") or HERE.parent.parent)
+    state_root = Path(state_root or os.environ.get("CS_STATE_ROOT") or HERE.parent.parent / "ledger")
+    config_root = Path(config_root or os.environ.get("CS_CONFIG_ROOT") or HERE.parent.parent)
     policy = load_resources_policy(config_root)
     vitals = None
     if cache_ttl > 0 and disk_free is None:
@@ -359,11 +462,18 @@ def status_extras(state_root=None, config_root=None, *, cache_ttl=0, disk_free=N
         vitals = read_vitals(state_root=state_root, config_root=config_root, disk_free=disk_free)
         if cache_ttl > 0 and disk_free is None:
             _VITALS_CACHE[key] = {"vitals": vitals, "at": time.time()}
+    try:
+        backup = json.loads((state_root / "backup-status.json").read_text())
+        if isinstance(backup, dict) and isinstance(backup.get("last_error"), str):
+            vitals = {**vitals, "backup_error": backup["last_error"][:120]}
+    except (OSError, ValueError):
+        pass
     held = resource_held(vitals, policy)
     body = {"vitals": vitals}
     if held:
         body["held"] = held
-    body.update(agent_capabilities(config_root))
+    body["release"] = {"id": installed_release(config_root), "protocol": 2}
+    body.update(agent_capabilities(config_root, cache_ttl=cache_ttl, background_discovery=True))
     body.update(status_limits(state_root))
     return body
 

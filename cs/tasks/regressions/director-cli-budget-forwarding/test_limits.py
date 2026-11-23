@@ -2,9 +2,9 @@ import json, subprocess, tempfile, unittest, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os, sys
-LAB=Path(__file__).resolve().parents[3]
-sys.path.insert(0,str(LAB/"ops/bin"))
-os.environ.setdefault('CS_TOOLS_BIN',str(LAB.parent/'target/release/cs-tools'))
+CODE_ROOT=Path(__file__).resolve().parents[3]
+sys.path.insert(0,str(CODE_ROOT/"ops/bin"))
+os.environ.setdefault('CS_TOOLS_BIN',str(CODE_ROOT.parent/'target/release/cs-tools'))
 from _cli_budget import Admission, Broker, declared, claude_args, native_result
 from _yaml import load
 

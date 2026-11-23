@@ -138,7 +138,7 @@ try:
     ws = jobs / "job_turn_1"
     ws.mkdir()
     (ws / "job.json").write_text(json.dumps({"job_id": "job_turn_1", "task": "tasks/turn"}))
-    env = {**hermetic_env(), "LAB_CONFIG_ROOT": str(cfg), "LAB_STATE_ROOT": str(state), "DIRECTOR_SPEC_NODE_TOKEN": fake.token}
+    env = {**hermetic_env(), "CS_CONFIG_ROOT": str(cfg), "CS_STATE_ROOT": str(state), "DIRECTOR_SPEC_NODE_TOKEN": fake.token}
     host = lead.ConversationHost(cid, state, cfg, model="claude-code-sonnet")
     with patch.dict(os.environ, env, clear=True):
         lead.ensure_session_credential(cid, cfg, state, "claude-code-sonnet")

@@ -17,6 +17,7 @@ A run belongs to a job by its frozen stimulus (stimulus/manifest.json source.job
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from _estate_io import write_atomic
@@ -55,6 +56,8 @@ def job_of(run_dir):
 
 def protocol_event(line):
     """One runner line as a protocol event, or None for a line that is not one."""
+    if not isinstance(line, dict):
+        return None
     seq, kind, payload = line.get("seq"), line.get("kind"), line.get("payload")
     if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1 or not isinstance(payload, dict):
         return None
@@ -69,10 +72,15 @@ def protocol_event(line):
         out = payload
     else:
         kind, out = "runner.event", {"kind": str(kind)[:64]}
+    at = next((line[key] for key in ("at", "timestamp", "ts")
+               if isinstance(line.get(key), str) and line[key]), None)
+    source = "adapter_receive" if at is None or line.get("timestamp_source") == "adapter_receive" else "producer"
+    if at is None:
+        at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
     out = redact_obj(out)
     if len(json.dumps(out)) > PAYLOAD_MAX:
         out = {"turn": out.get("turn"), "text": str(out.get("text") or "")[:PAYLOAD_MAX // 2], "truncated": True}
-    return {"seq": seq, "kind": kind, "partial": True, "payload": out}
+    return {"seq": seq, "kind": kind, "partial": True, "at": at, "timestamp_source": source, "payload": out}
 
 
 def lines(run_dir):

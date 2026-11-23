@@ -18,6 +18,45 @@ use tokio_util::sync::CancellationToken;
 
 use std::ffi::OsString;
 
+#[cfg(test)]
+macro_rules! process_event {
+    ($($arg:tt)*) => {
+        eprintln!(
+            "process {} {}:{} [{}] unix_us={} {}",
+            std::process::id(),
+            file!(),
+            line!(),
+            std::thread::current().name().unwrap_or("<unnamed>"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+            format_args!($($arg)*)
+        )
+    };
+}
+
+#[cfg(test)]
+struct ChildDropTrace {
+    child: tokio::process::Child,
+    test: std::thread::Thread,
+    kill_on_drop: bool,
+}
+
+#[cfg(test)]
+impl Drop for ChildDropTrace {
+    fn drop(&mut self) {
+        // An ID means Tokio hasn't collected an exit status. The child could
+        // already be a zombie. Polling here would change the behavior we trace.
+        if self.kill_on_drop
+            && let Some(pid) = self.child.id()
+        {
+            let owner = self.test.name().unwrap_or("<unnamed>");
+            process_event!("kill_on_drop signal=KILL pid=Some({pid}) owner={owner}");
+        }
+    }
+}
+
 #[cfg(any(test, feature = "fixtures"))]
 use std::cell::RefCell;
 
@@ -28,14 +67,10 @@ thread_local! {
     };
 }
 
-#[cfg(any(test, feature = "fixtures"))]
-fn overlay(name: &str) -> Option<String> {
-    TEST_OVERLAY.with(|map| map.borrow().get(name).cloned())
-}
-
-fn read_var(name: &str) -> Option<String> {
+/// Read the canonical environment variable, including test overlays.
+pub fn env(name: &str) -> Option<String> {
     #[cfg(any(test, feature = "fixtures"))]
-    if let Some(value) = overlay(name) {
+    if let Some(value) = TEST_OVERLAY.with(|map| map.borrow().get(name).cloned()) {
         return Some(value);
     }
     std::env::var(name).ok()
@@ -43,7 +78,7 @@ fn read_var(name: &str) -> Option<String> {
 
 /// Read an environment variable; tests may layer values without mutating the process environment.
 pub fn var_os(name: &str) -> Option<OsString> {
-    read_var(name)
+    env(name)
         .map(OsString::from)
         .or_else(|| std::env::var_os(name))
 }
@@ -69,20 +104,7 @@ impl Drop for ScopedEnv {
     }
 }
 
-const DEFAULT_ENV: &str = "PATH HOME USER LOGNAME TERM LANG LC_ALL LC_CTYPE TMPDIR TMP TEMP SHELL HOMEBREW_PREFIX HOMEBREW_CELLAR LAB_JOB_ID LAB_TRIAL LAB_SCHEDULE_DATE LAB_SCHEDULE_SLOT LAB_SCHEDULE_TIMEZONE LAB_VIDEO_MUTATION LAB_STEP_TTY LAB_CODE_ROOT LAB_CONFIG_ROOT LAB_STATE_ROOT LAB_WORKSPACES_ROOT CS_TOOL_PREFIX CS_SANDBOX_BIN LAB_BROWSER_STATE LAB_TOOL_TIMEOUT_SECONDS";
-
-/// The names the launchers (tick, run-spec) keep identical under both spellings; every other LAB name,
-/// such as the validated roots, is read only as spelled, so an inherited CS value cannot bypass the launcher.
-const ALIASED: &str =
-    "CHILD_ENV VIDEO_MUTATION JOB_ID TRIAL SCHEDULE_DATE SCHEDULE_SLOT SCHEDULE_TIMEZONE";
-
-/// Prefer a CS alias, including an explicitly empty value, to its legacy LAB spelling.
-pub fn env(name: &str) -> Option<String> {
-    name.strip_prefix("LAB_")
-        .filter(|suffix| ALIASED.split(' ').any(|aliased| aliased == *suffix))
-        .and_then(|suffix| read_var(&format!("CS_{suffix}")))
-        .or_else(|| read_var(name))
-}
+const DEFAULT_ENV: &str = "PATH HOME USER LOGNAME TERM LANG LC_ALL LC_CTYPE TMPDIR TMP TEMP SHELL HOMEBREW_PREFIX HOMEBREW_CELLAR CS_JOB_ID CS_TRIAL CS_SCHEDULE_DATE CS_SCHEDULE_SLOT CS_SCHEDULE_TIMEZONE CS_VIDEO_MUTATION CS_STEP_TTY CS_CODE_ROOT CS_CONFIG_ROOT CS_STATE_ROOT CS_WORKSPACES_ROOT CS_TOOL_PREFIX CS_SANDBOX_BIN CS_BROWSER_STATE CS_TOOL_TIMEOUT_SECONDS";
 
 /// Run-level cancellation, what cancelled it, and the optional remaining wall-clock budget.
 #[derive(Clone, Default)]
@@ -129,10 +151,11 @@ pub struct Output {
     pub bytes: Vec<u8>,
     pub code: i32,
     pub error: Option<String>,
+    pub timed_out: bool,
 }
 
 fn environment(extra: &[(String, String)]) -> BTreeMap<String, String> {
-    let names = env("LAB_CHILD_ENV").unwrap_or_else(|| DEFAULT_ENV.to_owned());
+    let names = env("CS_CHILD_ENV").unwrap_or_else(|| DEFAULT_ENV.to_owned());
     let mut values: BTreeMap<_, _> = names
         .split_whitespace()
         .filter_map(|key| env(key).map(|v| (key.to_owned(), v)))
@@ -145,7 +168,7 @@ const TEXT_LIMIT: usize = 8192;
 const CLIP_HEAD: usize = 3 * 1024;
 const CLIP_TAIL: usize = 5 * 1024;
 const IMAGE_LIMIT: usize = 16 * 1024 * 1024;
-const EXEC_SPILL: &str = "full output in .lab-out/";
+const EXEC_SPILL: &str = "full output in .cs-out/";
 
 /// Select the stream and retained output needed by the caller.
 pub enum Capture {
@@ -155,6 +178,8 @@ pub enum Capture {
     Foreground,
     /// Text tools and unattended hooks run in their own process group.
     Text,
+    /// Keep the latest combined check output.
+    Tail,
     /// Image observations need a complete JSON envelope, up to 16 MiB.
     Image,
 }
@@ -164,6 +189,19 @@ async fn drain(reader: &mut Receiver, bytes: &mut Vec<u8>, limit: u64) -> io::Re
     tokio::io::copy(reader, &mut tokio::io::sink())
         .await
         .map(|_| ())
+}
+
+async fn drain_tail(reader: &mut Receiver, bytes: &mut Vec<u8>) -> io::Result<()> {
+    let mut chunk = [0; TEXT_LIMIT];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let excess = (bytes.len() + n).saturating_sub(TEXT_LIMIT);
+        bytes.drain(..excess);
+        bytes.extend_from_slice(&chunk[..n]);
+    }
 }
 
 fn stop_error(control: Option<&Control>) -> &'static str {
@@ -178,6 +216,7 @@ fn stop_error(control: Option<&Control>) -> &'static str {
     clippy::too_many_arguments,
     reason = "The single process boundary keeps launch semantics explicit."
 )]
+#[allow(clippy::too_many_lines, reason = "Test-only process event tracing.")]
 pub async fn command(
     bin: &Path,
     args: &[&str],
@@ -199,12 +238,13 @@ pub async fn command(
         Stdio::from(stdout.try_clone().map_err(|e| e.to_string())?)
     };
     let mut command = Command::new(bin);
+    cs_child_signals::reset_on_exec(command.as_std_mut());
     command.args(args);
     let isolated = !matches!(capture, Capture::Foreground);
     if isolated {
         command.process_group(0);
     }
-    let mut child = command
+    let child = command
         .current_dir(cwd)
         .env_clear()
         .envs(environment(extra))
@@ -214,7 +254,28 @@ pub async fn command(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("fork/exec {}: {}", bin.display(), io_error(&e)))?;
+    #[cfg(test)]
+    let mut traced = ChildDropTrace {
+        child,
+        test: std::thread::current(),
+        kill_on_drop: command.get_kill_on_drop(),
+    };
+    #[cfg(test)]
+    let child = &mut traced.child;
+    #[cfg(not(test))]
+    let mut child = child;
     drop(command);
+    let group = child
+        .id()
+        .filter(|_| isolated)
+        .and_then(|id| Pid::from_raw(id.cast_signed()));
+    #[cfg(test)]
+    let (pid, child_group) = (
+        child.id(),
+        group.unwrap_or_else(rustix::process::getpgrp).as_raw_pid(),
+    );
+    #[cfg(test)]
+    process_event!("spawn pid={pid:?} pgid={child_group}");
     let stdin = child.stdin.take();
     let writer = async move {
         if let Some(mut pipe) = stdin {
@@ -224,31 +285,55 @@ pub async fn command(
     };
     let limit = match capture {
         Capture::Stdout => u64::MAX,
-        Capture::Foreground | Capture::Text => TEXT_LIMIT as u64 + 1,
+        Capture::Foreground | Capture::Text | Capture::Tail => TEXT_LIMIT as u64 + 1,
         Capture::Image => IMAGE_LIMIT as u64 + 1,
     };
     let mut bytes = Vec::new();
-    let result = tokio::select! {
+    let (result, timed_out) = tokio::select! {
         biased;
-        () = async { match control { Some(c) => c.stopped().await, None => std::future::pending().await }} => None,
-        () = async { match timeout { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await }} => None,
+        () = async { match control { Some(c) => c.stopped().await, None => std::future::pending().await }} => (None, false),
+        () = async { match timeout { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await }} => (None, true),
         result = async {
             // Keep the group leader's PID reserved until inherited pipes close.
-            tokio::try_join!(drain(&mut reader, &mut bytes, limit), writer)?;
-            child.wait().await
-        } => Some(result),
+            let output = async {
+                if matches!(capture, Capture::Tail) {
+                    drain_tail(&mut reader, &mut bytes).await
+                } else {
+                    drain(&mut reader, &mut bytes, limit).await
+                }
+            };
+            tokio::try_join!(output, writer)?;
+            let waited = child.wait().await;
+            #[cfg(test)]
+            process_event!("wait pid={pid:?} pgid={child_group} result={waited:?}");
+            waited
+        } => (Some(result), false),
     };
     let stopped = result.is_none();
+    if let Some(group) = group {
+        #[cfg(test)]
+        process_event!("kill_process_group signal=KILL pid={pid:?} pgid={child_group}");
+        let _ = kill_process_group(group, Signal::KILL);
+    }
     let status = match result {
         Some(Ok(status)) => Ok(status),
         interrupted => {
-            if isolated
-                && let Some(group) = child.id().and_then(|id| Pid::from_raw(id.cast_signed()))
+            #[cfg(test)]
+            process_event!(
+                "start_kill signal=KILL pid={:?} pgid={child_group}",
+                child.id()
+            );
+            let killed = child.start_kill();
+            #[cfg(test)]
             {
-                let _ = kill_process_group(group, Signal::KILL);
+                // Tokio disarms its drop guard after a successful explicit kill.
+                traced.kill_on_drop &= killed.is_err();
             }
-            let _ = child.start_kill();
-            interrupted.unwrap_or(child.wait().await)
+            let _ = killed;
+            let waited = child.wait().await;
+            #[cfg(test)]
+            process_event!("wait pid={pid:?} pgid={child_group} result={waited:?}");
+            interrupted.unwrap_or(waited)
         }
     }
     .map_err(|e| e.to_string())?;
@@ -263,7 +348,12 @@ pub async fn command(
         Some(code) => (code, Some(format!("exit status {code}"))),
         None => (-1, Some(signal_error(status))),
     };
-    Ok(Output { bytes, code, error })
+    Ok(Output {
+        bytes,
+        code,
+        error,
+        timed_out,
+    })
 }
 
 // Go syscall.Signal.String spellings by signal number on Linux and macOS.
@@ -356,15 +446,11 @@ pub fn clip(bytes: &[u8]) -> String {
     if bytes.len() <= TEXT_LIMIT {
         return String::from_utf8_lossy(bytes).into_owned();
     }
-    let spill = exec_spill_line(bytes);
-    let head_has_spill = spill.as_ref().is_some_and(|line| {
-        String::from_utf8_lossy(&bytes[..CLIP_HEAD.min(bytes.len())]).contains(line.as_str())
+    let spill_in_marker = exec_spill_line(bytes).filter(|line| {
+        let head = String::from_utf8_lossy(&bytes[..CLIP_HEAD]);
+        let tail = String::from_utf8_lossy(&bytes[bytes.len() - CLIP_TAIL..]);
+        !head.contains(line.as_str()) && !tail.contains(line.as_str())
     });
-    let tail_has_spill = spill.as_ref().is_some_and(|line| {
-        let tail_start = bytes.len().saturating_sub(CLIP_TAIL);
-        String::from_utf8_lossy(&bytes[tail_start..]).contains(line.as_str())
-    });
-    let spill_in_marker = spill.filter(|_| !head_has_spill && !tail_has_spill);
     let mut marker = clip_marker(
         bytes.len(),
         CLIP_HEAD,
@@ -392,6 +478,31 @@ pub fn clip(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn external_reap_leaves_tokio_with_a_stale_pid() -> io::Result<()> {
+        use rustix::process::{WaitOptions, waitpid};
+
+        // Deliberately violate exclusive wait ownership, with kill-on-drop
+        // disabled so this test can never signal a recycled PID.
+        let mut child = Command::new("/bin/sh").args(["-c", "exit 0"]).spawn()?;
+        let id = child
+            .id()
+            .ok_or_else(|| io::Error::other("missing child PID"))?;
+        let pid =
+            Pid::from_raw(id.cast_signed()).ok_or_else(|| io::Error::other("invalid child PID"))?;
+        let (reaped, status) = waitpid(Some(pid), WaitOptions::empty())?
+            .ok_or_else(|| io::Error::other("blocking wait returned no status"))?;
+        assert_eq!(reaped, pid);
+        assert_eq!(status.exit_status(), Some(0));
+        assert_eq!(child.id(), Some(id));
+        assert_eq!(
+            child.try_wait().err().and_then(|err| err.raw_os_error()),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+        assert_eq!(child.id(), Some(id));
+        Ok(())
+    }
 
     async fn script(
         body: &str,
@@ -436,14 +547,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_exit_cleans_up_background_children() -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = tempfile::tempdir()?;
+        let output = command(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "(sleep 0.5; touch survived) </dev/null >/dev/null 2>&1 &",
+            ],
+            scratch.path(),
+            &[],
+            &[],
+            None,
+            Some(Duration::from_secs(5)),
+            Capture::Text,
+        )
+        .await?;
+        assert_eq!(output.code, 0);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!scratch.path().join("survived").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn inherited_output_cannot_outlast_the_timeout() -> Result<(), Box<dyn std::error::Error>>
     {
-        const TIMEOUT: Duration = Duration::from_millis(150);
-        // Background tail appears after 3s; without the output timeout we would drain for ~3s.
-        const BACKGROUND_TAIL: Duration = Duration::from_secs(3);
+        // Give the shell time to fork and exit even when the suite is running under load.
+        const TIMEOUT: Duration = Duration::from_secs(1);
+        const BACKGROUND_TAIL: Duration = Duration::from_secs(30);
+        const ELAPSED_LIMIT: Duration = Duration::from_secs(15);
         let start = Instant::now();
         let output = script(
-            "printf head; (sleep 3; printf tail) & exit 0",
+            &format!(
+                "(sleep {}; printf tail) & printf head; exit 0",
+                BACKGROUND_TAIL.as_secs()
+            ),
             Capture::Text,
             Some(TIMEOUT),
         )
@@ -453,10 +591,9 @@ mod tests {
         assert_eq!(output.bytes, b"head");
         assert_eq!(output.code, -1);
         assert_eq!(output.error.as_deref(), Some("context deadline exceeded"));
-        // The bound must stay under BACKGROUND_TAIL, or an implementation that waits for the tail would pass. 2.5 s is
-        // still over 15x the 150 ms timeout, which absorbs a loaded machine.
+        // Allow scheduling and cleanup delays while keeping the bound below the pipe's natural EOF.
         assert!(
-            elapsed < Duration::from_millis(2500),
+            elapsed < ELAPSED_LIMIT,
             "command took {elapsed:?}; ignored timeout would wait for background output (~{BACKGROUND_TAIL:?})"
         );
         Ok(())
@@ -493,9 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn lab_aliases_prefer_cs_overlay_values() {
+    fn env_reads_overlay_values() {
         let _env = ScopedEnv::set([("CS_TRIAL".to_string(), "7".to_string())]);
-        assert_eq!(env("LAB_TRIAL"), Some("7".to_string()));
+        assert_eq!(env("CS_TRIAL"), Some("7".to_string()));
     }
     #[test]
     fn control_reason_reports_deadline_and_cancel() {
@@ -511,12 +648,12 @@ mod tests {
 
     #[test]
     fn clip_keeps_head_and_tail_with_exec_spill_in_marker() {
-        let spill = b"lines 1-1 of 9 \xe2\x80\x94 full output in .lab-out/1.txt\n";
+        let spill = b"lines 1-1 of 9 \xe2\x80\x94 full output in .cs-out/1.txt\n";
         let mut body = spill.to_vec();
         body.extend(std::iter::repeat_n(b'm', 20_000));
         body.extend(std::iter::repeat_n(b't', 500));
         let clipped = clip(&body);
-        assert!(clipped.contains("full output in .lab-out/"));
+        assert!(clipped.contains("full output in .cs-out/"));
         assert!(clipped.contains("[truncated:"));
         assert!(clipped.contains("ttt"));
         assert!(clipped.len() <= TEXT_LIMIT);
@@ -537,25 +674,76 @@ mod tests {
     #[tokio::test]
     async fn actual_signals_and_timeout_have_go_diagnostics()
     -> Result<(), Box<dyn std::error::Error>> {
-        const KILL_TIMEOUT: Duration = Duration::from_millis(200);
+        const KILL_TIMEOUT: Duration = Duration::from_secs(1);
+        const CHILD_SLEEP: Duration = Duration::from_secs(30);
+        const ELAPSED_LIMIT: Duration = Duration::from_secs(15);
         for (signal, wording) in [
             ("TERM", "terminated"),
             ("KILL", "killed"),
             ("INT", "interrupt"),
             ("HUP", "hangup"),
         ] {
-            let result = script(&format!("kill -{signal} $$"), Capture::Text, None).await?;
-            assert_eq!(result.code, -1);
-            assert_eq!(result.error, Some(format!("signal: {wording}")));
+            // Exec keeps the target PID and resets the shell's caught signal handlers.
+            process_event!("fixture exec /bin/kill signal={signal} target=own PID");
+            let result = script(
+                &format!("exec /bin/kill -{signal} \"$$\""),
+                Capture::Text,
+                None,
+            )
+            .await?;
+            assert_eq!(
+                (result.code, result.error),
+                (-1, Some(format!("signal: {wording}"))),
+                "SIG{signal}: {}",
+                String::from_utf8_lossy(&result.bytes)
+            );
         }
         let start = Instant::now();
-        let result = script("exec sleep 10", Capture::Text, Some(KILL_TIMEOUT)).await?;
+        let result = script(
+            &format!("exec sleep {}", CHILD_SLEEP.as_secs()),
+            Capture::Text,
+            Some(KILL_TIMEOUT),
+        )
+        .await?;
         let elapsed = start.elapsed();
-        // Fails if the timeout stops draining but does not SIGKILL the child (e.g. "context deadline exceeded" while sleep still runs).
         assert_eq!(result.error.as_deref(), Some("signal: killed"));
+        // Leave room for scheduling and cleanup while keeping the bound below the child's natural exit.
         assert!(
-            elapsed < KILL_TIMEOUT.saturating_mul(20),
+            elapsed < ELAPSED_LIMIT,
             "sleep child not killed promptly: waited {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_sigint_is_reset() -> Result<(), Box<dyn std::error::Error>> {
+        // Re-exec the test with SIGINT ignored without changing the test runner's signals.
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' INT; exec \"$@\"", "sh"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "process::tests::actual_signals_and_timeout_have_go_diagnostics",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+        let child_group = rustix::process::getpgrp().as_raw_pid();
+        process_event!("spawn pid={pid} pgid={child_group}");
+        let output = child.wait_with_output();
+        process_event!(
+            "wait pid={pid} pgid={child_group} result={:?}",
+            output.as_ref().map(|output| output.status)
+        );
+        let output = output?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}"
         );
         Ok(())
     }

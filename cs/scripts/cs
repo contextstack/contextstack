@@ -36,10 +36,12 @@ DOC = """cs: see and control this machine's ContextStack install.
   cs review weekly [--since DAYS] [--json] [--plist] [--director URL] [--credential-file PATH] [--node NAME]
                                              weekly task-lane review from the Director
   cs review schedule [--state PATH]          install the weekly review schedule on this machine
+  cs backup init|run|status|restore          encrypted off-machine Director and eval backups
+  cs device list|pair NAME|revoke ID        manage credentials from the Director host
   cs ui [--print]                            open or print a one-time Director UI pairing URL (five minutes, once)
 
 Most commands read ~/.contextstack and change nothing. Exceptions: `cs land` commits locally; `cs init` and `cs update`
-write install configuration and activate releases. Secrets are never printed. Env CS_PLATFORM overrides the platform
+write install configuration and activate releases. Pairing commands print a one-time code or URL. Env CS_PLATFORM overrides the platform
 probe (tests).
 """
 import argparse
@@ -213,7 +215,7 @@ def receiver():
 
 def state_root():
     _, node = load_plist(NODE)
-    return Path(((node or {}).get("EnvironmentVariables") or {}).get("LAB_STATE_ROOT") or ROOT / "state")
+    return Path(((node or {}).get("EnvironmentVariables") or {}).get("CS_STATE_ROOT") or ROOT / "state")
 
 
 def load_script(name, path):
@@ -240,9 +242,9 @@ def node_release():
     return load_script("node_release", path)
 
 
-def run(argv, timeout=10):
+def run(argv, timeout=10, *, env=None):
     try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
     except (OSError, subprocess.TimeoutExpired) as error:
         return subprocess.CompletedProcess(argv, 127, "", str(error))
 
@@ -813,7 +815,7 @@ def cli_pin_findings():
         except ValueError:
             out.append({"check": check, "ok": True, "info": True, "detail": "not installed"})
             continue
-        state, entry = pin_state(name, binary, env={"LAB_CONFIG_ROOT": str(CONFIG)})
+        state, entry = pin_state(name, binary, env={"CS_CONFIG_ROOT": str(CONFIG)})
         if state == "ok":
             out.append({"check": check, "ok": True, "detail": (entry or {}).get("version", "")})
         elif state == "unpinned":
@@ -858,7 +860,7 @@ def cmd_repin_cli(target):
             print("skip  %s: --version failed (%s)" % (name, version), file=sys.stderr)
             continue
         pkg = package_sha256(profile["package"]) if profile.get("package") else None
-        ensure_pin(name, binary, version, env={"LAB_CONFIG_ROOT": str(CONFIG)}, repin=True, package_sha=pkg)
+        ensure_pin(name, binary, version, env={"CS_CONFIG_ROOT": str(CONFIG)}, repin=True, package_sha=pkg)
         repinned.append((name, version))
     if not repinned:
         raise Stop("cs doctor --repin: nothing repinned", 1)
@@ -1035,23 +1037,25 @@ def doctor():
             live = run(["ssh", "-S", str(sock), "-O", "check", args[-1] if args else "spark"], timeout=8).returncode == 0
             add("tunnel socket %s" % label, live, "%s exists with no live master" % sock,
                 "rm %s, then cs restart tunnels" % sock)
-    ops = KIT / "ops/bin"
-    if (ops / "_toolchains.py").is_file():
-        try:
-            load = importlib.util.spec_from_file_location("_toolchains", ops / "_toolchains.py")
-            mod = importlib.util.module_from_spec(load)
-            load.loader.exec_module(mod)
-            out.extend(mod.doctor_findings(CONFIG / "toolchains.json"))
-        except Exception:
-            pass
     return out
+
+
+def toolchain_findings():
+    module = KIT / "ops/bin/_toolchains.py"
+    if not module.is_file():
+        return []
+    toolchains = load_script("_toolchains", module)
+    services = load_script("_node_services", Path(__file__).resolve().with_name("_node_services.py"))
+    path = CONFIG / "toolchains.json"
+    service_path = os.environ.get("CS_SERVICE_PATH", "%s:%s" % (CURRENT / "code/.venv/bin", services.SYSTEM_PATH))
+    return toolchains.doctor_findings(path) + toolchains.doctor_login_findings(path, service_path)
 
 
 def cmd_doctor(args):
     if getattr(args, "repin", None) is not None:
         return cmd_repin_cli(args.repin)
     need_install()
-    findings = doctor() + cli_pin_findings()
+    findings = doctor() + cli_pin_findings() + toolchain_findings()
     if args.json:
         print(json.dumps(findings, indent=2))
     else:
@@ -1137,12 +1141,32 @@ def cmd_review(args):
     """Weekly task-lane review, or install its Monday schedule (scripts/cs_review.py)."""
     mod = load_script("cs_review", Path(__file__).resolve().parent / "cs_review.py")
     if args.period == "schedule" and not getattr(args, "state", None):
-        # The node's plist, not the shell's LAB_STATE_ROOT (that is the checkout estate).
+        # The node's plist, not the shell's CS_STATE_ROOT (that is the checkout estate).
         args.state = str(state_root())
     try:
         return mod.run_cli(args, root=ROOT)
     except mod.ClientError as error:
         raise Stop("cs review: %s" % error, 1)
+
+
+def cmd_device(args):
+    need_install()
+    binary = release_bin(CURRENT, "cs-director")
+    if not os.access(binary, os.X_OK):
+        raise Stop("cs device: the Director is not installed on this machine (no %s)" % binary)
+    ui = load_script("cs_ui", Path(__file__).resolve().with_name("cs_ui.py"))
+    commands = {"list": ["credential", "list"], "pair": ["pair"], "revoke": ["credential", "revoke"]}
+    command = commands[args.action]
+    if args.action != "list":
+        if args.value.startswith("--"):
+            raise Stop("cs device: invalid name or credential ID", 2)
+        command.append(args.value)
+    result = run([str(binary), *command, "--data-dir", str(ui.data_dir(argparse.Namespace(**globals())))], timeout=30)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 def cmd_ui(args):
@@ -1254,15 +1278,27 @@ def main(argv=None):
     rev.add_argument("--director", help="Director URL (default: install.json)")
     rev.add_argument("--credential-file", help="owner credential file (default: state/director/local-credential)")
     rev.add_argument("--node", help="default node name")
+    backup = sub.add_parser("backup", help="back up the Director database and evals off-machine")
+    # Load only on demand so minimal releases keep their existing commands.
+    if argv[:1] == ["backup"]:
+        backup_module = load_script("cs_backup", Path(__file__).resolve().with_name("cs_backup.py"))
+        backup_module.add_arguments(backup)
+    device = sub.add_parser("device", help="manage client credentials on the Director host")
+    device_actions = device.add_subparsers(dest="action", required=True)
+    device_actions.add_parser("list")
+    device_actions.add_parser("pair").add_argument("value", metavar="NAME")
+    device_actions.add_parser("revoke").add_argument("value", metavar="ID")
     ui = sub.add_parser("ui", help="open a one-time Director UI pairing URL")
     ui.add_argument("--print", dest="print_url", action="store_true",
                     help="print the URL instead of opening it (one-time, expires in five minutes)")
     args = ap.parse_args(argv)
+    if args.cmd == "backup":
+        return backup_module.main(args, ROOT)
     if args.cmd in ("start", "stop", "restart"):
         args.action = args.cmd
     handler = {"status": cmd_status, "logs": cmd_logs, "models": cmd_models, "jobs": cmd_jobs, "doctor": cmd_doctor,
                "smoke": cmd_smoke, "update": cmd_update, "release": cmd_release, "land": cmd_land, "init": cmd_init, "lead": cmd_lead,
-               "review": cmd_review, "ui": cmd_ui, "repo": cmd_repo}.get(args.cmd, cmd_service)
+               "review": cmd_review, "ui": cmd_ui, "repo": cmd_repo, "device": cmd_device}.get(args.cmd, cmd_service)
     node_env()  # its values join the redactor before anything prints
     client_web_env()  # and client-web's APP_KEY
     try:

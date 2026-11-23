@@ -10,8 +10,8 @@ import tempfile
 from pathlib import Path
 
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 from _frozen_inputs import MAX_INPUTS, stage_frozen_inputs
 
 
@@ -51,7 +51,7 @@ with scratch_dir(prefix="frozen-inputs-") as raw:
     except ValueError as error:
         assert "at most" in str(error)
 
-source_text = (LAB / "ops/bin/_executor.py").read_text()
+source_text = (CODE_ROOT / "ops/bin/_executor.py").read_text()
 assert "stage_frozen_inputs(a.get(\"inputs\"), ws)" in source_text
 assert 'row["frozen_inputs"] = frozen_inputs' in source_text
 print("check: CLI executor stages only bounded hash-verified frozen inputs")

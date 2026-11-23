@@ -7,9 +7,9 @@ from pathlib import Path
 import sys
 import tempfile
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / 'scripts'))
-sys.path.insert(0, str(LAB / 'ops/bin'))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / 'scripts'))
+sys.path.insert(0, str(CODE_ROOT / 'ops/bin'))
 from _node_rename import RETIRED, migrate_config
 from _runner import runner_path, runner_kind
 from _sandbox_policy import wrapper_path
@@ -56,11 +56,11 @@ with tempfile.TemporaryDirectory(prefix='cs-rename-') as raw:
     assert policy.read_text() == '["CS_TOOL_PREFIX", "/release/cs/scripts/cs"]\n'
     assert policy.stat().st_mode & 0o777 == 0o644
     assert foreign.read_text() == RETIRED + '-kit'
-    loader = importlib.machinery.SourceFileLoader('rename_bundle', str(LAB / 'scripts/node-bundle'))
+    loader = importlib.machinery.SourceFileLoader('rename_bundle', str(CODE_ROOT / 'scripts/node-bundle'))
     spec = importlib.util.spec_from_loader('rename_bundle', loader)
     bundle = importlib.util.module_from_spec(spec)
     loader.exec_module(bundle)
-    bundle.LAB = code
+    bundle.CODE_ROOT = code
     bundle.release_files = lambda: ['marker']
     (code / 'marker').write_text('code')
     (root / 'gateway').mkdir()

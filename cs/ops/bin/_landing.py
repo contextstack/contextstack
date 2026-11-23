@@ -51,10 +51,10 @@ def _run_ids(raw):
     return [p.strip() for p in re.split(r"[\s,]+", text) if p.strip()]
 
 
-def _verdict_for_run(lab, run_id):
+def _verdict_for_run(code_root, run_id):
     """Return a ledger verdict for run_id, or None if unknown."""
-    lab = Path(lab)
-    for row in _rows(state_dir(lab) / "ledger.jsonl"):
+    code_root = Path(code_root)
+    for row in _rows(state_dir(code_root) / "ledger.jsonl"):
         run = str(row.get("run") or "")
         if not run:
             continue
@@ -63,7 +63,7 @@ def _verdict_for_run(lab, run_id):
             verdict = str(row.get("verdict") or "").strip()
             if verdict:
                 return verdict
-    runs = state_dir(lab) / "runs"
+    runs = state_dir(code_root) / "runs"
     if runs.is_dir():
         for child in runs.iterdir():
             if not child.is_dir():
@@ -81,24 +81,24 @@ def _verdict_for_run(lab, run_id):
     return None
 
 
-def _refusal_exists(lab, refusal_id):
+def _refusal_exists(code_root, refusal_id):
     if not refusal_id:
         return False
     rid = str(refusal_id).strip()
-    for row in _rows(state_dir(lab) / "refusals.jsonl"):
+    for row in _rows(state_dir(code_root) / "refusals.jsonl"):
         if str(row.get("id") or "") == rid:
             return True
     return False
 
 
-def _dispatch_exists(lab, run_id):
-    for row in _rows(state_dir(lab) / "dispatch.jsonl"):
+def _dispatch_exists(code_root, run_id):
+    for row in _rows(state_dir(code_root) / "dispatch.jsonl"):
         if str(row.get("id") or "") == run_id:
             return True
     return False
 
 
-def _factory_gap_count(lab, grant, cause, wave):
+def _factory_gap_count(code_root, grant, cause, wave):
     """Count prior factory_gap landings with the same grant/cause/wave."""
     grant = str(grant or "").strip()
     cause = str(cause or "").strip()
@@ -106,7 +106,7 @@ def _factory_gap_count(lab, grant, cause, wave):
     if not (grant and cause and wave):
         return 0
     n = 0
-    for row in _rows(state_dir(lab) / "ledger.jsonl"):
+    for row in _rows(state_dir(code_root) / "ledger.jsonl"):
         if str(row.get("verdict") or "") != "operator_close":
             continue
         reason = str(row.get("close_reason") or "").strip()
@@ -123,7 +123,7 @@ def _factory_gap_count(lab, grant, cause, wave):
     return n
 
 
-def validate_operator_close(lab, payload):
+def validate_operator_close(code_root, payload):
     """'' when legal; else refusal text quoting the rule and naming missing evidence."""
     reason = str(payload.get("reason") or "").strip()
     run_ids = _run_ids(payload.get("run_ids") or payload.get("run_id") or payload.get("run"))
@@ -153,7 +153,7 @@ def validate_operator_close(lab, payload):
             return "close: %s — refused (missing run id)" % RULE_MODEL_MISS
         non_pass = []
         for rid in run_ids:
-            verdict = _verdict_for_run(lab, rid)
+            verdict = _verdict_for_run(code_root, rid)
             if verdict is None:
                 continue
             if verdict not in PASS_VERDICTS:
@@ -166,19 +166,19 @@ def validate_operator_close(lab, payload):
     if reason == "factory_gap":
         if not run_ids and not refusal_id:
             return "close: %s — refused (missing run id and refusal receipt)" % RULE_FACTORY_GAP
-        if refusal_id and not _refusal_exists(lab, refusal_id):
+        if refusal_id and not _refusal_exists(code_root, refusal_id):
             return "close: %s — refused (refusal receipt %s not found)" % (
                 RULE_FACTORY_GAP, refusal_id)
         if run_ids and not refusal_id:
             missing = [rid for rid in run_ids
-                       if _verdict_for_run(lab, rid) is None
-                       and not _dispatch_exists(lab, rid)
-                       and not any((state_dir(lab) / "runs").glob("*" + rid + "*"))]
+                       if _verdict_for_run(code_root, rid) is None
+                       and not _dispatch_exists(code_root, rid)
+                       and not any((state_dir(code_root) / "runs").glob("*" + rid + "*"))]
             if missing:
                 return "close: %s — refused (run id not found: %s)" % (
                     RULE_FACTORY_GAP, ",".join(missing))
         if grant and cause and wave:
-            prior = _factory_gap_count(lab, grant, cause, wave)
+            prior = _factory_gap_count(code_root, grant, cause, wave)
             if prior >= 2:
                 return "close: %s" % ESCALATE
         return ""

@@ -59,14 +59,14 @@ candidate_paths() {
       git ls-files --others --exclude-standard
     else
       task_setup=
-      if [ -n "${LAB_CHECK:-}" ]; then
-        task_setup=$(dirname "$LAB_CHECK")/setup
+      if [ -n "${CS_CHECK:-}" ]; then
+        task_setup=$(dirname "$CS_CHECK")/setup
       fi
       find . -type f \
         ! -path './.git' ! -path './.git/*' \
         ! -path '*/.git/*' \
         ! -path '*/vendor/*' ! -path '*/node_modules/*' \
-        ! -path '*/.lab-tmp/*' ! -name '.lab-*' -print \
+        ! -path '*/.cs-tmp/*' ! -name '.cs-*' -print \
       | while IFS= read -r candidate; do
           relative=${candidate#./}
           if [ -n "$task_setup" ] && [ -f "$task_setup/$relative" ] \
@@ -81,7 +81,7 @@ candidate_paths() {
       .git|.git/*|*/.git|*/.git/*) continue ;;
       vendor/*|*/vendor/*) continue ;;
       node_modules/*|*/node_modules/*) continue ;;
-      .lab-*|.lab-tmp/*|*/.lab-tmp/*) continue ;;
+      .cs-*|.cs-tmp/*|*/.cs-tmp/*) continue ;;
     esac
     [ -f "$relative" ] || continue
     printf '%s\n' "$relative"

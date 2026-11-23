@@ -145,7 +145,7 @@ import sys
 try:
     bundle = Path(sys.argv[1])
     meta = json.loads((bundle / 'bundle.json').read_text())
-    if (meta['release'], meta['target'], meta['lab_commit']) != tuple(sys.argv[2:5]):
+    if (meta['release'], meta['target'], meta['code_commit']) != tuple(sys.argv[2:5]):
         raise ValueError('bundle metadata differs from channel manifest')
     try:
         terminal = open('/dev/tty')

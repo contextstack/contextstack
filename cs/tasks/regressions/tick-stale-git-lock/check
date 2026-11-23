@@ -11,22 +11,22 @@ import tempfile
 import time
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
-# refusing live lab root as a write target: planted locks stay in
-# TemporaryDirectory. Sweep and the mocked commit pass run there.
+CODE_ROOT = Path(__file__).resolve().parents[3]
+# refusing live code_root root as a write target: planted locks stay in
+# TemporaryDirectory. The lock sweep runs there.
 # tick resolves its shelves (dispatch.jsonl, tick-heartbeat, outbox) at import: give it a throwaway state
 # root first, or main() appends a real seat_snapshot and heartbeat to the live ledger (P5).
 STATE_DIR = scratch_dir(prefix="tick-stale-lock-state-")
-os.environ["LAB_STATE_ROOT"] = STATE_DIR.name
-os.environ.pop("LAB_TICK_HEARTBEAT", None)
-LIVE = [LAB / "ledger" / n for n in ("dispatch.jsonl", "tick-heartbeat")]
+os.environ["CS_STATE_ROOT"] = STATE_DIR.name
+os.environ.pop("CS_TICK_HEARTBEAT", None)
+LIVE = [CODE_ROOT / "ledger" / n for n in ("dispatch.jsonl", "tick-heartbeat", "restart-intake.lock")]
 live_before = [(p.stat().st_size, p.stat().st_mtime_ns) if p.exists() else None for p in LIVE]
-loader = importlib.machinery.SourceFileLoader("lab_tick_stale_lock", str(LAB / "ops/bin/tick"))
+loader = importlib.machinery.SourceFileLoader("code_tick_stale_lock", str(CODE_ROOT / "ops/bin/tick"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 tick = importlib.util.module_from_spec(spec)
 loader.exec_module(tick)
 
-source = (LAB / "ops/bin/tick").read_text(encoding="utf-8")
+source = (CODE_ROOT / "ops/bin/tick").read_text(encoding="utf-8")
 main_src = source.split("def main(", 1)[1]
 assert main_src.index("sweep_stale_locks()") < main_src.index("job_pull_pass()"), main_src[:400]
 
@@ -40,8 +40,10 @@ def plant(lock, age=5, size=0):
 
 with scratch_dir(prefix="tick-stale-lock-") as raw:
     root = Path(raw)
-    git = root / ".git"
-    (git / "objects").mkdir(parents=True)
+    import subprocess
+    subprocess.run(["git", "init", "-q", "--separate-git-dir", str(root / "admin"), str(root / "kit")], check=True)
+    git = root / "admin"
+    (git / "objects").mkdir(parents=True, exist_ok=True)
     runs = Path(STATE_DIR.name) / "runs"  # run workspaces live under the state root
     (runs / "example/workspace/.git").mkdir(parents=True)
     stale = git / "index.lock"
@@ -55,21 +57,24 @@ with scratch_dir(prefix="tick-stale-lock-") as raw:
     plant(workspace, age=5, size=0)
     plant(fresh, age=0.2, size=0)
     calls = []
-    tick.LAB = root
+    resolved = subprocess.run(["git", "-C", str(root / "kit"), "rev-parse", "--absolute-git-dir"],
+                              capture_output=True, text=True)
+    assert resolved.returncode == 0, resolved.stderr
+    tick.CODE_ROOT = root / "kit"
     tick.job_pull_pass = lambda: (
         calls.append("pull") if not stale.exists() else (_ for _ in ()).throw(
-            AssertionError("stale lab .git lock still present at job pull"))
+            AssertionError("stale code_root .git lock still present at job pull"))
     )
     tick.void_watch_pass = lambda: None
     tick.recover_orphaned_jobs = lambda: None
     tick.shadow_pass = lambda: {}
     tick.schedule_pass = lambda: "{}"
     tick.audit_pass = lambda: None
-    tick.lab_count = lambda: 0  # this fixture has no runners; avoid a host-wide process scan
+    tick.runner_count = lambda: 0  # this fixture has no runners; avoid a host-wide process scan
     tick.lockf = lambda exclusive: None
     tick.main()
     assert calls == ["pull"], calls
-    assert not stale.exists(), "zero-byte lab index.lock survived"
+    assert not stale.exists(), "zero-byte code_root index.lock survived"
     assert not nested.exists(), "pid-dead nested .git lock survived"
     assert loose_object.exists(), "immutable loose-object shard was traversed"
     assert not workspace.exists(), "run workspace lock survived"

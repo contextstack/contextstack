@@ -9,10 +9,10 @@ import sys
 import tempfile
 from unittest.mock import patch
 
-lab = Path(__file__).resolve().parents[3]
-os.environ.setdefault('CS_TOOLS_BIN', str(lab.parent / 'target/release/cs-tools'))
-sys.path.insert(0, str(lab / 'ops/bin'))
-loader = importlib.machinery.SourceFileLoader('budget_probe_tick', str(lab / 'ops/bin/tick'))
+code_root = Path(__file__).resolve().parents[3]
+os.environ.setdefault('CS_TOOLS_BIN', str(code_root.parent / 'target/release/cs-tools'))
+sys.path.insert(0, str(code_root / 'ops/bin'))
+loader = importlib.machinery.SourceFileLoader('budget_probe_tick', str(code_root / 'ops/bin/tick'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 tick = importlib.util.module_from_spec(spec)
 loader.exec_module(tick)
@@ -24,7 +24,7 @@ real_run = subprocess.run
 
 
 def child(command, **kwargs):
-    if Path(command[0]) != lab / 'ops/bin/executor':
+    if Path(command[0]) != code_root / 'ops/bin/executor':
         return real_run(command, **kwargs)
     calls.append(json.loads(kwargs['input']))
     return subprocess.CompletedProcess(command, 0)
@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix='director-budget-probe-') as temp:
     tick.Q.write_text('')
     (Path(temp) / 'fixture.yaml').write_text(text)  # the dispatcher reads the budget from the spec file as YAML
     with patch.object(tick, 'child_env', return_value={}), patch.object(tick.subprocess, 'run', side_effect=child), \
-            patch.object(tick, 'LAB', Path(temp)):
+            patch.object(tick, 'CODE_ROOT', Path(temp)):
         tick.one_executor_trial('fixture.yaml', text, 'tasks/work/fixture', 1)
 assert len(calls) == 1, 'Expected one executor launch'
 payload = calls[0]

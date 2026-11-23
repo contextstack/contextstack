@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Fixture prefix for exercising read-only repo tools on a static tree."""
+import json
+import os
+import sys
+
+_, flag, binding, separator, *argv = sys.argv
+assert flag == "--repo-view" and separator == "--", sys.argv
+view = json.loads(binding)
+assert view["read_only"] and view["path"] == os.environ["CS_REPO_VIEW"], view
+os.execv(argv[0], argv)

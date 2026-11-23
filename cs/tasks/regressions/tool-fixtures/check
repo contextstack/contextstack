@@ -1,7 +1,11 @@
 #!/bin/sh
 # tool-fixtures regression (goal.md): every manifest tool's contract fixtures, exec'd as the runner execs a tool.
-# Temp workspaces only; nothing under lab/ is written. Exit = the harness's exit.
+# Temp workspaces only; nothing under code_root/ is written. Exit = the harness's exit.
 cd "$(dirname "$0")/../../.." || exit 2
+git -C .. check-ignore -q -- .cs-out/probe.txt || {
+  echo "FAIL tool-fixtures: .cs-out spill files must be ignored" >&2
+  exit 1
+}
 # defuddle_extract runs tools/defuddle/extract.mjs; node_modules is gitignored (same as scripts/check rule 0b).
 if [ ! -d tools/defuddle/node_modules ] && command -v npm >/dev/null 2>&1; then
   (cd tools/defuddle && npm ci --silent --no-audit --no-fund >/dev/null 2>&1) || {

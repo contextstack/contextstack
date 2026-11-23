@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   task TEXT NOT NULL, trials INTEGER NOT NULL, bundle_sha256 TEXT NOT NULL, grant_id TEXT,
   grant_sha256 TEXT, meta TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
   accepted_at TEXT, finished_at TEXT, run_id TEXT, terminal_row TEXT, error TEXT,
-  revision INTEGER NOT NULL DEFAULT 0, intent_id TEXT);
+  revision INTEGER NOT NULL DEFAULT 0, intent_id TEXT, work_reason TEXT);
 CREATE TABLE IF NOT EXISTS job_files (
   job_id TEXT NOT NULL REFERENCES jobs(job_id), path TEXT NOT NULL, sha256 TEXT NOT NULL,
   bytes INTEGER NOT NULL, mode INTEGER NOT NULL, PRIMARY KEY (job_id, path));
@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS intents (
   intent_id TEXT PRIMARY KEY, title TEXT, node TEXT NOT NULL, spec TEXT NOT NULL, task TEXT NOT NULL,
   trials INTEGER NOT NULL, grant_id TEXT, meta TEXT NOT NULL, bundle_sha256 TEXT NOT NULL,
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
-  project_id TEXT, conversation_id TEXT, lead_conversation_id TEXT);
+  project_id TEXT, conversation_id TEXT, lead_conversation_id TEXT,
+  origin_kind TEXT NOT NULL DEFAULT 'api', origin_conversation_id TEXT, origin_turn_id TEXT);
 CREATE TABLE IF NOT EXISTS decisions (
   decision_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id), decision TEXT NOT NULL,
   note TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
@@ -125,9 +126,28 @@ CREATE TABLE IF NOT EXISTS summaries (
   detail TEXT, requested_by TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT,
   revision INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS summaries_job ON summaries(job_id);
+CREATE TABLE IF NOT EXISTS task_needs_you (
+  needs_you_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+  conversation_id TEXT NOT NULL, job_id TEXT, raised_at TEXT NOT NULL, raised_by TEXT NOT NULL,
+  status TEXT NOT NULL, cleared_at TEXT, cleared_by TEXT);
+CREATE INDEX IF NOT EXISTS task_needs_you_intent ON task_needs_you(intent_id);
+CREATE TABLE IF NOT EXISTS owner_message_marks (
+  message_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+  mark TEXT NOT NULL, actor TEXT NOT NULL, marked_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS owner_message_marks_intent ON owner_message_marks(intent_id);
 CREATE TABLE IF NOT EXISTS projects (
   project_id TEXT PRIMARY KEY, name TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
   revision INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS decision_log (
+  entry_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id),
+  number INTEGER NOT NULL CHECK (number > 0), body TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active', 'superseded', 'retired')),
+  superseded_by TEXT REFERENCES decision_log(entry_id),
+  created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0, UNIQUE (project_id, number));
+CREATE TABLE IF NOT EXISTS decision_log_revisions (
+  entry_id TEXT NOT NULL REFERENCES decision_log(entry_id), revision INTEGER NOT NULL,
+  snapshot TEXT NOT NULL, PRIMARY KEY (entry_id, revision));
 CREATE TABLE IF NOT EXISTS budgets (
   scope TEXT NOT NULL, scope_id TEXT NOT NULL, usd_micros INTEGER NOT NULL, period TEXT NOT NULL,
   set_by TEXT NOT NULL, set_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id));
@@ -151,12 +171,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS lands_one_current ON lands(run_id) WHERE curre
 ";
 
 /// Schema version this binary creates and upgrades through.
-const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 /// Numbered migrations after the v0 baseline path. Each entry is the `user_version` after it runs.
 type MigrationFn = fn(&Connection) -> rusqlite::Result<()>;
 
-const MIGRATIONS: &[(u32, MigrationFn)] = &[(2, migrate_v1_to_v2), (3, migrate_v2_to_v3)];
+const MIGRATIONS: &[(u32, MigrationFn)] = &[
+    (2, migrate_v1_to_v2),
+    (3, migrate_v2_to_v3),
+    (4, migrate_v3_to_v4),
+    (5, |db| db.execute_batch(crate::action_approvals::SCHEMA)),
+    (6, |db| {
+        db.execute_batch(
+            "ALTER TABLE action_approvals ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        )
+    }),
+    (7, |db| db.execute_batch(crate::backlog::SCHEMA)),
+    (8, |db| {
+        add_columns(
+            db,
+            &[
+                ("credentials", "created_by", "TEXT"),
+                ("credentials", "revoked_by", "TEXT"),
+                ("pairings", "issued_by", "TEXT"),
+            ],
+        )
+    }),
+];
 
 /// v2: a turn says who started it: `person` (a posted message) or `wake` (a hosted lead's follow-up after a lane ended).
 fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
@@ -166,6 +207,38 @@ fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
 /// v3: reversible conversation archival.
 fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("ALTER TABLE conversations ADD COLUMN archived_at TEXT")
+}
+
+/// v4: work-trace origin, job reasons, needs-you history and owner-message marks.
+fn migrate_v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
+    for (table, column, definition) in [
+        ("intents", "origin_kind", "TEXT NOT NULL DEFAULT 'api'"),
+        ("intents", "origin_conversation_id", "TEXT"),
+        ("intents", "origin_turn_id", "TEXT"),
+        ("jobs", "work_reason", "TEXT"),
+    ] {
+        let present = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+            ))?
+            .exists(params![column])?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_needs_you (
+          needs_you_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+          conversation_id TEXT NOT NULL, job_id TEXT, raised_at TEXT NOT NULL, raised_by TEXT NOT NULL,
+          status TEXT NOT NULL, cleared_at TEXT, cleared_by TEXT);
+        CREATE INDEX IF NOT EXISTS task_needs_you_intent ON task_needs_you(intent_id);
+        CREATE TABLE IF NOT EXISTS owner_message_marks (
+          message_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+          mark TEXT NOT NULL, actor TEXT NOT NULL, marked_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS owner_message_marks_intent ON owner_message_marks(intent_id);",
+    )
 }
 
 /// Columns added after step 3's schema: `(table, column, definition)`, added when absent.
@@ -235,11 +308,17 @@ pub enum Record {
     Summary,
     /// A project: intents and conversations grouped, with an optional budget.
     Project,
+    /// A project decision and its rationale.
+    DecisionLog,
+    /// An item in a project backlog.
+    BacklogItem,
+    /// A request for authorization to perform an action.
+    ActionApproval,
 }
 
 impl Record {
     /// Every kind.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::Intent,
         Self::Job,
         Self::Run,
@@ -253,6 +332,9 @@ impl Record {
         Self::Turn,
         Self::Summary,
         Self::Project,
+        Self::DecisionLog,
+        Self::BacklogItem,
+        Self::ActionApproval,
     ];
 
     /// The kind's name on the wire.
@@ -271,6 +353,9 @@ impl Record {
             Self::Turn => "turn",
             Self::Summary => "summary",
             Self::Project => "project",
+            Self::DecisionLog => "decision_log",
+            Self::BacklogItem => "backlog_item",
+            Self::ActionApproval => "action_approval",
         }
     }
 
@@ -294,6 +379,9 @@ impl Record {
             Self::Turn => ("turns", "turn_id"),
             Self::Summary => ("summaries", "summary_id"),
             Self::Project => ("projects", "project_id"),
+            Self::DecisionLog => ("decision_log", "entry_id"),
+            Self::BacklogItem => ("backlog_items", "item_id"),
+            Self::ActionApproval => ("action_approvals", "id"),
         }
     }
 }
@@ -408,8 +496,8 @@ pub fn write_tx(conn: &mut Connection) -> rusqlite::Result<Transaction<'_>> {
     conn.transaction_with_behavior(TransactionBehavior::Immediate)
 }
 
-fn add_columns(conn: &Connection) -> rusqlite::Result<()> {
-    for (table, column, definition) in ADDED {
+fn add_columns(conn: &Connection, columns: &[(&str, &str, &str)]) -> rusqlite::Result<()> {
+    for &(table, column, definition) in columns {
         let present = conn
             .prepare(&format!(
                 "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
@@ -430,7 +518,7 @@ fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
 
 /// Pre–schema-version installs: improvised column adds, `lands` rebuild, backfills, then stamp v1.
 fn migrate_v0_to_v1(conn: &Connection, data_dir: &Path) -> rusqlite::Result<()> {
-    add_columns(conn)?;
+    add_columns(conn, &ADDED)?;
     lands_keep_earlier_attempts(conn)?;
     backfill_conversation_lead(conn, data_dir)?;
     ensure_indexes(conn)?;
@@ -745,7 +833,8 @@ mod tests {
         let dir = tmp.path().join("data");
         let store = Store::open(&dir)?;
         store.db().execute_batch(
-            "ALTER TABLE conversations DROP COLUMN archived_at;
+            "DROP TABLE action_approvals;
+            ALTER TABLE conversations DROP COLUMN archived_at;
             INSERT INTO conversations (conversation_id, node, spec, spec_version, model,
                 instructions_tokens, tools, created_by, created_at)
             VALUES ('existing', 'n', 's', 'v', 'm', 0, 0, 'owner', 'then');
@@ -753,7 +842,7 @@ mod tests {
         )?;
         drop(store);
         let upgraded = Store::open(&dir)?;
-        assert_eq!(user_version(&upgraded.db())?, 3);
+        assert_eq!(user_version(&upgraded.db())?, SCHEMA_VERSION);
         let archived: Option<String> = upgraded.db().query_row(
             "SELECT archived_at FROM conversations WHERE conversation_id = 'existing'",
             [],
@@ -771,6 +860,61 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(archived, "now");
+        Ok(())
+    }
+
+    #[test]
+    fn v3_upgrades_to_v4_preserving_intents_and_jobs() -> Res {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("data");
+        private_dir(&dir)?;
+        let path = dir.join("director.sqlite");
+        let db = Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('installation', 'inst_test');
+             CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', last_seen TEXT);
+             INSERT INTO nodes VALUES (1, 'n', 'h', 't', 'active', NULL);
+             CREATE TABLE intents (intent_id TEXT PRIMARY KEY, node TEXT NOT NULL, spec TEXT NOT NULL,
+               task TEXT NOT NULL, trials INTEGER NOT NULL, meta TEXT NOT NULL, bundle_sha256 TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_at TEXT NOT NULL, lead_conversation_id TEXT, title TEXT);
+             INSERT INTO intents (intent_id, node, spec, task, trials, meta, bundle_sha256, created_by, created_at)
+             VALUES ('keep-intent', 'n', 's', 'tasks/t', 1, '{}', 'b', 'owner', 'then');
+             CREATE TABLE jobs (job_id TEXT PRIMARY KEY, node_id INTEGER NOT NULL, spec TEXT NOT NULL,
+               task TEXT NOT NULL, trials INTEGER NOT NULL, bundle_sha256 TEXT NOT NULL, grant_id TEXT,
+               grant_sha256 TEXT, meta TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
+               accepted_at TEXT, finished_at TEXT, run_id TEXT, terminal_row TEXT, intent_id TEXT,
+               revision INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
+             VALUES ('keep-job', 1, 's', 'tasks/t', 1, 'b', '{}', 'offered', 'then', 'keep-intent');
+             CREATE TABLE conversations (
+               conversation_id TEXT PRIMARY KEY, title TEXT, node TEXT NOT NULL, spec TEXT NOT NULL,
+               spec_version TEXT NOT NULL, model TEXT NOT NULL, instructions_tokens INTEGER NOT NULL,
+               tools INTEGER NOT NULL, intent_id TEXT, held INTEGER NOT NULL DEFAULT 0,
+               created_by TEXT NOT NULL, created_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
+               archived_at TEXT);
+             PRAGMA user_version = 3;",
+        )?;
+        drop(db);
+        let store = Store::open(&dir)?;
+        assert_eq!(user_version(&store.db())?, SCHEMA_VERSION);
+        let origin: String = store.db().query_row(
+            "SELECT origin_kind FROM intents WHERE intent_id = 'keep-intent'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(origin, "api");
+        let job: String = store.db().query_row(
+            "SELECT job_id FROM jobs WHERE job_id = 'keep-job'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(job, "keep-job");
+        store.db().execute_batch(
+            "SELECT 1 FROM task_needs_you LIMIT 0;
+             SELECT 1 FROM owner_message_marks LIMIT 0;",
+        )?;
         Ok(())
     }
 

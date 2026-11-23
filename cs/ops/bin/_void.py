@@ -7,9 +7,9 @@ from pathlib import Path
 from _estate_io import append_jsonl, read_jsonl, state_dir, utc_time
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
-DEFAULT_SCHEDULES = state_dir(LAB) / "schedules.jsonl"
-LOCK = state_dir(LAB) / "schedule.lock"
+CODE_ROOT = HERE.parent.parent
+DEFAULT_SCHEDULES = state_dir(CODE_ROOT) / "schedules.jsonl"
+LOCK = state_dir(CODE_ROOT) / "schedule.lock"
 
 CONFIG_VOID = re.compile(
     r"(?:gateway\.)?(no_provider_credential|provider_unsupported|unknown_model|capture-stimulus|env_policy|roots|sandbox_policy)"

@@ -223,7 +223,7 @@ it('shows source budgets labelled, off distinct from used up, and lets the owner
     Http::assertSent(fn (Request $request) => $request->method() === 'DELETE' && $request->url() === director('source-budgets/openai'));
 });
 
-it('shows the Director\'s 403 owner_only clearly when a paired device sets a source budget', function () {
+it('shows the Director\'s 403 owner_only clearly when a non-owner credential sets a source budget', function () {
     Http::fake([
         director('me') => Http::response(['credential_id' => 'cred_phone', 'owner' => false]),
         director('source-budgets') => Http::response(['gateway' => '127.0.0.1:9200', 'budgets' => ['total' => null, 'sources' => [
@@ -232,9 +232,9 @@ it('shows the Director\'s 403 owner_only clearly when a paired device sets a sou
         director('source-budgets/*') => Http::response(['error' => 'Forbidden', 'code' => 'owner_only', 'detail' => 'only the owner may do that'], 403),
     ]);
 
-    Livewire::test('pages::client.sources')->assertSee('This device is paired, not the owner')
+    Livewire::test('pages::client.sources')->assertSee('This credential is not the owner')
         ->set('source', '*')->set('usd', '5')->call('setSource')
-        ->assertSee('The Director refused: 403 owner_only')->assertSee('this device is paired, and a paired device may not')
+        ->assertSee('The Director refused: 403 owner_only')->assertSee('this credential is not the owner')
         ->assertSee('data-code="owner_only"', false);
 
     Http::assertSent(fn (Request $request) => $request->url() === director('source-budgets/%2A'));

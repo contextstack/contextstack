@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Execution receipt v1",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "adapter": {
+      "enum": [
+        "executor",
+        "harness"
+      ]
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9._-]+$"
+    },
+    "job_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "execution_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "trial": {
+      "type": "integer"
+    },
+    "spec_id": {
+      "type": "string"
+    },
+    "task_ref": {
+      "type": "string"
+    },
+    "task_name": {
+      "type": "string"
+    },
+    "started": {
+      "type": "number"
+    },
+    "native": {
+      "type": "object",
+      "properties": {
+        "stop": {
+          "type": "string"
+        },
+        "exit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "stop",
+        "exit"
+      ],
+      "additionalProperties": false
+    },
+    "stimulus": {
+      "type": "object",
+      "properties": {
+        "manifest": {
+          "const": "stimulus/manifest.json"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "manifest",
+        "sha256"
+      ],
+      "additionalProperties": false
+    },
+    "workspace": {
+      "type": "string"
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cache_read_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cache_creation_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "turns": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tool_calls": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "est_usd": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "est_basis": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "trace": {
+      "type": "object"
+    },
+    "row": {},
+    "finish": {},
+    "sandbox": {}
+  },
+  "required": [
+    "version",
+    "adapter",
+    "run_id",
+    "job_id",
+    "execution_id",
+    "trial",
+    "spec_id",
+    "task_ref",
+    "task_name",
+    "started",
+    "native",
+    "stimulus",
+    "workspace",
+    "usage",
+    "row",
+    "finish",
+    "sandbox",
+    "trace"
+  ],
+  "additionalProperties": false,
+  "if": {
+    "properties": {
+      "adapter": {
+        "const": "harness"
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "row": {
+        "type": "object",
+        "required": [
+          "run_id",
+          "run_dir",
+          "transcript",
+          "workspace",
+          "stimulus_dir",
+          "spec",
+          "task",
+          "trial",
+          "stimulus_sha",
+          "model",
+          "stop",
+          "verdict",
+          "turns",
+          "tool_calls",
+          "cost_usd",
+          "cost_class",
+          "terminal_state",
+          "started",
+          "ended",
+          "check_window"
+        ]
+      },
+      "finish": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "const": "harness"
+          },
+          "check_window": {
+            "type": "integer"
+          },
+          "defer": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mode",
+          "check_window",
+          "defer"
+        ],
+        "additionalProperties": false
+      },
+      "sandbox": {
+        "type": "null"
+      },
+      "stimulus": {
+        "properties": {
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "const": ""
+              }
+            ]
+          }
+        }
+      },
+      "trace": {
+        "required": [
+          "harness_trace"
+        ]
+      }
+    }
+  },
+  "else": {
+    "properties": {
+      "row": {
+        "type": "object",
+        "required": [
+          "transcript",
+          "trial",
+          "stimulus_sha",
+          "base_sha",
+          "model",
+          "auth",
+          "auth_verified",
+          "cost_usd",
+          "cost_class",
+          "cli_invoked"
+        ],
+        "properties": {
+          "transcript": {
+            "type": "string"
+          },
+          "trial": {
+            "type": "integer"
+          },
+          "stimulus_sha": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "base_sha": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "auth": {
+            "type": "string"
+          },
+          "auth_verified": {
+            "type": "boolean"
+          },
+          "cost_usd": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cost_class": {
+            "type": "string"
+          },
+          "cli_invoked": {
+            "type": "boolean"
+          }
+        }
+      },
+      "finish": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "enum": [
+              "task",
+              "semantic",
+              "hosted",
+              "profiled",
+              "terminal"
+            ]
+          },
+          "verdict": {
+            "enum": [
+              null,
+              "pass",
+              "fail",
+              "void"
+            ]
+          },
+          "lane": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "grant_paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "check_window": {
+            "type": "integer"
+          },
+          "memory_cap_mb": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode",
+          "verdict",
+          "lane",
+          "read_only",
+          "grant_paths",
+          "check_window",
+          "memory_cap_mb"
+        ],
+        "additionalProperties": false
+      },
+      "sandbox": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "const": "policy/sandbox.json"
+          },
+          "policy_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "caller": {
+            "type": "object"
+          },
+          "read_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "protected": {
+            "enum": [
+              null,
+              "budget-controls"
+            ]
+          },
+          "env_drop": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "work_order_env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "policy",
+          "policy_sha256",
+          "caller",
+          "read_roots",
+          "protected",
+          "env_drop",
+          "work_order_env"
+        ],
+        "additionalProperties": false
+      },
+      "stimulus": {
+        "properties": {
+          "sha256": {
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

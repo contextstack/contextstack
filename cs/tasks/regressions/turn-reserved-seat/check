@@ -36,9 +36,9 @@ class StillRunning(BaseException):
 
 with scratch_dir(prefix='turn-reserved-seat-', dir='/tmp') as tmp:
     state = Path(tmp)
-    os.environ['LAB_STATE_ROOT'] = tmp
+    os.environ['CS_STATE_ROOT'] = tmp
     (state / 'config').mkdir()
-    os.environ['LAB_CONFIG_ROOT'] = str(state / 'config')
+    os.environ['CS_CONFIG_ROOT'] = str(state / 'config')
     import _node_intake as intake
     import _vitals
     from _estate_io import append_jsonl, read_jsonl
@@ -142,7 +142,7 @@ with scratch_dir(prefix='turn-reserved-seat-', dir='/tmp') as tmp:
     noop = lambda *args, **kwargs: None
     overrides = {name: noop for name in (
         'sweep_stale_locks', 'finalize_sweep', 'job_pull_pass', 'spool_pass', 'write_heartbeat')}
-    overrides.update(NODE=True, lab_count=lambda: 0, run_spec=executor,
+    overrides.update(NODE=True, runner_count=lambda: 0, run_spec=executor,
                      local_model=lambda job: '', state_root_disk_free=lambda: 10**15,
                      spool_low=lambda free: None, emit=lambda row, swept: emitted.append(row))
     with ExitStack() as stack:

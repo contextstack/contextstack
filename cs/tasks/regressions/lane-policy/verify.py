@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[3]
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "LAB_"))}
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "CS_"))}
 ENV.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL="/dev/null", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
            GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
 problems = []

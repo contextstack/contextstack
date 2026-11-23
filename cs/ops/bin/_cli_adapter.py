@@ -133,7 +133,7 @@ def prepare(c):
     if profile['auth'] == 'opencode_db':
         staged_db = stage_opencode_db(real_home, home)
         auth_metadata = {'store': str(staged_db), 'checked': 'isolated opencode-go rows'}
-    env = {k: v for k, v in c['allowlist_env']([], ws / '.lab-tmp', ws).items()
+    env = {k: v for k, v in c['allowlist_env']([], ws / '.cs-tmp', ws).items()
            if k in ('PATH', 'LANG', 'LC_ALL', 'TERM', 'SHELL', 'USER', 'LOGNAME')}
     env.update(overrides,
                NO_PROXY='localhost,127.0.0.1', BASH_ENV='/dev/null', ENV='/dev/null')
@@ -161,7 +161,7 @@ def prepare(c):
     return binary, env, protected, identity
 
 
-def execute(folder, ws, real_home, binary, env, protected, identity, prompt, timeout, on_started=None, extra=(), memory_cap_mb=None, on_evidence=None):
+def execute(folder, ws, real_home, binary, env, protected, identity, prompt, timeout, on_started=None, extra=(), memory_cap_mb=None, on_evidence=None, trace=None):
     profile, resolved = pinned(folder, identity['provider'], real_home)
     if resolved != binary:
         raise ValueError('CLI identity changed after capture')
@@ -184,5 +184,10 @@ def execute(folder, ws, real_home, binary, env, protected, identity, prompt, tim
         if env.get('OPENCODE_DB') != str(staged_db) or not staged_db.is_file() or staged_db.is_symlink():
             raise ValueError('OpenCode login store changed after capture')
     args = [part.replace('{{prompt}}', prompt) for part in profile['args']]
-    return _muse.run_process(command(profile, binary, ws, home, real_home, protected, args, extra),
-                             ws, env, timeout, on_started=on_started, memory_cap_mb=memory_cap_mb, on_evidence=on_evidence)
+    bounded = command(profile, binary, ws, home, real_home, protected, args, extra)
+    if trace is not None:
+        from _run_record import run_observed
+        return run_observed(bounded, ws, env, timeout, trace=trace, on_started=on_started,
+                            memory_cap_mb=memory_cap_mb, on_evidence=on_evidence)
+    return _muse.run_process(bounded, ws, env, timeout, on_started=on_started,
+                             memory_cap_mb=memory_cap_mb, on_evidence=on_evidence)

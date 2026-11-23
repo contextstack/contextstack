@@ -20,7 +20,7 @@ it('pairs this device with a one-time code and then uses the device token, never
     unlink(config('client.local_credential'));
     Http::fake([
         'http://other.test/api/v1/pair' => Http::response(['credential_id' => 'cred_phone', 'name' => 'phone', 'token' => 'csd_secret_device_token']),
-        'http://other.test/api/v1/client/me' => Http::response(['credential_id' => 'cred_phone', 'owner' => false]),
+        'http://other.test/api/v1/client/me' => Http::response(['credential_id' => 'cred_phone', 'owner' => true]),
         'http://other.test/api/v1/client/intents?*' => Http::response(['intents' => [], 'jobs' => []]),
     ]);
 
@@ -31,7 +31,8 @@ it('pairs this device with a one-time code and then uses the device token, never
         ->assertHasNoErrors()
         ->assertSee('this device, paired as phone')
         ->assertSee('cred_phone')
-        ->assertSee('(paired device)')
+        ->assertSee('Connected as owner')
+        ->assertSee('Forget this device')
         ->assertDontSee('csd_secret_device_token');
 
     Http::assertSent(fn (Request $request) => $request->url() === 'http://other.test/api/v1/pair'

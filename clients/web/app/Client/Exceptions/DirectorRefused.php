@@ -29,7 +29,7 @@ class DirectorRefused extends RuntimeException
     {
         return match ($this->errorCode) {
             'unauthenticated' => 'The Director does not accept this device\'s credential. It may have been revoked: pair again.',
-            'owner_only' => 'Only the Director\'s owner can do that (403 owner_only): this device is paired, and a paired device may not. Use the Director\'s own machine, with its local credential.',
+            'owner_only' => 'Only the Director\'s owner can do that (403 owner_only), and this credential is not the owner\'s. Paired devices and the Director\'s own machine are owners; a lead\'s credential is limited to its own work.',
             'origin_refused', 'transport_refused' => 'The Director refused the connection: '.$this->detail,
             'idempotency_conflict' => 'An earlier request with this key was recorded and differs from this one.',
             'idempotency_key_required', 'idempotency_key_invalid' => 'The client sent a write without a usable Idempotency-Key: '.$this->detail,

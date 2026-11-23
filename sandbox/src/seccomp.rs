@@ -5,6 +5,7 @@
 //! vendored unchanged as `vendor/codex/linux_sandbox_seccomp.rs.txt`. Its three network modes map onto ours: `none` is
 //! Codex's `Restricted` (no socket but `AF_UNIX`, no connect, bind, send...), `gateway` keeps
 //! `AF_UNIX` connect for the one bind-mounted socket and refuses every other socket family, and
+//! `loopback` restricts IP sockets to a private network namespace, and
 //! `all` is Codex's `VmSocketRestricted` (no `AF_VSOCK`). Unlike Codex, ptrace and
 //! `process_vm_*` stay denied in every mode, since no policy here grants full-disk access. A
 //! matching call fails with `EPERM`; everything else is allowed. The namespaces (bwrap's
@@ -19,6 +20,8 @@ pub enum Domain {
     Any,
     /// Every domain except `AF_UNIX`.
     NotUnix,
+    /// Every domain except IPv4 and IPv6.
+    NotIp,
     /// `AF_VSOCK` only.
     Vsock,
 }
@@ -80,6 +83,19 @@ pub fn rules(net: Net) -> Vec<Deny> {
             Domain::NotUnix
         }
         Net::Gateway => Domain::NotUnix,
+        Net::Loopback => {
+            list.extend([
+                Deny {
+                    syscall: "socket",
+                    domain: Domain::NotIp,
+                },
+                Deny {
+                    syscall: "socketpair",
+                    domain: Domain::NotUnix,
+                },
+            ]);
+            return list;
+        }
         Net::All => Domain::Vsock,
     };
     list.extend(SOCKET_CALLS.iter().map(|&syscall| Deny {
@@ -99,7 +115,7 @@ mod tests {
 
     #[test]
     fn every_mode_denies_tracing_and_io_uring() {
-        for net in [Net::None, Net::Gateway, Net::All] {
+        for net in [Net::None, Net::Gateway, Net::Loopback, Net::All] {
             let list = names(net);
             for syscall in ["ptrace", "process_vm_readv", "io_uring_setup"] {
                 assert!(list.contains(&syscall), "{net:?} {syscall}");
@@ -134,7 +150,7 @@ mod tests {
 
     #[test]
     fn no_syscall_is_listed_twice() {
-        for net in [Net::None, Net::Gateway, Net::All] {
+        for net in [Net::None, Net::Gateway, Net::Loopback, Net::All] {
             let mut list = names(net);
             let len = list.len();
             list.sort_unstable();

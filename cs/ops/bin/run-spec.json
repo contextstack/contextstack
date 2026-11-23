@@ -1,9 +1,9 @@
 {
-  "description": "Operator: run every cell of a spec (tasks x trials) by invoking `cs-harness run -task T -trial n <spec>` per cell (the configured runner, default the Rust cs-harness), forwarding each cell's output, then print the banner and `TOTAL p/w pass` summary the runner printed before phase 1b. Also accepts argv `run-spec <spec.yaml> [-task dir]` for a human at a terminal (stepping through tool calls is the spec's `pre_tool: [step-confirm]`, not a flag). $LAB_RUNNER_BIN or $CS_RUNNER_BIN overrides the runner binary (default ./lab). Exit 3 if any cell exited 3 (finalization pending), else 1 if pass < want, else 0. Not a model tool.",
+  "description": "Operator: run every cell of a spec (tasks x trials) by invoking `run-api -task T -trial n <spec>` per cell, forwarding each machine-finished cell's output, then print the banner and `TOTAL p/w pass` summary the runner printed before phase 1b. Also accepts argv `run-spec <spec.yaml> [-task dir]` for a human at a terminal (stepping through tool calls is the spec's `pre_tool: [step-confirm]`, not a flag). $CS_RUNNER_BIN overrides the runner binary (default ../target/release/cs-harness). Exit 3 if any cell exited 3 (finalization pending), else 1 if pass < want, else 0. Not a model tool.",
   "schema": {
     "type": "object",
     "properties": {
-      "spec": {"type": "string", "description": "Spec path relative to the lab root, e.g. specs/x.yaml."},
+      "spec": {"type": "string", "description": "Spec path relative to the code root, e.g. specs/x.yaml."},
       "task": {"type": "string", "description": "Run only this task dir (default: every task the spec lists)."},
       "trials": {"type": "integer", "minimum": 1, "description": "Override the spec's trials."}
     },

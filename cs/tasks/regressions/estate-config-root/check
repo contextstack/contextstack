@@ -12,8 +12,8 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
-for k in [k for k in os.environ if k.startswith(("GIT_", "LAB_"))]:
+CODE_ROOT = Path(__file__).resolve().parents[3]
+for k in [k for k in os.environ if k.startswith(("GIT_", "CS_"))]:
     del os.environ[k]
 problems = []
 
@@ -32,29 +32,29 @@ def load(name, path):
     return mod
 
 
-live = [LAB / "ledger" / n for n in ("estate-commit.jsonl",)]
+live = [CODE_ROOT / "ledger" / n for n in ("check-red.jsonl",)]
 live_before = [(p.stat().st_size, p.stat().st_mtime_ns) if p.exists() else None for p in live]
 with scratch_dir(prefix="estate-config-root-") as raw:
     tmp = Path(os.path.realpath(raw))
     (tmp / "config").mkdir()
     (tmp / "state").mkdir()
     (tmp / "config/ESTATE").write_text("m9\n")
-    os.environ.update(LAB_CONFIG_ROOT=str(tmp / "config"), LAB_STATE_ROOT=str(tmp / "state"))
-    sys.path.insert(0, str(LAB / "ops/bin"))
+    os.environ.update(CS_CONFIG_ROOT=str(tmp / "config"), CS_STATE_ROOT=str(tmp / "state"))
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
     import _estate_io
     import _grant
-    expect(_estate_io.estate_id(LAB) == "m9", "estate_id(code root) reads config/ESTATE when LAB_CONFIG_ROOT is set")
+    expect(_estate_io.estate_id(CODE_ROOT) == "m9", "estate_id(code root) reads config/ESTATE when CS_CONFIG_ROOT is set")
     grant = {"estate": "m9", "status": "active", "expiry": "2099-01-01T00:00:00Z"}
     expect(_grant.live_error(grant) == "", "an m9 grant is live on m9: %s" % _grant.live_error(grant))
     expect(_grant.live_error(dict(grant, estate="dev")) == "grant estate mismatch", "a dev grant is refused on m9")
-    del os.environ["LAB_CONFIG_ROOT"]
-    expect(_estate_io.estate_id(LAB) == (LAB / "ESTATE").read_text().strip(),
-           "without LAB_CONFIG_ROOT the checkout reads lab/ESTATE, as before")
+    del os.environ["CS_CONFIG_ROOT"]
+    expect(_estate_io.estate_id(CODE_ROOT) == (CODE_ROOT / "ESTATE").read_text().strip(),
+           "without CS_CONFIG_ROOT the checkout reads code_root/ESTATE, as before")
 
-nb = load("node_bundle_estate", LAB / "scripts/node-bundle")
+nb = load("node_bundle_estate", CODE_ROOT / "scripts/node-bundle")
 files = nb.release_files()
-expect("ESTATE" not in files and "INVARIANTS.md" in files, "a release carries no lab/ESTATE (config/ESTATE names it)")
+expect("ESTATE" not in files and "INVARIANTS.md" in files, "a release carries no code_root/ESTATE (config/ESTATE names it)")
 live_after = [(p.stat().st_size, p.stat().st_mtime_ns) if p.exists() else None for p in live]
-expect(live_after == live_before, "the checkout's lab/ledger was not written")
+expect(live_after == live_before, "the checkout's cs/ledger was not written")
 print("check: estate-config-root %d problem(s)" % len(problems))
 sys.exit(1 if problems else 0)

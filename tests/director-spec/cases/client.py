@@ -90,10 +90,10 @@ def accept(ctx, node, job_id):
     ctx.expect(a.status == 200, "node accept", a)
 
 
-def finish(ctx, node, job_id, run_id=None):
+def finish(ctx, node, job_id, run_id=None, files=None):
     """The node reports a run and the job's end, as spool-send would. Returns the run fixture."""
     run_id = run_id or "%s-run" % ctx.serial_tag()
-    run = run_fixture(run_id)
+    run = run_fixture(run_id, overrides=files)
     for data in run["files"].values():
         ctx.expect(node.call("PUT", "objects/" + sha(data), raw=data).status == 200, "PUT objects")
     a = node.call("POST", "envelopes", body={"envelope": run["envelope"], "row_line": run["row_line"]})
@@ -483,7 +483,8 @@ def _(ctx):
     got = submitted(ctx, c, n)
     intent_id, job_id = got["intent"]["intent_id"], got["jobs"][0]["job_id"]
     accept(ctx, n, job_id)
-    run = finish(ctx, n, job_id)
+    trace = b'{"kind":"finalization","parent_id":"run"}\n{"kind":"run","outcome":"finalized"}\n'
+    run = finish(ctx, n, job_id, files={"trace.jsonl": trace})
     run_id = run["envelope"]["run_id"]
     view = c.call("GET", "intents/" + intent_id).json
     ctx.expect(view["jobs"][0]["state"] == "done" and view["jobs"][0]["run_ids"] == [run_id], "the job is done", view)
@@ -684,12 +685,22 @@ def _(ctx):
 
 @case(C, "access", "owner-only-and-credentials")
 def _(ctx):
-    """Pairing and revoking stay owner-only; no token, a node token and a revoked device are each 401; a revoked
-    device's open stream ends with revoked."""
-    n, o, d = ctx.node(), owner(ctx), device(ctx)
-    for method, path, body in (("POST", "pairings", {"name": "x"}), ("GET", "credentials", None),
-                               ("DELETE", "credentials/" + d.credential_id, None)):
-        refused(ctx, d.call(method, path, body=body), 403, "owner_only", "%s %s by a device" % (method, path))
+    """A paired owner can issue codes, list credentials and revoke another device."""
+    n, o, actor = ctx.node(), owner(ctx), device(ctx)
+    ctx.expect(actor.call("GET", "me").json["owner"] is True, "a paired device acts for the owner")
+    issued = actor.call("POST", "pairings", body={"name": "second-device"})
+    ctx.expect(issued.status == 200, "device issues a pairing code")
+    pending = actor.call("GET", "credentials").json["pairings"]
+    audit = next(p for p in pending if p["name"] == "second-device")
+    ctx.expect(audit["issued_by"] == actor.credential_id and audit["issued_at"]
+               and audit["credential_id"] is None and issued.json["code"] not in json.dumps(pending),
+               "pending pairing is attributed without exposing its code", audit)
+    paired = wire.request(ctx.target.url, "POST", "/api/v1/pair", body={"code": issued.json["code"]})
+    ctx.expect(paired.status == 200, "the code works for a second device")
+    d = Client(ctx.target, paired.json["token"], paired.json["credential_id"])
+    self_revoke = actor.call("DELETE", "credentials/" + actor.credential_id)
+    refused(ctx, self_revoke, 409, "self_revoke", "device cannot revoke itself")
+    ctx.expect("Forget this device" in self_revoke.json["detail"], "self-revocation explains local removal")
     for token, what in ((None, "no token"), (n.token, "a node token")):
         for method, path in (("GET", "intents"), ("POST", "intents"), ("GET", "events")):
             refused(ctx, o.call(method, path, body={}, key=new_key(), token=token), 401, "unauthenticated",
@@ -697,13 +708,34 @@ def _(ctx):
     s = d.stream()
     try:
         s.until(lambda name, _d: name == "hello")
-        ctx.expect(o.call("DELETE", "credentials/" + d.credential_id).status == 200, "the owner revokes")
+        ctx.expect(actor.call("DELETE", "credentials/" + d.credential_id).status == 200, "the device revokes")
         e, _ = s.until(lambda name, _d: name == "revoked", timeout=5)
         ctx.expect(e is not None, "the stream says revoked")
         ctx.expect(s.next(2) is None and s.ended, "and ends")
     finally:
         s.close()
     refused(ctx, d.call("POST", "intents", body=d.intent(n.name), key=new_key()), 401, "unauthenticated", "revoked")
+    listed = actor.call("GET", "credentials").json
+    row = next(c for c in listed["credentials"] if c["id"] == d.credential_id)
+    ctx.expect(row["revoked_by"] == actor.credential_id and row["revoked_at"], "revocation is attributed", row)
+    pairing = next(p for p in listed["pairings"] if p["credential_id"] == d.credential_id)
+    ctx.expect(pairing["issued_by"] == actor.credential_id and pairing["issued_at"] == audit["issued_at"]
+               and pairing["used_at"], "pairing linked to the new credential", pairing)
+
+    cli_target = device(ctx, "cli-target")
+    stream = cli_target.stream()
+    try:
+        stream.until(lambda name, _: name == "hello")
+        ctx.target.admin("credential", "revoke", cli_target.credential_id)
+        event, _ = stream.until(lambda name, _: name == "revoked", timeout=5)
+        ctx.expect(event is not None, "host CLI revocation reaches the running Director")
+        ctx.expect(stream.next(2) is None and stream.ended, "the CLI-revoked stream ends")
+    finally:
+        stream.close()
+    row = next(c for c in actor.call("GET", "credentials").json["credentials"]
+               if c["id"] == cli_target.credential_id)
+    ctx.expect(row["revoked_by"] == o.call("GET", "me").json["credential_id"],
+               "host CLI revocation is attributed to the local credential", row)
 
 
 @case(C, "access", "origin-and-transport-rules")
@@ -733,21 +765,22 @@ def lead(ctx, c, conversation, intent_id=None):
 
 @case(C, "lead", "lead-mint-owner-only")
 def _(ctx):
-    """Only the owner mints a lead; the stored credential names its conversation and optional intent, never token."""
+    """A paired owner mints a lead with an audited conversation and intent binding."""
     from cases.conversations import created
     n, o = ctx.node2(), owner(ctx)
     intent = submitted(ctx, o, n)["intent"]["intent_id"]
     conv = created(ctx, o, n, intent_id=intent)
-    l = lead(ctx, o, conv, intent)
+    actor = device(ctx)
+    l = lead(ctx, actor, conv, intent)
     ctx.expect(l.call("GET", "me").json["owner"] is False, "lead is not owner")
     credentials = o.call("GET", "credentials").json["credentials"]
     record = next(x for x in credentials if x["id"] == l.credential_id)
     ctx.expect(record["kind"] == "lead" and record["conversation_id"] == conv["conversation_id"]
-               and record["intent_id"] == intent and l.token not in json.dumps(credentials),
+               and record["intent_id"] == intent and record["created_by"] == actor.credential_id
+               and record["created_at"] and l.token not in json.dumps(credentials),
                "binding is stored and token is never listed", record)
-    for c in (device(ctx), l):
-        refused(ctx, c.call("POST", "credentials/lead", body={"name": "escape", "conversation_id": conv["conversation_id"]}),
-                403, "owner_only", "non-owner mint")
+    refused(ctx, l.call("POST", "credentials/lead", body={"name": "escape", "conversation_id": conv["conversation_id"]}),
+            403, "owner_only", "lead mint")
     for body in ({"name": "bad", "conversation_id": "missing"},
                  {"name": "bad", "conversation_id": conv["conversation_id"], "intent_id": "missing"},
                  {"conversation_id": conv["conversation_id"]}):
@@ -800,6 +833,11 @@ def _(ctx):
     calls = [("POST", "pairings", {"name": "escape"}), ("GET", "credentials", None),
              ("DELETE", "credentials/" + l.credential_id, None),
              ("POST", "credentials/lead", {"name": "escape", "conversation_id": cid}),
+             ("PUT", "lead-node", {"node": n.name}),
+             ("PUT", "chief-of-staff", {"enabled": False}),
+             ("PATCH", "conversations/" + cid, {"title": "escape"}),
+             ("POST", "action-approvals/missing/decide", {"decision": "approve"}),
+             ("PUT", "intents/missing/owner-messages/missing/mark", {"mark": "answer"}),
              ("POST", "conversations", create_body(o, n)),
              ("POST", "conversations/%s/turns" % cid, {"message": "escape"}),
              ("POST", "conversations/%s/stop" % cid, {}), ("POST", "conversations/%s/resume" % cid, {}),
@@ -1020,7 +1058,7 @@ def _(ctx):
     path = "intents/%s/jobs" % iid
     body, key = c.intent(n.name), new_key("attempt")
     body["meta"] = {"model": "codex"}
-    made = c.call("POST", path, body=body, key=key)
+    made = device(ctx).call("POST", path, body=body, key=key)
     ctx.expect(made.status == 201 and made.json.get("intent_id") == iid
                and made.json.get("job_id") != first["jobs"][0]["job_id"], "new job, same intent", made)
     again = c.call("POST", path, body=body, key=key)
@@ -1033,8 +1071,6 @@ def _(ctx):
             409, "idempotency_conflict", "changed replay")
     refused(ctx, c.call("POST", "intents/unknown/jobs", body=body, key=new_key()),
             404, "not_found", "unknown intent")
-    refused(ctx, device(ctx).call("POST", path, body=body, key=new_key()),
-            403, "owner_only", "paired device cannot add an attempt")
     refused(ctx, c.call("POST", path, body=dict(body, node="another-node"), key=new_key()),
             422, "invalid_request", "cannot move task to another node")
     for state in ("landed", "discarded"):

@@ -13,7 +13,7 @@
              _void's CONFIG_VOID and repeated_failure answer the same for a v1 row and its v2 twin
   dispatch   tick: an orphaned running job closes with class node_restart; a launcher refusal
              (env_policy) closes with class node_config, code env_policy; stop strings unchanged
-Isolated estates only; lab/ledger is never read or written.
+Isolated estates only; cs/ledger is never read or written.
 """
 import json
 import os
@@ -31,9 +31,9 @@ os.environ.clear()
 os.environ.update(_fixture_env)
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-sys.path.insert(0, str(LAB / "ops/bin"))
-sys.path.insert(0, str(LAB / "tasks/regressions/spool-delivery"))
+CODE_ROOT = HERE.parents[2]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
+sys.path.insert(0, str(CODE_ROOT / "tasks/regressions/spool-delivery"))
 import _errors  # noqa: E402
 import _void  # noqa: E402
 import _tick_estate as te  # noqa: E402
@@ -103,7 +103,7 @@ def test_sandbox(scratch):
     report = {"tool": "/x/fx", "cwd": w, "narrowed": [],
               "effective_policy": {"read": [w, r], "write": [w], "tmp": "/t/cs-sandbox-1", "write_env": {}}}
     narrowed = dict(report, narrowed=[{"capability": "net", "requested": "all", "granted": "none", "reason": "x"},
-                                      {"capability": "write_env", "requested": "LAB_STATE_X", "granted": "none", "reason": "y"}])
+                                      {"capability": "write_env", "requested": "CS_STATE_X", "granted": "none", "reason": "y"}])
     ev = lambda content, args=None, name="fx": {"event": "tool", "turn": 1, "error": True, "name": name,  # noqa: E731
                                                 "args": args or {}, "content": content + "\n\nexit: exit status 1"}
     cases = [
@@ -113,7 +113,7 @@ def test_sandbox(scratch):
         ("EROFS writing a readable, unwritable root", ev("fx: %s/a: Read-only file system" % r), report, "sandbox_denied"),
         ("EPERM writing a readable, unwritable root (Seatbelt)", ev("fx: %s/a: Operation not permitted" % r), report, "sandbox_denied"),
         ("a narrowed net and a network error", ev("curl: (6) Could not resolve host: example.com"), narrowed, "sandbox_denied"),
-        ("a narrowed write_env the failure names", ev("fx: LAB_STATE_X: Operation not permitted"), narrowed, "sandbox_denied"),
+        ("a narrowed write_env the failure names", ev("fx: CS_STATE_X: Operation not permitted"), narrowed, "sandbox_denied"),
         ("control: ENOENT outside the policy for a path the host lacks", ev("fx: /nonexistent-cs-x/y: No such file or directory"),
          report, "tool_exit"),
         ("control: ENOENT inside the workspace", ev("fx: missing.txt: No such file or directory", {"path": "missing.txt"}),
@@ -152,7 +152,7 @@ def test_readers():
 
 
 def test_dispatch(scratch):
-    root = te.build(scratch / "lab")
+    root = te.build(scratch / "code_root")
     (root / "ledger/dispatch.jsonl").write_text(json.dumps(
         {"ts": "2026-11-09T00:00:00Z", "id": "orphan-1", "job": "orphan-1", "spec": "specs/x.yaml",
          "state": "running", "pid": 999999, "origin": "dispatch"}) + "\n", encoding="utf-8")

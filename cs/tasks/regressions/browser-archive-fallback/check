@@ -22,7 +22,7 @@ case "$2" in
   wait) echo "Page loaded" ;;
   url) echo "https://93.184.216.34/source" ;;
   js) case "$3" in *querySelectorAll*) printf '[{"text":"Detail","href":"https://93.184.216.34/detail"}]' > "$5" ;; *) printf 'Rendered evidence.\\n' > "$5" ;; esac; echo written ;;
-  archive) if [ "$LAB_ARCHIVE_MODE" = fail ]; then exit 9; else : > "$3"; echo archived; fi ;;
+  archive) if [ "$CS_ARCHIVE_MODE" = fail ]; then exit 9; else : > "$3"; echo archived; fi ;;
   *) exit 2 ;;
 esac
 """)
@@ -30,9 +30,9 @@ esac
     for mode, expected in (("fail", "capture_failed"), ("empty", "empty_or_exceeds_limit")):
         workspace = root / mode; workspace.mkdir()
         state = root / (mode + "-state"); state.mkdir()
-        env = {**hermetic_env(), "LAB_BROWSE": str(fake), "LAB_BROWSER_STATE": str(state),
-               "LAB_BROWSER_ENGINE": "chrome", "LAB_BROWSER_VISIBILITY": "headed",
-               "LAB_ARCHIVE_MODE": mode}
+        env = {**hermetic_env(), "CS_BROWSE": str(fake), "CS_BROWSER_STATE": str(state),
+               "CS_BROWSER_ENGINE": "chrome", "CS_BROWSER_VISIBILITY": "headed",
+               "CS_ARCHIVE_MODE": mode}
         payload = json.dumps({"url": "https://93.184.216.34/source", "archive": True, "links": True})
         result = subprocess.run([str(tool)], input=payload, text=True, cwd=workspace,
                                 env=env, capture_output=True)

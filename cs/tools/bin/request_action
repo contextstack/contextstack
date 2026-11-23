@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Trusted harness operation. The node bearer stays here, outside the sandbox child."""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "ops/bin"))
+
+from _action_approval import request_action, sandbox_prefix
+
+
+def main():
+    if len(sys.argv) != 4:
+        sys.exit("request_action is available through the harness.")
+    try:
+        run, model, repo_view = sys.argv[1:]
+        return request_action(ROOT, Path(run), model, repo_view, json.load(sys.stdin),
+                              job=os.environ["CS_JOB_ID"], workspace=Path.cwd(),
+                              prefix=sandbox_prefix())
+    except (KeyError, ValueError, OSError, RuntimeError, subprocess.TimeoutExpired):
+        print("Action approval could not be completed. Continue without the action if possible.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

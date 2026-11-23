@@ -16,9 +16,9 @@ _fixture_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_fixture_env)
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 LIMIT = 50 * 1024 * 1024
-sys.path.insert(0, str(LAB / "ops/bin"))
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 from _setup_workspace import forget_worktree, materialize  # noqa: E402
 
 
@@ -33,7 +33,7 @@ def du_bytes(path):
 
 with scratch_dir(prefix="setup-workspace-") as raw:
     root = Path(raw)
-    lab = root / "lab"
+    code_root = root / "code_root"
     origin = root / "origin"
     origin.mkdir(parents=True)
     git(origin, "init", "-q", "-b", "main")
@@ -53,23 +53,23 @@ with scratch_dir(prefix="setup-workspace-") as raw:
     git(origin, "commit", "-qm", "base")
     head = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "HEAD"], text=True, env={**hermetic_env()}).strip()
 
-    setup = lab / "ledger/setups/corpus"
+    setup = code_root / "ledger/setups/corpus"
     subprocess.run(["git", "clone", "--quiet", str(origin), str(setup)], check=True, env={**hermetic_env()})
-    git(setup, "update-ref", "refs/lab/base", head)
+    git(setup, "update-ref", "refs/cs/base", head)
     (setup / "public" / "build").mkdir(parents=True)
     (setup / "public" / "build" / "manifest.json").write_text("{}\n")
     vendor = setup / "vendor" / "pkg"
     vendor.mkdir(parents=True)
     (vendor / "blob").write_bytes(b"V" * (40 * 1024 * 1024))
 
-    task = lab / "tasks/work/corpus-cell"
+    task = code_root / "tasks/work/corpus-cell"
     task.mkdir(parents=True)
     (task / "goal.md").write_text("cell\n")
     (task / "notes.md").write_text("writes: app/*,tests/*\n")
     (task / "setup").symlink_to(setup)
 
-    ws = lab / "ledger/runs/run-1/workspace"
-    materialize(task / "setup", ws, task=task, lab=lab)
+    ws = code_root / "ledger/runs/run-1/workspace"
+    materialize(task / "setup", ws, task=task, code_root=code_root)
     assert (ws / "app" / "ok.txt").read_text() == "app\n"
     assert (ws / "tests" / "ok.txt").read_text() == "tests\n"
     assert (ws / "storage" / "framework" / "views").is_dir()
@@ -81,7 +81,7 @@ with scratch_dir(prefix="setup-workspace-") as raw:
     blob.write_bytes(b"mutated")
     (ws / "vendor" / "COW").write_text("workspace")
     assert (vendor / "blob").read_bytes()[:1] == b"V"
-    cache = next((lab / "ledger/setups/installs").glob("*/vendor"))
+    cache = next((code_root / "ledger/setups/installs").glob("*/vendor"))
     assert cache.is_dir() and not cache.is_symlink()
     assert (cache / "pkg" / "blob").read_bytes()[:1] == b"V"
     assert not (cache / "COW").exists()
@@ -89,18 +89,18 @@ with scratch_dir(prefix="setup-workspace-") as raw:
     size = du_bytes(ws)
     assert size < LIMIT, "workspace %s bytes (cap 50 MB)" % size
     published = subprocess.run(
-        [str(LAB / "ops/bin/setup-workspace")],
-        input=json.dumps({"setup": str(setup), "workspace": str(lab / "ledger/runs/run-2/workspace"),
-                          "task": str(task), "lab": str(lab)}),
-        text=True, capture_output=True, cwd=str(LAB),
+        [str(CODE_ROOT / "ops/bin/setup-workspace")],
+        input=json.dumps({"setup": str(setup), "workspace": str(code_root / "ledger/runs/run-2/workspace"),
+                          "task": str(task), "code_root": str(code_root)}),
+        text=True, capture_output=True, cwd=str(CODE_ROOT),
         env={**hermetic_env()},
     )
     assert published.returncode == 0, published.stderr
     body = json.loads(published.stdout.splitlines()[-1])
     assert body.get("ok") and body.get("tag")
     forget_worktree(ws)
-    forget_worktree(lab / "ledger/runs/run-2/workspace")
-    installs = lab / "ledger/setups/installs"
+    forget_worktree(code_root / "ledger/runs/run-2/workspace")
+    installs = code_root / "ledger/setups/installs"
     for path in (*installs.rglob("*"), installs):
         if path.exists() and not path.is_symlink():
             path.chmod(0o755 if path.is_dir() else 0o644)
@@ -111,7 +111,7 @@ with scratch_dir(prefix="setup-workspace-") as raw:
     (plain / "vendor" / "pkg").mkdir(parents=True)
     (plain / "vendor" / "pkg" / "blob").write_bytes(b"V" * (40 * 1024 * 1024))
     copied = root / "plain-ws"
-    materialize(plain, copied, lab=lab)
+    materialize(plain, copied, code_root=code_root)
     assert (copied / "note.txt").read_text() == "plain\n"
     assert (copied / "vendor").is_dir() and not (copied / "vendor").is_symlink()
     assert du_bytes(copied) < LIMIT

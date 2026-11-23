@@ -9,7 +9,7 @@ from xml.etree import ElementTree
 
 MAX_BYTES = 5 * 1024 * 1024
 REDIRECTS = {301, 302, 303, 307, 308}
-USER_AGENT = "ContextStack-Lab/0.1 (+local grounded corpus sweep)"
+USER_AGENT = "ContextStack-ContextStack/0.1 (+local grounded corpus sweep)"
 
 
 def fail(message):

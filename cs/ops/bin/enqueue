@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ops/bin/enqueue — operator-called. Append a spec to the A2 queue.
+# Append a local spec to the dispatch queue for schedule-tick or an operator.
 # Product-class × local-coder refuses without override (PINNED routing).
 # Dest-bound rows require grants/<id>.yaml.
 from _dispatch import spec_value
@@ -7,17 +7,17 @@ from _estate_io import append_jsonl, state_dir
 import json, re, sys, time
 from pathlib import Path
 
-from _corpus_contract import metadata
 from _grant import cover, parse_expiry, record_refusal
 from _roots import roots
+from _workspace_setup import metadata
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 STATE = roots()["state"]
 # the dispatch shelf tick drains: under the state root (default <code>/ledger, as before)
 Q = STATE / "dispatch.jsonl"
 CHORE = re.compile(
-    r"(labignore|gofmt|pint|prune|readme|identity|gitignore|larastan|phpstan)",
+    r"(gofmt|pint|prune|readme|identity|gitignore|larastan|phpstan)",
     re.I,
 )
 PRODUCT = re.compile(r"(sotu|flowchart)", re.I)
@@ -39,14 +39,14 @@ if (not isinstance(effects, list) or
 spec = str(a.get("spec", ""))
 if not spec.endswith(".yaml") or ".." in spec:
     sys.exit("enqueue: spec must be a yaml path")
-p = (LAB / spec).resolve() if not Path(spec).is_absolute() else Path(spec)
-if not p.is_file() or not p.is_relative_to(LAB.resolve()):
-    sys.exit("enqueue: spec not in lab")
-rel = str(p.relative_to(LAB))
+p = (CODE_ROOT / spec).resolve() if not Path(spec).is_absolute() else Path(spec)
+if not p.is_file() or not p.is_relative_to(CODE_ROOT.resolve()):
+    sys.exit("enqueue: spec outside the code root")
+rel = str(p.relative_to(CODE_ROOT))
 text = p.read_text(encoding="utf-8")
 if not spec_value(text, "model"):
     # Never filled in here: the spec names its model; PINNED.md only says which to copy.
-    pinned_md = LAB / "PINNED.md"
+    pinned_md = CODE_ROOT / "PINNED.md"
     pinned = spec_value(pinned_md.read_text(encoding="utf-8"), "pinned") if pinned_md.is_file() else ""
     sys.exit("enqueue: %s has no model: ; PINNED.md pins %s — add model: %s (or the template/model this experiment varies)"
              % (rel, pinned or "(no pinned: line)", pinned or "<model>"))
@@ -56,7 +56,7 @@ if spec_value(text, "model") == "local-coder" and PRODUCT.search(blob) and not C
     sys.exit("enqueue: product-class cell on local-coder requires override=true (PINNED routing)")
 task = str(a.get("task") or "").strip()
 dest = str(a.get("dest") or a.get("resource") or "").strip()
-notes = metadata(LAB / task if task and not Path(task).is_absolute() else Path(task)) if task else {}
+notes = metadata(CODE_ROOT / task if task and not Path(task).is_absolute() else Path(task)) if task else {}
 repo = dest or str(notes.get("repo") or "").strip()
 need_grant = bool(a.get("grant") or dest or notes.get("repo") or effects)
 if lane == "probe" and not dest and not a.get("grant"):
@@ -78,7 +78,7 @@ if need_grant:
             code = "expired"
         elif "unregistered" in err:
             code = "grant not found"
-        rid = record_refusal(LAB, code=code, message=err, grant=grant, gid=gid,
+        rid = record_refusal(CODE_ROOT, code=code, message=err, grant=grant, gid=gid,
                              context={"spec": rel, "repo": repo, "lane": lane})
         sys.exit("enqueue: %s [refusal %s]" % (err, rid))
 else:

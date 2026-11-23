@@ -340,6 +340,43 @@ mod tests {
     }
 
     #[test]
+    fn shipped_policy_mounts_uv_and_managed_python_read_only() -> Result<(), String> {
+        let fx = layout()?;
+        let r = &fx.root;
+        let home = r.join("home");
+        let uv = home.join(".local/bin/uv");
+        let python = home.join(".local/share/uv/python");
+        let cache = home.join(".cache/uv");
+        for dir in [uv.parent().ok_or("uv has no parent")?, &python, &cache] {
+            std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(&uv, "").map_err(|error| error.to_string())?;
+
+        let host: crate::policy::HostPolicy =
+            serde_json::from_str(include_str!("../../cs/policy/sandbox.json"))
+                .map_err(|error| error.to_string())?;
+        let (effective, _) = crate::policy::intersect(
+            &host,
+            &crate::policy::Request::default(),
+            &r.join("code/runs/ws"),
+            &r.join("tmp/call"),
+            &r.join("code"),
+            &home,
+            &|_| None,
+        )
+        .map_err(|error| error.message().to_owned())?;
+        let got = plan(&effective, &[], &r.join("target/tools"));
+        assert!(got.mounts.contains(&Mount::Ro(uv)));
+        assert!(got.mounts.contains(&Mount::Ro(python)));
+        assert!(got.mounts.contains(&Mount::Rw(r.join("tmp/call"))));
+        assert!(!got.mounts.iter().any(|mount| match mount {
+            Mount::Ro(path) | Mount::Rw(path) => cache.starts_with(path),
+            Mount::Link { .. } => false,
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn a_tool_outside_every_read_path_is_bound_read_only() -> Result<(), String> {
         let fx = layout()?;
         let r = &fx.root;
@@ -411,9 +448,14 @@ mod tests {
             r.join("state/b.sock").display().to_string(),
             "/home/me/b.sock".to_owned(),
         ];
-        for net in [Net::None, Net::Gateway, Net::All] {
+        for net in [Net::None, Net::Gateway, Net::Loopback, Net::All] {
             assert!(words(net).windows(3).any(|w| w == named_bind), "{net:?}");
         }
+        assert!(
+            words(Net::Loopback)
+                .iter()
+                .any(|word| word == "--unshare-net")
+        );
         let all = words(Net::All);
         assert!(!all.contains(&"--unshare-net".to_owned()));
         Ok(())

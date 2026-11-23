@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,10 +16,14 @@ from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[3]
 MONOREPO = KIT.parent
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "LAB_"))}
+sys.path.insert(0, str(KIT / "tasks/regressions/_lib"))
+from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
+
+ENV = {k: v for k, v in hermetic_env().items() if not k.startswith(("GIT_", "CS_"))}
 ENV.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL="/dev/null", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
            GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-ENV.setdefault("CS_TOOLS_BIN", str(KIT.parent / "target/release/cs-tools"))  # the copied lab has no target/
+ENV.setdefault("CS_TOOLS_BIN", str(KIT.parent / "target/release/cs-tools"))  # the copied code_root has no target/
 problems = []
 
 
@@ -121,18 +126,27 @@ try:
            "HOME lane grants include traversal metadata for every Git ancestor", profile)
     expect(all('(allow file-read* (subpath %s))' % json.dumps(str(root)) in profile for root in roots),
            "HOME lane grants keep Git objects, refs, config, HEAD and info readable")
+    (plain_main / ".gitattributes").write_text("README export-ignore\n")
+    git(plain_main, "add", ".gitattributes")
+    git(plain_main, "commit", "-qm", "set archive export attributes")
+    archive_dir = tmp / "archive"
+    archive_dir.mkdir()
+    _lanes.archive_main(_lanes.repo_config("flat"), archive_dir / "repo")
+    expect((archive_dir / "repo/README").read_text() == "seed\n"
+           and not (archive_dir / "repo/.git").exists(),
+           "read-only snapshot includes committed files marked export-ignore and excludes Git metadata")
     if "--read-profile-only" in sys.argv:
         raise SystemExit(1 if problems else 0)
-    lab = tmp / "lab"
-    (lab / "ops/bin").mkdir(parents=True)
+    code_root = tmp / "code_root"
+    (code_root / "ops/bin").mkdir(parents=True)
     for f in (KIT / "ops/bin").iterdir():
         if f.is_file():
-            shutil.copy2(f, lab / "ops/bin" / f.name)
+            shutil.copy2(f, code_root / "ops/bin" / f.name)
     sys.path.insert(0, str(KIT / "tasks/regressions/_lib"))
     from native_runtime import stage_native_runtime
-    stage_native_runtime(lab / "ops/bin")
-    (lab / "ESTATE").write_text("dev\n")
-    (lab / "specs").mkdir()
+    stage_native_runtime(code_root / "ops/bin")
+    (code_root / "ESTATE").write_text("dev\n")
+    (code_root / "specs").mkdir()
     owner_home = tmp / "owner-home"
     owner_home.mkdir()
     (owner_home / '.gitconfig').write_text('[user]\n name = Lane Owner\n email = lane@example.test\n[credential]\n helper = fake-private-helper\n[core]\n excludesFile = ~/.gitignore\n')
@@ -221,27 +235,50 @@ print("done")
         "repo_config": str(common / "config"), "other_ref": str(common / "refs/heads/lane/other"),
         "packed_refs_lock": str(common / "packed-refs.lock"), "main_ref": str(common / "refs/heads/main"),
         "new_file_in_main": str(main / "src/new.txt")}))
-    (lab / "ops/bin/executor-templates.json").write_text(json.dumps({"fake-agent": {
+    (code_root / "ops/bin/executor-templates.json").write_text(json.dumps({"fake-agent": {
         "binary": str(agent), "args": ["{{prompt}}"], "cost_class": "subscription", "cost_usd": 0,
         "auth": "subscription"}}))
-    task = lab / "tasks/lane-task"
+    task = code_root / "tasks/lane-task"
     task.mkdir(parents=True)
     (task / "goal.md").write_text("Write hello.txt.\n")
     (task / "check").write_text("#!/bin/sh\ntest \"$(cat hello.txt)\" = hello\n")
     (task / "check").chmod(0o755)
 
-    def run_executor(spec_text, name="lane", task_rel="tasks/lane-task"):
-        (lab / "specs" / (name + ".yaml")).write_text("id: %s\nmodel: fake-agent\n%s" % (name, spec_text))
+    def launch_executor(spec_text, name, task_rel):
+        (code_root / "specs" / (name + ".yaml")).write_text("id: %s\nmodel: fake-agent\n%s" % (name, spec_text))
         order = {"executor": "fake-agent", "task": task_rel, "spec": "specs/%s.yaml" % name, "exp": "FIXTURE-LANE",
                  "trial": 1, "timeout_s": 60, "check_window": 30}
-        done = subprocess.run([sys.executable, str(lab / "ops/bin/_executor.py")], input=json.dumps(order),
-                              cwd=lab, text=True, capture_output=True, timeout=120, env={**ENV, "HOME": str(owner_home),
-                                  "GIT_DIR": str(common), "GIT_WORK_TREE": str(main), "GIT_PREFIX": "",
-                                  "GIT_INDEX_FILE": str(tmp / "hook.index"), "GIT_EDITOR": ":",
-                                  "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "maintenance.auto",
-                                  "GIT_CONFIG_VALUE_0": "true", "GIT_CONFIG_KEY_1": "gc.auto",
-                                  "GIT_CONFIG_VALUE_1": "1",
-                                  "GIT_CONFIG_PARAMETERS": "'maintenance.auto'='true' 'gc.auto'='1'"})
+        proc = subprocess.Popen(cli_command(sys.executable, code_root / "ops/bin/_executor.py"),
+                                cwd=code_root, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env={**ENV, "HOME": str(owner_home),
+                                    "GIT_DIR": str(common), "GIT_WORK_TREE": str(main), "GIT_PREFIX": "",
+                                    "GIT_INDEX_FILE": str(tmp / "hook.index"), "GIT_EDITOR": ":",
+                                    "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "maintenance.auto",
+                                    "GIT_CONFIG_VALUE_0": "true", "GIT_CONFIG_KEY_1": "gc.auto",
+                                    "GIT_CONFIG_VALUE_1": "1",
+                                    "GIT_CONFIG_PARAMETERS": "'maintenance.auto'='true' 'gc.auto'='1'"})
+        proc.stdin.write(json.dumps(order))
+        proc.stdin.close()
+        proc.stdin = None
+        return proc
+
+    def run_executor(spec_text, name="lane", task_rel="tasks/lane-task", *, cancel=False):
+        with launch_executor(spec_text, name, task_rel) as proc:
+            if cancel:
+                runs = code_root / "ledger/runs"
+                deadline = time.monotonic() + 30
+                while proc.poll() is None and time.monotonic() < deadline:
+                    if any(runs.glob("*/tmp/research-ready")):
+                        proc.send_signal(signal.SIGTERM)
+                        break
+                    time.sleep(0.05)
+            try:
+                stdout, stderr = proc.communicate(timeout=80)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                raise
+            done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         try:
             return done, json.loads(done.stdout.strip().splitlines()[-1])
         except (IndexError, ValueError):
@@ -273,7 +310,7 @@ print("done")
                "main's head and work tree are untouched")
         expect((main / "README").read_text() == "seed\n" and not (main / "src/new.txt").exists(),
                "main's files are untouched")
-        run_dir = lab / "ledger/runs" / value.get("run_id", "?")
+        run_dir = code_root / "ledger/runs" / value.get("run_id", "?")
         evidence = json.loads((run_dir / "evidence/manifest.json").read_text()) if run_dir.is_dir() else {}
         paths = sorted(f["path"] for f in evidence.get("files", []))
         expect(evidence.get("capture_state") == "complete" and paths == ["committed.txt", "hello.txt", "src/app.txt"],
@@ -310,16 +347,60 @@ print("done")
         expect(done.returncode == 0 and value.get("lane", {}).get("path") == str(plain_main.parent / "fix-y"),
                "a plain repo's lane sits beside it", (value, done.stderr))
 
-        ledger = lab / "ledger/ledger.jsonl"
+        original_agent, original_check = agent.read_text(), (task / "check").read_text()
+        (plain_main / "README").write_text("uncommitted\n")
+        (plain_main / "local-only").touch()
+        before_refs = git(plain_main, "show-ref")
+        before_worktrees = git(plain_main, "worktree", "list", "--porcelain")
+        (task / "check").write_text("#!/bin/sh\nexit 0\n")
+        agent.write_text(r"""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+repo = Path(sys.argv[1].split("snapshot at ", 1)[1].split(". Do not commit", 1)[0])
+assert (repo / "README").read_text() == "seed\n"
+assert not (repo / "local-only").exists()
+try:
+    (repo / "README").write_text("changed")
+except PermissionError:
+    pass
+else:
+    raise AssertionError("repo snapshot is writable")
+assert subprocess.run(["git", "commit", "--allow-empty", "-m", "no"]).returncode != 0
+if "cancel" in sys.argv[1]:
+    Path(os.environ["TMPDIR"], "research-ready").touch()
+    time.sleep(120)
+if "fail" in sys.argv[1]:
+    sys.exit(23)
+print("research probe passed")
+""")
+        for mode, expected in (("pass", "done"), ("fail", "executor_exit_23"), ("cancel", "cancelled")):
+            (task / "goal.md").write_text("research " + mode)
+            done, value = run_executor("repo: flat\nrepo_read_only: true\n", name="research-" + mode,
+                                       cancel=mode == "cancel")
+            expect(value.get("stop") == expected and "branch" not in value,
+                   "read-only repo workspace handles " + mode, (value, done.stderr))
+            expect(git(plain_main, "show-ref") == before_refs
+                   and git(plain_main, "worktree", "list", "--porcelain") == before_worktrees
+                   and not list((code_root / "ledger/runs").glob("*/read-only-*"))
+                   and (plain_main / "README").read_text() == "uncommitted\n",
+                   "read-only repo leaves no branch, worktree or snapshot after " + mode)
+        agent.write_text(original_agent)
+        (task / "check").write_text(original_check)
+
+        ledger = code_root / "ledger/ledger.jsonl"
         rows = ledger.read_text().count("\n")
         for spec_text, why in (("repo: demo\n", "both repo: and lane:"), ("repo: nope\nlane: a\n", "not in"),
                                ("repo: demo\nlane: Bad/Name\n", "want lowercase"), ("repo: demo\nlane: main\n", "main")):
             done, _ = run_executor(spec_text, name="refused")
             expect(done.returncode != 0 and why in done.stdout + done.stderr, "refused: " + spec_text.strip().replace("\n", "; "),
                    done.stdout + done.stderr)
-        (lab / "tasks/with-setup/setup").mkdir(parents=True)
+        (code_root / "tasks/with-setup/setup").mkdir(parents=True)
         for f in ("goal.md", "check"):
-            shutil.copy2(task / f, lab / "tasks/with-setup" / f)
+            shutil.copy2(task / f, code_root / "tasks/with-setup" / f)
         done, _ = run_executor("repo: demo\nlane: z\n", name="setup", task_rel="tasks/with-setup")
         expect(done.returncode != 0 and "no setup/" in done.stdout + done.stderr, "a lane task with setup/ is refused")
         expect(ledger.read_text().count("\n") == rows, "refusals precede any ledger row")

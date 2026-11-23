@@ -13,30 +13,30 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
-# refusing live lab root: every planted op, staged tree and commit is temporary.
-spec = importlib.util.spec_from_file_location("ops_cap", LAB / "scripts/ops-cap.py")
+CODE_ROOT = Path(__file__).resolve().parents[3]
+# refusing live code_root root: every planted op, staged tree and commit is temporary.
+spec = importlib.util.spec_from_file_location("ops_cap", CODE_ROOT / "scripts/ops-cap.py")
 cap = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cap)
-assert "python3 scripts/ops-cap.py check" in (LAB / "scripts/check").read_text()
+assert "python3 scripts/ops-cap.py check" in (CODE_ROOT / "scripts/check").read_text()
 
 
-def git(lab, *args, ok=True):
+def git(code_root, *args, ok=True):
     env = {**hermetic_env(), "GIT_AUTHOR_NAME": "Fixture", "GIT_COMMITTER_NAME": "Fixture",
            "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_EMAIL": "fixture@example.test"}
-    result = subprocess.run(["git", *args], cwd=lab, env=env, text=True, capture_output=True)
+    result = subprocess.run(["git", *args], cwd=code_root, env=env, text=True, capture_output=True)
     if ok:
         assert result.returncode == 0, result.stdout + result.stderr
     return result
 
 
-def run(lab, *args):
-    return subprocess.run(["python3", "scripts/ops-cap.py", *args], cwd=lab,
+def run(code_root, *args):
+    return subprocess.run(["python3", "scripts/ops-cap.py", *args], cwd=code_root,
                           text=True, capture_output=True, env={**hermetic_env()})
 
 
-def commit(lab, message, success):
-    result = git(lab, "commit", "-m", message, ok=False)
+def commit(code_root, message, success):
+    result = git(code_root, "commit", "-m", message, ok=False)
     assert (result.returncode == 0) == success, result.stdout + result.stderr
     return result.stdout + result.stderr
 
@@ -44,81 +44,81 @@ def commit(lab, message, success):
 now = datetime.now(timezone.utc)
 CAP_ONLY_CHECK = '#!/bin/sh\npython3 scripts/ops-cap.py check && exit 0\necho "check: ops-cap-only-failure"\nexit 1\n'
 with scratch_dir(prefix="ops-cap-fixture-") as raw:
-    lab = Path(raw)
+    code_root = Path(raw)
     for folder in ("scripts/hooks", "ops/bin", "ledger", "specs/archive"):
-        (lab / folder).mkdir(parents=True)
+        (code_root / folder).mkdir(parents=True)
     for name in ("ops-cap.py", "check-red-gate", "estate_classify.py",
                  "hooks/pre-commit", "hooks/commit-msg", "hooks/post-commit"):
-        shutil.copy2(LAB / "scripts" / name, lab / "scripts" / name)
-    shutil.copy2(LAB / "ops/bin/_estate_io.py", lab / "scripts/_estate_io.py")
+        shutil.copy2(CODE_ROOT / "scripts" / name, code_root / "scripts" / name)
+    shutil.copy2(CODE_ROOT / "ops/bin/_estate_io.py", code_root / "scripts/_estate_io.py")
     grant_lines = 0
     for name in ("_grant.py", "_estate_io.py"):
-        shutil.copy2(LAB / "ops/bin" / name, lab / "ops/bin" / name)
-        grant_lines += (lab / "ops/bin" / name).read_bytes().count(b"\n")
-    (lab / "ESTATE").write_text("dev\n")
-    (lab / "grants").mkdir(exist_ok=True)
-    (lab / "grants/g-lab-session.yaml").write_text(
-        "id: g-lab-session\nestate: dev\nrepo: %s\npaths: [ops/bin/, scripts/, grants/]\n"
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, code_root / "ops/bin" / name)
+        grant_lines += (code_root / "ops/bin" / name).read_bytes().count(b"\n")
+    (code_root / "ESTATE").write_text("dev\n")
+    (code_root / "grants").mkdir(exist_ok=True)
+    (code_root / "grants/g-code_root-session.yaml").write_text(
+        "id: g-code_root-session\nestate: dev\nrepo: %s\npaths: [ops/bin/, scripts/, grants/]\n"
         "gates: [scripts/check]\ncommit: true\nstatus: active\nexpiry: 2099-01-01T00:00:00Z\n"
-        % lab.resolve())
-    (lab / "scripts/check").write_text(CAP_ONLY_CHECK)
-    (lab / "scripts/check").chmod(0o755)
-    (lab / "specs/archive/fixture.yaml").write_text('hypothesis: "fixture"\nverdict: fixture\n')
-    (lab / "ledger/ledger.jsonl").write_text("")
-    (lab / "ledger/last-prune").write_text((now - timedelta(days=1)).isoformat())
-    review = lab / "ledger/ops-prune-review.json"
+        % code_root.resolve())
+    (code_root / "scripts/check").write_text(CAP_ONLY_CHECK)
+    (code_root / "scripts/check").chmod(0o755)
+    (code_root / "specs/archive/fixture.yaml").write_text('hypothesis: "fixture"\nverdict: fixture\n')
+    (code_root / "ledger/ledger.jsonl").write_text("")
+    (code_root / "ledger/last-prune").write_text((now - timedelta(days=1)).isoformat())
+    review = code_root / "ledger/ops-prune-review.json"
     review.write_text(json.dumps({"reviewed_at": (now - timedelta(days=1)).isoformat()}))
-    body = lab / "ops/bin/_body.py"
+    body = code_root / "ops/bin/_body.py"
     body.write_text("# line\n" * (cap.CAPS["lines"] - grant_lines))
     for index in range(cap.CAPS["executables"]):
-        path = lab / "ops/bin" / f"op{index}"
+        path = code_root / "ops/bin" / f"op{index}"
         path.touch()
         path.chmod(0o755)
-    git(lab, "init", "-q", "-b", "main")
-    git(lab, "add", ".")
-    git(lab, "commit", "-qm", "fixture at verified caps")
-    git(lab, "config", "core.hooksPath", "scripts/hooks")
-    (lab / ".lab-session").write_text(json.dumps({"grant": "g-lab-session", "via": "session-start"}) + "\n")
-    baseline = cap.measure(lab, "HEAD")
-    assert baseline == cap.measure(lab, "worktree") == cap.measure(lab, "index")
+    git(code_root, "init", "-q", "-b", "main")
+    git(code_root, "add", ".")
+    git(code_root, "commit", "-qm", "fixture at verified caps")
+    git(code_root, "config", "core.hooksPath", "scripts/hooks")
+    (code_root / ".cs-session").write_text(json.dumps({"grant": "g-code_root-session", "via": "session-start"}) + "\n")
+    baseline = cap.measure(code_root, "HEAD")
+    assert baseline == cap.measure(code_root, "worktree") == cap.measure(code_root, "index")
     assert baseline["ops_bin_non_test_lines"] == cap.CAPS["lines"]
-    assert run(lab, "check").returncode == 0
-    supplied = json.loads(run(lab, "measure", "HEAD", "--paths", "15").stdout)
+    assert run(code_root, "check").returncode == 0
+    supplied = json.loads(run(code_root, "measure", "HEAD", "--paths", "15").stdout)
     assert supplied["independent_decision_paths"] == 15
-    assert json.loads(run(lab, "measure", "HEAD").stdout)["independent_decision_paths"] is None
+    assert json.loads(run(code_root, "measure", "HEAD").stdout)["independent_decision_paths"] is None
 
-    extra = lab / "ops/bin/op-extra"
+    extra = code_root / "ops/bin/op-extra"
     extra.write_text("# growth\n")
     extra.chmod(0o755)
-    result = run(lab, "check")
+    result = run(code_root, "check")
     assert result.returncode == 0 and "WARN" in result.stdout and "FAIL" not in result.stdout
-    git(lab, "add", "ops/bin")
-    commit(lab, "fix: growth without debt marker\n\nOps-cap-state: forged", True)
+    git(code_root, "add", "ops/bin")
+    commit(code_root, "fix: growth without debt marker\n\nOps-cap-state: forged", True)
     def footer():
-        message = git(lab, "show", "-s", "--format=%B").stdout
+        message = git(code_root, "show", "-s", "--format=%B").stdout
         records = [json.loads(line[len(cap.FOOTER):]) for line in message.splitlines() if line.startswith(cap.FOOTER)]
         assert len(records) == 1 and records[0]["suspended"] is True
-        assert records[0]["counts"] == cap.counts(cap.measure(lab, "HEAD"))
+        assert records[0]["counts"] == cap.counts(cap.measure(code_root, "HEAD"))
         return records[0]
     footer()
     # Index measurement is authoritative even with a smaller working tree.
     body.write_text(body.read_text() + "# staged growth\n")
-    git(lab, "add", "ops/bin/_body.py")
+    git(code_root, "add", "ops/bin/_body.py")
     body.write_text("")
-    commit(lab, "fix: indexed growth with optional historical marker\n\ncap-debt: +1 lines historical obligation", True)
+    commit(code_root, "fix: indexed growth with optional historical marker\n\ncap-debt: +1 lines historical obligation", True)
     assert footer()["counts"]["lines"] == cap.CAPS["lines"] + 2
-    git(lab, "add", "ops/bin/_body.py")
-    commit(lab, "fix: subtract below former line cap", True)
+    git(code_root, "add", "ops/bin/_body.py")
+    commit(code_root, "fix: subtract below former line cap", True)
     assert footer()["counts"]["lines"] == grant_lines + 1  # op-extra remains
-    (lab / "scripts/touch").write_text("rules change without ops edits")
-    git(lab, "add", "-f", "scripts/touch")
-    commit(lab, "fix: every rules commit measured", True)
+    (code_root / "scripts/touch").write_text("rules change without ops edits")
+    git(code_root, "add", "-f", "scripts/touch")
+    commit(code_root, "fix: every rules commit measured", True)
     footer()
-    check = lab / "scripts/check"
+    check = code_root / "scripts/check"
     check.write_text('#!/bin/sh\npython3 scripts/ops-cap.py check\necho "check: FAIL — fixture unrelated rule"\nexit 1\n')
-    (lab / "scripts/touch").write_text("changed")
-    git(lab, "add", "-f", "scripts/touch")
-    commit(lab, "fix: unrelated red is still refused", False)
-    commit(lab, "check-red: fixture unrelated rule", True)
+    (code_root / "scripts/touch").write_text("changed")
+    git(code_root, "add", "-f", "scripts/touch")
+    commit(code_root, "fix: unrelated red is still refused", False)
+    commit(code_root, "check-red: fixture unrelated rule", True)
     footer()
 print("check: suspended ops measurement and indexed footers; unrelated rules preserved")

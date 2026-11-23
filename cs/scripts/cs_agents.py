@@ -59,6 +59,10 @@ def agents_dir():
     return Path(os.environ.get("CS_AGENTS_DIR") or kit_dir() / "agents")
 
 
+def harness_model(model):
+    return isinstance(model, str) and re.fullmatch(r"harness:[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", model)
+
+
 def known_models():
     try:
         return set(json.loads((kit_dir() / "ops/bin/executor-templates.json").read_text()))
@@ -140,13 +144,13 @@ def parse(text, stem):
         raise Refused("budget: %s not one of %s" % (", ".join(bad), ", ".join(BUDGET_KEYS)))
     check_budget(budget, "budget")
     models = known_models()
-    if models is not None and fields["model"] not in models:
+    if models is not None and fields["model"] not in models and not harness_model(fields["model"]):
         raise Refused("model %r is not an executor template (%s)" % (fields["model"], ", ".join(sorted(models))))
     chain = fields.get("fallback") or []
     if chain:
-        bad = [m for m in chain if not isinstance(m, str) or (models is not None and m not in models)]
+        bad = [m for m in chain if not isinstance(m, str) or (models is not None and m not in models and not harness_model(m))]
         if bad:
-            raise Refused("fallback lists unknown templates: %s" % ", ".join(str(x) for x in bad))
+            raise Refused("fallback lists invalid models: %s" % ", ".join(str(x) for x in bad))
     fields["system"] = "\n".join(lines[end + 1:]).strip() + "\n"
     if not fields["system"].strip():
         raise Refused("the body (the worker's system prompt) is empty")
@@ -307,8 +311,8 @@ def retry_limit_refuse(model, profile, limits_rows):
     return msg
 
 
-def pick_retry_model(prior_model, profile, limits_rows, explicit=None, *, allow_fallback=False):
-    """retry_task model: explicit model, else prior_model; profile fallback only when allow_fallback."""
+def pick_retry_model(prior_model, profile, limits_rows, explicit=None, *, allow_fallback=False, edit_refused=False):
+    """Keep the prior template by default and automatically switch after an edit refusal stop."""
     if explicit:
         chosen, skipped, err = choose_model(explicit, profile, limits_rows, allow_fallback=False)
         if err:
@@ -323,15 +327,15 @@ def pick_retry_model(prior_model, profile, limits_rows, explicit=None, *, allow_
     except ImportError as error:
         raise Refused(str(error))
     limited, _ = is_limited(prior_model, limits_rows)
-    if not limited:
+    if not limited and not edit_refused:
         return prior_model, None
-    if not allow_fallback:
+    if not allow_fallback and not edit_refused:
         raise Refused(retry_limit_refuse(prior_model, profile, limits_rows))
     if not profile:
         raise Refused("no agent profile on the job: pass model= explicitly")
     chosen = pick_fallback(prior_model, profile, limits_rows)
     if not chosen or chosen == prior_model:
-        raise Refused("no fallback model after %s (all limited or none left)" % prior_model)
+        raise Refused("no available fallback model after %s: pass model= explicitly" % prior_model)
     return chosen, prior_model
 
 

@@ -39,7 +39,7 @@ from pathlib import Path
 
 
 from _job_reason import persist_output, redact as redact_secrets
-from _lead_session import ClaudeStreamSession, prepare_runtime_home, redact_msg
+from _lead_session import ClaudeStreamSession, SessionExited, TurnCancelled, prepare_runtime_home, redact_msg
 from _lead_wake import start_wake
 from _lead_socket import private_socket_dir, read_socket_token, remove_socket_dir, sweep_socket_dirs, temporary_socket_dir
 from _roots import roots
@@ -311,7 +311,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _stop_host_session(host: ConversationHost) -> None:
+def _stop_host_session(host: ConversationHost, *, force=False) -> None:
     """Drop the CLI child quickly, then finalize private login copies before host exit."""
     sess = host._session
     if sess and getattr(sess, "mcp_bridge", None):
@@ -320,7 +320,8 @@ def _stop_host_session(host: ConversationHost) -> None:
         return
     proc = sess.proc
     if proc and proc.poll() is None:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        signals = (signal.SIGKILL,) if force else (signal.SIGTERM, signal.SIGKILL)
+        for sig in signals:
             try:
                 os.killpg(proc.pid, sig)
             except (ProcessLookupError, OSError):
@@ -482,16 +483,13 @@ def build_mcp_config(workspace: Path, cred: Path, meta: dict | None = None) -> d
 
 def turn_message(workspace: Path, *, first_turn: bool) -> str:
     goal = (workspace / "tasks/turn/goal.md").read_text(encoding="utf-8")
-    if not first_turn:
+    files = ["prompts/system.md", "conversation/context.md"] if first_turn else []
+    files.append("conversation/decision-log.md")
+    parts = [(workspace / path).read_text(encoding="utf-8").strip()
+             for path in files if (workspace / path).is_file()]
+    if not first_turn and not parts:
         return goal
-    parts = []
-    system = workspace / "prompts/system.md"
-    context = workspace / "conversation/context.md"
-    if system.is_file():
-        parts.append(system.read_text(encoding="utf-8").strip())
-    if context.is_file():
-        parts.append(context.read_text(encoding="utf-8").strip())
-    parts.append(goal.strip())
+    parts.append(goal.strip() if first_turn else goal)
     return "\n\n".join(p for p in parts if p)
 
 
@@ -731,8 +729,10 @@ class ConversationHost:
           fail("job is not a turn of this conversation")
       return ws
 
-  def handle_turn(self, workspace: Path, message: str | None = None, timeout: float = 300) -> str:
+  def handle_turn(self, workspace: Path, message: str | None = None, timeout: float = 300, *, on_event=None, cancelled=None) -> str:
       with self._lock:
+          if cancelled is not None and cancelled():
+              raise TurnCancelled("turn cancelled")
           ensure_session_credential(self.conversation_id, self.config_root, self.state, self.model)
           ws = self.validate_workspace(workspace)
           if self._workspace is None:
@@ -772,7 +772,13 @@ class ConversationHost:
           self._turn_depth += 1
           try:
               try:
-                  reply = self._session.run_turn(text, timeout=timeout)
+                  stream = {"on_event": on_event} if on_event is not None else {}
+                  if cancelled is not None:
+                      stream["cancelled"] = cancelled
+                  reply = self._session.run_turn(text, timeout=timeout, **stream)
+              except TurnCancelled:
+                  _stop_host_session(self, force=True)
+                  raise
               except TimeoutError:
                   # The CLI may still answer this turn later; a reused session would hand that late reply to the
                   # next turn or wake-up. Stop it so the next turn starts (or resumes) a clean one.
@@ -816,7 +822,7 @@ def _wait_socket_ping(sock: Path, deadline: float) -> bool:
     return False
 
 
-def socket_request(sock_path: Path, payload: dict, timeout: float = 300) -> dict:
+def socket_request(sock_path: Path, payload: dict, timeout: float = 300, *, on_event=None, cancelled=None) -> dict:
     payload = dict(payload, token=read_socket_token(sock_path))
     wait_budget = max(timeout, 0.1) + 5
     deadline = time.monotonic() + wait_budget
@@ -832,19 +838,40 @@ def socket_request(sock_path: Path, payload: dict, timeout: float = 300) -> dict
         else:
             raise TimeoutError("lead session socket did not become ready")
         client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-        chunks = []
+        pending = bytearray()
+        relayed_cancel = False
+        reply_deadline = time.monotonic() + max(timeout, 10) + 30
         while True:
-            part = client.recv(65536)
+            if cancelled is not None:
+                if not relayed_cancel and cancelled():
+                    # Signal EOF to the host and keep reading until it has stopped the CLI.
+                    try:
+                        client.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass  # The server may have already sent the completed reply.
+                    relayed_cancel = True
+                if time.monotonic() >= reply_deadline:
+                    raise TimeoutError("lead session host did not reply")
+                client.settimeout(0.1)
+            try:
+                part = client.recv(65536)
+            except socket.timeout:
+                if cancelled is None:
+                    raise
+                continue
             if not part:
                 break
-            chunks.append(part)
-            if b"\n" in part:
-                break
-        lines = b"".join(chunks).splitlines()
-        if not lines:
-            raise RuntimeError("lead session host closed the connection without a reply "
-                               "(its traceback is in state/lead-sessions/<conversation>-serve.log)")
-        return json.loads(lines[0].decode("utf-8"))
+            pending.extend(part)
+            if b"\n" not in part:
+                continue
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                response = json.loads(line)
+                if on_event is None or "cli_event" not in response:
+                    return response
+                on_event(response["cli_event"])
+        raise RuntimeError("lead session host closed the connection without a reply "
+                           "(its traceback is in state/lead-sessions/<conversation>-serve.log)")
 
 
 def ensure_serving(
@@ -883,9 +910,9 @@ def ensure_serving(
     r = roots(HERE.parent.parent, os.environ)
     env = dict(os.environ)
     env.update(
-        LAB_STATE_ROOT=str(state),
-        LAB_CONFIG_ROOT=str(config_root),
-        LAB_CODE_ROOT=str(r["code"]),
+        CS_STATE_ROOT=str(state),
+        CS_CONFIG_ROOT=str(config_root),
+        CS_CODE_ROOT=str(r["code"]),
         LEAD_HOST_QUIET="1",
     )
     # The serve outlives the turn client that spawned it: it must stay up between turns to deliver lane
@@ -928,20 +955,53 @@ def client_turn(
     cli_binary: str = "claude",
     sandbox: bool = True,
     timeout: float = 300,
+    trace=None,
+    cancelled=None,
+    cost_per_1k=0,
 ) -> str:
     cid = resolve_conversation_id(config_root, conversation_id)
     host = ConversationHost(cid, state, config_root)
     ensure_session_credential(cid, config_root, state, model)
     host.validate_workspace(Path(workspace).resolve())
     sock = ensure_serving(cid, state, config_root, model=model, cli_binary=cli_binary, sandbox=sandbox)
-    resp = socket_request(
-        sock,
-        {"op": "turn", "workspace": str(Path(workspace).resolve()), "timeout": timeout},
-        timeout=timeout,
-    )
+    if cancelled is not None and cancelled():
+        raise HostedTurnError("turn cancelled", 143, "cancelled")
+    request = {"op": "turn", "workspace": str(Path(workspace).resolve()), "timeout": timeout}
+    if trace is None:
+        resp = socket_request(sock, request, timeout=timeout)
+    else:
+        from _est import parse_usage
+
+        def record_event(event):
+            raw = json.dumps(event)
+            trace.event(raw.encode("utf-8"))
+            if event.get("type") == "result":
+                trace.report_usage("claude_code_native", parse_usage(raw, "", cost_per_1k),
+                                   reported=bool(event.get("usage") or event.get("modelUsage")))
+            elif event.get("type") == "assistant":
+                # A turn that ends before the result can still report message usage.
+                message = event.get("message") or {}
+                if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                    usage = json.dumps({"type": "result", "usage": message["usage"]})
+                    trace.report_usage("claude_code_native", parse_usage(usage, "", cost_per_1k), reported=True)
+
+        stream = {}
+        if cancelled is not None:
+            request["cancel_on_eof"] = True
+            stream["cancelled"] = cancelled
+        resp = socket_request(sock, dict(request, stream_events=True), timeout=timeout, on_event=record_event, **stream)
+        if resp.get("error"):
+            raise HostedTurnError(str(resp["error"]), resp.get("exit_status", 1), resp.get("outcome", "failed"))
     if resp.get("error"):
         fail(str(resp["error"]))
     return str(resp.get("reply") or "")
+
+
+class HostedTurnError(RuntimeError):
+    def __init__(self, message, status, outcome):
+        super().__init__(message)
+        self.status = status
+        self.outcome = outcome
 
 
 def _peer_uid(conn: socket.socket) -> int | None:
@@ -1106,16 +1166,42 @@ def _serve_conn(conn: socket.socket, host: ConversationHost) -> None:
             return
         workspace = Path(req.get("workspace") or "")
         timeout = float(req.get("timeout") or 300)
-        reply = host.handle_turn(workspace, timeout=timeout)
+        disconnected = False
+
+        def relay(event):
+            nonlocal disconnected
+            if disconnected:
+                return
+            try:
+                conn.sendall(json.dumps({"cli_event": redact_msg(event)}).encode("utf-8") + b"\n")
+            except OSError:
+                disconnected = True
+
+        stream = {"on_event": relay} if req.get("stream_events") is True else {}
+        if req.get("cancel_on_eof") is True:
+            stream["cancelled"] = lambda: disconnected or bool(select.select([conn], [], [], 0)[0])
+        reply = host.handle_turn(workspace, timeout=timeout, **stream)
+        if disconnected:
+            return
         safe = redact_text(reply)
         conn.sendall(
             json.dumps({"reply": safe, "session_id": host._session.session_id if host._session else None}).encode("utf-8") + b"\n"
         )
+    except TurnCancelled:
+        try:
+            conn.sendall(b'{"error":"turn cancelled","exit_status":143,"outcome":"cancelled"}\n')
+        except OSError:
+            pass
     except BaseException as error:  # fail() raises SystemExit: still answer, and keep the traceback
         import traceback
         print(redact_text(traceback.format_exc()), flush=True)
         try:
-            conn.sendall(json.dumps({"error": redact_text("%s: %s" % (type(error).__name__, error))}).encode("utf-8") + b"\n")
+            response = {"error": redact_text("%s: %s" % (type(error).__name__, error))}
+            if isinstance(error, SessionExited):
+                response.update(exit_status=error.status, outcome="exited")
+            elif isinstance(error, TimeoutError):
+                response.update(exit_status=124, outcome="timeout")
+            conn.sendall(json.dumps(response).encode("utf-8") + b"\n")
         except OSError:
             pass
     finally:
@@ -1133,7 +1219,7 @@ def is_hosted_turn_task(task: Path, spec: dict) -> bool:
     return rel.endswith("/tasks/turn") or task.name == "turn"
 
 
-def authorize_hosted_turn(job: dict, task: Path, spec: dict, lab: Path) -> str:
+def authorize_hosted_turn(job: dict, task: Path, spec: dict, code_root: Path) -> str:
     """Only transport-owned Director identity authorizes the hosted path."""
     if not job.get("conversation_id") or not job.get("turn_id"):
         return "hosted-lead and tasks/turn require a Director conversation turn"
@@ -1154,22 +1240,15 @@ def turn_bundle(task: Path, ws: Path) -> Path:
 
 def run_hosted_lead_turn(globals_dict: dict) -> None:
     """Executor hook: one conversation turn via the session host; reply becomes the run result."""
-    import _run_record
     from _agent_stream import append as append_event
-    from functools import partial
 
     ws = Path(globals_dict["ws"])  # the run workspace: the task check and evidence run here
     bundle = turn_bundle(Path(globals_dict["task"]), ws)  # what the session host reads
     run_dir = Path(globals_dict["run_dir"])
     emit = globals_dict["emit"]
-    started = globals_dict["started"]
-    check_window = globals_dict["check_window"]
-    stim_dir = run_dir / "stimulus"
-    child_env = globals_dict["child_env"]
-    LAB = globals_dict["LAB"]
-    run_op = globals_dict["run_op"]
+    CODE_ROOT = globals_dict["CODE_ROOT"]
 
-    r = roots(LAB, os.environ)
+    r = roots(CODE_ROOT, os.environ)
     config_root = r["config"]
     state = r["state"]
     job = globals_dict.get("a") or {}
@@ -1184,6 +1263,17 @@ def run_hosted_lead_turn(globals_dict: dict) -> None:
     elif "opus" in model:
         template_model = "opus"
 
+    trace = globals_dict["trace"]
+    row = globals_dict.setdefault("row", {})
+    row.update(est_usd=0, est_basis="unreported")
+    turn_start = trace.launch()
+    cancelled = False
+
+    def stop_turn(_signum, _frame):
+        nonlocal cancelled
+        cancelled = True
+
+    prior = signal.signal(signal.SIGTERM, stop_turn)
     try:
         reply = client_turn(
             bundle,
@@ -1193,9 +1283,27 @@ def run_hosted_lead_turn(globals_dict: dict) -> None:
             model=template_model,
             cli_binary=cli_binary,
             sandbox=sandbox,
+            trace=trace,
+            cancelled=lambda: cancelled,
+            cost_per_1k=globals_dict.get("cost_per_1k", 0),
         )
     except (Exception, SystemExit) as error:  # client fail() raises SystemExit; the turn still gets its row
-        emit("fail", "lead_host", extra={"note": redact_text(str(error))})
+        if isinstance(error, HostedTurnError):
+            status, outcome = error.status, error.outcome
+        elif isinstance(error, TimeoutError):
+            status, outcome = 124, "timeout"
+        else:
+            status, outcome = 1, "failed"
+        row.update(trace.usage_row)
+        turn_end = trace.clock()
+        trace.exited(turn_start, turn_end, status, outcome)
+        trace.finalization_start = turn_end
+        stop = "cancelled" if outcome == "cancelled" else "lead_host"
+        return emit("fail", stop, extra={"note": redact_text(str(error))})
+    finally:
+        signal.signal(signal.SIGTERM, prior)
+    trace.exited(turn_start, trace.clock(), 0, "completed")
+    trace.finalization_start = trace.clock()
 
     safe_reply = redact_text(reply)
     append_event(run_dir / "messages.jsonl", {"event": "turn", "turn": 1, "text": safe_reply})
@@ -1203,45 +1311,6 @@ def run_hosted_lead_turn(globals_dict: dict) -> None:
     log = "reply:\n%s\n" % safe_reply
     persist_output(run_dir / "cli.log", log)
     persist_output(run_dir / "transcript.md", log)
-    globals_dict["row"]["cli_invoked"] = True
-    globals_dict["row"]["cli_exit"] = 0
-    globals_dict["row"]["turns"] = 1
+    row.update(trace.usage_row, cli_invoked=True, cli_exit=0, turns=1)
 
-    try:
-        chk = globals_dict["run_check_sandboxed"]()
-    except Exception as error:
-        emit("fail", "check_timeout", extra={"note": redact_text(str(error))})
-
-    _run_record.check_json(
-        run_dir,
-        globals_dict["row"].get("stimulus_sha"),
-        check_window,
-        chk.returncode,
-        (chk.stdout or "") + (chk.stderr or ""),
-    )
-    if chk.returncode != 0:
-        emit("fail", "check", extra={"note": redact_text(chk.stderr or chk.stdout or "")[:500]})
-
-    publish_verdict = "pass"
-    _run_record.footer(run_dir, "done", publish_verdict, globals_dict["row"])
-    published, publish_err = run_op(
-        LAB,
-        "publish-evidence",
-        {
-            "run_dir": str(run_dir),
-            "adapter": "executor",
-            "workspace": str(ws),
-            "verdict": publish_verdict,
-            "stop": "done",
-            "check_output": redact_text((chk.stdout or "") + (chk.stderr or ""))[:8192],
-            "check_exit": chk.returncode,
-            "check_skipped": False,
-        },
-    )
-    if publish_err:
-        emit("fail", "publish_evidence", extra={"note": "publish-evidence: " + publish_err})
-    globals_dict["row"]["evidence_sha"] = (published or {}).get("evidence_sha", "")
-    globals_dict["row"]["capture_state"] = (published or {}).get("capture_state", "")
-    if (published or {}).get("capture_state") != "complete":
-        emit("fail", "evidence_incomplete", extra={"note": "; ".join((published or {}).get("incomplete_reasons") or [])})
-    emit("pass", "done")
+    globals_dict["hosted_finish"]()

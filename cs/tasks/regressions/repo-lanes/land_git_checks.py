@@ -14,7 +14,7 @@ def run(kit, expect, tmp):
     home.mkdir()
     config = home / ".gitconfig"
     config.write_text("")
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "LAB_"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "CS_"))}
     env.update(HOME=str(home), GIT_CONFIG_GLOBAL=str(config), GIT_CONFIG_NOSYSTEM="1",
                GIT_TERMINAL_PROMPT="0", CS_REPOS_FILE=str(root / "repos.json"))
 

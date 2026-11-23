@@ -138,6 +138,14 @@ fn network_rules(net: Net, gateway_socket: Option<&Path>) -> Result<Vec<String>,
             }
             Ok(rules)
         }
+        Net::Loopback => Ok([
+            "(deny network*)",
+            "(allow network-bind (local ip \"localhost:*\"))",
+            "(allow network-inbound (local ip \"localhost:*\"))",
+            "(allow network-outbound (remote ip \"localhost:*\"))",
+        ]
+        .map(str::to_owned)
+        .to_vec()),
         Net::All => {
             let mut rules = vec![
                 "(deny network*)".to_owned(),
@@ -311,19 +319,19 @@ mod tests {
                 PathBuf::from("/opt/homebrew"),
                 PathBuf::from("/private/tmp/ws"),
                 PathBuf::from("/private/var/folders/xy/T/cs-sandbox-7-8"),
-                PathBuf::from("/Users/me/.contextstack/lab/browser-state"),
+                PathBuf::from("/Users/me/.contextstack/state/browser-state"),
                 PathBuf::from("/usr"),
             ],
             write: vec![
                 PathBuf::from("/private/tmp/ws"),
                 PathBuf::from("/private/var/folders/xy/T/cs-sandbox-7-8"),
-                PathBuf::from("/Users/me/.contextstack/lab/browser-state"),
+                PathBuf::from("/Users/me/.contextstack/state/browser-state"),
             ],
             net,
             tmp: PathBuf::from("/private/var/folders/xy/T/cs-sandbox-7-8"),
             write_env: std::collections::BTreeMap::from([(
-                "LAB_BROWSER_STATE".to_owned(),
-                PathBuf::from("/Users/me/.contextstack/lab/browser-state"),
+                "CS_BROWSER_STATE".to_owned(),
+                PathBuf::from("/Users/me/.contextstack/state/browser-state"),
             )]),
             profile: None,
             sockets: std::collections::BTreeMap::new(),
@@ -344,11 +352,11 @@ mod tests {
 (allow file-read* (subpath "/opt/homebrew"))
 (allow file-read* (subpath "/private/tmp/ws"))
 (allow file-read* (subpath "/private/var/folders/xy/T/cs-sandbox-7-8"))
-(allow file-read* (subpath "/Users/me/.contextstack/lab/browser-state"))
+(allow file-read* (subpath "/Users/me/.contextstack/state/browser-state"))
 (allow file-read* (subpath "/usr"))
 (allow file-write* (subpath "/private/tmp/ws"))
 (allow file-write* (subpath "/private/var/folders/xy/T/cs-sandbox-7-8"))
-(allow file-write* (subpath "/Users/me/.contextstack/lab/browser-state"))
+(allow file-write* (subpath "/Users/me/.contextstack/state/browser-state"))
 (allow file-read* file-write-data (literal "/dev/null"))
 (allow file-read* (literal "/dev/urandom") (literal "/dev/random") (literal "/dev/zero"))
 (allow file-read* (literal "/dev/tty"))
@@ -363,7 +371,7 @@ mod tests {
 (allow file-read* (require-all (subpath "/opt/homebrew") (regex #"/\.env\.example$")))
 (allow file-read* (require-all (subpath "/private/tmp/ws") (regex #"/\.env\.example$")))
 (allow file-read* (require-all (subpath "/private/var/folders/xy/T/cs-sandbox-7-8") (regex #"/\.env\.example$")))
-(allow file-read* (require-all (subpath "/Users/me/.contextstack/lab/browser-state") (regex #"/\.env\.example$")))
+(allow file-read* (require-all (subpath "/Users/me/.contextstack/state/browser-state") (regex #"/\.env\.example$")))
 (allow file-read* (require-all (subpath "/usr") (regex #"/\.env\.example$")))
 "#;
 
@@ -381,11 +389,11 @@ mod tests {
 (allow file-read* (subpath "/opt/homebrew"))
 (allow file-read* (subpath "/private/tmp/ws"))
 (allow file-read* (subpath "/private/var/folders/xy/T/cs-sandbox-7-8"))
-(allow file-read* (subpath "/Users/me/.contextstack/lab/browser-state"))
+(allow file-read* (subpath "/Users/me/.contextstack/state/browser-state"))
 (allow file-read* (subpath "/usr"))
 (allow file-write* (subpath "/private/tmp/ws"))
 (allow file-write* (subpath "/private/var/folders/xy/T/cs-sandbox-7-8"))
-(allow file-write* (subpath "/Users/me/.contextstack/lab/browser-state"))
+(allow file-write* (subpath "/Users/me/.contextstack/state/browser-state"))
 (allow file-read* file-write-data (literal "/dev/null"))
 (allow file-read* (literal "/dev/urandom") (literal "/dev/random") (literal "/dev/zero"))
 (allow file-read* (literal "/dev/tty"))
@@ -406,7 +414,7 @@ mod tests {
 (allow file-read* (require-all (subpath "/opt/homebrew") (regex #"/\.env\.example$")))
 (allow file-read* (require-all (subpath "/private/tmp/ws") (regex #"/\.env\.example$")))
 (allow file-read* (require-all (subpath "/private/var/folders/xy/T/cs-sandbox-7-8") (regex #"/\.env\.example$")))
-(allow file-read* (require-all (subpath "/Users/me/.contextstack/lab/browser-state") (regex #"/\.env\.example$")))
+(allow file-read* (require-all (subpath "/Users/me/.contextstack/state/browser-state") (regex #"/\.env\.example$")))
 (allow file-read* (require-all (subpath "/usr") (regex #"/\.env\.example$")))
 "#;
 

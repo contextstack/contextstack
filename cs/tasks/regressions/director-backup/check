@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Exercise cs backup over a loopback S3-compatible HTTP server."""
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import plistlib
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from threading import Event, Thread
+from urllib.parse import parse_qs, unquote, urlsplit
+import xml.etree.ElementTree as xml
+
+HERE = Path(__file__).resolve().parent
+CS = HERE.parents[2]
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from hermetic_env import hermetic_env
+
+ACCESS = "fixture-access"
+SECRET = b"fixture-s3-secret"
+MACHINE = "fixture"
+PREFIX = f"backups/director/{MACHINE}/"
+EVAL = b"fixture plaintext eval containing distinctive data\n"
+
+
+class FakeS3(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def respond(self, code, body=b""):
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def verify(self, body):
+        authorization = self.headers.get("Authorization", "")
+        stamp = self.headers["x-amz-date"]
+        digest = hashlib.sha256(body).hexdigest()
+        path, _, query = self.path.partition("?")
+        fields = ["host", "x-amz-content-sha256", "x-amz-date"]
+        canonical = "\n".join([self.command, path, query,
+                               "".join(f"{name}:{self.headers[name]}\n" for name in fields),
+                               ";".join(fields), digest])
+        scope = f"{stamp[:8]}/fixture-region/s3/aws4_request"
+        algorithm = "AWS4-HMAC-SHA256"
+        message = f"{algorithm}\n{stamp}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
+        key = b"AWS4" + SECRET
+        for part in scope.encode().split(b"/"):
+            key = hmac.new(key, part, hashlib.sha256).digest()
+        signature = hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
+        expected = f"{algorithm} Credential={ACCESS}/{scope}, SignedHeaders={';'.join(fields)}, Signature={signature}"
+        return hmac.compare_digest(authorization, expected) and self.headers["x-amz-content-sha256"] == digest
+
+    def do_GET(self):
+        if not self.verify(b""):
+            return self.respond(403)
+        uri = urlsplit(self.path)
+        if uri.path == "/fixture-bucket":
+            query = parse_qs(uri.query)
+            assert query["list-type"] == ["2"] and query["prefix"] == [PREFIX]
+            # Deliberately include unrelated keys and use an opaque continuation token.
+            keys = sorted(self.server.objects)
+            listing = xml.Element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+            next_page = "continuation-token" in query
+            if next_page:
+                assert query["continuation-token"] == ["opaque+/="]
+            for key in keys[20:] if next_page else keys[:20]:
+                xml.SubElement(xml.SubElement(listing, "Contents"), "Key").text = key
+            xml.SubElement(listing, "IsTruncated").text = "false" if next_page else "true"
+            if not next_page:
+                xml.SubElement(listing, "NextContinuationToken").text = "opaque+/="
+            return self.respond(200, xml.tostring(listing))
+        key = unquote(uri.path.removeprefix("/fixture-bucket/"))
+        if key not in self.server.objects:
+            return self.respond(404)
+        self.respond(200, self.server.objects[key])
+
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        if not self.verify(body) or not self.path.startswith("/fixture-bucket/" + PREFIX):
+            return self.respond(403)
+        self.server.uploaded = unquote(self.path.removeprefix("/fixture-bucket/"))
+        self.server.objects[self.server.uploaded] = body
+        self.respond(200)
+
+    def do_DELETE(self):
+        if not self.verify(b""):
+            return self.respond(403)
+        key = unquote(self.path.removeprefix("/fixture-bucket/"))
+        self.server.deleted.add(key)
+        self.server.objects.pop(key, None)
+        self.respond(204)
+
+
+def dump(db):
+    with closing(sqlite3.connect(db)) as connection:
+        return list(connection.iterdump())
+
+
+def exercise(server, home):
+    root = home / ".contextstack"
+    state = root / "state"
+    db = state / "director/director.sqlite"
+    config = root / "config"
+    creds = root / "credentials"
+    db.parent.mkdir(parents=True)
+    config.mkdir()
+    env = hermetic_env()
+    env.update(HOME=str(home), NODE_INSTALL_PLATFORM="macos", NO_PROXY="*")
+
+    def cli(*args, platform="macos", success=True):
+        result = subprocess.run([CS / "scripts/cs", "backup", *args],
+                                env={**env, "NODE_INSTALL_PLATFORM": platform},
+                                capture_output=True, text=True, timeout=30)
+        assert (result.returncode == 0) == success, (result.stdout, result.stderr)
+        return result.stdout + result.stderr
+
+    assert "password manager" in cli("init", "--no-load")
+    key_path = creds / "backup-encryption-key"
+    key = key_path.read_bytes()
+    assert key.strip().decode() not in cli("init", "--no-load", platform="linux")
+    assert key_path.read_bytes() == key
+    assert key_path.stat().st_mode & 0o777 == 0o600
+    plist = plistlib.loads((home / "Library/LaunchAgents/com.contextstack.backup.plist").read_bytes())
+    assert plist["StartCalendarInterval"] == {"Hour": 3, "Minute": 0}
+    assert plist["ProgramArguments"][-2:] == ["backup", "run"]
+    unit_dir = home / ".config/systemd/user"
+    assert "Type=oneshot" in (unit_dir / "com.contextstack.backup.service").read_text()
+    assert "OnCalendar=*-*-* 03:00:00" in (unit_dir / "com.contextstack.backup.timer").read_text()
+
+    (config / "backup.json").write_text(json.dumps({
+        "endpoint": f"http://127.0.0.1:{server.server_port}", "bucket": "fixture-bucket",
+        "prefix": "backups/director", "region": "fixture-region", "machine": MACHINE,
+    }))
+    for name, value in [("backup-s3-access-key", ACCESS.encode()), ("backup-s3-secret-key", SECRET)]:
+        (creds / name).write_bytes(value)
+        (creds / name).chmod(0o600)
+
+    (root / "evals/nested").mkdir(parents=True)
+    (root / "evals/nested/example").write_bytes(EVAL)
+    (root / "evals/credential-link").symlink_to(key_path)
+    os.link(key_path, root / "evals/credential-hardlink")
+    assert "cannot read credential backup-encryption-key" in cli("run", success=False)
+    (root / "evals/credential-hardlink").unlink()
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    old_keys = {PREFIX + (today - timedelta(days=offset)).strftime("%Y%m%dT%H%M%S.%fZ.tar.csenc")
+                for offset in range(1, 80)}
+    unrelated = {PREFIX + "readme", PREFIX + "sub/20000101T010101.000000Z.tar.csenc",
+                 PREFIX.replace(MACHINE, MACHINE + "-other") + "20000101T010101.000000Z.tar.csenc",
+                 "other-prefix/20000101T010101.000000Z.tar.csenc"}
+    server.objects.update(dict.fromkeys(old_keys | unrelated, b"older backup"))
+    with closing(sqlite3.connect(db)) as live:
+        assert live.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        live.execute("PRAGMA wal_autocheckpoint=0")
+        live.execute("CREATE TABLE records(id INTEGER PRIMARY KEY, payload BLOB)")
+        live.executemany("INSERT INTO records(payload) VALUES (?)", [(bytes([i]) * 18000,) for i in range(80)])
+        live.commit()
+        assert db.with_suffix(".sqlite-wal").stat().st_size > 1024 * 1024
+        failure = cli("run", success=False)
+        assert "evals/credential-link" in failure, failure
+        (root / "evals/credential-link").unlink()
+        alias = root / "evals/nested/alias"
+        os.link(root / "evals/nested/example", alias)
+        failure = cli("run", success=False)
+        assert "evals/nested/" in failure, failure
+        alias.unlink()
+        expected = dump(db)
+        active, stop = Event(), Event()
+
+        def writer():
+            with closing(sqlite3.connect(db)) as write:
+                write.execute("BEGIN IMMEDIATE")
+                while not stop.wait(0.001):
+                    write.execute("INSERT INTO records(payload) VALUES ('uncommitted')")
+                    active.set()
+                write.rollback()
+
+        thread = Thread(target=writer)
+        thread.start()
+        try:
+            assert active.wait(5)
+            uploaded_uri = cli("run").strip()
+            assert thread.is_alive()
+        finally:
+            stop.set()
+            thread.join(5)
+        uploaded = server.uploaded
+        ciphertext = server.objects[uploaded]
+        assert ciphertext.startswith(b"CSBACKUP\x01")
+        assert b"SQLite format 3\x00" not in ciphertext and EVAL not in ciphertext
+
+        # Compute the expected union by grouping distinct dates and ISO weeks.
+        names = sorted(old_keys | {uploaded}, reverse=True)
+        daily = names[:14]  # fixture has exactly one backup per UTC day
+        weekly = {}
+        for name in names:
+            date = datetime.strptime(name[len(PREFIX):len(PREFIX) + 8], "%Y%m%d")
+            weekly.setdefault(date.isocalendar()[:2], name)
+        kept = set(daily) | set(list(weekly.values())[:8])
+        assert server.deleted == old_keys - kept
+        assert set(server.objects) == kept | unrelated
+        status = json.loads(cli("status"))
+        assert status["last_success"] and status["last_error"] is None
+        assert status["size_bytes"] == len(ciphertext) and status["object_count"] == len(kept)
+
+        restored = home / "restored"
+        restored.mkdir()
+        assert "cs stop director" in cli("restore", "latest", "--to", restored)
+        with closing(sqlite3.connect(restored / db.name)) as copy:
+            assert copy.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert dump(restored / db.name) == expected
+        assert (restored / "evals/nested/example").read_bytes() == EVAL
+        assert not list((restored / "evals").glob("credential-*"))
+        assert {p.name for p in restored.iterdir()} == {db.name, "evals"}
+        assert "live Director database" in cli("restore", "latest", "--to", db.parent, success=False)
+        assert "live Director database" in cli("restore", "latest", "--to", db, success=False)
+        assert "new or empty" in cli("restore", "latest", "--to", restored, success=False)
+        assert dump(db) == expected
+        server.objects[uploaded] = ciphertext[:-1]
+        assert "decryption failed" in cli("restore", uploaded_uri, "--to", home / "corrupt", success=False)
+        assert not (home / "corrupt").exists()
+
+    (creds / "backup-s3-secret-key").unlink()
+    failure = cli("run", success=False)
+    assert "missing credential backup-s3-secret-key" in failure and SECRET.decode() not in failure
+    status = json.loads(cli("status"))
+    assert status["last_success"] and status["object_count"] == len(kept)
+    assert status["last_error"] == "missing credential backup-s3-secret-key"
+    sys.path.insert(0, str(CS / "ops/bin"))
+    from _vitals import status_extras
+    vitals = status_extras(state, config, disk_free=10**10)["vitals"]
+    assert vitals["backup_error"] == status["last_error"]
+
+
+with tempfile.TemporaryDirectory(prefix="director-backup-check-") as tmp, ThreadingHTTPServer(
+        ("127.0.0.1", 0), FakeS3) as server:
+    server.objects = {}
+    server.deleted = set()
+    thread = Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        # The credential helper rejects symlink components (macOS /var is one).
+        exercise(server, Path(tmp).resolve())
+    finally:
+        server.shutdown()
+        thread.join()
+print("director-backup: WAL snapshot, SigV4, encryption, retention, restore and scheduling OK")

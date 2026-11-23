@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# lab tool: run a command (argv array, no shell) in the workspace.
-# Argv: no absolute paths, no '..'. Writes: OS sandbox (cwd only).
+# code_root tool: run a command (argv or shell string) in the workspace.
+# Absolute argv paths must resolve under the workspace or repository view. No '..'.
 # Already confined by cs-sandbox -> run the command directly, since neither backend nests
 # (Seatbelt refuses; bwrap gets no user namespace); not confined -> wrap it in this tool's own
 # sandbox-exec profile (macOS) or bwrap (Linux).
-# Output clip: pi truncate.ts dual limits; spill full text to .lab-out/<n>.txt.
-# Child timeout: LAB_TOOL_TIMEOUT_SECONDS from the runner (max(descriptor, 60)), minus MARGIN
+# Output clip: pi truncate.ts dual limits; spill full text to .cs-out/<n>.txt.
+# Child timeout: CS_TOOL_TIMEOUT_SECONDS from the runner (max(descriptor, 60)), minus MARGIN
 # so this process can emit exec: timed out after N s before the runner kills it.
-import ctypes, json, os, shutil, subprocess, sys
+import ctypes, json, os, re, shutil, subprocess, sys
 import _calllog
 
 MAX_LINES, MAX_BYTES = 2000, 50 * 1024
@@ -45,7 +45,7 @@ def already_confined():
 
 
 def runner_timeout_seconds():
-    raw = os.environ.get("LAB_TOOL_TIMEOUT_SECONDS")
+    raw = os.environ.get("CS_TOOL_TIMEOUT_SECONDS")
     if raw:
         try:
             return max(1, int(raw))
@@ -77,14 +77,14 @@ def emit(raw, code):
             out.append(line)
             n += extra
     if truncated:
-        os.makedirs(".lab-out", exist_ok=True)
+        os.makedirs(".cs-out", exist_ok=True)
         k = 1
-        while os.path.exists(".lab-out/%d.txt" % k):
+        while os.path.exists(".cs-out/%d.txt" % k):
             k += 1
-        open(".lab-out/%d.txt" % k, "w", encoding="utf-8").write(raw)
+        open(".cs-out/%d.txt" % k, "w", encoding="utf-8").write(raw)
         shown = "\n".join(out)
         end = len(out) if out else 0
-        print("lines 1-%d of %d — re-read with offset=%d; full output in .lab-out/%d.txt" % (
+        print("lines 1-%d of %d — re-read with offset=%d; full output in .cs-out/%d.txt" % (
             end, len(lines), end + 1, k))
         print()
         print(shown, end="")
@@ -92,22 +92,47 @@ def emit(raw, code):
         print(raw, end="")
 
 
-a = json.load(sys.stdin)
-_calllog.record("exec", a)
-cmd = a.get("cmd")
-if not cmd:
-    sys.exit("bad args: need cmd:[...]")
-for s in cmd:
-    if os.path.isabs(s) or ".." in s.split("/"):
-        sys.exit("path escapes workspace: " + s)
+CMD_HELP = 'Pass {"cmd":["ls","docs"]} for argv or {"cmd":"cd docs && ls | head"} for shell syntax.'
 
+
+def path_help():
+    if repo_view:
+        return f"Relative paths resolve in your workspace. Use the absolute repository path under {repo_view} or use repo_search."
+    return "Use paths relative to your workspace."
+
+
+try:
+    a = json.load(sys.stdin)
+except ValueError:
+    sys.exit("Invalid JSON. " + CMD_HELP)
+_calllog.record("exec", a)
+cmd = a.get("cmd") if isinstance(a, dict) else a
+repo_view = os.environ.get("CS_REPO_VIEW")
 cwd = os.path.realpath(os.getcwd())
+if isinstance(cmd, str) and cmd.strip():
+    cmd = ["/bin/sh", "-c", cmd]
+elif isinstance(cmd, list) and isinstance(a, dict) and cmd and all(isinstance(s, str) for s in cmd) and cmd[0]:
+    roots = [cwd]
+    if repo_view:
+        roots.append(os.path.realpath(repo_view))
+    for s in cmd:
+        if s in {"|", "||", "&&", ";", "&"} or re.match(r"^(?:[0-9]*[<>]|&>)", s):
+            sys.exit(f"Shell syntax {s!r} is unsupported. Pass argv as a list without redirection or pipes, or use a shell string."
+                     + (" " + path_help() if repo_view else ""))
+        absolute = os.path.isabs(s)
+        target = os.path.realpath(s) if absolute else None
+        outside = absolute and not any(os.path.commonpath([root, target]) == root for root in roots)
+        if outside or ".." in s.split("/"):
+            sys.exit(f"Path escapes workspace: {s!r}. " + path_help())
+else:
+    sys.exit("Exec requires a nonempty shell string or argv list of strings. " + CMD_HELP)
+
 plat = sys.platform
 if already_confined():
     wrapped = list(cmd)
 elif plat == "darwin":
     if not shutil.which("sandbox-exec"):
-        sys.exit("exec sandbox unavailable: sandbox-exec not on PATH")
+        sys.exit("Exec sandbox unavailable: sandbox-exec is missing. Use a dedicated file tool.")
     safe = cwd.replace("\\", "\\\\").replace('"', '\\"')
     profile = (
         '(version 1)\n(allow default)\n(deny file-write*)\n'
@@ -123,7 +148,7 @@ elif plat.startswith("linux"):
                "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
                "--bind", cwd, cwd, "--chdir", cwd] + list(cmd)
 else:
-    sys.exit("exec sandbox unavailable on " + plat)
+    sys.exit(f"Exec sandbox unavailable on {plat}. Use a dedicated file tool.")
 
 budget = runner_timeout_seconds()
 timeout = max(1, budget - MARGIN)
@@ -132,25 +157,37 @@ try:
     # PHP/composer tools write to the system temp dir; the sandbox denies
     # writes outside cwd, so point TMPDIR/TMP/TEMP at a workspace dir.
     # Composer's package cache (~/.composer/cache) gets the same treatment.
-    t = os.path.join(cwd, ".lab-tmp")
+    t = os.path.join(cwd, ".cs-tmp")
     os.makedirs(t, exist_ok=True)
     env = dict(os.environ, TMPDIR=t, TMP=t, TEMP=t,
                COMPOSER_CACHE_DIR=os.path.join(t, "composer"))
     r = subprocess.run(wrapped, capture_output=True, text=True, timeout=timeout, env=env)
 except subprocess.TimeoutExpired as e:
-    partial = (e.stdout or "") + (e.stderr or "")
-    print("exec: timed out after %d s; output so far:" % budget, end="")
+    partial = ((e.stdout or b"") + (e.stderr or b"")).decode("utf-8", errors="replace")
+    print("exec: timed out after %d s; output so far:" % budget)
+    print("Narrow the command's scope or use a dedicated file tool.", end="")
     if partial:
         print()
         emit(partial, TIMEOUT_EXIT)
     sys.exit(TIMEOUT_EXIT)
 except Exception as e:
-    sys.exit(str(e))
+    sys.exit(f"Cannot run {cmd[0]!r}: {e}. " + CMD_HELP)
 
 raw = r.stdout + r.stderr
+if r.returncode != 0:
+    reason = f"Command {cmd[0]!r} exited {r.returncode}."
+    if cmd[0] in {"grep", "rg"} and r.returncode == 1:
+        hint = "No matches. Check the query and search path."
+    elif "no such file" in raw.lower() or "not found" in raw.lower():
+        hint = path_help()
+    elif any(message in raw.lower() for message in ("permission denied", "operation not permitted",
+                                                     "read-only file system")):
+        hint = "Use readable input paths and write outputs in the workspace."
+    else:
+        hint = path_help() if repo_view else CMD_HELP
+    raw = f"{reason} {hint}\n" + raw
 if not raw.strip():
-    print("(no output, exit %d)" % r.returncode, end="")
-    sys.exit(0 if r.returncode == 0 else 1)
-
-emit(raw, r.returncode)
+    print("(no output, exit 0)", end="")
+else:
+    emit(raw, r.returncode)
 sys.exit(0 if r.returncode == 0 else 1)

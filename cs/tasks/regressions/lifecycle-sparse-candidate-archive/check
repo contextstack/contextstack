@@ -11,8 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
-HERE = LAB / "ops/bin"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+HERE = CODE_ROOT / "ops/bin"
 sys.path.insert(0, str(HERE))
 loader = importlib.machinery.SourceFileLoader("publish_sparse", str(HERE / "publish-evidence"))
 module_spec = importlib.util.spec_from_loader("publish_sparse", loader)

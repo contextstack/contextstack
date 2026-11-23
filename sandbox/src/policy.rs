@@ -20,6 +20,8 @@ pub enum Net {
     None,
     /// One unix socket, the gateway's, and nothing else.
     Gateway,
+    /// IP traffic on loopback only.
+    Loopback,
     /// Unrestricted network.
     All,
 }
@@ -30,6 +32,7 @@ impl Net {
         match self {
             Net::None => "none",
             Net::Gateway => "gateway",
+            Net::Loopback => "loopback",
             Net::All => "all",
         }
     }
@@ -257,10 +260,10 @@ pub fn socket_var(name: &str) -> String {
     format!("CS_SOCKET_{}", name.to_ascii_uppercase().replace('-', "_"))
 }
 
-/// `$CODE_ROOT`: `LAB_CODE_ROOT` when set, else the policy file's grandparent directory
+/// `$CODE_ROOT`: `CS_CODE_ROOT` when set, else the policy file's grandparent directory
 /// (the code root when the file is `cs/policy/sandbox.json`).
 pub fn code_root(policy_path: &Path) -> PathBuf {
-    if let Some(root) = env::var_os("LAB_CODE_ROOT") {
+    if let Some(root) = env::var_os("CS_CODE_ROOT") {
         return PathBuf::from(root);
     }
     let absolute = if policy_path.is_absolute() {
@@ -742,11 +745,11 @@ mod tests {
         std::fs::write(&file, good).map_err(|error| error.to_string())?;
         let parsed = load_host(&file).map_err(|failure| failure.message().to_owned())?;
         assert_eq!(parsed, host(&[Net::None, Net::All]).with_usr_only());
-        let with_env = r#"{"version":1,"runtime_read":["/usr"],"allow_net":["none"],"write_env":{"LAB_X":["$HOME/.contextstack"]}}"#;
+        let with_env = r#"{"version":1,"runtime_read":["/usr"],"allow_net":["none"],"write_env":{"CS_X":["$HOME/.contextstack"]}}"#;
         std::fs::write(&file, with_env).map_err(|error| error.to_string())?;
         let parsed = load_host(&file).map_err(|failure| failure.message().to_owned())?;
         assert_eq!(
-            parsed.write_env.get("LAB_X"),
+            parsed.write_env.get("CS_X"),
             Some(&vec!["$HOME/.contextstack".to_owned()])
         );
         let with_profile = r#"{"version":1,"runtime_read":["/usr"],"allow_net":["all"],"profiles":{"browser":{"read":{"macos":["$HOME/b"]}}}}"#;
@@ -763,9 +766,9 @@ mod tests {
             r#"{"version":2,"runtime_read":[],"allow_net":[]}"#,
             r#"{"version":1,"runtime_read":[],"allow_net":["lan"]}"#,
             r#"{"version":1,"runtime_read":[],"allow_net":[],"extra":1}"#,
-            r#"{"version":1,"runtime_read":[],"allow_net":[],"tmp_in_workspace":".lab-tmp"}"#,
-            r#"{"version":1,"runtime_read":[],"allow_net":[],"write_env":["LAB_X"]}"#,
-            r#"{"version":1,"runtime_read":[],"allow_net":[],"write_env":{"LAB_X":"/s"}}"#,
+            r#"{"version":1,"runtime_read":[],"allow_net":[],"tmp_in_workspace":".cs-tmp"}"#,
+            r#"{"version":1,"runtime_read":[],"allow_net":[],"write_env":["CS_X"]}"#,
+            r#"{"version":1,"runtime_read":[],"allow_net":[],"write_env":{"CS_X":"/s"}}"#,
             r#"{"version":1,"allow_net":[]}"#,
             r#"{"version":1,"runtime_read":{"windows":["/x"]},"allow_net":[]}"#,
             r#"{"version":1,"runtime_read":{"linux":"/usr"},"allow_net":[]}"#,
@@ -1006,7 +1009,7 @@ mod tests {
             .path()
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        let code_root = repo.join("lab");
+        let code_root = repo.join("cs");
         let bin_dir = code_root.join("tools/bin");
         std::fs::create_dir_all(&bin_dir).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(repo.join("target")).map_err(|error| error.to_string())?;
@@ -1380,26 +1383,26 @@ mod tests {
             .path()
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        let state = home.join(".contextstack/lab/browser-state");
+        let state = home.join(".contextstack/state/browser-state");
         let mut policy = host(&[Net::None]);
         policy
             .write_env
-            .insert("LAB_X".to_owned(), vec!["$HOME/.contextstack".to_owned()]);
+            .insert("CS_X".to_owned(), vec!["$HOME/.contextstack".to_owned()]);
         let request = Request {
-            write_env: vec!["LAB_X".to_owned(), "LAB_UNLISTED".to_owned()],
+            write_env: vec!["CS_X".to_owned(), "CS_UNLISTED".to_owned()],
             ..Request::default()
         };
         let tmp = Path::new("/private/tmp/cs-sandbox-9-9");
-        let set = |name: &str| (name == "LAB_X").then(|| state.clone().into_os_string());
+        let set = |name: &str| (name == "CS_X").then(|| state.clone().into_os_string());
         let (effective, narrowed) =
             intersect(&policy, &request, &ws, tmp, Path::new("/code"), &home, &set)
                 .map_err(|failure| failure.message().to_owned())?;
-        assert_eq!(effective.write_env.get("LAB_X"), Some(&state));
+        assert_eq!(effective.write_env.get("CS_X"), Some(&state));
         assert!(effective.write.contains(&state));
         assert!(effective.read.contains(&state));
         assert_eq!(narrowed.len(), 1);
         assert_eq!(narrowed[0].capability, "write_env");
-        assert_eq!(narrowed[0].requested, "LAB_UNLISTED");
+        assert_eq!(narrowed[0].requested, "CS_UNLISTED");
         assert!(narrowed[0].reason.contains("does not list"));
         let (unset, narrowed) = intersect(
             &policy,
@@ -1413,10 +1416,10 @@ mod tests {
         .map_err(|failure| failure.message().to_owned())?;
         assert!(unset.write_env.is_empty());
         assert!(!unset.write.contains(&state));
-        assert_eq!(narrowed[0].reason, "LAB_X is unset");
+        assert_eq!(narrowed[0].reason, "CS_X is unset");
         policy
             .write_env
-            .insert("LAB_X".to_owned(), vec!["relative/root".to_owned()]);
+            .insert("CS_X".to_owned(), vec!["relative/root".to_owned()]);
         let code = intersect(&policy, &request, &ws, tmp, Path::new("/code"), &home, &set)
             .err()
             .map(|failure| failure.code());

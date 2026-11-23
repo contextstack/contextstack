@@ -2,7 +2,7 @@
 # Strip Co-authored-by so Cursor injection cannot land (AGENTS.md).
 msg="$1"
 case "$msg" in /*) ;; *) msg="$PWD/$msg" ;; esac
-# lab may be a repo of its own or a subfolder of one: root is this file's lab.
+# The code root may be its own repo or a subfolder of one.
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root" || exit 1
 if grep -qiE 'Co-Authored-By:|Co-authored-by:|Generated with' "$msg"; then

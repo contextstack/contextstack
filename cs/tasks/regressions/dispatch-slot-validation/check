@@ -9,15 +9,15 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 
 with scratch_dir(prefix="dispatch-slot-") as raw:
     root = Path(raw)
     (root / "ops/bin").mkdir(parents=True)
     (root / "specs").mkdir()
     (root / "ledger").mkdir()
-    for name in ('_dispatch.py', '_estate_io.py', '_roots.py', "enqueue", "_grant.py", "_corpus_contract.py", "_workspace_setup.py"):
-        shutil.copy2(LAB / "ops/bin" / name, root / "ops/bin" / name)
+    for name in ('_dispatch.py', '_estate_io.py', '_roots.py', "enqueue", "_grant.py", "_workspace_setup.py"):
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, root / "ops/bin" / name)
     (root / "specs/fixture.yaml").write_text("id: fixture\nmodel: local-coder\n", encoding="utf-8")
     enqueue = root / "ops/bin/enqueue"
     bad = subprocess.run(

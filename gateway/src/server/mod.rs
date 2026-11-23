@@ -1,15 +1,15 @@
 //! HTTP: one handler served on TCP and, optionally, a unix socket. Bearer auth and
-//! admission apply identically on both; loopback-origin routes (lab-execute) refuse over the socket,
+//! admission apply identically on both; loopback-origin routes (cli.run) refuse over the socket,
 //! which has no peer IP.
 
-mod lab;
+mod cli;
 mod model_call;
 mod routes;
 mod typed;
 
 use crate::gateway::Gateway;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Full, Limited, combinators::UnsyncBoxBody};
 use hyper::{Request, Response, StatusCode, body::Incoming};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -42,7 +42,7 @@ const ROUTES: [(&str, &str); 14] = [
     ("/v1/inventory/refresh", "POST"),
     ("/v1/discovery/health", "GET"),
     ("/v1/catalog", "GET"),
-    ("/v1/ai/lab-execute", "POST"),
+    ("/v1/agent/cli.run", "POST"),
     ("/v1/ai/typed-question", "POST"),
 ];
 
@@ -75,11 +75,6 @@ pub fn error(status: u16, msg: &str, code: &str) -> Response<Body> {
 /// A plain-text error (Go's `http.Error`).
 /// The most of a refused request's body read before answering: Go net/http's `maxPostHandlerReadBytes`.
 const REFUSED_BODY_MAX: usize = 256 * 1024;
-/// A model call carries the prompt, the transcript and tool results. 32 MiB is the same ceiling as
-/// `POST /v1/ai/typed-question`: large enough for a long context, and a bound so one call cannot
-/// buffer without a limit.
-const MODEL_CALL_MAX: usize = 32 * 1024 * 1024;
-
 /// Answer `resp` to a request refused before its body was read, reading that body first (at most
 /// 256 KiB, for at most 5 s). hyper closes a connection whose body is unread, so a client still
 /// sending it (Python's http.client writes headers and body separately) got a broken pipe instead of
@@ -160,7 +155,7 @@ async fn route(gw: &Arc<Gateway>, peer: Peer, req: Request<Incoming>) -> Respons
         .trim()
         .to_string();
     if let Some(id) = path
-        .strip_prefix("/v1/ai/lab-execute/")
+        .strip_prefix("/v1/agent/cli.run/")
         .and_then(|r| r.strip_suffix("/cancel"))
     {
         if method != "POST" {
@@ -170,7 +165,7 @@ async fn route(gw: &Arc<Gateway>, peer: Peer, req: Request<Incoming>) -> Respons
             return refuse(req, r).await;
         }
         let id = id.to_string();
-        return lab::cancel(gw, peer, &caller, &id, req).await;
+        return cli::cancel(gw, peer, &caller, &id, req).await;
     }
     let wants: Vec<&str> = ROUTES
         .iter()
@@ -202,18 +197,9 @@ async fn route(gw: &Arc<Gateway>, peer: Peer, req: Request<Incoming>) -> Respons
     let query = parse_query(req.uri().query().unwrap_or(""));
     match path.as_str() {
         "/v1/agent/model.call" | "/v1/cs/model.call" => {
-            match Limited::new(req.into_body(), MODEL_CALL_MAX)
-                .collect()
-                .await
-            {
-                Ok(b) => model_call::handle(gw, &path, &caller, &b.to_bytes()).await,
-                Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
-                    error(413, "model call over 32 MiB", "payload_too_large")
-                }
-                Err(e) => model_call::undecodable(&e.to_string()),
-            }
+            model_call::receive(gw, &path, &caller, req.into_body()).await
         }
-        "/v1/ai/lab-execute" => lab::execute(gw, peer, &caller, req).await,
+        "/v1/agent/cli.run" => cli::execute(gw, peer, &caller, req).await,
         "/v1/ai/typed-question" => typed::handle(gw, req).await,
         "/v1/health" => routes::health(gw).await,
         "/v1/capabilities" => routes::capabilities(gw),
@@ -224,7 +210,7 @@ async fn route(gw: &Arc<Gateway>, peer: Peer, req: Request<Incoming>) -> Respons
         "/v1/catalog" => json(200, &gw.catalog_status()),
         "/v1/admission" => json(200, &gw.admission.report()),
         "/v1/budgets" if method == "PUT" => routes::put_budgets(gw, peer, req).await,
-        "/v1/budgets" => routes::budgets(gw),
+        "/v1/budgets" => routes::budgets(gw).await,
         _ => full(404, "text/plain; charset=utf-8", "404 page not found\n"),
     }
 }

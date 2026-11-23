@@ -1,5 +1,5 @@
 //! Director-owned chief-of-staff slot, stored atomically with its conversation in meta.
-use crate::access::{Client, Kind};
+use crate::access::Client;
 use crate::server::{Call, Reply, State, internal, json};
 use crate::store::{Record, touch};
 use crate::util::{now_utc, ulid};
@@ -57,7 +57,7 @@ fn title(value: &Value) -> Result<&str, No> {
 }
 
 fn owner(client: &Client) -> Result<(), No> {
-    if client.kind != Kind::Local {
+    if !client.is_owner() {
         return Err(No(
             403,
             "owner_only",

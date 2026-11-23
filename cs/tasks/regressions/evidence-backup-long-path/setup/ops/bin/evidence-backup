@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Incrementally back up lab run evidence to the DGX without remote deletion."""
+"""Incrementally back up cs-harness run evidence to the DGX without remote deletion."""
 import fcntl
 import json
 import os

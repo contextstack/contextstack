@@ -121,8 +121,8 @@ def render(route, name, state):
             raise FileNotFoundError(str(path))
         return io.BytesIO(raw) if 'b' in mode else io.StringIO(raw.decode())
     env = {'HOME': str(V), 'PATH': str(node.parent), 'TMPDIR': str(TMP),
-           'LAB_STATE_ROOT': str(V / '.contextstack/state'), 'LAB_CODE_ROOT': str(V / 'code'),
-           'LAB_CONFIG_ROOT': str(V / 'config'), 'LAB_WORKSPACES_ROOT': str(WS)}
+           'CS_STATE_ROOT': str(V / '.contextstack/state'), 'CS_CODE_ROOT': str(V / 'code'),
+           'CS_CONFIG_ROOT': str(V / 'config'), 'CS_WORKSPACES_ROOT': str(WS)}
     if state == 'ssh-agent':
         env['SSH_AUTH_SOCK'] = '/e2-baseline/agent.sock'
     profile = Profile()
@@ -150,7 +150,7 @@ def render(route, name, state):
         toolchains.discover.cache_clear()
         toolchains.discover_sandbox_links.cache_clear()
         captured = {}
-        def capture_request(lab, policy, request):
+        def capture_request(code_root, policy, request):
             captured.update(request)
             return b'(version 1)\n'
         stack.enter_context(patch.object(estate_io, 'render_native_sandbox', capture_request))

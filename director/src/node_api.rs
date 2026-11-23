@@ -89,6 +89,12 @@ pub async fn handle(state: &Arc<State>, call: &Call, rest: &str) -> Reply {
         };
         if v >= 2 && call.method == "GET" && rest == "work" {
             live::work(state, call, node_id).await
+        } else if v >= 2
+            && call.method == "POST"
+            && let ["jobs", job, "action-approvals", parts @ ..] =
+                rest.split('/').collect::<Vec<_>>().as_slice()
+        {
+            crate::action_approvals::node(state, call, node_id, job, parts)
         } else {
             route(state, call, &node, rest)
         }

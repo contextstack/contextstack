@@ -26,21 +26,21 @@ PLAYWRIGHT_REVISION = "1208"
 
 
 def estate_runtime():
-    configured = os.environ.get("LAB_ESTATE_RUNTIME")
+    configured = os.environ.get("CS_ESTATE_RUNTIME")
     if configured:
         return Path(configured).expanduser()
     return Path(__file__).resolve().parents[2].parent / ".estate/runtime"
 
 
 def browse_binary():
-    configured = os.environ.get("LAB_BROWSE")
+    configured = os.environ.get("CS_BROWSE")
     if configured:
         path = Path(configured).expanduser()
     else:
         tagged = estate_runtime() / "browse"
         path = tagged if tagged.is_file() else Path.home() / ".claude/skills/gstack/browse/dist/browse"
     if not path.is_file() or not os.access(path, os.X_OK):
-        fail("gstack browse is unavailable; set LAB_BROWSE to its executable")
+        fail("gstack browse is unavailable; set CS_BROWSE to its executable")
     return str(path)
 
 
@@ -110,24 +110,24 @@ try:
     want_links = bool(args.get("links", False))
     evidence = safe_directory("_evidence")
     safe_directory("_evidence/.tmp")
-    lab = Path(__file__).resolve().parents[2]
+    code_root = Path(__file__).resolve().parents[2]
     state_root = isolated_state_dir(
-        os.environ.get("LAB_BROWSER_STATE", "/tmp/contextstack-lab-corpus-browser"),
-        Path.cwd(), lab,
+        os.environ.get("CS_BROWSER_STATE", "/tmp/contextstack-corpus-browser"),
+        Path.cwd(), code_root,
     )
     state_dir = state_root / state_partition_for(requested)
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     requested_auth = cookie_import_for(requested, requested)
-    engine = os.environ.get("LAB_BROWSER_ENGINE", "auto")
+    engine = os.environ.get("CS_BROWSER_ENGINE", "auto")
     if engine not in {"auto", "chrome", "chromium"}:
-        fail("LAB_BROWSER_ENGINE must be auto, chrome, or chromium")
-    visibility = os.environ.get("LAB_BROWSER_VISIBILITY", "auto")
+        fail("CS_BROWSER_ENGINE must be auto, chrome, or chromium")
+    visibility = os.environ.get("CS_BROWSER_VISIBILITY", "auto")
     if visibility not in {"auto", "headless", "headed"}:
-        fail("LAB_BROWSER_VISIBILITY must be auto, headless, or headed")
+        fail("CS_BROWSER_VISIBILITY must be auto, headless, or headed")
     headed = visibility == "headed" or (visibility == "auto" and bool(requested_auth))
     use_real_chrome = engine == "chrome" or (engine == "auto" and bool(requested_auth))
-    keep_open = os.environ.get("LAB_BROWSER_KEEP_OPEN") == "1"
-    env = {**os.environ, "LAB_BROWSER_STATE": str(state_dir),
+    keep_open = os.environ.get("CS_BROWSER_KEEP_OPEN") == "1"
+    env = {**os.environ, "CS_BROWSER_STATE": str(state_dir),
            "BROWSE_STATE_FILE": str(state_dir / "state.json"),
            "CHROMIUM_PROFILE": str(state_dir / "chromium-profile"),
            "BROWSE_PARENT_PID": "0" if keep_open else str(os.getpid()),
@@ -135,7 +135,7 @@ try:
            "GSTACK_TELEMETRY_OFF": "1"}
     if use_real_chrome:
         chrome = Path(os.environ.get(
-            "LAB_REAL_CHROME",
+            "CS_REAL_CHROME",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         ))
         if not chrome.is_file() or not os.access(chrome, os.X_OK):

@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 import json
 import os
@@ -31,9 +32,9 @@ for invalid in ("", final_fixture[:len(final_fixture) // 2],
 # Includes Claude file-login staging, refresh, isolation, and symlink refusal.
 subprocess.run([sys.executable, str(HERE / "read-denies")], check=True, env={**hermetic_env()})
 subprocess.run([sys.executable, str(HERE / "login-copies")], check=True, env={**hermetic_env()})
-LAB_SRC = HERE.parents[2]
-OPS = LAB_SRC / "ops/bin"
-GW_MODELS = LAB_SRC.parent / "gateway" / "models.json"
+CS_SRC = HERE.parents[2]
+OPS = CS_SRC / "ops/bin"
+GW_MODELS = CS_SRC.parent / "gateway" / "models.json"
 CURSOR_MODELS = {
     "cursor-sol": "gpt-5.6-sol-high",
     "cursor-codex": "gpt-5.3-codex-high",
@@ -44,8 +45,8 @@ CURSOR_MODELS = {
 AGY_MODELS = {
     "antigravity-hydrogen": "gemini-4-hydrogen-high",
 }
-COPY = ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py",
-        "_yaml.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_job_reason.py",
+COPY = ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_est.py",
+        "_yaml.py", "_grant.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "_agent_stream.py", "_job_reason.py",
         "_cli_native.py", "_harness_usage.py", "_run_record.py", "_env_policy.py", "_errors.py", "capture-stimulus", "publish-evidence",
         "harvest", "finalize-run")
 FAKE = """#!%(python)s
@@ -120,9 +121,9 @@ def lines(events):
 
 def run(root, name, executor, binary, fixture, writable=(), links=(), link_root=("GEMINI_CLI_HOME", ".gemini"),
         personal=None):
-    lab, home = root / name, root / (name + "-home")
-    ops, task, fake = lab / "ops/bin", lab / "tasks/fixture", root / (name + "-bin")
-    for path in (ops, task, lab / "ledger", fake, home / "Library/Keychains"):
+    code_root, home = root / name, root / (name + "-home")
+    ops, task, fake = code_root / "ops/bin", code_root / "tasks/fixture", root / (name + "-bin")
+    for path in (ops, task, code_root / "ledger", fake, home / "Library/Keychains"):
         path.mkdir(parents=True, exist_ok=True)
     for rel, text in (personal or {}).items():
         (home / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -142,21 +143,21 @@ def run(root, name, executor, binary, fixture, writable=(), links=(), link_root=
     exe.chmod(0o755)
     tmpl = json.loads((OPS / "executor-templates.json").read_text())[executor]
     (ops / "executor-templates.json").write_text(json.dumps({executor: dict(tmpl, binary=str(exe))}))
-    (lab / "ESTATE").write_text("dev\n")
+    (code_root / "ESTATE").write_text("dev\n")
     (task / "goal.md").write_text("Do nothing.\n")
     (task / "check").write_text("#!/bin/sh\nexit 0\n")
     (task / "check").chmod(0o755)
-    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_", "CSGATEWAY_"))}
+    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("CS_", "GIT_", "CSGATEWAY_"))}
     env.update(HOME=str(home), CURSOR_API_KEY="sk-canary", GEMINI_API_KEY="sk-canary", GOOGLE_API_KEY="sk-canary",
-               OPENAI_API_KEY="sk-canary", CS_TOOLS_BIN=str(LAB_SRC.parent / "target/release/cs-tools"))
+               OPENAI_API_KEY="sk-canary", CS_TOOLS_BIN=str(CS_SRC.parent / "target/release/cs-tools"))
     order = json.dumps({"executor": executor, "task": "tasks/fixture", "exp": "task-fixture", "trial": 1,
                         "timeout_s": 60})
-    done = subprocess.run([sys.executable, str(ops / "_executor.py")], cwd=lab, env=env, input=order, text=True,
+    done = subprocess.run(cli_command(sys.executable, ops / "_executor.py"), cwd=code_root, env=env, input=order, text=True,
                           capture_output=True, timeout=120)
     assert "Traceback" not in done.stderr, done.stderr
-    rows = [json.loads(x) for x in (lab / "ledger/ledger.jsonl").read_text().splitlines()]
+    rows = [json.loads(x) for x in (code_root / "ledger/ledger.jsonl").read_text().splitlines()]
     assert len(rows) == 1, rows
-    run_dir = lab / rows[0]["transcript"]
+    run_dir = code_root / rows[0]["transcript"]
     ws = run_dir / "workspace"
     report = json.loads((ws / "agent-report.json").read_text()) if (ws / "agent-report.json").is_file() else None
     leftovers = [p for p in run_dir.rglob("*") if p.is_symlink() and not str(p.resolve()).startswith(str(run_dir))]

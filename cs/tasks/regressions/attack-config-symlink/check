@@ -39,7 +39,7 @@ def skip_or_run():
 
 def git_env():
     env = {key: value for key, value in hermetic_env().items()
-           if not key.startswith(("GIT_", "LAB_")) and key != "CS_LAND_COMMIT"}
+           if not key.startswith(("GIT_", "CS_")) and key != "CS_LAND_COMMIT"}
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -168,7 +168,7 @@ def main():
     if not skip_or_run():
         return 0
     for key in list(os.environ):
-        if key.startswith(("GIT_", "LAB_")) or key == "CS_LAND_COMMIT":
+        if key.startswith(("GIT_", "CS_")) or key == "CS_LAND_COMMIT":
             os.environ.pop(key, None)
     sys.path.insert(0, str(OPS))
     import _lanes

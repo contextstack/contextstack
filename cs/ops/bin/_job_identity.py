@@ -21,15 +21,25 @@ def _darwin_lib():
     return ctypes.CDLL('/usr/lib/libc.dylib', use_errno=True)
 
 
+def _darwin_identity(pid):
+    # PROC_PIDT_BSDINFOWITHUNIQID samples proc_bsdinfo and the unique
+    # identifier together. The unique ID survives exec; pidversion need not.
+    buf = ctypes.create_string_buffer(192)
+    if _darwin_lib().proc_pidinfo(int(pid), 18, 0, buf, len(buf)) != len(buf):
+        return None
+    raw = buf.raw
+    if struct.unpack_from('=I', raw, 4)[0] == 5:  # SZOMB
+        return None
+    birth = struct.unpack_from('=QQ', raw, 120)
+    unique_id, _, version = struct.unpack_from('=QQI', raw, 152)
+    return (*birth, unique_id), version
+
+
 def _pid_identity(pid):
-    """Kernel birth time, excluding zombies; None means gone/unreadable, never permission to kill."""
+    """Kernel birth identity, excluding zombies and unreadable processes."""
     if platform.system() == 'Darwin':
-        buf = ctypes.create_string_buffer(136)  # SDK sys/proc_info.h: struct proc_bsdinfo
-        if _darwin_lib().proc_pidinfo(int(pid), 3, 0, buf, len(buf)) != len(buf):
-            return None
-        if struct.unpack_from('=I', buf.raw, 4)[0] == 5:  # SZOMB
-            return None
-        return struct.unpack_from('=QQ', buf.raw, 120)
+        sample = _darwin_identity(pid)
+        return sample[0] if sample else None
     try:
         fields = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()
         return None if fields[0] == 'Z' else int(fields[19])  # field 22, starttime
@@ -40,7 +50,24 @@ def _pid_identity(pid):
 def _signal_pid(pid, identity, sig):
     # Revalidate before EACH signal, including the KILL following STOP. A failed
     # sample must never turn a cached integer into authority over a reused PID.
-    if identity is None or _pid_identity(pid) != identity:
+    if identity is None or pid <= 0:
+        return False
+    if platform.system() == 'Darwin':
+        sample = _darwin_identity(pid)
+        if sample is None or sample[0] != identity:
+            return False
+        if sig == 0:
+            return True
+        # XNU uses PID and pidversion from the token to look up the target.
+        # The kernel checks the version while acquiring the process reference.
+        token = (ctypes.c_uint32 * 8)(0, 0, 0, 0, 0, pid, 0, sample[1])
+        error = _darwin_lib().proc_signal_with_audittoken(token, int(sig))
+        if not error:
+            return True
+        if error == errno.ESRCH and _darwin_identity(pid) != sample:
+            return False
+        raise OSError(error, os.strerror(error), pid)
+    if _pid_identity(pid) != identity:
         return False
     try:
         os.kill(pid, sig)
@@ -157,7 +184,7 @@ def suspect_pids(root_identity, owned, deadline):
         if pid in owned or pid == os.getpid():
             continue
         birth = _pid_identity(pid)
-        if birth is None or birth <= root_identity:
+        if birth is None or birth[-1] <= root_identity[-1]:
             continue
         # Birth identities must bracket EVERY metadata query, including path.
         env = _darwin_environment(pid)

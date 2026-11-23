@@ -1,4 +1,4 @@
-//! Run the Rust binary against the real Lab finalizer in temporary estates.
+//! Run the Rust binary against the repository’s finalizer in temporary estates.
 
 #[test]
 fn runtime_quality_regressions() -> std::io::Result<()> {

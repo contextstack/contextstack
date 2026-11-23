@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+from contextlib import nullcontext
+from pathlib import Path
+from unittest.mock import patch
+
+CS = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CS / "tasks/regressions/_lib"))
+from hermetic_env import hermetic_env
+from native_runtime import stage_native_runtime
+from scratch import scratch_dir
+from receipt_schema import matches_schema
+from cli_execution import reserve
+from _lanes import lane_owner
+
+SCHEMA = json.loads((CS / "ops/execution-receipt.schema.json").read_text())
+def executable(path, text):
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+def load(path):
+    return json.loads(path.read_text())
+
+
+with scratch_dir(prefix="cli-machine-finisher-") as tmp:
+    root = Path(tmp).resolve()
+    code, state, home, bins = (root / name for name in ("code", "state", "home", "bin"))
+    ops, repo = code / "ops/bin", root / "main"
+    for directory in (ops, state, home, bins, repo, code / "grants", code / "config"):
+        directory.mkdir(parents=True)
+    for path in (CS / "ops/bin").glob("_*.py"):
+        shutil.copy2(path, ops / path.name)
+    for name in ("capture-stimulus", "publish-evidence", "harvest", "finalize-run", "machine-finish"):
+        shutil.copy2(CS / "ops/bin" / name, ops / name)
+    stage_native_runtime(ops)
+    (code / "ESTATE").write_text("fixture\n")
+    (code / "config/repos.json").write_text(json.dumps({"demo": str(repo)}))
+    (home / ".gitconfig").write_text("[user]\nname = Fixture\nemail = fixture@example.test\n")
+    git = shutil.which("git")
+    executable(bins / "git", f"""#!/bin/sh
+export GIT_AUTHOR_DATE=2026-01-02T12:00:00Z GIT_COMMITTER_DATE=2026-01-02T12:00:00Z
+export GIT_CEILING_DIRECTORIES="{root}"
+exec "{git}" "$@"
+""")
+    if sys.platform == "darwin":
+        executable(bins / "sandbox-exec", '#!/bin/sh\n[ "$1" = -f ] || exit 2\nshift 2\nexec "$@"\n')
+    env = {key: value for key, value in hermetic_env().items() if not key.startswith(("CS_", "GIT_", "FINALIZE_RUN_"))}
+    env.update(HOME=str(home), PATH=str(bins) + os.pathsep + env["PATH"], PYTHONDONTWRITEBYTECODE="1",
+               CS_STATE_ROOT=str(state), CS_REPOS_FILE=str(code / "config/repos.json"),
+               CS_EXECUTOR_ALLOW_UNSANDBOXED="1", CS_JOB_ID="fixture",
+               CS_TOOLS_BIN=os.environ.get("CS_TOOLS_BIN", str(CS.parent / "target/release/cs-tools")))
+    # Freeze only run naming. Hosted execution uses the production adapter with a fake session host reply.
+    launcher = """import sys, time
+import _executor, _lead_host
+gmtime = time.gmtime
+time.gmtime = lambda stamp=None: gmtime(1767355200 if stamp is None else stamp)
+_lead_host.client_turn = lambda *args, **kwargs: 'fixture hosted reply'
+_lead_host.conversation_meta = lambda *args: {}
+sys.exit(_executor.main())
+"""
+    (ops / "launch.py").write_text(launcher)
+    fake = bins / "fixture-cli"
+    cli_script = "#!/bin/sh\nprintf candidate > candidate.txt\ntouch -t 202601021200 candidate.txt\nprintf 'fixture reply\\n'\n"
+    (ops / "executor-templates.json").write_text(json.dumps({"fixture": {
+        "binary": str(fake), "args": [], "env_drop": [], "auth": "none",
+        "cost_class": "free_local", "cost_usd": 0,
+    }}))
+
+    def run(command, payload=None, **overrides):
+        return subprocess.run(command, env={**env, **overrides}, cwd=code, text=True,
+                              input=json.dumps(payload) if payload is not None else None,
+                              capture_output=True, timeout=60)
+
+    def git_run(*args):
+        done = run([str(bins / "git"), "-C", str(repo), *args])
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip()
+
+    git_run("init", "-q", "-b", "main")
+    git_run("commit", "--allow-empty", "-qm", "base")
+
+    base = git_run("rev-parse", "HEAD")
+    cases = (
+        ("pass", 0, "done"), ("fail", 1, "check"), ("native", 1, "executor_exit_7"),
+        ("refused", 1, "preflight"),
+        ("skip", 0, "preflight_skip"), ("lane", 0, "done"), ("grant", 1, "grant_paths"),
+        ("hosted", 0, "done"),
+    )
+    if sys.platform == "darwin":
+        cases += (("read-only", 0, "done"),)
+    for case, expected, expected_stop in cases:
+        agent = "#!/bin/sh\nprintf 'research reply\n'\n" if case == "read-only" else cli_script
+        executable(fake, agent + ("exit 7\n" if case == "native" else ""))
+        task = code / "tasks" / ("turn" if case == "hosted" else case)
+        task.mkdir(parents=True)
+        (task / "goal.md").write_text("Fixture.\n")
+        executable(task / "check", "#!/bin/sh\nprintf 'fixture check\\n'\nexit %d\n" % (case == "fail"))
+        if case in ("refused", "skip"):
+            skip = case == "skip"
+            executable(task / "preflight", """#!/bin/sh
+echo '{"run":false,"reason":"fixture preflight"}'
+exit %d
+""" % (3 if skip else 1))
+        order = {"executor": "fixture", "task": str(task), "trial": 1}
+        spec = "id: fixture\nmodel: fixture\ntrials: 1\n"
+        if case in ("lane", "grant"):
+            spec += "repo: demo\nlane: fixture-lane\n"
+        if case == "read-only":
+            spec += "repo: demo\nrepo_read_only: true\n"
+        if case == "hosted":
+            spec = spec.replace("id: fixture", "id: hosted-lead")
+            order.update(conversation_id="fixture", turn_id="fixture-turn")
+        if case == "grant":
+            (code / "grants/fixture.yaml").write_text(
+                "id: fixture\nestate: fixture\nrepo: demo\nstatus: active\ncommit: true\nexpiry: 2099-01-01T00:00:00Z\npaths:\n  - allowed.txt\n"
+                "gates:\n  - check\neffects:\n  - edit\n")
+            order["grant"] = "fixture"
+        (code / "spec.yaml").write_text(spec)
+        order["spec"] = "spec.yaml"
+        cmd = [sys.executable, str(ops / "launch.py")]
+
+        path, child_env = reserve(code, env, order)
+        # This fixture deliberately separates execution from recovery finishing.
+        lease = lane_owner(repo, "fixture-lane") if case in ("lane", "grant") else nullcontext()
+        with patch.dict(os.environ, env, clear=True), lease as binding:
+            if binding:
+                order["_cs_lane_binding"] = binding
+            with subprocess.Popen([*cmd, "--gateway-owned", "--execution-only"], env=child_env, cwd=code,
+                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  text=True, start_new_session=True) as child:
+                child.stdin.write(json.dumps(order) + "\n")
+                child.stdin.flush()
+                assert child.wait(timeout=60) == 0, child.stderr.read()
+        receipt = load(path / "execution-receipt.json")
+        if case == "read-only":
+            assert len(list(path.glob("read-only-*/repo"))) == 1
+        matches_schema(SCHEMA, receipt)
+        path = state / "runs" / receipt["run_id"]
+        assert not any((path / file).exists() for file in ("check.json", "terminal.json", "evidence"))
+        assert not (state / "ledger.jsonl").exists()
+        request = {"run_dir": str(path), "receipt": receipt}
+        finish = [str(ops / "machine-finish")]
+        for malformed in (None, {**receipt, "version": 2}):
+            altered = run(finish, {**request, "receipt": malformed})
+            assert altered.returncode == 2 and not (path / "check.json").exists(), altered.stdout
+        if case == "pass":
+            with (path / "execution.lock").open("w") as execution_lock:
+                fcntl.flock(execution_lock, fcntl.LOCK_EX)
+                blocked = run(finish, request)
+                assert blocked.returncode == 2 and not (path / "check.json").exists(), blocked.stdout
+            frozen_check = path / "stimulus/check"
+            frozen = frozen_check.read_bytes()
+            frozen_check.write_bytes(frozen + b"# tampered\n")
+            invalid = run(finish, request)
+            assert invalid.returncode == 2 and not (path / "check.json").exists(), invalid.stdout
+            frozen_check.write_bytes(frozen)
+            interrupted = run(finish, request, FINALIZE_RUN_CRASH_AFTER="row")
+            assert interrupted.returncode == 3, (interrupted.stdout, interrupted.stderr)
+            assert len((state / "ledger.jsonl").read_text().splitlines()) == 1
+            assert not list((state / "outbox").glob("*.json"))
+            interrupted = run(finish, request, FINALIZE_RUN_CRASH_AFTER="envelope")
+            assert interrupted.returncode == 3, (interrupted.stdout, interrupted.stderr)
+            assert len(list((state / "outbox").glob("*.json"))) == 1
+            assert not (path / "finalized.json").exists()
+        final = run(finish, request)
+        assert final.returncode == expected, (case, final.stdout, final.stderr)
+        row = load(state / "ledger.jsonl")
+        assert load(path / "finalized.json")["verdict"] == row["verdict"]
+        assert row["stop"] == expected_stop, (case, row)
+        if case == "read-only":
+            assert not list(path.glob("read-only-*"))
+            assert "branch" not in row
+        check = load(path / "check.json")
+        assert check["skipped"] == (case == "refused"), (case, check)
+        evidence = load(path / "evidence/manifest.json")
+        assert evidence["stimulus_sha"] == receipt["stimulus"]["sha256"], evidence
+        again = run(finish, request)
+        assert again.returncode == expected and json.loads(again.stdout) == json.loads(final.stdout), (case, again.stdout, again.stderr)
+        assert len((state / "ledger.jsonl").read_text().splitlines()) == 1
+        assert len(list((state / "outbox").glob("*.json"))) == 1
+        if case in ("lane", "grant"):
+            head = git_run("rev-parse", "lane/fixture-lane")
+            assert head == (row["lane"]["commit"] if case == "lane" else base)
+            assert evidence["candidate_archive"]["scope"] == "changed_files"
+        shutil.rmtree(state)
+        state.mkdir()
+        if case in ("lane", "grant"):
+            git_run("worktree", "remove", "--force", str(root / "fixture-lane"))
+            git_run("branch", "-f", "lane/fixture-lane", base)
+
+print("check: CLI receipt schema, execution-only boundary, and idempotent machine finishing")

@@ -1,0 +1,8 @@
+{
+  "exit": 0,
+  "stdout": "shell result\n",
+  "files": {
+    ".cs-calls.jsonl": "{\"args\": \"cd docs && cat fact.txt 2>&1 | tail -n 1\", \"name\": \"exec\"}\n"
+  },
+  "untouched": true
+}

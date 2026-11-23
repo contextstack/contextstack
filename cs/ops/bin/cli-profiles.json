@@ -1,7 +1,7 @@
 {
   "opencode": {
     "binary": "/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe",
-    "model": "lab/local-coder",
+    "model": "cs/local-coder",
     "cost_class": "free_local",
     "auth": "none",
     "network_port": "*",
@@ -13,7 +13,7 @@
       "--format",
       "json",
       "--model",
-      "lab/local-coder",
+      "cs/local-coder",
       "{{prompt}}"
     ],
     "environment": {
@@ -27,13 +27,13 @@
     "files": {
       "opencode.json": {
         "$schema": "https://opencode.ai/config.json",
-        "model": "lab/local-coder",
-        "small_model": "lab/local-coder",
+        "model": "cs/local-coder",
+        "small_model": "cs/local-coder",
         "enabled_providers": [
-          "lab"
+          "cs"
         ],
         "provider": {
-          "lab": {
+          "cs": {
             "npm": "@ai-sdk/openai-compatible",
             "options": {
               "baseURL": "http://127.0.0.1:8000/v1",

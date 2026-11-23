@@ -65,7 +65,7 @@ with scratch_dir(prefix="many-leads-host-") as tmp:
     legacy_cred = cfg / "lead-credential"
     legacy_cred.write_text("cslead_legacy\n")
     os.chmod(legacy_cred, 0o600)
-    env = {**hermetic_env(), "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(cfg)}
+    env = {**hermetic_env(), "CS_STATE_ROOT": str(state), "CS_CONFIG_ROOT": str(cfg)}
     with patch.dict(os.environ, env, clear=True):
         _lead_host.migrate_legacy_lead_config(cfg, state)
         expect((_lead_host.session_credential_path(state, cid_a)).is_file(), "legacy credential migrates")

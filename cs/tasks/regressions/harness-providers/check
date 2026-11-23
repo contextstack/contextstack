@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 import json
 import os
@@ -15,9 +16,9 @@ import tempfile
 
 HERE = Path(__file__).resolve().parent
 subprocess.run([sys.executable, str(HERE.parent / "cli-agent-runtimes/read-denies")], check=True, env={**hermetic_env()})
-LAB_SRC = HERE.parents[2]
-OPS = LAB_SRC / "ops/bin"
-GW = LAB_SRC.parent / "gateway" / "models.json"
+CS_SRC = HERE.parents[2]
+OPS = CS_SRC / "ops/bin"
+GW = CS_SRC.parent / "gateway" / "models.json"
 sys.path.insert(0, str(OPS))
 from _job_reason import reason_of
 
@@ -62,9 +63,9 @@ def lines(value):
 
 
 def run(root, name, fixture, budget=None, delay=0, timeout_s=60, symlink_auth=False):
-    lab, home = root / name, root / (name + "-home")
-    ops, task, fake = lab / "ops/bin", lab / "tasks/fixture", root / (name + "-bin")
-    for path in (ops, task, lab / "ledger", fake, home / "Library/Keychains",
+    code_root, home = root / name, root / (name + "-home")
+    ops, task, fake = code_root / "ops/bin", code_root / "tasks/fixture", root / (name + "-bin")
+    for path in (ops, task, code_root / "ledger", fake, home / "Library/Keychains",
                  home / ".pi/agent/sessions", home / ".pi/agent/skills", home / ".pi/agent/install",
                  home / ".pi/agent/bin", home / ".config/goose/chatgpt_codex",
                  home / ".config/goose/gemini_oauth", home / ".config/goose/xai_oauth",
@@ -113,23 +114,23 @@ def run(root, name, fixture, budget=None, delay=0, timeout_s=60, symlink_auth=Fa
     exe.chmod(0o755)
     tmpl = json.loads((OPS / "executor-templates.json").read_text())[name.split("-")[0]]
     (ops / "executor-templates.json").write_text(json.dumps({name.split("-")[0]: dict(tmpl, binary=str(exe))}))
-    (lab / "ESTATE").write_text("dev\n")
+    (code_root / "ESTATE").write_text("dev\n")
     (task / "goal.md").write_text("Do nothing.\n")
     (task / "check").write_text("#!/bin/sh\nexit 0\n")
     (task / "check").chmod(0o755)
-    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_", "CSGATEWAY_"))}
+    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("CS_", "GIT_", "CSGATEWAY_"))}
     env.update(HOME=str(home), XAI_API_KEY="sk-canary", GROK_API_KEY="sk-canary",
-               CS_TOOLS_BIN=str(LAB_SRC.parent / "target/release/cs-tools"))
+               CS_TOOLS_BIN=str(CS_SRC.parent / "target/release/cs-tools"))
     order = {"executor": name.split("-")[0], "task": "tasks/fixture", "exp": "task-fixture", "trial": 1,
              "timeout_s": timeout_s}
     if budget is not None:
         order["budget"] = budget
-    done = subprocess.run([sys.executable, str(ops / "_executor.py")], cwd=lab, env=env,
+    done = subprocess.run(cli_command(sys.executable, ops / "_executor.py"), cwd=code_root, env=env,
                           input=json.dumps(order), text=True, capture_output=True, timeout=120)
     assert "Traceback" not in done.stderr, done.stderr[-2000:]
-    ledger = lab / "ledger/ledger.jsonl"
+    ledger = code_root / "ledger/ledger.jsonl"
     rows = [json.loads(x) for x in ledger.read_text().splitlines()] if ledger.is_file() else []
-    run_dir = (lab / rows[0]["transcript"]) if rows else None
+    run_dir = (code_root / rows[0]["transcript"]) if rows else None
     report = None
     if run_dir and (run_dir / "workspace/agent-report.json").is_file():
         report = json.loads((run_dir / "workspace/agent-report.json").read_text())
@@ -242,7 +243,7 @@ with scratch_dir(prefix="harness-providers-") as raw:
     done, row, *_ = run(root, "goose-zero", GOOSE_ZERO)
     assert (row["verdict"], row["stop"]) == ("fail", "no_model_call"), row
     assert reason_of(row) == "no_model_call", row
-    assert row["cost_usd"] is None and row["est_basis"] == "unmetered", row
+    assert row["cost_usd"] is None and row["est_usd"] == 0 and row["est_basis"] == "unmetered", row
     done, row, *_ = run(root, "goose-err", {"messages": [], "metadata": {"status": "error"}})
     assert (row["verdict"], row["stop"]) == ("fail", "native_terminal_error"), row
 

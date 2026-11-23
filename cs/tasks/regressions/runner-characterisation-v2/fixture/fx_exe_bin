@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Fixture-only runtime exe binary. Not a lab tool: it reports the argv it was exec'd with,
+# Fixture-only runtime exe binary. Not a code_root tool: it reports the argv it was exec'd with,
 # its stdin and its cwd, so tool-exe-dispatch pins argv = bin + the descriptor's args, with the model's
 # input on stdin only.
 import json

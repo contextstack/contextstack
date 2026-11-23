@@ -18,7 +18,7 @@ _clean_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_clean_env)
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 
 
 def write_jsonl(path, rows):
@@ -30,7 +30,7 @@ with scratch_dir(prefix="schedule-deferral-") as raw:
     ops = root / "ops/bin"
     ops.mkdir(parents=True)
     for name in ("schedule-tick", "_grant.py", "_estate_io.py", "_void.py"):
-        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, ops / name)
     (root / "ESTATE").write_text("dev\n")
     (root / "grants").mkdir()
     (root / "grants/fixture.yaml").write_text(
@@ -66,8 +66,8 @@ with scratch_dir(prefix="schedule-deferral-") as raw:
 
     import importlib.machinery
     import importlib.util
-    sys.path.insert(0, str(LAB / "ops/bin"))
-    loader = importlib.machinery.SourceFileLoader("st", str(LAB / "ops/bin/schedule-tick"))
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
+    loader = importlib.machinery.SourceFileLoader("st", str(CODE_ROOT / "ops/bin/schedule-tick"))
     spec = importlib.util.spec_from_loader("st", loader)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

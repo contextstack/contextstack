@@ -11,16 +11,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 # A commit hook runs scripts/check with GIT_DIR and GIT_INDEX_FILE set; those would reach node-bundle, uv and the
 # installed release through every child of these checks. A node install never runs under a caller's git: drop them.
 for _k in [k for k in os.environ if k.startswith("GIT_")]:
     del os.environ[_k]
+# The lane can read the checkout but may be denied access to the owner's Git config.
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 BIN_NAMES = ("cs-harness", "cs-sandbox", "cs-tools", "cs-gateway")
 
 
 def node_bundle():
-    loader = importlib.machinery.SourceFileLoader("node_bundle", str(LAB / "scripts/node-bundle"))
+    loader = importlib.machinery.SourceFileLoader("node_bundle", str(CODE_ROOT / "scripts/node-bundle"))
     spec = importlib.util.spec_from_loader("node_bundle", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
@@ -30,12 +32,16 @@ def node_bundle():
 def host_python():
     """(uv, managed interpreter dir) or (None, reason)."""
     nb = node_bundle()
-    version = (LAB / ".python-version").read_text().strip()
+    version = (CODE_ROOT / ".python-version").read_text().strip()
     uv = os.environ.get("UV") or shutil.which("uv") or str(Path.home() / ".local/bin/uv")
     if not os.access(uv, os.X_OK):
         return None, "no uv on this host"
-    pydir = subprocess.run([uv, "python", "dir"], capture_output=True, text=True).stdout.strip()
-    managed = sorted(p for p in Path(pydir).glob("cpython-%s-*" % version) if nb.host_target() in p.name)
+    result = subprocess.run([uv, "python", "dir"], capture_output=True, text=True)
+    pydir = Path(result.stdout.strip())
+    if result.returncode or not pydir.is_absolute():
+        return None, "uv python dir did not return an absolute path"
+    managed = sorted(p for p in pydir.glob("cpython-%s-*" % version)
+                     if nb.host_target() in p.name and os.access(p / "bin/python3", os.X_OK))
     if not managed:
         return None, "no uv-managed cpython-%s for %s under %s" % (version, nb.host_target(), pydir)
     return uv, managed[0]
@@ -55,7 +61,7 @@ def fake_bins(where):
 
 def bundle(out, uv, release_id, bins, extra=None):
     """OUT/{uv/uv, python/, release/, bundle.json} as `node-bundle build` writes them, minus the downloads.
-    `extra` {lab-relative path: text} makes releases differ."""
+    `extra` {code-root-relative path: text} makes releases differ."""
     nb = node_bundle()
     (out / "uv").mkdir(parents=True)
     (out / "python").mkdir()
@@ -66,7 +72,7 @@ def bundle(out, uv, release_id, bins, extra=None):
         files["release/%s/%s" % (nb.KIT, rel)] = nb.sha256(out / "release" / nb.KIT / rel)
     tools = nb.manifest_tools()
     uvver = subprocess.run([uv, "--version"], capture_output=True, text=True).stdout.split()[1]
-    nb.write_meta(out, {"target": nb.host_target(), "release": release_id, "python": {"version": (LAB / ".python-version").read_text().strip()},
+    nb.write_meta(out, {"target": nb.host_target(), "release": release_id, "python": {"version": (CODE_ROOT / ".python-version").read_text().strip()},
                         "uv": {"version": uvver}, "files": files, "binaries": binaries,
                         "tools": [{"name": t["name"], "runtime": t["runtime"], "requires": t.get("requires", [])} for t in tools]})
     return files
@@ -105,11 +111,28 @@ def dead_network_env(home, **more):
     return env
 
 
+def directory_snapshot(path):
+    """Observe directory changes even when the lane can stat a path but cannot list it."""
+    try:
+        return sorted(path.iterdir())
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        try:
+            return path.stat().st_mtime_ns
+        except (FileNotFoundError, PermissionError):
+            return None
+
+
 def real_agents():
     """{label: pid} for every com.contextstack.* job in the real gui domain (read-only /bin/launchctl list)."""
     if sys.platform != "darwin":
         return {}
-    out = subprocess.run(["/bin/launchctl", "list"], capture_output=True, text=True).stdout
+    try:
+        out = subprocess.run(["/bin/launchctl", "list"], capture_output=True, text=True).stdout
+    except PermissionError:
+        # Lanes cannot reach the owner's launchd. Installer calls still use the fixture shim.
+        return {}
     return {parts[2]: parts[0] for parts in (l.split("\t") for l in out.splitlines()[1:])
             if len(parts) == 3 and parts[2].startswith("com.contextstack.")}
 

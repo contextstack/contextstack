@@ -1,7 +1,1 @@
-{
-  "cmd": [
-    "sh",
-    "-c",
-    "echo x > /tmp/tool-fixtures-denied && echo wrote"
-  ]
-}
+{"cmd": "echo x > \"$FIXTURE_OUTSIDE\" && echo wrote"}

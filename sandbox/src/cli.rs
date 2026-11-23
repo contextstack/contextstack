@@ -1,4 +1,4 @@
-//! Command line: `--policy FILE [--cwd DIR] [--report-dir DIR] -- TOOL [ARGS...]`,
+//! Command line: `--policy FILE [--cwd DIR] [--report-dir DIR] [--repo-view JSON] [--action-widening JSON] -- TOOL [ARGS...]`,
 //! `--probe --policy FILE`, or `--policy FILE --profile cli-executor --request FILE|-`.
 
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::failure::{Failure, usage};
 
 /// The usage line printed with every argument error.
-pub const USAGE_LINE: &str = "usage: cs-sandbox --policy FILE [--cwd DIR] [--report-dir DIR] -- TOOL [ARGS...] | cs-sandbox --probe --policy FILE | cs-sandbox --policy FILE --profile cli-executor --request FILE|-";
+pub const USAGE_LINE: &str = "usage: cs-sandbox --policy FILE [--cwd DIR] [--report-dir DIR] [--repo-view JSON] [--action-widening JSON] -- TOOL [ARGS...] | cs-sandbox --probe --policy FILE | cs-sandbox --policy FILE --profile cli-executor --request FILE|-";
 
 /// A parsed command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -31,10 +31,33 @@ pub struct Run {
     pub cwd: Option<PathBuf>,
     /// Where to write the per-call report; nothing is written when absent.
     pub report_dir: Option<PathBuf>,
+    /// The launcher-provided read-only repo binding.
+    pub repo_view: Option<RepoView>,
+    pub widening: Option<Widening>,
     /// The tool, an absolute path, a relative path or a bare name on `PATH`.
     pub tool: String,
     /// The tool's own arguments.
     pub args: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct RepoView {
+    pub path: PathBuf,
+    pub deny_write: Vec<PathBuf>,
+    #[serde(default)]
+    pub read_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub read_links: Vec<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Widening {
+    pub network: bool,
+    #[serde(default)]
+    pub loopback: bool,
+    pub delete: bool,
+    pub write_paths: Vec<PathBuf>,
 }
 
 fn value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf, Failure> {
@@ -44,11 +67,21 @@ fn value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf,
     }
 }
 
+fn json_arg<T: serde::de::DeserializeOwned>(
+    iter: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<T, Failure> {
+    serde_json::from_str(&iter.next().unwrap_or_default())
+        .map_err(|error| usage(format!("invalid {flag}: {error}; {USAGE_LINE}")))
+}
+
 /// Parse the arguments after the program name.
 pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
     let mut policy = None;
     let mut cwd = None;
     let mut report_dir = None;
+    let mut repo_view = None;
+    let mut widening = None;
     let mut probe = false;
     let mut profile = None;
     let mut request = None;
@@ -59,6 +92,10 @@ pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
             "--policy" => policy = Some(value(&mut iter, "--policy")?),
             "--cwd" => cwd = Some(value(&mut iter, "--cwd")?),
             "--report-dir" => report_dir = Some(value(&mut iter, "--report-dir")?),
+            "--repo-view" => repo_view = Some(json_arg(&mut iter, "--repo-view")?),
+            "--action-widening" if widening.is_none() => {
+                widening = Some(json_arg(&mut iter, "--action-widening")?);
+            }
             "--profile" => {
                 profile = Some(
                     iter.next()
@@ -81,6 +118,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
         if tool_argv.is_some()
             || cwd.is_some()
             || report_dir.is_some()
+            || repo_view.is_some()
+            || widening.is_some()
             || profile.is_some()
             || request.is_some()
         {
@@ -97,7 +136,12 @@ pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
                 "--profile cli-executor needs --request FILE|-; {USAGE_LINE}"
             )));
         };
-        if tool_argv.is_some() || cwd.is_some() || report_dir.is_some() {
+        if tool_argv.is_some()
+            || cwd.is_some()
+            || report_dir.is_some()
+            || repo_view.is_some()
+            || widening.is_some()
+        {
             return Err(usage(format!(
                 "--profile cli-executor takes only --policy and --request; {USAGE_LINE}"
             )));
@@ -122,6 +166,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
         policy,
         cwd,
         report_dir,
+        repo_view,
+        widening,
         tool,
         args: rest,
     }))
@@ -144,6 +190,8 @@ mod tests {
             policy: PathBuf::from("p.json"),
             cwd: Some(PathBuf::from("ws")),
             report_dir: Some(PathBuf::from("r")),
+            repo_view: None,
+            widening: None,
             tool: "/bin/echo".to_owned(),
             args: vec!["hi".to_owned(), "there".to_owned()],
         });

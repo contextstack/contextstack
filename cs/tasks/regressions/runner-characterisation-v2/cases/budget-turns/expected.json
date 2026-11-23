@@ -21,10 +21,11 @@
         "runner_implementation": "<RUNNER>",
         "runner_path": "<RUNNER_PATH>",
         "spec": "specs/fx.yaml",
-        "spec_sha": "6c39e163e284bea9f05163835bd85a9f1dd42bde52728f6f2aaa9457bfc58fd2",
+        "spec_sha": "1b3519c9f97ae5ec1c5c39fdcb4d3d5f21fb1295a3816e80bb4040e33849ca01",
         "task": "tasks/fx",
         "tools": [
-          "fx_tool"
+          "fx_tool",
+          "fs_write"
         ],
         "trial": 1,
         "workspace": "<ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1/workspace"
@@ -75,10 +76,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 2.\nProduce the deliverable requested in the task goal now, then stop.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -89,12 +89,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-budget-turns",
+        "run_id": "<RUNSTAMP>-fx-budget-turns-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 1,
         "tool_schema": [
           {
             "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
@@ -107,6 +108,25 @@
               },
               "required": [
                 "mode"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
+            "schema": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
               ],
               "type": "object"
             }
@@ -127,10 +147,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 1.\nProduce the deliverable requested in the task goal now, then stop.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -151,7 +170,7 @@
             ]
           },
           {
-            "content": "[fx_tool {\"mode\":\"echo\"}]\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
+            "content": "[fx_tool {\"mode\":\"echo\"}]\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"CS_TOOL_TIMEOUT_SECONDS\", \"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
             "role": "tool",
             "tool_call_id": "1"
           }
@@ -159,24 +178,134 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-budget-turns",
+        "run_id": "<RUNSTAMP>-fx-budget-turns-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 2,
+        "tool_choice": {
+          "function": {
+            "name": "fs_write"
+          },
+          "type": "function"
+        },
         "tool_schema": [
           {
-            "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
-            "name": "fx_tool",
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
             "schema": {
               "properties": {
-                "mode": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
                   "type": "string"
                 }
               },
               "required": [
-                "mode"
+                "path",
+                "content"
+              ],
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "content_type": "application/json",
+      "path": "/v1/agent/model.call"
+    },
+    {
+      "body": {
+        "budget": {
+          "max_output_tokens": 4096,
+          "max_usd": "0.980000",
+          "timeout_ms": 120000
+        },
+        "capability": {
+          "kind": "generic",
+          "model_tier_hint": "fake"
+        },
+        "messages": [
+          {
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nRead tools are unavailable. You must now write the deliverable using what you already have.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1/workspace",
+            "role": "system"
+          },
+          {
+            "content": "Create hello.txt containing exactly: hello\n",
+            "role": "user"
+          },
+          {
+            "content": "looping",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "mode": "echo"
+                },
+                "id": "1",
+                "name": "fx_tool"
+              }
+            ]
+          },
+          {
+            "content": "[fx_tool {\"mode\":\"echo\"}]\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"CS_TOOL_TIMEOUT_SECONDS\", \"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n",
+            "role": "tool",
+            "tool_call_id": "1"
+          },
+          {
+            "content": "looping",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": {
+                  "mode": "echo"
+                },
+                "id": "1",
+                "name": "fx_tool"
+              }
+            ]
+          },
+          {
+            "content": "[fx_tool {\"mode\":\"echo\"}] ERROR\ntool \"fx_tool\" was withheld because read tools are unavailable on the final turn",
+            "is_error": true,
+            "role": "tool",
+            "tool_call_id": "1"
+          }
+        ],
+        "request_id": "<REQUEST_ID>",
+        "role": {
+          "role_name": "loop",
+          "role_pack_name": "cs",
+          "role_pack_version": "0"
+        },
+        "run_id": "<RUNSTAMP>-fx-budget-turns-fx-t1",
+        "schema_version": "agent.gateway.model_call.v2",
+        "send_index": 1,
+        "step_id": 3,
+        "tool_choice": {
+          "function": {
+            "name": "fs_write"
+          },
+          "type": "function"
+        },
+        "tool_schema": [
+          {
+            "description": "Write a file, creating parent dirs. Args: {path, content}.",
+            "name": "fs_write",
+            "schema": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "content"
               ],
               "type": "object"
             }
@@ -190,24 +319,24 @@
   "rows": [
     {
       "cost_class": "api",
-      "cost_usd": 0.02,
+      "cost_usd": 0.03,
       "env_sha": "<ENV_SHA>",
       "est_basis": "rate",
-      "est_usd": 0.02,
+      "est_usd": 0.03,
       "estate": "dev",
       "model": "fake-model",
       "seconds": "<SECONDS>",
       "spec": "fx-budget-turns",
-      "spec_sha": "6c39e163e284bea9f05163835bd85a9f1dd42bde52728f6f2aaa9457bfc58fd2",
+      "spec_sha": "1b3519c9f97ae5ec1c5c39fdcb4d3d5f21fb1295a3816e80bb4040e33849ca01",
       "stimulus_sha": "<STIMULUS_SHA>",
       "stop": "budget:turns",
       "task": "tasks/fx",
       "task_sha": "93cb431da1cef22a7d34a14d103f90ad3987451606e052447cbe9aa28fa171dc",
-      "tool_calls": 2,
+      "tool_calls": 3,
       "transcript": "ledger/runs/<RUNSTAMP>-fx-budget-turns-fx-t1",
       "trial": 1,
       "ts": "<TS>",
-      "turns": 2,
+      "turns": 3,
       "verdict": "fail"
     }
   ],
@@ -218,12 +347,15 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "messages.jsonl",
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -231,12 +363,12 @@
         "check": "#!/bin/sh\n[ \"$(cat hello.txt)\" = \"hello\" ]\n",
         "goal.md": "Create hello.txt containing exactly: hello\n"
       },
-      "transcript": "# fx-budget-turns · tasks/fx · trial 1\n\nmodel fake · budget 2 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nlooping\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n### turn 2\n\nlooping\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"HOME\", \"LAB_TOOL_TIMEOUT_SECONDS\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n---\nstop budget:turns · verdict **fail** · turns 2 · tools 2 · cost $0.0200\n",
+      "transcript": "# fx-budget-turns · tasks/fx · trial 1\n\nmodel fake · budget 2 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\nlooping\n\n`fx_tool {\"mode\":\"echo\"}`\n\n```\n{\"args\": {\"mode\": \"echo\"}, \"cwd_base\": \"workspace\", \"env_names\": [\"CS_TOOL_TIMEOUT_SECONDS\", \"HOME\", \"LANG\", \"PATH\", \"TMPDIR\"]}\n\n```\n\n### turn 2\n\nlooping\n\n`fx_tool {\"mode\":\"echo\"}` ERROR\n\n```\ntool \"fx_tool\" was withheld because read tools are unavailable on the final turn\n```\n\n### turn 3\n\nlooping\n\n`fx_tool {\"mode\":\"echo\"}` ERROR\n\n```\ntool \"fx_tool\" was withheld because read tools are unavailable on the final turn\n```\n\n---\nstop budget:turns · verdict **fail** · turns 3 · tools 3 · cost $0.0300\n",
       "workspace": {}
     }
   ],
   "stderr": [],
   "stdout": [
-    "  tasks/fx                       t1  fail stop=budget:turns turns=2 tools=2 $0.0200"
+    "  tasks/fx                       t1  fail stop=budget:turns turns=3 tools=3 $0.0300"
   ]
 }

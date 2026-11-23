@@ -50,7 +50,7 @@ with scratch_dir() as raw:
  except ValueError:pass
  else:raise AssertionError('HOME reused')
  sibling=Path(raw)/'workspace-escape';sibling.mkdir()
- outside=Path(raw)/'scope';outside.mkdir();(outside/'.lab-tmp').symlink_to(sibling)
+ outside=Path(raw)/'scope';outside.mkdir();(outside/'.cs-tmp').symlink_to(sibling)
  try:stage(outside,profile)
  except ValueError:pass
  else:raise AssertionError('prefix escape accepted')

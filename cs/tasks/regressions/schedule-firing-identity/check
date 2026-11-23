@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 FAILED = []
 
 
@@ -19,13 +19,13 @@ def expect(cond, label, detail=""):
 
 
 def host(root):
-    """A director host whose schedule fires through a stand-in LAB_DIRECTOR_DISPATCH (no enqueue, no setup)."""
+    """A director host whose schedule fires through a stand-in CS_DIRECTOR_DISPATCH (no enqueue, no setup)."""
     for d in ("ops/bin", "grants", "ledger", "home"):
         (root / d).mkdir(parents=True)
-    for p in (LAB / "ops/bin").iterdir():
+    for p in (CODE_ROOT / "ops/bin").iterdir():
         if p.is_file():
             shutil.copy2(p, root / "ops/bin" / p.name)
-    shutil.copy2(LAB / "INVARIANTS.md", root / "INVARIANTS.md")
+    shutil.copy2(CODE_ROOT / "INVARIANTS.md", root / "INVARIANTS.md")
     (root / "ESTATE").write_text("dev\n")
     (root / "grants/g-n.yaml").write_text('id: g-n\nestate: node-n\nrepo: /nonexistent\npaths: ["src/"]\ngates: ["true"]\n'
                                           'commit: false\nstatus: active\nexpiry: "2099-01-01T00:00:00Z"\n')
@@ -46,7 +46,7 @@ def tick(root, now, **extra):
     args = {"now": now, "schedules": str(root / "ledger/schedules.jsonl"), "fires": str(root / "ledger/fires.jsonl"),
             "dispatch": str(root / "ledger/dispatch.jsonl"), "lock": str(root / "ledger/schedule.lock"), "scan_stale": False, **extra}
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(root / "home"),
-           "LAB_DIRECTOR_DISPATCH": json.dumps([str(root / "dispatch")]), "LAB_DIRECTOR_ESTATE_ROOT": str(root / "estate")}
+           "CS_DIRECTOR_DISPATCH": json.dumps([str(root / "dispatch")]), "CS_DIRECTOR_ESTATE_ROOT": str(root / "estate")}
     r = subprocess.run([sys.executable, str(root / "ops/bin/schedule-tick")], input=json.dumps(args), text=True,
                        capture_output=True, cwd=str(root), env=env, timeout=60)
     out = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}

@@ -17,7 +17,7 @@ use Livewire\Component;
 
 /*
  * client-web's settings: this device's connection to its Director (CLIENT-API.md §2). The Director URL; pairing
- * with a one-time code from `cs-director pair NAME` (the device token is kept in this device's settings file, never
+ * with a one-time code from `cs device pair NAME` (the device token is kept in this device's settings file, never
  * shown); on the Director's own machine, its local credential file; and this device's identity as the Director
  * sees it (`GET me`). There is no account and no login (outline decision 7).
  */
@@ -137,7 +137,7 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
             $paired = DirectorClient::pair($this->url, $this->code, (int) config('client.timeout'));
         } catch (DirectorRefused $refused) {
             $this->problem = $refused->is('pairing_refused')
-                ? __('That code was not accepted. Codes work once and for 10 minutes; issue a new one with `cs-director pair NAME`.')
+                ? __('That code was not accepted. Codes work once and for 10 minutes; issue a new one with `cs device pair NAME`.')
                 : $refused->explain();
 
             return;
@@ -256,12 +256,12 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
             @if ($me !== [])
                 <flux:text data-test="device-identity">
                     {{ __('This device') }}: <span class="font-mono">{{ $me['credential_id'] ?? '?' }}</span>
-                    {{ ($me['owner'] ?? false) ? __('(owner: may pair and revoke devices)') : __('(paired device)') }}
+                    {{ ($me['owner'] ?? false) ? __('(owner: may pair and revoke devices)') : __('(not the owner)') }}
                 </flux:text>
                 <flux:badge color="green" data-test="connected">{{ ($me['owner'] ?? false) ? __('Connected as owner') : __('Connected') }}</flux:badge>
             @endif
             <div>
-                <flux:button size="sm" variant="ghost" wire:click="forget">{{ __('Forget this connection') }}</flux:button>
+                <flux:button size="sm" variant="ghost" wire:click="forget">{{ $connection->mode === \App\Client\Connection::Device ? __('Forget this device') : __('Forget this connection') }}</flux:button>
             </div>
         @else
             <flux:text data-test="not-connected">{{ __('Not connected. Pair this device below.') }}</flux:text>
@@ -317,7 +317,7 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
 
     <flux:card class="space-y-4">
         <flux:heading size="lg">{{ __('Pair this device') }}</flux:heading>
-        <flux:text>{{ __('On a trusted machine, run `cs-director pair NAME` and enter the code here within 10 minutes.') }}</flux:text>
+        <flux:text>{{ __('On the Director host, run `cs device pair NAME` and enter the code here within 10 minutes.') }}</flux:text>
         <form wire:submit="pair" class="space-y-4">
             <flux:input wire:model="url" :label="__('Director URL')" placeholder="http://127.0.0.1:8780" />
             <flux:input wire:model="code" :label="__('Pairing code')" autocomplete="off" />

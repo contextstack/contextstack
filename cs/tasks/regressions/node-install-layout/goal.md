@@ -11,13 +11,13 @@ In a fake HOME, offline, the check must show:
 1. `node-install install BUNDLE --node N --director URL` lays out
    `~/.contextstack/{releases/<id>,current,config,state,workspaces,logs}`
    (0700), `current -> releases/<id>`, every binary in the release's `bin/`,
-   `target/release/cs-tools` the same file, no `bin/lab`, `bin/cs`, `bin/cs-go`
+   `target/release/cs-tools` the same file, no `bin/code_root`, `bin/cs`, `bin/cs-go`
    or `bin/csgateway` (Go is archived, the owner 2026-11-10), no `ledger/`, `specs/`, `tasks/`
    in the code root, `config/ESTATE` and a director receiver.
 2. PATH links `csgateway`, `cs` (the CLI), `node-install` in
    `~/.local/bin` (on the login PATH) point through `current`, and there is no
-   `lab` link. An upgrade removes our old `lab` link and reports it; a foreign
-   `lab` (GitLab's CLI) is never refused or removed. With it off the PATH the link dir is
+   `code_root` link. An upgrade removes our old `code_root` link and reports it; a foreign
+   `code_root` (GitLab's CLI) is never refused or removed. With it off the PATH the link dir is
    `~/.local/bin`, created if missing; `--link-dir` wins. A TTY asks before adding a marked
    shell PATH line; --yes/non-TTY print it. Reinstalls never duplicate it; uninstall removes it.
 3. Both plists name absolute paths into the install, set an explicit PATH,
@@ -39,7 +39,7 @@ In a fake HOME, offline, the check must show:
    The gateway plist's own command, with the real `cs-gateway`
    and a DGX-shaped overlay, answers `/v1/health` 200 (first fall, prod-1
    2026-11-10: the shipped `models.json` named the dev checkout's
-   `lab_executor` and the gateway exited; activation now derives
+   `cli_executor` and the gateway exited; activation now derives
    `~/.contextstack/gateway/models.json` pointing it into `current`).
 4. Installing the same bundle again changes nothing.
 5. The plist's own command, with its environment and the director down, is
@@ -54,7 +54,7 @@ In a fake HOME, offline, the check must show:
    `config/` and `state/`; `--purge` removes those too, never a foreign file.
    The real `~/.local/bin` and `~/Library/LaunchAgents` are never touched.
 9. A director host (`--estate workstation`, no receiver, no node plist) whose
-   `~/.contextstack` already holds `gateway/` (with `providers.d`), `lab/setups`,
+   `~/.contextstack` already holds `gateway/` (with `providers.d`), `code_root/setups`,
    `browser/`, `director/`, `credentials/`, `estate-deploy/` and a state root
    with a ledger: a gateway plist that runs from the checkout is refused and
    nothing outside `releases/` changes; `--adopt` keeps the original in

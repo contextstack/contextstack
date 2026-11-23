@@ -51,6 +51,12 @@ def deny(pid, sig):
         return
     attempts.append(sig)
     raise OSError(int(sys.argv[2]), 'injected supervisor signal denial')
+def deny_audit_token(token, sig):
+    try:
+        deny(token[5], sig)
+    except OSError as error:
+        return error.errno
+    return 0
 def owned(*args):
     # The retry succeeds. This must NOT erase the first cleanup failure.
     return {} if attempts else {987654: 100}
@@ -58,10 +64,15 @@ with ExitStack() as stack:
     def mock(target, name, **kwargs):
         return stack.enter_context(patch.object(target, name, **kwargs))
     if sys.argv[3] == '_job_darwin':
+        mock(identity.platform, 'system', return_value='Darwin')
+        mock(identity, '_darwin_identity', return_value=(100, 1))
+        lib = mock(identity, '_darwin_lib').return_value
+        lib.proc_signal_with_audittoken.side_effect = deny_audit_token
         mock(supervisor, 'responsible_pid', return_value=os.getpid())
         mock(supervisor, '_pid_identity', return_value=100)
         mock(supervisor, 'owned_pids', side_effect=owned)
     else:
+        mock(identity.platform, 'system', return_value='Linux')
         libc = Mock()
         libc.prctl.return_value = 0
         mock(supervisor.ctypes, 'CDLL', return_value=libc)
@@ -69,9 +80,9 @@ with ExitStack() as stack:
         mock(supervisor, '_children', side_effect=owned)
         mock(supervisor, '_stat', return_value=(os.getpid(), '100', 'S'))
         mock(supervisor.os, 'waitpid', side_effect=ChildProcessError)
+        mock(identity, '_pid_identity', return_value=100)
+        mock(identity.os, 'kill', side_effect=deny)
     mock(supervisor.subprocess, 'Popen', return_value=child)
-    mock(identity, '_pid_identity', return_value=100)
-    mock(identity.os, 'kill', side_effect=deny)
     try:
         supervisor.supervise(['fixture'])
     finally:
@@ -90,10 +101,12 @@ for boundary in ('_job_darwin', '_job_linux'):
                 result = m.run_process(command, ws, {'PATH':os.environ['PATH']}, 5)
                 assert result.returncode != 0, ('supervisor reported clean', boundary, denial)
                 assert 'job cleanup failed:' in result.stderr, result.stderr
-                assert 'injected supervisor signal denial' in result.stderr, result.stderr
+                expected = os.strerror(denial) if boundary == '_job_darwin' else 'injected supervisor signal denial'
+                assert expected in result.stderr, result.stderr
 # Ordinary exit between validation and kill remains a harmless race.
 import _job_identity as identity
-with patch.object(identity, '_pid_identity', side_effect=[100, None]), \
+with patch.object(identity.platform, 'system', return_value='Linux'), \
+     patch.object(identity, '_pid_identity', side_effect=[100, None]), \
      patch.object(identity.os, 'kill', side_effect=ProcessLookupError):
     assert identity._signal_pid(987654, 100, signal.SIGKILL) is False
 print('check: one sweep on timeout/normal; supervisor signal denials remain loud after retry')

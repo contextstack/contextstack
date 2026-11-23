@@ -4,9 +4,12 @@ and a "running" job is a dispatch row naming a live process (this suite's own)."
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 from harness.run import case
 from harness.wire import H_PROTOCOL
@@ -53,10 +56,20 @@ def ts(offset=0):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset))
 
 
-def running(rig, job_id, pid=None):
+def running(rig, job_id, pid=None, *, stale=False):
     """job_id as tick leaves it while a trial runs: a running row under a live process (this one, or `pid`)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "cs/ops/bin"))
+    try:
+        from _job_identity import _pid_identity
+    finally:
+        sys.path.pop(0)
+    pid = pid or os.getpid()
+    identity = _pid_identity(pid)
+    if stale:
+        identity = (*identity[:-1], identity[-1] - 1) if isinstance(identity, tuple) else identity - 1
     with open(rig.state / "dispatch.jsonl", "a") as shelf:
-        shelf.write(json.dumps({"ts": ts(-5), "id": job_id, "job": job_id, "state": "running", "pid": pid or os.getpid(),
+        shelf.write(json.dumps({"ts": ts(-5), "id": job_id, "job": job_id, "state": "running", "pid": pid,
+                                "pid_identity": identity,
                                 "director_job": job_id, "origin": "dispatch", "spec": "spec.yaml"}) + "\n")
 
 
@@ -233,6 +246,28 @@ def _(ctx):
     ctx.expect(any(r.get("state") == "cancelled" for r in rig.dispatch_rows() if r.get("director_job") == jid), "closed cancelled")
 
 
+@case(N, "control", "node2-cancel-reused-dispatcher")
+def _(ctx):
+    """A stale running row cannot authorize signals to a replacement dispatcher's child."""
+    rig = p2(ctx.rig)
+    jid = rig.director.offer("node-dspec")["job_id"]
+    queue(rig, jid)
+    with subprocess.Popen(["/bin/sh", "-c", "sleep 300 & wait"], start_new_session=True) as decoy:
+        try:
+            rig.until(lambda: subprocess.run(["pgrep", "-P", str(decoy.pid)], capture_output=True).stdout.strip(),
+                      5, "the unrelated child")
+            running(rig, jid, decoy.pid, stale=True)
+            cid = rig.director.cancel("node-dspec", jid)
+            rig.listen()
+            ctx.expect(settled(rig, cid)["outcome"] == "stopped", "cancelled the stale job")
+            ctx.expect(decoy.poll() is None, "the unrelated child was not signalled")
+        finally:
+            try:
+                os.killpg(decoy.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @case(N, "control", "node2-control-never-twice")
 def _(ctx):
     """A settled message listed again (a Director that lost it, a restart) is reported from the record, never re-applied."""
@@ -283,7 +318,9 @@ def _(ctx):
     held = rig.until(lambda: len((rig.director.events.get(run_id) or {}).get("events", {})) == 3
                      and rig.director.events[run_id]["events"], 15, "three events")
     ctx.expect([held[s]["kind"] for s in (1, 2, 3)] == ["delta", "delta", "stop"] and held[1]["payload"]["text"] == "Hel"
-               and held[3]["payload"] == {"turn": 1, "reason": "end_turn"} and all(e["partial"] for e in held.values()),
+               and held[3]["payload"] == {"turn": 1, "reason": "end_turn"}
+               and all(e["partial"] and e.get("at") and e.get("timestamp_source") in ("producer", "adapter_receive")
+                       for e in held.values()),
                "mapped with the runner's seq", held)
     status = rig.until(lambda: [s for s in rig.director.status.get("node-dspec", []) if s["active"]
                                 and s["active"][0].get("run_id") == run_id], 10, "status naming the run")
@@ -352,47 +389,55 @@ def _(ctx):
 
 @case(N, "control", "node2-cancel-gateway-work-order")
 def _(ctx):
-    """A running job whose trial is a gateway work order (the `executor` op): the gateway's cancel call
-    (POST <CSGATEWAY_LAB_ENDPOINT>/<job>/cancel, a stub here) comes first, then SIGTERM to the op."""
-    import http.server
+    """A running CLI job is cancelled through its machine launcher."""
     rig = p2(ctx.rig)
     jid = rig.director.offer("node-dspec")["job_id"]
     queue(rig, jid)
-    seen = []
-
-    class Gateway(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            seen.append((self.path, self.rfile.read(int(self.headers.get("Content-Length") or 0))))
-            body = b'{"cancelled": true}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a):
-            pass
-
-    gateway = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
-    threading.Thread(target=gateway.serve_forever, daemon=True).start()
+    ready, stopped = rig.tmp / "launcher-ready", rig.tmp / "launcher-stopped"
     executor = rig.tmp / "bin/executor"
     executor.parent.mkdir(parents=True, exist_ok=True)
-    executor.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(300)\n")
+    executor.write_text("""#!/usr/bin/env python3
+import signal, subprocess, sys
+from pathlib import Path
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+def cancel(*_):
+    Path(sys.argv[2]).write_text("SIGTERM")
+    child.wait()
+    raise SystemExit(1)
+signal.signal(signal.SIGTERM, cancel)
+Path(sys.argv[1]).touch()
+signal.pause()
+""")
     executor.chmod(0o755)
-    tick = subprocess.Popen(["/bin/sh", "-c", '"%s" & wait' % executor])
+    tick = subprocess.Popen([sys.executable, "-c", """
+import subprocess, sys
+with subprocess.Popen(sys.argv[1:], start_new_session=True) as launcher:
+    print(launcher.pid, flush=True)
+""", str(executor), str(ready), str(stopped)], stdout=subprocess.PIPE, text=True)
+    with tick.stdout:
+        group = int(tick.stdout.readline())
     threading.Thread(target=tick.wait, daemon=True).start()
     try:
-        rig.until(lambda: subprocess.run(["pgrep", "-P", str(tick.pid)], capture_output=True).stdout.strip(), 5, "the op")
+        rig.until(ready.exists, 5, "machine launcher")
         running(rig, jid, tick.pid)
         cid = rig.director.cancel("node-dspec", jid)
-        rig.listen(CSGATEWAY_LAB_ENDPOINT="http://127.0.0.1:%d/v1/ai/lab-execute" % gateway.server_address[1])
+        rig.listen()
         c = settled(rig, cid, timeout=60)
+        ctx.expect(stopped.is_file(), "SIGTERM reached the machine launcher")
+        ctx.expect(c["outcome"] == "stopped" and "SIGTERM" in c["detail"], "stopped", c)
+        tick.wait(timeout=5)
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("the machine launcher group survived cancellation")
     finally:
-        tick.kill()
-        tick.wait()
-        gateway.shutdown()
-    ctx.expect([p for p, _ in seen] == ["/v1/ai/lab-execute/%s/cancel" % jid], "the gateway's cancel call", seen)
-    ctx.expect(c["outcome"] == "stopped" and "gateway cancelled" in c["detail"] and "SIGTERM" in c["detail"], "stopped", c)
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        tick.wait(timeout=5)
 
 
 @case(N, "envelopes", "node2-run-envelope-names-job")

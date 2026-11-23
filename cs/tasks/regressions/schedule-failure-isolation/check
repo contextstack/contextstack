@@ -10,9 +10,9 @@ from hermetic_env import hermetic_env
 _clean_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_clean_env)
-LAB=pathlib.Path(__file__).resolve().parents[3]
-sys.path.insert(0,str(LAB/'ops/bin'))
-m=runpy.run_path(str(LAB/'ops/bin/schedule-tick'))
+CODE_ROOT=pathlib.Path(__file__).resolve().parents[3]
+sys.path.insert(0,str(CODE_ROOT/'ops/bin'))
+m=runpy.run_path(str(CODE_ROOT/'ops/bin/schedule-tick'))
 with scratch_dir() as tmp:
  p=pathlib.Path(tmp)
  schedules=[{'id':s,'enabled':s!='held','cron':'0 6 * * *','timezone':'UTC','requires':['held'] if s=='dependent' else []} for s in ['held','dependent','independent']]

@@ -1,8 +1,8 @@
 //! Pay-as-you-go source budgets (WIRE.md request budget): per-source day and month limits replace a single legacy daily total.
 //!
 //! A source is the catalog endpoint id an api-class model is served by (openrouter, openai, anthropic,
-//! gemini, an overlay id). `free_local` and subscription calls never reach this module. A source is OFF
-//! until `~/.contextstack/config/gateway/limits.json` gives it a budget:
+//! gemini, an overlay id). Local and subscription calls debit the same budgets when a provider
+//! reports an actual charge. API admission for a source is OFF until `~/.contextstack/config/gateway/limits.json` gives it a budget:
 //!
 //! ```json
 //! {"sources": {"openrouter": {"usd": 20, "period": "month"},
@@ -332,6 +332,8 @@ impl Guard {
     ) -> Result<Reservation, Box<Denial>> {
         let source = source.to_ascii_lowercase();
         let invalid = |m: String| Box::new(Denial::new("invalid", &source, m));
+        // Serialize the spent + held snapshot against the hold-to-charge transition.
+        let _write = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         let limits = self.limits().map_err(invalid)?;
         let apply =
             applicable(&limits, &source).map_err(|m| Box::new(Denial::new("off", &source, m)))?;
@@ -390,9 +392,44 @@ impl Guard {
         })
     }
 
+    pub async fn admit_async(
+        self: &Arc<Self>,
+        source: &str,
+        max_usd: &str,
+        est: f64,
+    ) -> Result<Reservation, Box<Denial>> {
+        let guard = Arc::clone(self);
+        let source = source.to_owned();
+        let max_usd = max_usd.to_owned();
+        tokio::task::spawn_blocking(move || guard.admit(&source, &max_usd, est))
+            .await
+            .map_err(|e| Box::new(Denial::new("invalid", "", e.to_string())))?
+    }
+
+    /// Debit a provider-reported charge even when admission did not require a hold.
+    pub fn debit_reported(&self, source: &str, charged: f64) {
+        let _write = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(error) = self.record_charge(&source.to_ascii_lowercase(), charged) {
+            crate::logf!("paid API counter not updated: {error}");
+        }
+    }
+
+    // A positive charge requires the caller to hold `writing`.
+    fn record_charge(&self, source: &str, charged: f64) -> Result<(), String> {
+        if !(charged > 0.0 && charged.is_finite()) {
+            return Ok(());
+        }
+        let mut counter = self.read(Local::now())?;
+        let spend = counter.sources.entry(source.to_owned()).or_default();
+        spend.day_usd += charged;
+        spend.month_usd += charged;
+        self.write(&counter)
+    }
+
     /// Each source's state for `GET /v1/budgets`: `known` are the pay-as-you-go sources the catalog and
     /// inventory name; configured ones are added. No key or credential is read.
     pub fn report(&self, known: impl IntoIterator<Item = String>) -> Value {
+        let _write = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Local::now();
         let held = self
             .held
@@ -412,6 +449,13 @@ impl Guard {
                 return json!({"schema_version": "csgateway.budgets.v1", "sources": rows, "total": null, "error": e});
             }
         };
+        names.extend(
+            counter
+                .sources
+                .keys()
+                .filter(|s| s.as_str() != UNATTRIBUTED)
+                .cloned(),
+        );
         names.extend(limits.keys().filter(|k| *k != ALL).cloned());
         let budget = |key: &str, b: &Budget| {
             let (spent, h) = (counter.spent(key, b.period), held_under(&held, key));
@@ -619,13 +663,8 @@ impl Reservation {
         self.est
     }
 
-    /// Alias for [`reservation_usd`] (pre-flight hold against source budgets).
-    pub fn held_estimate(&self) -> f64 {
-        self.reservation_usd()
-    }
-
-    /// Record the call's charge against its source and release the hold.
-    pub fn settle(mut self, charged_usd: f64, over_reservation: bool) {
+    /// Release the hold and return the charge recorded against its source.
+    pub fn settle(mut self, charged_usd: f64, over_reservation: bool) -> f64 {
         if over_reservation {
             crate::log::row(&json!({
                 "event": "spend_over_reservation",
@@ -636,6 +675,9 @@ impl Reservation {
         }
         if let Err(e) = self.finish(charged_usd) {
             crate::logf!("paid API counter not updated: {e}");
+            0.0
+        } else {
+            charged_usd
         }
     }
 
@@ -645,6 +687,8 @@ impl Reservation {
         }
         self.done = true;
         let g = &self.guard;
+        let _write = (charged > 0.0 && charged.is_finite())
+            .then(|| g.writing.lock().unwrap_or_else(PoisonError::into_inner));
         let mut held = g.held.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(h) = held.get_mut(&self.source) {
             *h -= self.est;
@@ -652,15 +696,8 @@ impl Reservation {
                 held.remove(&self.source);
             }
         }
-        if !(charged > 0.0 && charged.is_finite()) {
-            return Ok(());
-        }
-        let _write = g.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut c = g.read(Local::now())?;
-        let s = c.sources.entry(self.source.clone()).or_default();
-        s.day_usd += charged;
-        s.month_usd += charged;
-        g.write(&c)
+        drop(held);
+        g.record_charge(&self.source, charged)
     }
 }
 
@@ -881,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_precision_loss, clippy::unwrap_used)]
+    #[allow(clippy::cast_precision_loss)]
     fn concurrent_settlements_sum() -> Res {
         use std::sync::Barrier;
         use std::thread::{self, JoinHandle};
@@ -902,7 +939,7 @@ mod tests {
             }));
         }
         for h in handles {
-            h.join().unwrap();
+            h.join().map_err(|_| "settlement worker panicked")?;
         }
         let want = n as f64 * charge;
         let spent = g.read(Local::now())?.spent("a", Period::Day);
@@ -914,7 +951,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn invalid_denial_wire_has_no_path() -> Res {
         use crate::errors::WireError;
         let (_d, g) = guard("not json")?;
@@ -941,5 +977,34 @@ mod tests {
         };
         let want = 0.01 * 4196.0 / 1000.0;
         assert!((estimate(rates, 400, 0) - want).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod settlement_lock_tests {
+    use super::*;
+
+    #[test]
+    fn pending_counter_write_leaves_hold_lock_available() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let guard = Arc::new(Guard::new(Some(dir.path())));
+        guard
+            .replace(br#"{"api_usd_per_day": 1}"#)
+            .map_err(|e| format!("{e:?}"))?;
+        let reserved = guard.admit("api", "", 0.5)?;
+        let writing = guard.writing.lock().map_err(|_| "writer lock")?;
+        let (start, started) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = start.send(());
+            reserved.settle(0.5, false)
+        });
+        started.recv()?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let hold_available = guard.held.try_lock().is_ok();
+        drop(writing);
+        assert_eq!(worker.join().map_err(|_| "settlement panicked")?, 0.5);
+        assert!(hold_available);
+        Ok(())
     }
 }

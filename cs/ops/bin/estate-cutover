@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """estate-cutover — name an install's state root as its new estate (dev -> m4, 2026-11-11).
 
-Operator-called, never palette, never run by tick. Runs against an install's roots: LAB_STATE_ROOT (the state root in
-place, ~/.contextstack/state; nothing is copied) and LAB_CONFIG_ROOT (whose ESTATE the operator has already set to the
+Operator-called, never palette, never run by tick. Runs against an install's roots: CS_STATE_ROOT (the state root in
+place, ~/.contextstack/state; nothing is copied) and CS_CONFIG_ROOT (whose ESTATE the operator has already set to the
 new name) must both be set. Input {estate, aliases (default: the state root's estate-cutover-v1 record's estate, e.g.
 ["dev"]), mode: "dry-run" (default) | "write" | "verify"}.
 
@@ -43,8 +43,8 @@ def main():
         mode = args.get("mode", "dry-run")
         if mode not in ("dry-run", "write", "verify"):
             raise ValueError('mode must be "dry-run", "write" or "verify"')
-        if not os.environ.get("LAB_STATE_ROOT") or not os.environ.get("LAB_CONFIG_ROOT"):
-            raise ValueError("LAB_STATE_ROOT and LAB_CONFIG_ROOT must name the install's roots")
+        if not os.environ.get("CS_STATE_ROOT") or not os.environ.get("CS_CONFIG_ROOT"):
+            raise ValueError("CS_STATE_ROOT and CS_CONFIG_ROOT must name the install's roots")
         from _roots import roots
         found = roots()
         state, config = found["state"], found["config"]

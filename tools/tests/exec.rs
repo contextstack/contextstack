@@ -83,7 +83,7 @@ fn fs_read_file_and_call_log() {
     let out = tool("fs_read", ws.path(), r#"{"path": "a.txt"}"#);
     assert_eq!((out.code, out.stdout.as_str()), (0, "alpha\nbeta\ngamma\n"));
     assert_eq!(
-        read(&ws.path().join(".lab-calls.jsonl")),
+        read(&ws.path().join(".cs-calls.jsonl")),
         "{\"args\": {\"path\": \"a.txt\"}, \"name\": \"fs_read\"}\n"
     );
 }
@@ -98,23 +98,23 @@ fn fs_read_appends_batch_child_call_log_when_parent_pid_matches() {
         ws.path(),
         r#"{"path": "a.txt"}"#,
         &[
-            ("LAB_BATCH_CHILD_CALLLOG", ".lab-batch-child-calls.jsonl"),
-            ("LAB_BATCH_PARENT_PID", parent.as_str()),
+            ("CS_BATCH_CHILD_CALLLOG", ".cs-batch-child-calls.jsonl"),
+            ("CS_BATCH_PARENT_PID", parent.as_str()),
         ],
         &[],
     );
     assert_eq!((out.code, out.stdout.as_str()), (0, "alpha\nbeta\ngamma\n"));
     assert_eq!(
-        read(&ws.path().join(".lab-batch-child-calls.jsonl")),
+        read(&ws.path().join(".cs-batch-child-calls.jsonl")),
         "{\"args\": {\"path\": \"a.txt\"}, \"name\": \"fs_read\"}\n"
     );
-    assert!(!ws.path().join(".lab-calls.jsonl").exists());
+    assert!(!ws.path().join(".cs-calls.jsonl").exists());
 }
 
 #[test]
 fn fs_read_skips_call_log_when_default_path_is_a_directory() {
     let ws = workspace();
-    fs::create_dir(ws.path().join(".lab-calls.jsonl")).unwrap_or_else(|e| panic!("{e}"));
+    fs::create_dir(ws.path().join(".cs-calls.jsonl")).unwrap_or_else(|e| panic!("{e}"));
     let out = tool("fs_read", ws.path(), r#"{"path": "a.txt"}"#);
     assert_eq!((out.code, out.stdout.as_str()), (0, "alpha\nbeta\ngamma\n"));
 }
@@ -144,7 +144,7 @@ fn fs_read_window_and_listing() {
     );
     assert_eq!(out.stdout, "lines 2-2 of 4 — re-read with offset=3\n\nbeta");
     let out = tool("fs_read", ws.path(), r#"{"path": "."}"#);
-    assert_eq!(out.stdout, ".lab-calls.jsonl\na.txt\nsub/\n");
+    assert_eq!(out.stdout, ".cs-calls.jsonl\na.txt\nsub/\n");
 }
 
 #[test]
@@ -153,17 +153,23 @@ fn fs_read_errors_exit_one_on_stderr() {
     let out = tool("fs_read", ws.path(), r#"{"path": "nope.txt"}"#);
     assert_eq!(
         (out.code, out.stderr.as_str()),
-        (1, "not a file: nope.txt\n")
+        (
+            1,
+            "not a file: nope.txt (path does not exist). Use a path relative to the workspace.\n"
+        )
     );
     let out = tool("fs_read", ws.path(), r#"{"path": "../x"}"#);
     assert_eq!(
         (out.code, out.stderr.as_str()),
-        (1, "path escapes workspace: ../x\n")
+        (
+            1,
+            "path escapes workspace: ../x. Use a path relative to the workspace.\n"
+        )
     );
     let out = tool("fs_read", ws.path(), r#"{"path": "a.txt", "offset": 9}"#);
     assert_eq!(
         out.stderr,
-        "Offset 9 is beyond end of file (4 lines total)\n"
+        "Offset 9 is beyond end of file (4 lines total). Path \"a.txt\" exists.\n"
     );
 }
 
@@ -214,18 +220,29 @@ fn symlinks_out_of_the_workspace_are_refused() {
     };
     link(&outside.path().join("secret.txt"), "link.txt");
     link(outside.path(), "linkdir");
-    link(&outside.path().join("calls.jsonl"), ".lab-calls.jsonl");
+    link(&outside.path().join("calls.jsonl"), ".cs-calls.jsonl");
     link(&ws.path().join("a.txt"), "inner.txt");
-    for path in ["link.txt", "linkdir", "linkdir/secret.txt"] {
+    for path in [
+        "link.txt",
+        "linkdir",
+        "linkdir/secret.txt",
+        ".cs-calls.jsonl",
+    ] {
         let out = tool("fs_read", ws.path(), &format!(r#"{{"path": "{path}"}}"#));
         assert_eq!(
             (out.code, out.stderr),
-            (1, format!("path escapes workspace: {path}\n"))
+            (
+                1,
+                format!("path escapes workspace: {path}. Use a path relative to the workspace.\n")
+            )
         );
     }
     let args = r#"{"path": "link.txt", "edits": [{"oldText": "SECRET", "newText": "x"}]}"#;
     assert_eq!(tool("fs_edit", ws.path(), args).code, 1);
     assert_eq!(read(&outside.path().join("secret.txt")), "SECRET\n");
+    let out = tool("fs_read", ws.path(), r#"{"path": "missing"}"#);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.starts_with("not a file: missing"));
     assert!(!outside.path().join("calls.jsonl").exists());
     let out = tool("fs_read", ws.path(), r#"{"path": "inner.txt"}"#);
     assert_eq!((out.code, out.stdout.as_str()), (0, "alpha\nbeta\ngamma\n"));
@@ -295,7 +312,7 @@ fn okf_migrates_lints_and_writes_no_call_log() {
     let out = tool("okf", ws.path(), r#"{"action": "lint", "root": "corpus"}"#);
     assert_eq!(out.code, 0);
     assert!(out.stdout.starts_with("{\"ok\":true,\"action\":\"lint\""));
-    assert!(!ws.path().join(".lab-calls.jsonl").exists());
+    assert!(!ws.path().join(".cs-calls.jsonl").exists());
 }
 
 #[test]
@@ -704,4 +721,99 @@ fn in_workspace_file_symlinks_are_safely_read_and_edited() {
             .file_type()
             .is_symlink()
     );
+}
+
+#[test]
+fn repo_search_confines_relative_and_absolute_paths_to_the_view() -> std::io::Result<()> {
+    let workspace = TempDir::new()?;
+    let view = TempDir::new()?;
+    let docs = view.path().join("docs");
+    fs::create_dir(&docs)?;
+    fs::write(docs.join("facts.txt"), "snapshot fact\n")?;
+    let outside = workspace.path().join("outside");
+    fs::create_dir(&outside)?;
+    symlink(&outside, view.path().join("link"))?;
+
+    let view_env = view
+        .path()
+        .to_str()
+        .ok_or(std::io::ErrorKind::InvalidData)?;
+    let search = |path: &Path| {
+        let args = serde_json::json!({"mode": "text", "query": "snapshot fact", "path": path});
+        exec_with_env(
+            &bin_path(),
+            &["repo_search"],
+            workspace.path(),
+            &args.to_string(),
+            &[("CS_REPO_VIEW", view_env)],
+            &[],
+        )
+    };
+
+    for path in [Path::new("docs"), &docs] {
+        let out = search(path);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(out.stdout.ends_with("/docs/facts.txt:1: snapshot fact\n"));
+    }
+    for path in [
+        outside,
+        "../outside".into(),
+        view.path().join("docs/../docs"),
+        "link".into(),
+        view.path().join("link"),
+    ] {
+        let out = search(&path);
+        assert_eq!(out.code, 1, "{}", path.display());
+        assert!(
+            out.stderr.contains("outside the repository view"),
+            "{}",
+            out.stderr
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn absolute_write_refusals_explain_where_to_write() -> std::io::Result<()> {
+    let ws = workspace();
+    let repo = workspace();
+    let root = repo.path().to_string_lossy();
+    let path = repo.path().join("a.txt");
+    let input = serde_json::json!({
+        "path": path,
+        "content": "changed",
+        "oldText": "alpha",
+        "newText": "changed"
+    });
+    let write = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cs/tools/bin/fs_write");
+    let workspace = ws.path().canonicalize()?;
+    for (program, args) in [(write, &[][..]), (bin_path(), &["fs_edit"][..])] {
+        for repo_view in [false, true] {
+            let env = [("CS_REPO_VIEW", root.as_ref())];
+            let out = exec_with_env(
+                &program,
+                args,
+                ws.path(),
+                &input.to_string(),
+                if repo_view { &env } else { &[] },
+                if repo_view { &[] } else { &["CS_REPO_VIEW"] },
+            );
+            let repo_help = if repo_view {
+                ". The repository view is read-only. Write deliverables in your workspace with a relative path, e.g. answer.md."
+            } else {
+                ""
+            };
+            assert_eq!(out.code, 1);
+            assert_eq!(
+                out.stderr,
+                format!(
+                    "path escapes workspace: {}{repo_help}\nYour workspace is {}; write there or use a relative path such as a.txt.\n",
+                    path.display(),
+                    workspace.display()
+                )
+            );
+        }
+    }
+    assert_eq!(fs::read_to_string(path)?, "alpha\nbeta\ngamma\n");
+    Ok(())
 }

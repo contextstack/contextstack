@@ -17,30 +17,58 @@ const MAX_BYTES: usize = 50 * 1024;
 
 /// Run the tool on decoded args; `Ok` is stdout (exit 0).
 pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
-    let p = py::fspath(py::getitem(a, "path")?)?;
-    if jail::lexically_escapes(p) || jail::resolves_outside(Path::new(p)) {
-        return Err(Failure::exit(format!("path escapes workspace: {p}")));
-    }
+    let p = py::getitem(a, "path")
+        .and_then(py::fspath)
+        .map_err(|error| {
+            Failure::exit(format!(
+                "{}. Pass path as a string naming a workspace file or directory.",
+                error.0
+            ))
+        })?;
     let path = Path::new(p);
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Failure::exit(format!("not a file: {p}")));
-        }
-        Err(e) => return Err(py::os_error(&e, p)),
+    let repo = jail::repo_view();
+    let with_path_help = |failure: Failure| {
+        let help = repo.as_ref().map_or_else(
+            || "Use a path relative to the workspace.".to_owned(),
+            |root| format!("Relative paths use the workspace. For snapshot files use an absolute path under {} or repo_search.", root.display()),
+        );
+        Failure::exit(format!("{}. {help}", failure.0))
     };
-    if meta.is_dir() {
-        return list(a, p);
+    let escape = || with_path_help(Failure::exit(format!("path escapes workspace: {p}")));
+    if jail::lexically_escapes(p, repo.as_deref())
+        || jail::read_resolves_outside(path, repo.as_deref())
+    {
+        return Err(escape());
     }
-    if meta.file_type().is_symlink() {
-        if jail::link_leaves_workspace(path) {
-            return Err(Failure::exit(format!("path escapes workspace: {p}")));
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+                return Err(escape());
+            }
+            return Err(with_path_help(Failure::exit(format!(
+                "not a file: {p} (path does not exist)"
+            ))));
         }
-    } else if !meta.is_file() {
-        return Err(Failure::exit(format!("not a file: {p}")));
+        Err(e) => {
+            if fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+                return Err(escape());
+            }
+            return Err(with_path_help(py::os_error(&e, p)));
+        }
+    };
+    if !meta.is_dir() && !meta.is_file() {
+        return Err(Failure::exit(format!(
+            "not a file: {p}. Select a regular file or directory."
+        )));
     }
-    let file = jail::open_for_read(path).map_err(|e| open_error(&e, p))?;
-    read_file(a, p, file).map(String::into_bytes)
+    let result = if meta.is_dir() {
+        list(a, p)
+    } else {
+        let file = jail::open_for_read(path).map_err(|e| with_path_help(open_error(&e, p)))?;
+        read_file(a, p, file).map(String::into_bytes)
+    };
+    result.map_err(|failure| Failure::exit(format!("{}. Path {p:?} exists.", failure.0)))
 }
 
 fn open_error(error: &io::Error, path: &str) -> Failure {
@@ -51,6 +79,9 @@ fn open_error(error: &io::Error, path: &str) -> Failure {
     }
     if error.kind() == io::ErrorKind::PermissionDenied {
         return Failure::exit(format!("cannot open {path} safely: {error}"));
+    }
+    if error.kind() == io::ErrorKind::InvalidInput && error.to_string() == "not a regular file" {
+        return Failure::exit(format!("not a file: {path}"));
     }
     py::os_error(error, path)
 }
@@ -316,25 +347,6 @@ fn slice_end(len: usize, lim: i128) -> usize {
 }
 
 /// How many lines fit, whether output was cut, and whether the first line alone is too big.
-#[cfg(test)]
-fn take(lines: &[&str]) -> (usize, bool, bool) {
-    let Some(first) = lines.first() else {
-        return (0, false, false);
-    };
-    if first.len() > MAX_BYTES {
-        return (0, true, true);
-    }
-    let mut used = 0;
-    for (i, line) in lines.iter().enumerate() {
-        let extra = line.len() + usize::from(i > 0);
-        if i >= MAX_LINES || used + extra > MAX_BYTES {
-            return (i, true, false);
-        }
-        used += extra;
-    }
-    (lines.len(), false, false)
-}
-
 fn take_bytes(lines: &[Vec<u8>]) -> (usize, bool, bool) {
     let Some(first) = lines.first() else {
         return (0, false, false);
@@ -416,14 +428,12 @@ mod tests {
 
     #[test]
     fn truncates_at_line_and_byte_caps() {
-        let many: Vec<String> = (0..2500).map(|i| i.to_string()).collect();
-        let lines: Vec<&str> = many.iter().map(String::as_str).collect();
-        let (shown, truncated, huge) = take(&lines);
-        assert_eq!((shown, truncated, huge), (2000, true, false));
-        let wide = "x".repeat(30 * 1024);
-        assert_eq!(take(&[&wide, &wide]), (1, true, false));
-        let huge_line = "x".repeat(MAX_BYTES + 1);
-        assert_eq!(take(&[&huge_line]), (0, true, true));
+        let lines: Vec<Vec<u8>> = (0..2500).map(|i| i.to_string().into_bytes()).collect();
+        assert_eq!(take_bytes(&lines), (2000, true, false));
+        let wide = vec![b'x'; 30 * 1024];
+        assert_eq!(take_bytes(&[wide.clone(), wide]), (1, true, false));
+        let huge_line = vec![b'x'; MAX_BYTES + 1];
+        assert_eq!(take_bytes(&[huge_line]), (0, true, true));
     }
 
     #[test]
@@ -465,8 +475,8 @@ mod tests {
     }
 
     #[test]
-    fn take_on_empty_input_returns_zero_lines() {
-        assert_eq!(take(&[]), (0, false, false));
+    fn take_bytes_on_empty_input_returns_zero_lines() {
+        assert_eq!(take_bytes(&[]), (0, false, false));
     }
 
     #[test]
@@ -597,7 +607,7 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("expected error"));
         let _ = std::env::set_current_dir(&old);
-        assert!(err.0.contains("path escapes workspace"));
+        assert!(err.0.starts_with("path escapes workspace: "));
     }
 
     #[test]

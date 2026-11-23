@@ -3,6 +3,8 @@
 Split out of scripts/node-release so that file and _node_services stay near 500 lines. Stdlib only.
 """
 import base64
+from contextlib import closing, contextmanager
+import fcntl
 import json
 import sqlite3
 import os
@@ -17,7 +19,7 @@ from pathlib import Path
 from _atomic_write import write_atomic as _write_atomic_bytes  # noqa: E402
 
 from _node_services import (CLIENT_WEB, CLIENT_WEB_ENV, CLIENT_WEB_STATE, CONFIG, CURRENT, DIRECTOR_RS_DATA,
-                            DIRECTOR_RS_LISTEN, GATEWAY_BIN, HOME, MODELS, Refused, ROOT)
+                            DIRECTOR_RS_LISTEN, GATEWAY_BIN, HOME, MODELS, Refused, ROOT, release_bin)
 
 RELEASES, RECORD = ROOT / "releases", CONFIG / "install.json"
 DIRECTOR_ENV = CONFIG / "director/director.env"
@@ -26,7 +28,7 @@ CLIENT_WEB_PHP = 80300
 KEPT_STATE = ("director", "client-web")
 LARAVEL_KEYS = ("serve_director", "php", "director_key_from", "director_url")
 LINKS = {"csgateway": None, "node-install": "scripts/node-install", "cs": "scripts/cs"}
-RETIRED_LINKS = ("lab", "u" + "ah")
+RETIRED_LINKS = ("u" + "ah",)
 SEEDED = ("policy/spool.json", "policy/env.json")
 OVERLAY_PROVIDERS = ()
 
@@ -58,6 +60,49 @@ class DrainRefused(Exception):
     def __init__(self, reason):
         super().__init__("active jobs")
         self.reason = reason
+
+
+INSTALL_LOCK = RELEASES / "install.lock"
+INSTALL_LOCK_FD = "NODE_INSTALL_LOCK_FD"
+
+
+@contextmanager
+def install_lock(command):
+    """Hold the same lock as the shell bootstrap, including for direct node-release calls."""
+    inherited = os.environ.pop(INSTALL_LOCK_FD, None)
+    if inherited is not None:
+        fd = int(inherited)
+        if os.path.samestat(os.fstat(fd), INSTALL_LOCK.stat()):
+            with os.fdopen(fd, "r+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.set_inheritable(fd, False)
+                yield lock
+                return
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    RELEASES.mkdir(mode=0o700, exist_ok=True)
+    with INSTALL_LOCK.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.seek(0)
+            holder = lock.read().strip()
+            raise Refused("install lock held by " + (holder or "another node-install invocation")) from None
+        lock.seek(0)
+        lock.truncate()
+        lock.write(f"pid {os.getpid()} ({command})\n")
+        lock.flush()
+        yield lock
+
+
+def exec_locked(script, args):
+    try:
+        with install_lock("node-install " + args[0]) as lock:
+            fd = lock.fileno()
+            os.set_inheritable(fd, True)
+            os.environ[INSTALL_LOCK_FD] = str(fd)
+            os.execv("/bin/sh", ["/bin/sh", script, *args])
+    except (OSError, Refused) as error:
+        sys.exit(f"node-install: {error}")
 
 
 def load_record():
@@ -299,12 +344,20 @@ def check_config(rec):
         raise Refused("--director needs --node NAME (the node's ESTATE and its director node name)")
 
 
+def ensure_private_root(path):
+    path.mkdir(mode=0o700, exist_ok=True)
+    if stat.S_IMODE(path.stat().st_mode) != 0o700:
+        path.chmod(0o700)
+
+
 def seed_config(rid, rec):
-    """config/ and the empty roots: create what is missing (0700), never touch what exists."""
+    """Seed config and ensure the install, state and workspace roots are private."""
     estate, want = CONFIG / "ESTATE", rec.get("estate") or rec.get("node")
-    for d in ("config", "config/policy", "config/gateway", "state", "workspaces", "logs", "gateway"):
+    for path in (ROOT, ROOT / "state", ROOT / "workspaces"):
+        ensure_private_root(path)
+    for d in ("config", "config/policy", "config/gateway", "logs", "gateway"):
         if not (ROOT / d).exists():
-            (ROOT / d).mkdir(parents=True)
+            (ROOT / d).mkdir(mode=0o700)
             (ROOT / d).chmod(0o700)
     providers, legacy = CONFIG / "gateway/providers.d", ROOT / "gateway/providers.d"
     if not providers.exists():
@@ -348,11 +401,11 @@ def overlay_providers():
 
 
 def derive_models(rid):
-    """ROOT/gateway/models.json: the release's catalog, its absolute lab_executor replaced by this install's, and
+    """ROOT/gateway/models.json: the release's catalog, its absolute cli_executor replaced by this install's, and
     the deployments of OVERLAY_PROVIDERS this host's overlay does not define dropped. True when it changed."""
     models = json.loads((RELEASES / rid / "gateway/models.json").read_text(encoding="utf-8"))
-    if "lab_executor" in models:
-        models["lab_executor"] = str(CURRENT / kit(rid) / "ops/bin/_executor.py")
+    if "cli_executor" in models:
+        models["cli_executor"] = str(CURRENT / kit(rid) / "ops/bin/_executor.py")
     absent = set(configured_overlay_providers()) - overlay_providers()
     if isinstance(models.get("deployments"), list):
         models["deployments"] = [d for d in models["deployments"] if not (isinstance(d, dict) and d.get("provider") in absent)]
@@ -377,31 +430,63 @@ def prune_director_db_snapshots(keep=2):
         stale.unlink(missing_ok=True)
 
 
+def director_db_schema(path=DIRECTOR_DB):
+    try:
+        # A normal read-only SQLite connection can leave WAL sidecars behind
+        # even when the stopped Director has already checkpointed its database.
+        journals = [path.with_name(path.name + suffix) for suffix in ("-wal", "-journal")]
+        if not any(journal.exists() for journal in journals):
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+            if not any(journal.exists() for journal in journals):
+                return version
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+            return db.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.Error as error:
+        raise Refused(f"cannot read Director database schema from {path}: {error}") from error
+
+
+def director_supported_schema(rid):
+    binary = release_bin(RELEASES / rid, "cs-director")
+    try:
+        result = subprocess.run([binary, "--schema-version"], check=True, capture_output=True, text=True, timeout=10)
+        version = result.stdout.strip()
+        if version.isascii() and version.isdecimal():
+            return int(version)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    print(f"warning: Director schema support is unknown for release {rid} ({binary} --schema-version)",
+          file=sys.stderr)
+    return None
+
+
+def check_director_schema(rid):
+    if DIRECTOR_DB.is_file():
+        live = director_db_schema()
+        supported = director_supported_schema(rid)
+        if supported is not None and live > supported:
+            raise Refused(f"release {rid} supports Director schema {supported}, but the live database is schema {live}")
+
+
 def snapshot_director_db(rid):
     """Consistent copy of director.sqlite before a release that will restart the Director."""
     if not DIRECTOR_DB.is_file():
         return None
     dest = director_db_snapshot_path(rid)
     DIRECTOR_DB_SNAPS.mkdir(mode=0o700, parents=True, exist_ok=True)
-    src = sqlite3.connect(str(DIRECTOR_DB))
-    dst = sqlite3.connect(str(dest))
-    with dst:
+    with closing(sqlite3.connect(DIRECTOR_DB)) as src, closing(sqlite3.connect(dest)) as dst:
         src.backup(dst)
-    src.close()
     os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR)
     prune_director_db_snapshots()
     return dest
 
 
-def restore_director_db(rid):
-    snap = director_db_snapshot_path(rid)
-    if not snap.is_file():
-        return False
-    tmp = snap.with_suffix(snap.suffix + ".tmp.%d" % os.getpid())
-    shutil.copy2(snap, tmp)
-    os.replace(tmp, DIRECTOR_DB)
+def restore_director_db(snapshot):
+    # Restore through SQLite so pages in the live WAL cannot overlay the restored database.
+    with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True)) as src:
+        with closing(sqlite3.connect(DIRECTOR_DB)) as dst:
+            src.backup(dst)
     os.chmod(DIRECTOR_DB, stat.S_IRUSR | stat.S_IWUSR)
-    return True
 
 
 def switch_current(rid):
@@ -418,6 +503,8 @@ def pid_live(pid):
     try:
         os.kill(int(pid), 0)
         return True
+    except PermissionError:
+        return True
     except (OSError, ValueError, TypeError):
         return False
 
@@ -427,12 +514,12 @@ def active_jobs():
     shelf = ROOT / "state/dispatch.jsonl"
     if not shelf.is_file():
         return []
-    try:
-        rows = [json.loads(line) for line in shelf.read_text(encoding="utf-8").splitlines() if line.strip()]
-    except ValueError:
-        return []
     by_id = {}
-    for row in rows:
+    for line in shelf.read_bytes().splitlines():
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
         if not isinstance(row, dict):
             continue
         jid = str(row.get("id") or row.get("job") or "")
@@ -447,8 +534,11 @@ def active_jobs():
             out.append({"id": jid, "job_id": str(row.get("director_job") or jid), "state": "queued"})
             continue
         if state == "running":
-            pid = int(row.get("pid") or 0)
-            if pid_live(pid):
+            try:
+                pid = int(row.get("pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid > 0 and pid_live(pid):
                 out.append({"id": jid, "job_id": str(row.get("director_job") or jid), "state": "running", "pid": pid})
     return out
 
@@ -495,6 +585,26 @@ def drain_before_restart(load, opts):
     return {"waited_s": waited, "active": []}
 
 
+@contextmanager
+def restart_window(load, opts):
+    if not load:
+        yield None
+        return
+    state = ROOT / "state"
+    ensure_private_root(state)
+    # Stop job pulls while letting already queued jobs run and drain.
+    with (state / "restart-intake.lock").open("a") as intake:
+        fcntl.flock(intake, fcntl.LOCK_EX)
+        drain = drain_before_restart(load, opts)
+        # Tick holds this lock while recording admission. Keep it through the
+        # service restart and check the shelf again once admission is frozen.
+        with (state / "dispatch.lock").open("a") as admission:
+            fcntl.flock(admission, fcntl.LOCK_EX)
+            if not opts.get("force") and active_jobs():
+                raise Refused("jobs arrived during drain; retry the release switch")
+            yield drain
+
+
 def migrate_noindex(parent, name):
     """Make parent/<name>.noindex the real directory and parent/<name> a relative symlink to it.
 
@@ -539,7 +649,7 @@ def migrate_noindex(parent, name):
 
 def migrate_churn_dirs():
     """Point bundles and state/runs at *.noindex directories. workspaces/ and releases/ stay real
-    directories: current -> releases/<id>, LAB_WORKSPACES_ROOT, and uninstall's rmtree all name them,
+    directories: current -> releases/<id>, CS_WORKSPACES_ROOT, and uninstall's rmtree all name them,
     and Python's rmtree refuses to remove a directory symlink."""
     # state/runs stays a real directory: agent profiles resolve run paths (CODEX_HOME's realpath
     # needs metadata on every literal parent), and a symlinked runs dir broke that once (2026-11-12).

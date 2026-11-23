@@ -168,7 +168,7 @@ for cli, source in SOURCES.items():
                              binary=cli, args=['--model', 'fixture'], name='template-' + cli,
                              run_dir=run, ws=ws, cli_tmp=tmp, cli_env=hermetic_env(), HOME=home,
                              sandbox_policy=root / 'policy', sandbox_cmd=sandbox,
-                             LAB=ROOT, state_dir=lambda lab: state)
+                             CODE_ROOT=ROOT, state_dir=lambda cs: state)
                 exec(code, scope)
                 with patch('_muse.run_process', side_effect=pi_probe), patch('_login_refresh.codex_refresh', side_effect=probe):
                     scope['finalize_login_copies'](expired=expired)

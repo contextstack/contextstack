@@ -160,7 +160,8 @@ class ToolchainDiscoveryTests(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True):
                 clear_toolchain_caches()
                 lane_env = _toolchains.uv_lane_env(root / "tmp")
-                self.assertIn("uv-cache", lane_env["UV_CACHE_DIR"])
+                self.assertEqual(lane_env["UV_CACHE_DIR"], str(root / "tmp/uv-cache"))
+                self.assertEqual(lane_env["UV_OFFLINE"], "1")
                 self.assertEqual(lane_env["UV_PYTHON_INSTALL_DIR"], str(pydir.resolve()))
 
     def test_rust_profile_denies_toolchain_writes_and_grants_symlink_metadata(self):
@@ -266,28 +267,28 @@ class EstateIoJsonlTests(unittest.TestCase):
             self.assertIn(b'"a"', body)
 
     def test_lab_path_maps_ledger_relative_path_into_relocated_state_root(self):
-        with scratch_dir(prefix="est-lab-") as raw:
+        with scratch_dir(prefix="est-code_root-") as raw:
             root = Path(raw)
-            lab = root / "lab"
+            code_root = root / "code_root"
             state = root / "state"
-            lab.mkdir()
+            code_root.mkdir()
             state.mkdir()
-            (lab / "ledger").mkdir()
-            (lab / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
-            env = {**hermetic_env(), "LAB_CODE_ROOT": str(lab), "LAB_STATE_ROOT": str(state)}
+            (code_root / "ledger").mkdir()
+            (code_root / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
+            env = {**hermetic_env(), "CS_CODE_ROOT": str(code_root), "CS_STATE_ROOT": str(state)}
             with patch.dict(os.environ, env, clear=True):
-                mapped = _estate_io.lab_path(lab, "ledger/setups/x")
+                mapped = _estate_io.code_path(code_root, "ledger/setups/x")
                 self.assertEqual(Path(mapped).resolve(), (state / "setups/x").resolve())
-                self.assertEqual(_estate_io.lab_path(lab, "tasks/y"), lab / "tasks/y")
+                self.assertEqual(_estate_io.code_path(code_root, "tasks/y"), code_root / "tasks/y")
 
     def test_estate_row_stamps_ledger_shelf_rows_with_estate_id(self):
         with scratch_dir(prefix="est-row-") as raw:
             root = Path(raw)
-            lab = root / "lab"
-            lab.mkdir()
-            (lab / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
-            (lab / "ESTATE").write_text("devtest\n", encoding="utf-8")
-            ledger = lab / "ledger"
+            code_root = root / "code_root"
+            code_root.mkdir()
+            (code_root / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
+            (code_root / "ESTATE").write_text("devtest\n", encoding="utf-8")
+            ledger = code_root / "ledger"
             ledger.mkdir()
             shelf = ledger / "runs.jsonl"
             row = _estate_io.estate_row(shelf, {"job": "j1"})
@@ -296,11 +297,11 @@ class EstateIoJsonlTests(unittest.TestCase):
     def test_estate_row_refuses_foreign_estate_on_ledger_shelf(self):
         with scratch_dir(prefix="est-refuse-") as raw:
             root = Path(raw)
-            lab = root / "lab"
-            lab.mkdir()
-            (lab / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
-            (lab / "ESTATE").write_text("devtest\n", encoding="utf-8")
-            ledger = lab / "ledger"
+            code_root = root / "code_root"
+            code_root.mkdir()
+            (code_root / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
+            (code_root / "ESTATE").write_text("devtest\n", encoding="utf-8")
+            ledger = code_root / "ledger"
             ledger.mkdir()
             shelf = ledger / "runs.jsonl"
             with self.assertRaises(ValueError):
@@ -309,17 +310,17 @@ class EstateIoJsonlTests(unittest.TestCase):
     def test_link_target_resolves_relative_symlink_to_ledger_setup(self):
         with scratch_dir(prefix="est-link-") as raw:
             root = Path(raw)
-            lab = root / "lab"
-            lab.mkdir()
-            (lab / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
-            target = lab / "ledger" / "setups" / "x"
+            code_root = root / "code_root"
+            code_root.mkdir()
+            (code_root / "INVARIANTS.md").write_text("# x\n", encoding="utf-8")
+            target = code_root / "ledger" / "setups" / "x"
             target.mkdir(parents=True)
-            link = lab / "tasks" / "t" / "setup"
+            link = code_root / "tasks" / "t" / "setup"
             link.parent.mkdir(parents=True)
             link.symlink_to("../../ledger/setups/x")
             env = {**hermetic_env(), "HOME": str(root)}
             with patch.dict(os.environ, env, clear=True):
-                resolved = _estate_io.link_target(lab, link)
+                resolved = _estate_io.link_target(code_root, link)
                 self.assertEqual(resolved, target)
 
 

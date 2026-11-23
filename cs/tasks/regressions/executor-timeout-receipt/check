@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 import json
 import os
@@ -14,14 +15,14 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[3]
 subprocess.run([sys.executable, str(Path(__file__).with_name("verify_retry.py"))], check=True, env={**hermetic_env()})
 with scratch_dir(prefix="executor-timeout-") as raw:
-    lab = Path(raw) / "lab"
-    ops = lab / "ops/bin"
-    task = lab / "tasks/fixture"
-    ledger = lab / "ledger"
-    fake = lab / "fake"
+    code_root = Path(raw) / "code_root"
+    ops = code_root / "ops/bin"
+    task = code_root / "tasks/fixture"
+    ledger = code_root / "ledger"
+    fake = code_root / "fake"
     for path in (ops, task, ledger, fake):
         path.mkdir(parents=True, exist_ok=True)
-    for name in ('_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_est.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py",
+    for name in ('_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_est.py", "_grant.py", "_workspace_setup.py",
                  "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "capture-stimulus", "publish-evidence",
                  "harvest", "_run_record.py", "_env_policy.py", "_errors.py", "finalize-run"):
         shutil.copy2(ROOT / "ops/bin" / name, ops / name)
@@ -30,7 +31,7 @@ with scratch_dir(prefix="executor-timeout-") as raw:
     for module in sorted((ROOT / "ops/bin").glob("_*.py")):  # direct imports between ops/bin modules: ship every sibling module
         if not (ops / module.name).exists():
             shutil.copy2(module, ops / module.name)
-    (lab / "ESTATE").write_text("dev\n")  # finalize-run's node identity
+    (code_root / "ESTATE").write_text("dev\n")  # finalize-run's node identity
     for name in ("_executor.py", "capture-stimulus", "publish-evidence", "harvest"):
         (ops / name).chmod(0o755)
     claude = fake / "claude"
@@ -68,7 +69,7 @@ time.sleep(5)
     check = task / "check"
     check.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     check.chmod(0o755)
-    home = lab / "home"
+    home = code_root / "home"
     home.mkdir()
     # This fixture tests receipts, not Seatbelt (covered by the Darwin probes).
     # Stub only the sandbox launcher so it also runs in confined lanes.
@@ -76,7 +77,7 @@ time.sleep(5)
     launcher.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n")
     launcher.chmod(0o755)
     result = subprocess.run(
-        [str(ops / "_executor.py")],
+        cli_command(ops / "_executor.py"),
         input=json.dumps({
             "executor": "fake-claude",
             "task": "tasks/fixture",
@@ -84,11 +85,11 @@ time.sleep(5)
             "trial": 1,
             "timeout_s": 3,  # 1 s raced Python startup under the full check
         }),
-        cwd=lab,
+        cwd=code_root,
         text=True,
         capture_output=True,
         timeout=15,
-        env={**{k: v for k, v in hermetic_env().items() if k not in ("LAB_STATE_ROOT", "CSGATEWAY_ENDPOINT")}, "HOME": str(home), "PATH": str(fake) + os.pathsep + os.environ["PATH"], "ANTHROPIC_API_KEY": "must-not-leak"},
+        env={**{k: v for k, v in hermetic_env().items() if k not in ("CS_STATE_ROOT", "CSGATEWAY_ENDPOINT")}, "HOME": str(home), "PATH": str(fake) + os.pathsep + os.environ["PATH"], "ANTHROPIC_API_KEY": "must-not-leak"},
     )
     assert result.returncode != 0
     assert "Traceback" not in result.stderr, result.stderr
@@ -101,7 +102,7 @@ time.sleep(5)
     assert row["verdict"] == "fail" and row["stop"] == "timeout"
     assert row["auth_refresh"] == "pass"
     assert row["note"] == "task_after_auth_refresh timed out after 3s"
-    run = lab / row["transcript"]
+    run = code_root / row["transcript"]
     assert "stage=task_after_auth_refresh" in (run / "cli.log").read_text()
     # finalize-run closes the transcript with the runner's footer; the log before it is unchanged.
     transcript = (run / "transcript.md").read_text()

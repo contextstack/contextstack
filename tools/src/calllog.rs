@@ -1,5 +1,5 @@
 //! `_calllog.record`: one `{"args": ..., "name": ...}` line per call, appended to
-//! `.lab-calls.jsonl` (or a batch parent's child log) in the workspace. Failures are silent.
+//! `.cs-calls.jsonl` (or a batch parent's child log) in the workspace. Failures are silent.
 
 use crate::jail;
 use crate::pyjson;
@@ -9,13 +9,13 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::Path;
 
-const LOG: &str = ".lab-calls.jsonl";
-const CHILD_LOG: &str = ".lab-batch-child-calls.jsonl";
+const LOG: &str = ".cs-calls.jsonl";
+const CHILD_LOG: &str = ".cs-batch-child-calls.jsonl";
 
 /// A direct batch parent may isolate composed child-call evidence in its own file.
 fn destination() -> &'static str {
-    let candidate = env::var("LAB_BATCH_CHILD_CALLLOG").unwrap_or_default();
-    let parent = env::var("LAB_BATCH_PARENT_PID").unwrap_or_default();
+    let candidate = env::var("CS_BATCH_CHILD_CALLLOG").unwrap_or_default();
+    let parent = env::var("CS_BATCH_PARENT_PID").unwrap_or_default();
     let ppid = std::os::unix::process::parent_id().to_string();
     if candidate == CHILD_LOG && parent == ppid {
         return CHILD_LOG;
@@ -71,7 +71,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("chdir: {e}"));
         record("fs_read", &json!({"path": "a.txt"}));
         let _ = std::env::set_current_dir(&prev);
-        let text = fs::read_to_string(dir.path().join(".lab-calls.jsonl"))
+        let text = fs::read_to_string(dir.path().join(".cs-calls.jsonl"))
             .unwrap_or_else(|e| panic!("read: {e}"));
         assert!(text.contains("fs_read"));
     }

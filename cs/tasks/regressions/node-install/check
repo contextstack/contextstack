@@ -2,7 +2,7 @@
 """node-install regression (goal.md): stdlib-only tools, node-install's refusals, and an offline install of a release.
 
 Network-free. Part 3 runs only when this host has uv and a uv-managed interpreter of the pinned version;
-otherwise it prints SKIP and why. Temp dirs only; nothing under lab/ or $HOME is written (asserted).
+otherwise it prints SKIP and why. Temp dirs only; nothing under code_root/ or $HOME is written (asserted).
 """
 import importlib.machinery
 import importlib.util
@@ -19,8 +19,8 @@ from hermetic_env import hermetic_env
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "node-install-layout"))
 import _bundle  # noqa: E402
 
-LAB = Path(__file__).resolve().parents[3]
-INSTALL = LAB / "scripts/node-install"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+INSTALL = CODE_ROOT / "scripts/node-install"
 problems = []
 
 
@@ -39,11 +39,11 @@ def expect(cond, msg):
 
 def run(argv, **kw):
     kw.setdefault("env", {**hermetic_env()})
-    return subprocess.run(argv, capture_output=True, text=True, cwd=str(LAB), **kw)
+    return subprocess.run(argv, capture_output=True, text=True, cwd=str(CODE_ROOT), **kw)
 
 
 def load_node_bundle():
-    loader = importlib.machinery.SourceFileLoader("node_bundle", str(LAB / "scripts/node-bundle"))
+    loader = importlib.machinery.SourceFileLoader("node_bundle", str(CODE_ROOT / "scripts/node-bundle"))
     spec = importlib.util.spec_from_loader("node_bundle", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
@@ -55,10 +55,10 @@ def part_deps():
     rep = json.loads(r.stdout or "{}")
     if r.returncode != 0 or rep.get("external_imports") != {}:
         fail("node-bundle deps: exit %s, external %r" % (r.returncode, rep.get("external_imports")))
-    elif len(rep.get("tools", [])) != 12:
-        fail("node-bundle deps: %d tools, want 12" % len(rep["tools"]))
+    elif len(rep.get("tools", [])) != 14:
+        fail("node-bundle deps: %d tools, want 14" % len(rep["tools"]))
     else:
-        ok("deps: 12 tools, %d python files, no non-stdlib import" % len(rep["python_files"]))
+        ok("deps: 13 tools, %d python files, no non-stdlib import" % len(rep["python_files"]))
 
 
 def part_refusals(tmp):
@@ -145,16 +145,16 @@ def part_install(tmp):
     if uv is None:
         print("SKIP install: %s" % managed)
         return
-    version = (LAB / ".python-version").read_text().strip()
+    version = (CODE_ROOT / ".python-version").read_text().strip()
     bins = _bundle.fake_bins(tmp / "fakebin")
-    bins["cs-tools"] = LAB.parent / "target/release/cs-tools"  # real: the fixtures below exec it
+    bins["cs-tools"] = CODE_ROOT.parent / "target/release/cs-tools"  # real: the fixtures below exec it
     if not os.access(bins["cs-tools"], os.X_OK):
         return fail("target/release/cs-tools is not built (scripts/check rule 0 builds it)")
     bundle, home, rid = tmp / "bundle", tmp / "home-install", "20990101-000000000"
     files = _bundle.bundle(bundle, uv, rid, bins)
     _bundle.seed_python(home, rid, managed)
     rel = home / ".contextstack/releases" / rid
-    bin_before = set(os.listdir(Path.home() / ".local/bin")) if (Path.home() / ".local/bin").is_dir() else set()
+    bin_before = _bundle.directory_snapshot(Path.home() / ".local/bin")
     env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin" % home)
     r = run(["sh", str(INSTALL), "install", str(bundle), "--no-load"], env=env)
     if r.returncode != 0:
@@ -170,18 +170,18 @@ def part_install(tmp):
     else:
         ok("install offline: python %s in the release, %d files verified, missing host runtimes %s" %
            (version, rep["files_checked"], sorted(rep["missing_host_runtimes"]) or "none"))
-    bin_after = set(os.listdir(Path.home() / ".local/bin")) if (Path.home() / ".local/bin").is_dir() else set()
+    bin_after = _bundle.directory_snapshot(Path.home() / ".local/bin")
     (fail if bin_after != bin_before else ok)("nothing written to the real ~/.local/bin")
     exe_ok = [t["name"] for t in rep["tools"] if t["runtime"] == "exe" and t["ok"]]
-    (ok if sorted(exe_ok) == ["fs_edit", "fs_read", "okf"] else fail)(
-        "cs-tools installed at release/target/release for fs_read, fs_edit, okf: %s" % exe_ok)
+    (ok if sorted(exe_ok) == ["fs_edit", "fs_read", "okf", "repo_search"] else fail)(
+        "cs-tools installed at release/target/release for fs_read, fs_edit, okf, repo_search: %s" % exe_ok)
     venv_py = rel / "cs/.venv/bin/python3"
     r = run([str(venv_py), str(rel / "cs/scripts/tool-fixtures"), "--python", str(venv_py),
-             "--tool", "fs_read", "--tool", "okf"])
+             "--tool", "fs_read", "--tool", "okf"], env=env)
     (fail if r.returncode != 0 else ok)("installed release runs fs_read and okf (cs-tools, no ruby) fixtures: %s"
                                         % (r.stdout.strip().splitlines() or ["(no output)"])[-1])
     (rel / "target/release/cs-tools").unlink()
-    r = run([str(venv_py), "-I", str(rel / "cs/scripts/node-bundle"), "verify", str(bundle), str(rel)])
+    r = run([str(venv_py), "-I", str(rel / "cs/scripts/node-bundle"), "verify", str(bundle), str(rel)], env=env)
     rep = json.loads(r.stdout or "{}")
     (ok if r.returncode == 1 and any("target/release/cs-tools missing" in e for e in rep.get("errors", [])) else fail)(
         "verify refuses a release whose target/release/cs-tools is gone: exit %s" % r.returncode)
@@ -198,7 +198,7 @@ def part_binaries(tmp):
      and all("phase 3b" in b.get("reason", "") for b in binaries) and not (out / "release/bin").exists()
      else fail)("%s bundle records its %d binaries required, not bundled" % (other, len(binaries)))
     (ok if "release/cs/scripts/node-release" in files and not any(f.startswith(("release/cs/ledger/", "release/cs/specs/",
-     "release/cs/tasks/", "release/lab/")) for f in files) and "release/gateway/models.json" in files else fail)(
+     "release/cs/tasks/", "release/code_root/")) for f in files) and "release/gateway/models.json" in files else fail)(
         "release tree: node-release and models.json in, ledger/, specs/, tasks/ out (%d files)" % len(files))
 
 
@@ -225,7 +225,7 @@ def part_host_binaries(tmp):
     (shim / "go").chmod(0o755)
     path = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and not os.access(os.path.join(d, "go"), os.X_OK)]
     env = {**hermetic_env(), 'PATH': os.pathsep.join([str(shim)] + path)}
-    r = run([sys.executable, "-I", "-c", HOST_BUILD, str(LAB / "scripts/node-bundle"), str(out)], env=env)
+    r = run([sys.executable, "-I", "-c", HOST_BUILD, str(CODE_ROOT / "scripts/node-bundle"), str(out)], env=env)
     if r.returncode != 0:
         return fail("host-target build_binaries + stage with no go on PATH: exit %s\n%s" % (r.returncode, r.stderr[-1500:]))
     rep = json.loads(r.stdout)
@@ -248,7 +248,7 @@ def part_tracked_only(tmp):
     (cs / "scripts").mkdir(parents=True)
     # need valid .python-version for build() after the dirty gate
     (cs / ".python-version").write_text("3.13.9\n")
-    shutil.copy2(LAB / "scripts/node-bundle", cs / "scripts/node-bundle")
+    shutil.copy2(CODE_ROOT / "scripts/node-bundle", cs / "scripts/node-bundle")
     (cs / "scripts/tracked.txt").write_text("ok\n")
     env = {**hermetic_env(), "HOME": str(fake_home), "GIT_AUTHOR_NAME": "regression", "GIT_AUTHOR_EMAIL": "r@test",
            "GIT_COMMITTER_NAME": "regression", "GIT_COMMITTER_EMAIL": "r@test"}
@@ -256,6 +256,10 @@ def part_tracked_only(tmp):
     subprocess.run(["git", "add", "cs/.python-version", "cs/scripts"], cwd=repo, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, env=env)
     (cs / "local-only.txt").write_text("must not ship\n")
+    # The lane disables global Git config because the owner's file can be unreadable.
+    # A malformed fixture makes the probe fail if node-bundle drops that override.
+    (fake_home / ".gitconfig").write_text("[broken\n")
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
     probe = ("import importlib.machinery, importlib.util, json, sys\n"
              "l = importlib.machinery.SourceFileLoader('nb', sys.argv[1])\n"
              "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('nb', l)); l.exec_module(m)\n"
@@ -274,26 +278,26 @@ def part_tracked_only(tmp):
 
 
 def part_export(tmp):
-    """A production build comes from `git archive HEAD | tar -x`: release_files() there lists the commit's lab files
+    """A production build comes from `git archive HEAD | tar -x`: release_files() there lists the commit's code_root files
     (outside ledger/, specs/, tasks/), never the checkout's untracked files; build refuses an export without --commit."""
     x = tmp / "export"
-    K = LAB.name  # the code root in the commit (cs)
+    K = CODE_ROOT.name  # the code root in the commit (cs)
     x.mkdir()
-    arch = subprocess.run(["git", "-C", str(LAB.parent), "archive", "HEAD", K + "/scripts", K + "/ops", K + "/tools",
+    arch = subprocess.run(["git", "-C", str(CODE_ROOT.parent), "archive", "HEAD", K + "/scripts", K + "/ops", K + "/tools",
                            K + "/policy", K + "/.python-version"], capture_output=True, check=True).stdout
     subprocess.run(["tar", "-x", "-C", str(x)], input=arch, check=True, env={**hermetic_env()})
-    shutil.copy2(LAB / "scripts/node-bundle", x / K / "scripts/node-bundle")  # this checkout's version under test
+    shutil.copy2(CODE_ROOT / "scripts/node-bundle", x / K / "scripts/node-bundle")  # this checkout's version under test
     (x / K / "scripts/not-committed").write_text("an untracked file in the export dir itself\n")
     probe = ("import importlib.machinery, importlib.util, json, sys\n"
              "l = importlib.machinery.SourceFileLoader('nb', sys.argv[1])\n"
              "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('nb', l)); l.exec_module(m)\n"
              "print(json.dumps([m.in_git(), m.release_files()]))\n")
-    gitdir = subprocess.run(["git", "-C", str(LAB), "rev-parse", "--absolute-git-dir"], capture_output=True,
+    gitdir = subprocess.run(["git", "-C", str(CODE_ROOT), "rev-parse", "--absolute-git-dir"], capture_output=True,
                             text=True, check=True).stdout.strip()
     hook_env = {**hermetic_env(), 'GIT_DIR': gitdir, 'GIT_INDEX_FILE': gitdir + '/index'}  # as a commit hook runs check
     r = run([sys.executable, "-I", "-c", probe, str(x / K / "scripts/node-bundle")], env=hook_env)
     in_git, files = json.loads(r.stdout or "[true, []]")
-    want = set(subprocess.run(["git", "-C", str(LAB.parent), "ls-tree", "-r", "--name-only", "HEAD", K + "/scripts",
+    want = set(subprocess.run(["git", "-C", str(CODE_ROOT.parent), "ls-tree", "-r", "--name-only", "HEAD", K + "/scripts",
                                K + "/ops", K + "/tools", K + "/policy", K + "/.python-version"], capture_output=True,
                               text=True, check=True).stdout.split())
     want = {w[len(K) + 1:] for w in want if not w.startswith(K + "/tools/defuddle/node_modules")}
@@ -306,19 +310,19 @@ def part_export(tmp):
 
 def part_director_retired(tmp):
     """node-bundle --director (the Laravel director's release tree) is retired (2026-11-11): refused before writing."""
-    r = run([sys.executable, str(LAB / "scripts/node-bundle"), "build", "--director", str(tmp / "laravel-out")])
+    r = run([sys.executable, str(CODE_ROOT / "scripts/node-bundle"), "build", "--director", str(tmp / "laravel-out")])
     expect(r.returncode != 0 and "--director" in r.stderr and not (tmp / "laravel-out").exists(),
            "build --director: refused before writing: %s" % r.stderr.strip()[-160:])
 
 
-def lab_files():
-    """The parts of lab/ the scripts could touch (never ledger/, which is huge)."""
-    roots = [p for p in LAB.iterdir() if p.is_file()] + [LAB / d for d in ("tools", "scripts", "ops", "policy")]
+def code_files():
+    """The parts of code_root/ the scripts could touch (never ledger/, which is huge)."""
+    roots = [p for p in CODE_ROOT.iterdir() if p.is_file()] + [CODE_ROOT / d for d in ("tools", "scripts", "ops", "policy")]
     return {str(p) for r in roots for p in ([r] if r.is_file() else r.rglob("*")) if p.is_file() and "__pycache__" not in str(p)}
 
 
 def main():
-    before, agents = lab_files(), _bundle.real_agents()
+    before, agents = code_files(), _bundle.real_agents()
     tmp = Path(tempfile.mkdtemp(prefix="node-install-regression-", suffix=".noindex"))
     try:
         part_deps()
@@ -332,9 +336,9 @@ def main():
         part_install(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    after = lab_files()
+    after = code_files()
     if after - before:
-        fail("files created under lab/: %s" % sorted(after - before)[:5])
+        fail("files created under code_root/: %s" % sorted(after - before)[:5])
     leak = _bundle.launchd_untouched(agents)
     if leak:
         fail(leak)

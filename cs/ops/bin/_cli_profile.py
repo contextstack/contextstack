@@ -7,7 +7,7 @@ from pathlib import Path
 
 def stage(ws, profile, home_name="cli-home"):
     ws = ws.resolve()
-    home = ws / ".lab-tmp" / home_name
+    home = ws / ".cs-tmp" / home_name
     if home.exists() or home.is_symlink():
         raise ValueError("cli-home exists or is a symlink")
     rhome = home.resolve()

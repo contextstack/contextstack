@@ -1,0 +1,2 @@
+# Regression directory followed by a reason. Keep this list in sync with scripts/check.
+claude-auth-context # check consumes auth-context.json from the verify fixture, which is already a full-check rule.

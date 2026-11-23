@@ -34,7 +34,7 @@ try:  # the four roots (_roots): code (specs, tools, hooks), config (prompts), s
 except RootsError as error:
     print("capture-stimulus: " + str(error), file=sys.stderr)
     raise SystemExit(2)
-LAB, CONFIG, STATE = ROOTS["code"], ROOTS["config"], ROOTS["state"]
+CODE_ROOT, CONFIG, STATE = ROOTS["code"], ROOTS["config"], ROOTS["state"]
 CONTRACT = "lifecycle-v1"
 HASH_ALGO = "sha256"
 # The check may source a shared library from the estate. Freeze it too: a
@@ -60,7 +60,7 @@ def build_of(path):
 
 def import_closure():
     """scripts/node-bundle's python_closure (its ast import walk), loaded from the code root, or None when absent."""
-    path = LAB / "scripts" / "node-bundle"
+    path = CODE_ROOT / "scripts" / "node-bundle"
     if not path.is_file():
         return None
     from importlib.machinery import SourceFileLoader
@@ -72,9 +72,9 @@ def import_closure():
 
 
 def file_label(f):
-    """A hashed file's name: relative to the lab, else to the repo holding it (a runtime exe's bin such as
-    target/release/cs-tools), else absolute. Lab-relative names keep every earlier digest stable."""
-    for base in (LAB, LAB.resolve().parent):
+    """A hashed file's name: relative to the code_root, else to the repo holding it (a runtime exe's bin such as
+    target/release/cs-tools), else absolute. Code-root-relative names keep every earlier digest stable."""
+    for base in (CODE_ROOT, CODE_ROOT.resolve().parent):
         try:
             return str(f.relative_to(base))
         except ValueError:
@@ -103,23 +103,26 @@ def palette_builds(args):
     closure = import_closure()
     tools = {}
     for name in dict.fromkeys(str(n) for n in args.get("tools") or []):
-        exe, desc = LAB / "tools/bin" / name, LAB / "tools/bin" / (name + ".json")
+        exe, desc = CODE_ROOT / "tools/bin" / name, CODE_ROOT / "tools/bin" / (name + ".json")
+        if name == "run_check":
+            tools[name] = files_build([Path(args["runner_path"])])
+            continue
         helpers = []
         try:
             descriptor = json.loads(desc.read_text(encoding="utf-8"))
             if descriptor.get("bin"):  # runtime exe: the bin both runners exec (_sandbox_policy.tool_argv)
-                exe = LAB.resolve().parent / descriptor["bin"]
+                exe = CODE_ROOT.resolve().parent / descriptor["bin"]
             runtime = descriptor.get("runtime")
             if closure and runtime == "python3":
                 helpers = sorted((p for p in closure([{"name": name, "runtime": runtime}])[0] if p != exe),
-                                 key=lambda p: str(p.relative_to(LAB)))
+                                 key=lambda p: str(p.relative_to(CODE_ROOT)))
         except (OSError, ValueError, SyntaxError, AttributeError):
             pass  # unreadable descriptor: files_build reports null; an unparseable tool: no helpers
         tools[name] = files_build([exe, desc] + helpers)
     hooks = {}
     for name in dict.fromkeys(str(n) for n in args.get("hooks") or []):
-        sidecar = LAB / "hooks/bin" / (name + ".json")
-        hooks[name] = files_build([LAB / "hooks/bin" / name] + ([sidecar] if sidecar.is_file() else []))
+        sidecar = CODE_ROOT / "hooks/bin" / (name + ".json")
+        hooks[name] = files_build([CODE_ROOT / "hooks/bin" / name] + ([sidecar] if sidecar.is_file() else []))
     return {"tool_builds": tools, "hook_builds": hooks,
             "tool_builds_basis": "executable+descriptor+imports" if closure else "executable+descriptor"}
 
@@ -188,11 +191,11 @@ def baseline(workspace):
 def work_order():
     """The work order this run is executing, by its exact dispatch job id.
 
-    The dispatcher exports LAB_JOB_ID for the child. Matching on spec or task
+    The dispatcher exports CS_JOB_ID for the child. Matching on spec or task
     instead picks a sibling job whenever two share them, which silently binds
     one job's evidence to another job's authority. No id, no work order.
     """
-    job_id = str(os.environ.get("LAB_JOB_ID") or "").strip()
+    job_id = str(os.environ.get("CS_JOB_ID") or "").strip()
     shelf = STATE / "dispatch.jsonl"
     if not job_id or not shelf.is_file():
         return None
@@ -259,7 +262,7 @@ def grant_state(args):
             return {"state": "unknown", "id": "",
                     "provenance": str(args.get("authority")
                                       or "no dispatch job id; run is outside the queue")}
-    path = LAB / "grants" / (gid + ".yaml")
+    path = CODE_ROOT / "grants" / (gid + ".yaml")
     spec = str(args.get("spec") or "")
     job = job_dir_of(spec) if spec and Path(spec).is_absolute() else None
     if job is not None:  # a director job's grant is the copy it carried, never the node's checkout
@@ -306,6 +309,14 @@ def main():
         (staging / "goal.md").write_bytes(raw_goal)
         inputs.append({"role": "goal", "path": "goal.md", "source": str(goal_src),
                        "sha256": sha256_bytes(raw_goal), "bytes": len(raw_goal)})
+        context_path = "context/decision-log.md"
+        context_src = task / context_path
+        if context_src.is_file():
+            raw_context = context_src.read_bytes()
+            (staging / "context").mkdir()
+            (staging / context_path).write_bytes(raw_context)
+            inputs.append({"role": "context", "path": context_path, "source": str(context_src),
+                           "sha256": sha256_bytes(raw_context), "bytes": len(raw_context)})
         if check_src.is_file():
             raw_check = check_src.read_bytes()
             (staging / "check").write_bytes(raw_check)
@@ -313,7 +324,7 @@ def main():
             inputs.append({"role": "check", "path": "check", "source": str(check_src),
                            "sha256": sha256_bytes(raw_check), "bytes": len(raw_check)})
         for rel in DEPENDENCIES:
-            src = LAB / rel
+            src = CODE_ROOT / rel
             if not src.is_file():
                 continue
             dest = staging / rel
@@ -325,7 +336,7 @@ def main():
                            "sha256": sha256_bytes(raw), "bytes": len(raw)})
         spec_rel = str(args.get("spec") or "")
         if spec_rel:
-            spec_src = LAB / spec_rel if not Path(spec_rel).is_absolute() else Path(spec_rel)
+            spec_src = CODE_ROOT / spec_rel if not Path(spec_rel).is_absolute() else Path(spec_rel)
             if spec_src.is_file():
                 raw = spec_src.read_bytes()
                 (staging / "spec.yaml").write_bytes(raw)
@@ -359,11 +370,11 @@ def main():
         # hook file pair, in spec order.
         for name in list(args.get("tools") or []):
             for suffix in ("", ".json"):
-                f = LAB / "tools" / "bin" / (str(name) + suffix)
+                f = CODE_ROOT / "tools" / "bin" / (str(name) + suffix)
                 env.update(f.read_bytes() if f.is_file() else b"")
         for name in list(args.get("hooks") or []):
             for suffix in ("", ".json"):
-                f = LAB / "hooks" / "bin" / (str(name) + suffix)
+                f = CODE_ROOT / "hooks" / "bin" / (str(name) + suffix)
                 env.update(f.read_bytes() if f.is_file() else b"")
 
         executor_files = args.get("executor_files") or []
@@ -388,8 +399,8 @@ def main():
             if rel_str in seen_executor:
                 refuse("executor_files duplicate entry: " + rel_str)
             seen_executor.add(rel_str)
-            exec_src = LAB / relp
-            ancestor = LAB
+            exec_src = CODE_ROOT / relp
+            ancestor = CODE_ROOT
             for part in relp.parts:
                 ancestor = ancestor / part
                 if ancestor.is_symlink():
@@ -464,7 +475,7 @@ def main():
         # Checks resolve shared libraries with
         #   . "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/scripts/..."
         # Copying the library is not enough: from inside ledger/runs that
-        # resolves to the live lab and executes the live file. Making the
+        # resolves to the live code_root and executes the live file. Making the
         # snapshot its own repository root redirects that resolution to the
         # frozen copy, so the check runs what was captured.
         subprocess.run(["git", "init", "-q", str(staging)],

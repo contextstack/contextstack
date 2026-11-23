@@ -46,9 +46,12 @@
       "dir": "<RUNSTAMP>-fx-tool-unknown-at-load-fx-t1",
       "entries": [
         "check.json",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -57,7 +60,7 @@
     }
   ],
   "stderr": [
-    "lab: tasks/fx — tool \"warp_drive\": open <ESTATE>/tools/bin/warp_drive.json: no such file or directory — file pair in tools/bin"
+    "cs: tasks/fx — tool \"warp_drive\": open <ESTATE>/tools/bin/warp_drive.json: no such file or directory — file pair in tools/bin"
   ],
   "stdout": [
     "  tasks/fx                       t1  void stop=error: tool \"warp_drive\": open <ESTATE>/tools/bin/warp_drive.json: no such file or directory — file pair in tools/bin turns=0 tools=0 $0.0000"

@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix='executor-read-denies-') as raw:
         path.mkdir()
     _executor.HOME = home
     secrets = ['.contextstack/director-db-backup/legacy.sqlite',
-               '.contextstack/browser/cookies', '.contextstack/lab/browser-state/cookies', '.contextstack/config/lead-credential', '.contextstack/config/hosted-lead.json',
+               '.contextstack/browser/cookies', '.contextstack/state/browser-state/cookies', '.contextstack/config/lead-credential', '.contextstack/config/hosted-lead.json',
                '.contextstack/state/lead-sessions/con_fixture/home/session',
                '.contextstack/dev-state/lead-sessions/con_fixture/transcript', '.contextstack/credentials/x', '.contextstack/state/director/local-credential',
                '.contextstack/dev-state/director/db', '.contextstack/gateway/token',
@@ -447,7 +447,7 @@ for name in DECOYS:
         pass
     else:
         raise AssertionError('secret overwrite allowed: ' + name)
-fresh = Path('.lab-env-probe')
+fresh = Path('.cs-env-probe')
 fresh.mkdir()
 for name in ('.env', '.env.local'):
     target = fresh / name

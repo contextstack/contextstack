@@ -1,5 +1,0 @@
-{
-  "description": "Fixture-only tool. Args: {mode: echo|both|fail|big|sleep|write, ...}.",
-  "schema": {"type": "object", "properties": {"mode": {"type": "string"}}, "required": ["mode"]},
-  "timeout_seconds": 1
-}

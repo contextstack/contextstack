@@ -9,14 +9,14 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 
 
 def run_tick(root, ready):
     ops = root / "ops/bin"
     ops.mkdir(parents=True, exist_ok=True)
     for name in ("schedule-tick", "_grant.py", "_estate_io.py", "_void.py"):
-        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, ops / name)
     (root / "ESTATE").write_text("dev\n")
     (root / "grants").mkdir(exist_ok=True)
     (root / "grants/fixture.yaml").write_text(
@@ -49,7 +49,7 @@ def run_tick(root, ready):
     }
     result = subprocess.run(
         [str(ops / "schedule-tick")],
-        input=json.dumps(payload), text=True, capture_output=True, cwd=LAB,
+        input=json.dumps(payload), text=True, capture_output=True, cwd=CODE_ROOT,
      env={**hermetic_env()})
     assert result.returncode == 0, result.stderr
     receipt = json.loads(result.stdout)
@@ -75,7 +75,7 @@ with scratch_dir() as raw:
                 if json.loads(line).get("job")]
     assert admitted[-1]["slot"] == "2026-09-02T12:00:00Z"
 
-tick_source = (LAB / "ops/bin/tick").read_text(encoding="utf-8")
+tick_source = (CODE_ROOT / "ops/bin/tick").read_text(encoding="utf-8")
 gate = tick_source.index("local_coder_unavailable")
 running = tick_source.index('"state": "running"')
 assert gate < running, "pending local-coder jobs are marked running before the health gate"

@@ -95,10 +95,10 @@ pub struct Gateway {
     pub cache: Cache,
     /// Executables policy.
     pub exe: Resolver,
-    /// The Lab executor, when configured.
+    /// The CLI executor, when configured.
     pub executor: Option<Executor>,
-    /// Lab work orders running now and recently finished (cancel by execution id).
-    pub runs: crate::labrun::Registry,
+    /// CLI work orders running now and recently finished (cancel by execution id).
+    pub runs: crate::clirun::Registry,
     /// Wire cutover counters.
     pub wire: Mutex<crate::server::WireUsage>,
     /// Pay-as-you-go spend guard and per-source limits.
@@ -173,7 +173,7 @@ impl Gateway {
             cache: Cache::default(),
             exe,
             executor,
-            runs: crate::labrun::Registry::default(),
+            runs: crate::clirun::Registry::default(),
             wire: Mutex::new(crate::server::WireUsage::default()),
             spend: Arc::new(crate::spend::Guard::new(settings.home.as_deref())),
             started: std::time::Instant::now(),
@@ -599,6 +599,7 @@ impl Gateway {
         provider: &str,
         call: &Call,
         deadline: Instant,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<Reply, CallError> {
         let ep = Self::endpoint(snap, provider, &call.model)?;
         Self::guard(snap, ep, call, false)?;
@@ -607,7 +608,13 @@ impl Gateway {
             .await?;
         let key = self.credential(ep).await?;
         match ep.protocol {
-            Protocol::Mock => Ok(mock::reply(&ep.entry.name, call)),
+            Protocol::Mock => {
+                if call.tool_choice.is_some() {
+                    trace.drop_tool_choice();
+                }
+                trace.begin_attempt(provider, &[], false);
+                Ok(mock::reply(&ep.entry.name, call))
+            }
             Protocol::TypesafeSystemOne => Err(not_chat(ep)),
             Protocol::OpenAiChatCompletions => {
                 let a = OpenAi {
@@ -615,14 +622,15 @@ impl Gateway {
                     base: &ep.base,
                     default_model: &ep.entry.default_model,
                 };
-                a.invoke(&self.http, Some(&key), call, deadline).await
+                a.invoke(&self.http, Some(&key), call, deadline, trace)
+                    .await
             }
             Protocol::AnthropicMessages => {
                 let a = Anthropic {
                     base: &ep.base,
                     default_model: &ep.entry.default_model,
                 };
-                a.invoke(&self.http, &key, call, deadline).await
+                a.invoke(&self.http, &key, call, deadline, trace).await
             }
         }
     }
@@ -660,6 +668,7 @@ impl Gateway {
         provider: &str,
         call: &Call,
         deadline: Instant,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<OpenStream, CallError> {
         let ep = Self::endpoint(snap, provider, &call.model)?;
         Self::guard(snap, ep, call, true)?;
@@ -673,7 +682,7 @@ impl Gateway {
                     base: &ep.base,
                     default_model: &ep.entry.default_model,
                 };
-                Upstream::Anthropic(a.stream(&self.http, &key, call, deadline).await?)
+                Upstream::Anthropic(a.stream(&self.http, &key, call, deadline, trace).await?)
             }
             Protocol::OpenAiChatCompletions => {
                 let a = OpenAi {
@@ -681,9 +690,18 @@ impl Gateway {
                     base: &ep.base,
                     default_model: &ep.entry.default_model,
                 };
-                Upstream::OpenAi(a.stream(&self.http, Some(&key), call, deadline).await?)
+                Upstream::OpenAi(
+                    a.stream(&self.http, Some(&key), call, deadline, trace)
+                        .await?,
+                )
             }
-            Protocol::Mock => Upstream::Mock(mock::Stream::open(&ep.entry.name, call)),
+            Protocol::Mock => {
+                if call.tool_choice.is_some() {
+                    trace.drop_tool_choice();
+                }
+                trace.begin_attempt(provider, &[], true);
+                Upstream::Mock(mock::Stream::open(&ep.entry.name, call))
+            }
             Protocol::TypesafeSystemOne => return Err(not_chat(ep)),
         };
         Ok(OpenStream {

@@ -9,8 +9,8 @@ from hermetic_env import hermetic_env
 import json
 import subprocess
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 from _muse_adapter import check_command
 from _cli_native import declared_home_reads
 from _cli_adapter import command
@@ -43,8 +43,8 @@ with scratch_dir(prefix="opencode-go-check-") as raw:
     db.write_bytes(b"")
     tmp = run / "tmp"
     tmp.mkdir()
-    templates = json.loads((LAB / "ops/bin/executor-templates.json").read_text())
-    profiles = json.loads((LAB / "ops/bin/cli-profiles.json").read_text())
+    templates = json.loads((CODE_ROOT / "ops/bin/executor-templates.json").read_text())
+    profiles = json.loads((CODE_ROOT / "ops/bin/cli-profiles.json").read_text())
     tmpl, profile = templates["opencode-go"], profiles["opencode-go"]
     assert tmpl["auth"] == "opencode_db" and profile["auth"] == "opencode_db"
     extra = dict(caller_grants=[dict(path=str(path), access="read")

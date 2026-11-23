@@ -26,6 +26,16 @@ def request_bytes(t):
 
 
 @case("translation")
+def tool_choice_forwarded(t):
+    """OpenAI-compatible local endpoints receive named and required selection."""
+    named = {"type": "function", "function": {"name": "fs_read"}}
+    for choice in (named, "required"):
+        b = t.gw.call(model_call("local-coder", tool_schema=TOOLS, tool_choice=choice)).json
+        eq(b["status"], "ok", "status")
+        eq(t.run.calls(t.vllm)[-1]["json"]["tool_choice"], choice, "upstream tool_choice")
+
+
+@case("translation")
 def default_max_tokens(t):
     """max_output_tokens absent or 0 sends max_tokens 4096."""
     t.gw.call(model_call("local-coder", budget={"max_output_tokens": 0}))
@@ -48,7 +58,7 @@ def native_tool_calls(t):
 
 @case("translation")
 def tool_args_empty_or_unparseable(t):
-    """Arguments "" or whitespace mean {}; arguments that are not JSON (alone or beside a valid call) fail the whole call as runtime_fault gateway.provider_failed, $0, no partial tool_calls; never an empty 200 (decided 2026-11-10)."""
+    """Empty arguments mean {}; malformed arguments are flagged per tool call."""
     def reply(*calls):
         t.vllm.chat["local-coder"] = {"json": upstreams.chat_completion(text="", finish="tool_calls", tool_calls=[
             {"id": "c%d" % i, "type": "function", "function": {"name": n, "arguments": a}} for i, (n, a) in enumerate(calls, 1)])}
@@ -58,10 +68,11 @@ def tool_args_empty_or_unparseable(t):
     for what, args in (("empty string", ""), ("whitespace", "  ")):
         sub(reply(("bare", args)), {"status": "ok", "tool_calls": [{"id": "c1", "name": "bare", "args": {}}]}, what)
     for what, calls in (("not json", [("bad", "{\"path\": ")]), ("valid beside malformed", [("ok", "{}"), ("bad", "not json")])):
-        b = reply(*calls)
-        sub(b, {"status": "error", "cost": {"currency": "USD", "amount": "0.000000"},
-                "error": {"class": "runtime_fault", "code": "gateway.provider_failed", "recoverable": False}}, what)
-        eq("tool_calls" in b, False, what + ": no partial result")
+        expected = [
+            {"id": "c%d" % i, "name": n, **({"args": {}} if n == "ok" else
+                                         {"args": {}, "invalid_arguments": True})}
+            for i, (n, _) in enumerate(calls, 1)]
+        sub(reply(*calls), {"status": "ok", "tool_calls": expected}, what)
 
 
 @case("translation")
@@ -188,15 +199,15 @@ def upstream_status_classes(t):
 
 @case("translation")
 def upstream_garbage(t):
-    """A 200 with an undecodable body is runtime_fault; a dropped connection retries then returns transient, $0."""
+    """An undecodable body and a dropped paid POST both produce a runtime fault."""
     t.vllm.chat["local-coder"] = {"raw": b"<html>oops</html>"}
     b = t.gw.call(model_call("local-coder")).json
     sub(b, {"status": "error", "cost": {"amount": "0.000000"}, "error": {"class": "runtime_fault", "code": "gateway.transport_failed"}}, "not json")
     t.run.reset()
-    t.vllm.chat["local-coder"] = {"drop": True}
-    b = t.gw.call(model_call("local-coder", budget={"timeout_ms": 15000})).json
-    sub(b, {"status": "error", "error": {"class": "retryable_gateway", "code": "gateway.provider_transient"}}, "dropped")
-    eq(len(t.run.calls(t.vllm)), 3, "dropped: three upstream attempts")
+    t.vllm.chat["fake-paid"] = {"drop": True}
+    b = t.gw.call(model_call("fake-paid", budget={"timeout_ms": 15000})).json
+    sub(b, {"status": "error", "error": {"class": "runtime_fault", "code": "gateway.transport_failed"}}, "dropped")
+    eq(len(t.run.calls(t.vllm)), 1, "dropped: POST is not replayed")
 
 
 @case("translation")

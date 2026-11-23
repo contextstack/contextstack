@@ -101,6 +101,8 @@ pub struct Call {
     pub messages: Vec<Message>,
     /// Tools.
     pub tools: Vec<Tool>,
+    /// Optional OpenAI-compatible tool selection.
+    pub tool_choice: Option<serde_json::Value>,
     /// Sampling limit (0: 4096).
     pub max_tokens: i64,
     /// For X-Request-Id and trace rows.
@@ -183,6 +185,10 @@ pub struct MeteredUsage {
     pub input_tokens: i64,
     /// Completion tokens when known.
     pub output_tokens: i64,
+    /// Cache reads when known.
+    pub cache_read_tokens: i64,
+    /// Cache writes when known.
+    pub cache_write_tokens: i64,
     /// Provider-reported charge when known.
     pub charged: Option<f64>,
 }
@@ -247,15 +253,6 @@ impl Http {
             if attempt.previous().len() >= 10 {
                 return attempt.error("stopped after 10 redirects");
             }
-            let authority = |u: &reqwest::Url| {
-                u.host_str().map(|h| {
-                    format!(
-                        "{}:{}",
-                        h.to_lowercase(),
-                        u.port_or_known_default().unwrap_or(0)
-                    )
-                })
-            };
             let first = attempt.previous().first().and_then(authority);
             let next = authority(attempt.url());
             if first == next {
@@ -269,7 +266,7 @@ impl Http {
                 attempt.error(msg)
             }
         });
-        let client = reqwest::Client::builder()
+        let client = cs_http_client::builder()
             .no_proxy()
             .proxy(proxy)
             .redirect(redirect)
@@ -279,10 +276,74 @@ impl Http {
         Ok(Self { client })
     }
 
+    /// Send a model POST, tracking body dispatch while preserving explicit redirects.
+    async fn model_post(
+        &self,
+        req: reqwest::RequestBuilder,
+        url: &str,
+        raw: Vec<u8>,
+        trace: &mut crate::trace::Exchange,
+    ) -> Result<reqwest::Response, CallError> {
+        let mut req = req.build().map_err(|e| transport("Post", url, &e, false))?;
+        let raw = bytes::Bytes::from(raw);
+        let mut sent_before_redirect = false;
+        for redirects in 0..10 {
+            let mut post = req
+                .try_clone()
+                .ok_or_else(|| CallError::transport_local("could not clone POST headers"))?;
+            *post.body_mut() = Some(trace.request_body(raw.clone()));
+            let response = self.client.execute(post).await.map_err(|e| {
+                if redirects == 0 && e.is_request() && !e.is_connect() && closed_before_headers(&e)
+                {
+                    return CallError::connection_lost_before_headers(transport_message(
+                        "Post", url, &e,
+                    ));
+                }
+                transport(
+                    "Post",
+                    url,
+                    &e,
+                    sent_before_redirect || trace.request_body_sent(),
+                )
+            })?;
+            if !matches!(response.status().as_u16(), 307 | 308) || response.url() != req.url() {
+                return Ok(response);
+            }
+            // reqwest cannot clone a tracked body for a 307/308. Follow only an explicit
+            // redirect allowed by the same authority rule as reqwest's redirect policy.
+            let Some(next) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| response.url().join(location).ok())
+            else {
+                return Ok(response);
+            };
+            if !matches!(next.scheme(), "http" | "https")
+                || authority(&next) != authority(req.url())
+            {
+                return Err(CallError::transport_local("refused cross-host redirect"));
+            }
+            sent_before_redirect |= trace.request_body_sent();
+            *req.url_mut() = next;
+        }
+        Err(CallError::transport_local("stopped after 10 redirects"))
+    }
+
     /// The underlying client.
     pub fn client(&self) -> &reqwest::Client {
         &self.client
     }
+}
+
+fn authority(url: &reqwest::Url) -> Option<String> {
+    url.host_str().map(|host| {
+        format!(
+            "{}:{}",
+            host.to_lowercase(),
+            url.port_or_known_default().unwrap_or(0)
+        )
+    })
 }
 
 fn bypass(no_proxy: &str, host: &str) -> bool {
@@ -308,23 +369,47 @@ fn transport_message(method: &str, url: &str, err: &reqwest::Error) -> String {
     format!("{method} {url:?}: {cause}")
 }
 
-/// A connection-level transport error (connect, timeout before headers): may retry.
-pub fn transport(method: &str, url: &str, err: &reqwest::Error) -> CallError {
-    CallError::Transport(TransportDetail::network(transport_message(
-        method, url, err,
-    )))
+/// A close while waiting for headers occurs before any response body is delivered.
+fn closed_before_headers(err: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                )
+            })
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
-/// A transport error after a 2xx status (body read or decode): must not retry.
+fn transport(method: &str, url: &str, err: &reqwest::Error, body_sent: bool) -> CallError {
+    let message = transport_message(method, url, err);
+    let is_connect = err.is_connect();
+    if is_connect && !body_sent {
+        CallError::Transport(TransportDetail::network(message))
+    } else if is_connect || err.is_request() || err.is_timeout() {
+        CallError::connection_lost(message)
+    } else {
+        CallError::transport_local(message)
+    }
+}
+
+/// A transport error after receiving headers.
 pub fn transport_after_response(method: &str, url: &str, err: &reqwest::Error) -> CallError {
-    CallError::Transport(TransportDetail::local(transport_message(method, url, err)))
+    CallError::connection_lost(transport_message(method, url, err))
 }
 
 /// The deadline error.
 pub fn deadline(method: &str, url: &str) -> CallError {
-    CallError::Transport(TransportDetail::local(format!(
-        "{method} {url:?}: context deadline exceeded"
-    )))
+    CallError::deadline(format!("{method} {url:?}: context deadline exceeded"))
 }
 
 /// Await `fut` until `deadline`.
@@ -357,17 +442,27 @@ pub const MAX_SUCCESS_BODY: usize = 64 * 1024 * 1024;
 
 /// Read a 2xx body up to [`MAX_SUCCESS_BODY`]; over the cap is a local transport fault.
 pub async fn success_body(
+    resp: reqwest::Response,
+    method: &str,
+    url: &str,
+) -> Result<bytes::Bytes, CallError> {
+    bounded_body(resp, method, url, MAX_SUCCESS_BODY).await
+}
+
+/// Read a response with a hard cap on buffered bytes.
+async fn bounded_body(
     mut resp: reqwest::Response,
     method: &str,
     url: &str,
+    limit: usize,
 ) -> Result<bytes::Bytes, CallError> {
     let mut out = Vec::new();
     loop {
         match resp.chunk().await {
             Ok(Some(c)) => {
-                if out.len().saturating_add(c.len()) > MAX_SUCCESS_BODY {
+                if out.len().saturating_add(c.len()) > limit {
                     return Err(CallError::transport_local(format!(
-                        "{method} {url:?}: upstream response body exceeds {MAX_SUCCESS_BODY} bytes"
+                        "{method} {url:?}: upstream response body exceeds {limit} bytes"
                     )));
                 }
                 out.extend_from_slice(&c);
@@ -384,37 +479,8 @@ pub fn request_id_header(id: &str) -> Option<&str> {
     (!id.is_empty() && id.len() <= 256 && !id.contains(['\r', '\n'])).then_some(id)
 }
 
-/// The `provider_http_trace` row: transport boundaries, never prompts, credentials or response text.
-pub fn trace(
-    request_id: &str,
-    body: &[u8],
-    started: chrono::DateTime<chrono::Utc>,
-    took: Duration,
-    fields: &serde_json::Value,
-) {
-    if request_id.is_empty() {
-        return;
-    }
-    let digest = crate::log::sha256_hex(body);
-    let mut row = serde_json::json!({
-        "event": "provider_http_trace",
-        "request_id": request_id,
-        "started_at": crate::log::rfc3339(started),
-        "request_sha256": digest,
-        "request_bytes": body.len(),
-        "complete_ms": took.as_secs_f64() * 1000.0,
-    });
-    if let (Some(r), Some(f)) = (row.as_object_mut(), fields.as_object()) {
-        for (k, v) in f {
-            r.insert(k.clone(), v.clone());
-        }
-    }
-    crate::log::row(&row);
-}
-
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
@@ -436,18 +502,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_body_rejects_oversized_stream() {
+    async fn connect_error_retries_only_before_body_dispatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let url = "http://127.0.0.1:1";
+        let client = cs_http_client::builder().no_proxy().build()?;
+        let error = client
+            .post(url)
+            .body("{}")
+            .send()
+            .await
+            .err()
+            .ok_or("closed port accepted connection")?;
+        assert!(matches!(
+            transport("Post", url, &error, false),
+            CallError::Transport(TransportDetail { network: true, .. })
+        ));
+        assert!(transport("Post", url, &error, true).is_connection_lost());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn success_body_rejects_oversized_stream() -> Result<(), Box<dyn std::error::Error>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         let url = format!("http://{addr}/v1/chat/completions");
         let chunk = vec![b'x'; 1024 * 1024];
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = listener.accept().await?;
             let mut buf = [0u8; 4096];
             loop {
-                let n = socket.read(&mut buf).await.unwrap();
+                let n = socket.read(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
@@ -461,28 +547,30 @@ mod tests {
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
                 )
                 .await
-                .unwrap();
+                ?;
             for _ in 0..70 {
                 socket
                     .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
-                    .await
-                    .unwrap();
-                socket.write_all(&chunk).await.unwrap();
-                socket.write_all(b"\r\n").await.unwrap();
+                    .await?;
+                socket.write_all(&chunk).await?;
+                socket.write_all(b"\r\n").await?;
             }
-            let _ = socket.write_all(b"0\r\n\r\n").await;
+            socket.write_all(b"0\r\n\r\n").await
         });
-        let client = reqwest::Client::builder().build().unwrap();
+        let client = cs_http_client::builder().build()?;
         let resp = client
             .post(&url)
             .header("Content-Type", "application/json")
             .body("{}")
             .send()
+            .await?;
+        let err = success_body(resp, "Post", &url)
             .await
-            .unwrap();
-        let err = success_body(resp, "Post", &url).await.unwrap_err();
+            .err()
+            .ok_or("oversized response was accepted")?;
         assert!(matches!(err, CallError::Transport(_)));
         assert!(err.to_string().contains("exceeds"), "unexpected: {err}");
         server.abort();
+        Ok(())
     }
 }

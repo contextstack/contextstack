@@ -2,7 +2,7 @@
 # ops/bin/tick — A2 worker. Model capacity is owned by the gateway.
 # Close every terminal state by enqueue id (first-terminal-wins).
 # Every declared trial executes; a clean tree is not an unexecuted trial.
-import collections, fcntl, hashlib, json, os, re, subprocess, sys, threading, time
+import collections, fcntl, hashlib, json, os, re, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -13,10 +13,11 @@ from _node_env import node_env
 # Validate and retain node-local settings at startup without exporting them.
 NODE_SETTINGS = node_env()
 
-from _runner import runner_path, running_count
+from _runner import running_count
 from _dispatch import spec_value
 from _env_policy import EnvPolicyError, child_env_value, resolve
 from _estate_io import read_jsonl, state_dir, pid_live, append_jsonl, call_op
+from _job_identity import _pid_identity
 from _dispatch import TERMINAL, first_terminal, qid
 from _void import config_void_reason, hold_schedule, is_config_void
 from _node_restart import NODE_RESTART_REASON, ORPHANED_RUNNING_STOP, orphan_error
@@ -24,7 +25,7 @@ from _job_reason import append_job_log, job_log_path, reason_of
 from _roots import RootsError, ledger_path, outbox_dir, roots, runs_dir, sandbox_reports_dir, workspace_dir
 from _sandbox_policy import SandboxPolicyError, browser_state_value, cell_prefix, sweep_orphan_cells, tool_prefix_value
 
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 STATE = roots()["state"]  # the node's shelves: default <code>/ledger, byte for byte as before
 Q = STATE / "dispatch.jsonl"
 LOCK = STATE / "dispatch.lock"
@@ -37,7 +38,7 @@ JOB_META = ("resource", "expected_head", "task", "lane", "batch_id", "grant",
             "conversation_id", "turn_id", "dispatch_seat")
 RESLOCK = STATE / "resource-locks"
 RUNS = runs_dir()
-FINALIZE_GRACE_S = 60  # a live runner finalizes its own dir first; the flock makes a race safe anyway
+FINALIZE_GRACE_S = 60  # give the foreground machine finisher the first attempt
 FINALIZE_SWEEP = {}
 SPOOL = {}  # spool_pass: spool-send's outbox counts (S2)
 SPOOL_POLICY = roots()["config"] / "policy/spool.json"  # receiver, min_free_bytes; absent = no receiver, no floor
@@ -62,7 +63,7 @@ def error_object(cls, code, source, retryable, detail):
     return {"class": cls, "code": code, "source": source, "retryable": retryable,
             "detail": str(detail).encode("utf-8")[:512].decode("utf-8", "ignore")}
 POLICY_ENV = {}  # run_spec: {"child_env": names} from policy/env.json + the spec's env: request (_env_policy),
-#   {"tool_prefix": CS_TOOL_PREFIX or None, "browser_state": LAB_BROWSER_STATE or None} from policy/sandbox.json (_sandbox_policy),
+#   {"tool_prefix": CS_TOOL_PREFIX or None, "browser_state": CS_BROWSER_STATE or None} from policy/sandbox.json (_sandbox_policy),
 #   {"reports": <state>/sandbox-reports}, where cell_prefix gives each cell its own report dir
 
 
@@ -98,13 +99,14 @@ def execution_row(rel, sid, after=0):
 
 
 def unfinalized_runs(min_age=0, now=None):
-    """Run dirs whose execution ended (terminal.json) without finalized.json."""
+    """Run dirs with a receipt or terminal record, awaiting finalization."""
     now = time.time if now is None else now
     stamp, found = now(), []
     for d in RUNS.iterdir() if RUNS.is_dir() else ():
         try:
-            if (d / "terminal.json").is_file() and not (d / "finalized.json").is_file() \
-                    and stamp - (d / "terminal.json").stat().st_mtime >= min_age:
+            terminal = d / "terminal.json"
+            record = terminal if terminal.is_file() else d / "execution-receipt.json"
+            if not (d / "finalized.json").is_file() and stamp - record.stat().st_mtime >= min_age:
                 found.append(d)
         except OSError:
             continue
@@ -113,20 +115,31 @@ def unfinalized_runs(min_age=0, now=None):
 
 def terminal_of(run_dir):
     try:
-        return json.loads((run_dir / "terminal.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        terminal = run_dir / "terminal.json"
+        if terminal.is_file():
+            return json.loads(terminal.read_text(encoding="utf-8"))
+        return json.loads((run_dir / "execution-receipt.json").read_text(encoding="utf-8"))["row"]
+    except (OSError, ValueError, KeyError, TypeError):
         return {}
 
 
 def finalize_run(run_dir, run=None):
     run = subprocess.run if run is None else run
+    if not (run_dir / "terminal.json").is_file():
+        from _api_run import finish_request
+
+        try:
+            finish_request(CODE_ROOT, run_dir, run=run)
+            return (run_dir / "finalized.json").is_file()
+        except (OSError, ValueError):
+            return False
     r = run([str(HERE / "finalize-run")], input=json.dumps({"run_dir": str(run_dir)}),
-            text=True, capture_output=True, cwd=str(LAB))
+            text=True, capture_output=True, cwd=str(CODE_ROOT))
     return r.returncode == 0
 
 
 def finalize_sweep(min_age=FINALIZE_GRACE_S):
-    """Retry finalize-run on every unfinished run dir; the sweep is the whole retry mechanism."""
+    """Resume finishing from each run’s durable receipt or terminal record."""
     dirs = unfinalized_runs(min_age)
     done = sum(finalize_run(d) for d in dirs)
     FINALIZE_SWEEP.update({"attempted": len(dirs), "finalized": done, "pending": len(dirs) - done})
@@ -165,7 +178,7 @@ def spool_pass(run=None):
     if not op.is_file():
         return SPOOL
     try:
-        r = run([str(op)], input="{}", text=True, capture_output=True, cwd=str(LAB), timeout=300)
+        r = run([str(op)], input="{}", text=True, capture_output=True, cwd=str(CODE_ROOT), timeout=300)
         out = json.loads((r.stdout or "").strip().splitlines()[-1])
         SPOOL.update({k: out[k] for k in ("pending", "sent", "failed") if k in out})
         if not out.get("ok"):
@@ -255,7 +268,7 @@ def job_pull_pass(run=None):
     """node role only: ops/bin/job-pull accepts the director's jobs into the local shelf."""
     run = subprocess.run if run is None else run
     try:
-        r = run([str(HERE / "job-pull")], input="{}", text=True, capture_output=True, cwd=str(LAB), timeout=300)
+        r = run([str(HERE / "job-pull")], input="{}", text=True, capture_output=True, cwd=str(CODE_ROOT), timeout=300)
         out = json.loads((r.stdout or "").strip().splitlines()[-1])
         JOB_PULL.update({k: out[k] for k in ("accepted", "failed", "error") if out.get(k)})
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as error:
@@ -335,7 +348,7 @@ def admit(pending):
 
 
 def local_model(job):
-    spec = LAB / str(job.get("spec") or "")
+    spec = CODE_ROOT / str(job.get("spec") or "")
     if not spec.is_file():
         return False
     model = spec_value(spec.read_text(encoding="utf-8"), "model").strip("\"' ")
@@ -352,12 +365,12 @@ def refresh_job(job):
         return job
     scheduled = bool(job.get("schedule_id"))
     if scheduled:
-        call_op(LAB, "setup-preflight", {"task": job["task"], "require_ready": False},
+        call_op(CODE_ROOT, "setup-preflight", {"task": job["task"], "require_ready": False},
                 failure="scheduled setup link preflight failed")
     payload = {"task": job["task"], "dest": job["resource"]}
-    result = call_op(LAB, "setup-refresh", payload, failure="setup refresh failed")
+    result = call_op(CODE_ROOT, "setup-refresh", payload, failure="setup refresh failed")
     if scheduled:
-        call_op(LAB, "setup-preflight", {"task": job["task"], "setup": result["setup"],
+        call_op(CODE_ROOT, "setup-preflight", {"task": job["task"], "setup": result["setup"],
                                          "expected_head": result["head"]},
                 failure="scheduled prepared setup preflight failed")
     updated = dict(job)
@@ -365,12 +378,12 @@ def refresh_job(job):
     return updated
 
 
-def lab_count():
-    return running_count(LAB)
+def runner_count():
+    return running_count(CODE_ROOT)
 
 
 def occupied():
-    n = lab_count()
+    n = runner_count()
     rows = read_jsonl(Q, strict=True)
     closed = {qid(r) for r in rows if r.get("state") in TERMINAL and qid(r)}
     live = {qid(r) for r in rows if r.get("state") == "running" and qid(r) not in closed
@@ -381,40 +394,32 @@ def occupied():
 def child_env(job_id="", external_effects=None, trial=None, env=None):
     parent_env = os.environ if env is None else env
     env = {key: value for key, value in parent_env.items()
-           if key not in ("LAB_VIDEO_MUTATION", "LAB_CHILD_ENV")}
+           if key not in ("CS_VIDEO_MUTATION", "CS_CHILD_ENV", "CS_JOB_ID", "CS_TRIAL",
+                          "CS_SCHEDULE_DATE", "CS_SCHEDULE_SLOT", "CS_SCHEDULE_TIMEZONE")}
     if "child_env" in POLICY_ENV:  # the runner inherits the node's resolution, never the parent's
-        env["LAB_CHILD_ENV"] = child_env_value(POLICY_ENV["child_env"])
+        env["CS_CHILD_ENV"] = child_env_value(POLICY_ENV["child_env"])
     if POLICY_ENV.get("tool_prefix") is not None:  # _sandbox_policy: the wrapper prefix, or a preset passed through
         env["CS_TOOL_PREFIX"] = cell_prefix(POLICY_ENV["tool_prefix"], parent_env, POLICY_ENV.get("reports"))
-    if POLICY_ENV.get("browser_state") is not None:  # _sandbox_policy: policy write_env lists LAB_BROWSER_STATE
-        env["LAB_BROWSER_STATE"] = POLICY_ENV["browser_state"]
+    if POLICY_ENV.get("browser_state") is not None:  # _sandbox_policy: policy write_env lists CS_BROWSER_STATE
+        env["CS_BROWSER_STATE"] = POLICY_ENV["browser_state"]
     if trial is not None:
-        env["LAB_TRIAL"] = str(trial)
+        env["CS_TRIAL"] = str(trial)
     if job_id:
-        env["LAB_JOB_ID"] = str(job_id)
+        env["CS_JOB_ID"] = str(job_id)
         selected = None
         for row in read_jsonl(Q, strict=True):
             if qid(row) == str(job_id):
                 selected = row
         if selected:
             for source, target in (
-                ("schedule_date", "LAB_SCHEDULE_DATE"),
-                ("slot", "LAB_SCHEDULE_SLOT"),
-                ("schedule_timezone", "LAB_SCHEDULE_TIMEZONE"),
+                ("schedule_date", "CS_SCHEDULE_DATE"),
+                ("slot", "CS_SCHEDULE_SLOT"),
+                ("schedule_timezone", "CS_SCHEDULE_TIMEZONE"),
             ):
                 if selected.get(source):
                     env[target] = str(selected[source])
     if "youtube_playlist_mutation" in (external_effects or []):
-        env["LAB_VIDEO_MUTATION"] = "1"
-    # Both runners consume the dispatcher's resolution; inherited CS aliases
-    # must not override its policy, grants, or work-order identity.
-    for suffix in ("CHILD_ENV", "VIDEO_MUTATION", "JOB_ID", "TRIAL",
-                   "SCHEDULE_DATE", "SCHEDULE_SLOT", "SCHEDULE_TIMEZONE"):
-        legacy, alias = "LAB_" + suffix, "CS_" + suffix
-        if legacy in env:
-            env[alias] = env[legacy]
-        else:
-            env.pop(alias, None)
+        env["CS_VIDEO_MUTATION"] = "1"
     return env
 
 
@@ -453,17 +458,22 @@ def no_row_reason(rc):
     return " | ".join(lines[-3:])[-480:] or "exit %s, no stderr" % rc
 
 
-def one_trial(rel, n, task=None, job_id="", external_effects=None):
-    # The runner executes exactly one cell: the trial goes on argv (LAB_TRIAL
+def one_trial(rel, n, task=None, job_id="", external_effects=None, *, repo_read_only=False):
+    # The runner executes exactly one cell: the trial goes on argv (CS_TRIAL
     # stays in the env for capture-stimulus and tools). The child freezes its
     # stimulus against THIS work order, by id. Matching on spec or task picks
     # a sibling job when two share them.
     env = child_env(job_id, external_effects, trial=n)
-    cmd = [str(runner_path(LAB)), "run"]
+    cmd = [str(HERE / "run-api")]
     if task:
         cmd.extend(["-task", task])
     cmd.extend(["-trial", str(n), rel])
-    return run_teed(cmd, log_path=job_log_path(STATE, job_id), cwd=str(LAB), env=env)
+    if repo_read_only:
+        # The dispatcher outlives run-api even when cancellation escalates to SIGKILL.
+        with tempfile.TemporaryDirectory(prefix="read-only-", dir=STATE) as staging:
+            env["CS_REPO_VIEW_STAGING"] = staging
+            return run_teed(cmd, log_path=job_log_path(STATE, job_id), cwd=str(CODE_ROOT), env=env)
+    return run_teed(cmd, log_path=job_log_path(STATE, job_id), cwd=str(CODE_ROOT), env=env)
 
 
 def one_executor_trial(rel, spec_text, task, n, job_id="", external_effects=None):
@@ -478,7 +488,7 @@ def one_executor_trial(rel, spec_text, task, n, job_id="", external_effects=None
     if spec_value(spec_text, 'budget') and Path(template.get('binary', '')).name == 'claude':
         from _cli_budget import declared  # an inline budget, forwarded; a block one the executor reads itself
         from _yaml import load as load_yaml
-        payload['budget'], payload['check_window'] = declared(load_yaml(LAB / rel))
+        payload['budget'], payload['check_window'] = declared(load_yaml(CODE_ROOT / rel))
     # Bind authority to this exact queued work order, never a sibling spec run.
     order = next((row for row in read_jsonl(Q, strict=True)
                   if job_id and qid(row) == job_id and row.get("state") == "pending"), {})
@@ -489,11 +499,12 @@ def one_executor_trial(rel, spec_text, task, n, job_id="", external_effects=None
         payload["grant"] = order["grant"]
     env = child_env(job_id, external_effects)
     return run_teed([str(HERE / "executor")], log_path=job_log_path(STATE, job_id),
-                    input=json.dumps(payload), text=True, cwd=str(LAB), env=env)
+                    input=json.dumps(payload), text=True, cwd=str(CODE_ROOT), env=env,
+                    start_new_session=True)
 
 
 def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion=None, job_task=None, env=None):
-    p = LAB / rel
+    p = CODE_ROOT / rel
     text = p.read_text(encoding="utf-8")
     ntrials = spec_trials(text)
     sid = spec_value(text, "id")
@@ -504,9 +515,9 @@ def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion
     failure = None
     try:  # the node's roots (_roots), then the spec's env: request against policy/env.json; a refusal is a config void, nothing launches
         roots()
-        POLICY_ENV["child_env"] = resolve(LAB, text)
-        POLICY_ENV["tool_prefix"] = tool_prefix_value(LAB)  # policy/sandbox.json; None = unconfined
-        POLICY_ENV["browser_state"] = browser_state_value(LAB)  # None unless policy write_env lists it
+        POLICY_ENV["child_env"] = resolve(CODE_ROOT, text)
+        POLICY_ENV["tool_prefix"] = tool_prefix_value(CODE_ROOT)  # policy/sandbox.json; None = unconfined
+        POLICY_ENV["browser_state"] = browser_state_value(CODE_ROOT)  # None unless policy write_env lists it
         POLICY_ENV["reports"] = str(sandbox_reports_dir())
         cell_prefix(POLICY_ENV["tool_prefix"], os.environ if env is None else env, POLICY_ENV["reports"])  # refuses a report root holding whitespace
     except (RootsError, EnvPolicyError, SandboxPolicyError) as error:
@@ -528,6 +539,8 @@ def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion
                     rc = one_executor_trial(rel, text, task, n, job_id, external_effects)
                 else:
                     rc = one_executor_trial(rel, text, task, n, job_id)
+            elif spec_value(text, "repo_read_only") == "true":
+                rc = one_trial(rel, n, task, job_id, external_effects, repo_read_only=True)
             else:
                 if external_effects:
                     rc = one_trial(rel, n, task, job_id, external_effects)
@@ -537,7 +550,7 @@ def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion
             if cancelled(job_id):  # a cancel: nothing more runs; a trial that finished first keeps its result
                 return (failure or (rc, row or final_row)) if rc == 0 else (rc, row or final_row)
             if rc == 3 or not row:
-                # Exit 3 is the runner's own "finalization pending": a failed publish still
+                # Exit 3 is the machine launcher's "finalization pending": a failed publish still
                 # appends the row, so a fresh row does not close the cell; finalized.json does.
                 # Until the sweep writes it, the trial's row is the placeholder, never a ledger
                 # fact invented here, and completion is withheld.
@@ -614,15 +627,28 @@ def lock_held(path, run=None):
 
 
 def git_lock_roots():
-    runs = runs_dir(LAB)  # resolved at call time, under whatever LAB names (the stale-lock fixture repoints it)
-    return [LAB / ".git", *(runs.glob("*/workspace/.git") if runs.is_dir() else ())]
+    runs = runs_dir(CODE_ROOT)  # resolved at call time, under whatever CODE_ROOT names (the stale-lock fixture repoints it)
+    roots = list(runs.glob("*/workspace/.git")) if runs.is_dir() else []
+    dotgit = CODE_ROOT / ".git"
+    if dotgit.is_dir():
+        roots.append(dotgit)
+    elif dotgit.is_file():
+        from _lanes import clean_env
+        gitdir = subprocess.run(["git", "-C", str(CODE_ROOT), "rev-parse", "--absolute-git-dir"],
+                                env=clean_env({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}),
+                                capture_output=True, text=True)
+        if gitdir.returncode == 0:
+            roots.append(Path(gitdir.stdout.strip()))
+    return set(roots)
 
 
 def git_lock_candidates(root):
     root, found = Path(root), []
     for current, dirs, files in os.walk(root):
         current = Path(current)
-        found.extend(current / name for name in files if name.endswith(".lock"))
+        found.extend(current / name for name in files if name.endswith(".lock") and name != "cs-land.lock")
+        if current == root and "cs-lanes" in dirs:
+            dirs.remove("cs-lanes")
         if current == root / "objects":
             dirs[:] = [name for name in dirs if not re.fullmatch(r"[0-9a-f]{2}", name)]
     return found
@@ -656,7 +682,7 @@ def sweep_stale_locks(now=None):
 
 def write_heartbeat(env=None):
     env = os.environ if env is None else env
-    path = Path(env.get("LAB_TICK_HEARTBEAT") or (STATE / "tick-heartbeat"))
+    path = Path(env.get("CS_TICK_HEARTBEAT") or (STATE / "tick-heartbeat"))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
@@ -687,7 +713,7 @@ def main(turn_only=False):
         finalize_sweep()
     recover_orphaned_jobs()
     if not turn_only:
-        job_pull_pass()
+        job_pull_pass()  # _node_intake gates acceptance during a restart.
         spool_pass()
     write_heartbeat()
     rl = None
@@ -731,7 +757,8 @@ def main(turn_only=False):
         selected = admit(eligible)
         if turn_only:
             selected = dict(selected, dispatch_seat="reserved")
-        if (model := local_model(selected)) and not local_model_ready(model):
+        # Director offers must reach a terminal row with the runner's reason.
+        if not selected.get("director_job") and (model := local_model(selected)) and not local_model_ready(model):
             emit({"ok": True, "skip": "local_coder_unavailable",
                   "pending": qid(selected)}, swept)
             return
@@ -765,7 +792,8 @@ def main(turn_only=False):
             return
         running = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                   "id": jid, "job": jid, "spec": job["spec"],
-                  "state": "running", "pid": os.getpid(), "origin": "dispatch"}
+                  "state": "running", "pid": os.getpid(), "pid_identity": _pid_identity(os.getpid()),
+                  "origin": "dispatch"}
         for key in JOB_META:
             if job.get(key):
                 running[key] = job[key]

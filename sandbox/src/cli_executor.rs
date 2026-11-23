@@ -99,6 +99,8 @@ pub struct Toolchains {
     pub read_roots: Vec<PathBuf>,
     #[serde(default)]
     pub proxy_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub uv_cache_roots: Vec<PathBuf>,
 }
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +119,8 @@ pub struct Lane {
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RunProtection {
+    #[serde(default)]
+    pub action_capabilities: bool,
     #[serde(default)]
     pub run_root: Option<PathBuf>,
     #[serde(default)]
@@ -233,11 +237,12 @@ impl ExecutorRequest {
             .chain(self.ssh_auth_sock.iter())
             .chain(self.login_targets.iter().map(|target| &target.path))
             .chain(self.deny_write_roots.iter())
-            .chain(
-                self.toolchains
+            .chain(self.toolchains.iter().flat_map(|v| {
+                v.read_roots
                     .iter()
-                    .flat_map(|v| v.read_roots.iter().chain(v.proxy_paths.iter())),
-            )
+                    .chain(&v.proxy_paths)
+                    .chain(&v.uv_cache_roots)
+            }))
             .chain(self.lane.iter().flat_map(|v| {
                 v.common_git_dir
                     .iter()
@@ -264,10 +269,11 @@ impl ExecutorRequest {
     fn has_caller_inputs(&self) -> bool {
         !self.caller_grants.is_empty()
             || !self.deny_write_roots.is_empty()
-            || self
-                .toolchains
-                .as_ref()
-                .is_some_and(|v| !v.read_roots.is_empty() || !v.proxy_paths.is_empty())
+            || self.toolchains.as_ref().is_some_and(|v| {
+                !v.read_roots.is_empty()
+                    || !v.proxy_paths.is_empty()
+                    || !v.uv_cache_roots.is_empty()
+            })
             || self.lane.is_some()
             || self.run_protection.is_some()
     }
@@ -442,7 +448,7 @@ const PROTECTED_READS: &[&str] = &[
 const HOSTED_READS: &[&str] = &[
     ".contextstack/director-db-backup",
     ".contextstack/browser",
-    ".contextstack/lab/browser-state",
+    ".contextstack/state/browser-state",
     ".contextstack/config/lead-credential",
     ".contextstack/config/hosted-lead.json",
     ".contextstack/state/lead-sessions",
@@ -717,6 +723,17 @@ fn read_rules(request: &ExecutorRequest, read_roots: &[PathBuf]) -> Result<Vec<S
     Ok(rules)
 }
 
+fn action_capability_rules(tmpdir: &Path) -> Result<[String; 2], Failure> {
+    // Alternate state roots may live outside the home read boundary.
+    let own_tmp = crate::sbpl::quote(&crate::sbpl::resolve(tmpdir)?)?;
+    Ok([
+        format!(
+            r#"(deny file-read* file-write* file-link (require-all (regex #"/lane-mcp-capability-[^/]+$") (require-not (subpath {own_tmp}))))"#
+        ),
+        r#"(deny file-read* file-write* file-link (regex #"/action-mcp-binding$"))"#.to_owned(),
+    ])
+}
+
 fn socket_deny_rules() -> Vec<String> {
     let mut rules = Vec::new();
     // Keep the short socket namespace denied even outside the protected state root.
@@ -929,6 +946,13 @@ pub fn seatbelt_profile(request: &ExecutorRequest) -> Result<String, Failure> {
     let mut read_roots = vec![workspace.clone(), request.tmpdir.clone()];
     read_roots.extend(request.read_roots.iter().cloned());
     lines.extend(read_rules(request, &read_roots)?);
+    if request
+        .run_protection
+        .as_ref()
+        .is_some_and(|run| run.action_capabilities)
+    {
+        lines.extend(action_capability_rules(&tmpdir)?);
+    }
     lines.extend(ssh_rules(request)?);
     if let Some(protected) = request.protected.as_ref() {
         lines.extend(protected_rules(protected, request.version.is_some())?);

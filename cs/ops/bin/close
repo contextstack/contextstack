@@ -10,12 +10,12 @@ from pathlib import Path
 from _roots import roots
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 STATE = roots()["state"]
 # the dispatch shelf tick drains: under the state root (default <code>/ledger, as before)
 Q = STATE / "dispatch.jsonl"
 LOCK = STATE / "dispatch.lock"
-LEDGER = state_dir(LAB) / "ledger.jsonl"
+LEDGER = state_dir(CODE_ROOT) / "ledger.jsonl"
 
 
 a = json.load(sys.stdin)
@@ -26,7 +26,7 @@ state = str(a.get("state") or "operator_close")
 if state not in TERMINAL:
     sys.exit("close: state must be done, error, or operator_close")
 if state == "operator_close" and a.get("reason"):
-    err = validate_operator_close(LAB, a)
+    err = validate_operator_close(CODE_ROOT, a)
     if err:
         sys.exit(err)
 LOCK.parent.mkdir(parents=True, exist_ok=True)

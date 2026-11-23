@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# lab tool: regex search over workspace files. Output clipped to 8KB.
+# code_root tool: regex search over workspace files. Output clipped to 8KB.
 import json, os, re, sys
 import _calllog
 

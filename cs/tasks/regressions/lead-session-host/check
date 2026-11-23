@@ -20,6 +20,7 @@ KIT = HERE.parents[2]
 sys.path.insert(0, str(HERE.parent / "_lib"))
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 _fixture_env = hermetic_env()
 os.environ.clear()
@@ -178,8 +179,8 @@ def timed_subprocess(step: str, **kwargs) -> subprocess.CompletedProcess:
 
 
 def workspace_turn(root: Path, seq: int, message: str) -> Path:
-    state = Path(os.environ["LAB_STATE_ROOT"])
-    cfg = Path(os.environ["LAB_CONFIG_ROOT"])
+    state = Path(os.environ["CS_STATE_ROOT"])
+    cfg = Path(os.environ["CS_CONFIG_ROOT"])
     conversation = json.loads((cfg / "hosted-lead.json").read_text())["conversation_id"]
     ws = state / "jobs" / ("turn-%d" % seq)
     ws.mkdir(parents=True)
@@ -475,7 +476,7 @@ def test_executor_hook(root: Path, cs_root: Path, state: Path, env: dict) -> Non
     task = executor_fixture_task(root)
     run_env = dict(
         env,
-        LEAD_CLI_BIN=str(STUB),
+        LEAD_CLI_BIN=str(STUB), CS_JOB_ID=task.parent.parent.name,
         LEAD_HOST_NO_SANDBOX="1", CS_EXECUTOR_ALLOW_UNSANDBOXED="1",
         CS_TOOLS_BIN=env.get("CS_TOOLS_BIN", ""),
     )
@@ -491,7 +492,7 @@ def test_executor_hook(root: Path, cs_root: Path, state: Path, env: dict) -> Non
     try:
         done = timed_subprocess(
             "executor hosted turn",
-            args=[sys.executable, str(OPS / "_executor.py")],
+            args=cli_command(sys.executable, OPS / "_executor.py"),
             input=order,
             cwd=str(KIT),
             env=run_env,
@@ -539,6 +540,40 @@ def test_executor_hook(root: Path, cs_root: Path, state: Path, env: dict) -> Non
         if evidence.is_file():
             blob += evidence.read_text(encoding="utf-8")
         expect(FAKE_TOKEN not in blob and SECRET not in blob, "executor artifacts redact secrets")
+        trace = run_dir / "trace.jsonl"
+        directory_map = root / "trace-directories.json"
+        directory_map.write_text(json.dumps({"run_directories": {run_dir.name: str(run_dir)}}))
+        checked = subprocess.run(
+            [str(KIT.parent / "tracing/check-trace"), str(trace), str(directory_map)],
+            env=run_env, capture_output=True, text=True, timeout=10,
+        )
+        assert checked.returncode == 0, (checked.stdout, checked.stderr)
+        assert json.loads(checked.stdout) == {"result": "complete", "findings": [], "missing": []}
+        spans = [json.loads(line) for line in trace.read_text().splitlines()]
+        root_span = next(span for span in spans if span["kind"] == "run")
+        assert root_span["attributes"]["coverage"] == "observed"
+        assert root_span["attributes"]["job_id"] == run_env["CS_JOB_ID"]
+        assert root_span["attributes"]["task"] == "tasks/turn"
+        assert root_span["attributes"]["trial"] == 1
+        process = next(span for span in spans if span["kind"] == "cli_process")
+        assert process["outcome"] == "completed" and process["duration_ms"] > 0
+        assert process["attributes"]["exit_status"] == 0
+        assert process["attributes"]["received_events"] == 2
+        assert process["attributes"]["usage_reported"] is True
+        events = [json.loads(json.loads(line)["output"])
+                  for line in (run_dir / "cli-events.jsonl").read_text().splitlines()]
+        assert [event["type"] for event in events] == ["system", "result"]
+        usage = next(span["attributes"] for span in spans if span["kind"] == "cli_usage")
+        assert usage["source"] == "claude_code_native"
+        assert (usage["input_tokens"], usage["output_tokens"]) == (5, 12)
+        terminal = json.loads((run_dir / "terminal.json").read_text())
+        assert (terminal["est_usd"], terminal["est_basis"], terminal["cost_usd"]) == (0.00017, "rate", 0), terminal
+        usage = json.loads((state / "outbox" / (run_dir.name + ".json")).read_text())["usage"]
+        assert (usage["est_usd"], usage["est_basis"], usage["charged_usd"]) == (0.00017, "rate", 0), usage
+        final = next(span for span in spans if span["kind"] == "finalization")
+        assert final["attributes"]["verdict"] == out["verdict"] == "pass"
+        assert [json.loads(line)["event"] for line in messages.read_text().splitlines()] == ["turn"]
+
     kill_serve(state, CONV_EXECUTOR)
 
 
@@ -633,9 +668,9 @@ def main():
         env = dict(
             hermetic_env(),
             HOME=str(fixture_home),
-            LAB_STATE_ROOT=str(state),
-            LAB_CONFIG_ROOT=str(cs_root / "config"),
-            LAB_CODE_ROOT=str(KIT),
+            CS_STATE_ROOT=str(state),
+            CS_CONFIG_ROOT=str(cs_root / "config"),
+            CS_CODE_ROOT=str(KIT),
             CS_TOOLS_BIN=tools,
             LEAD_HOST_SERVE_READY_S=CHECK_SERVE_READY_S,
             LEAD_HOST_WAKE="0",

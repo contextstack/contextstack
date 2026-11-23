@@ -6,15 +6,16 @@ use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\ListRecords;
 use App\Client\LiveUpdates;
 use App\Client\RunEvidence;
-use App\Livewire\DirectorPage;
+use App\Livewire\ApprovalsPage;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Locked;
 use Livewire\Attributes\Title;
 
 /*
- * One coding lane (job): live output, result summaries, cancel, decide, and land instructions.
+ * One coding lane (job): live output, result summaries, cancel, decide, and land instructions, and the requests its
+ * agent made beyond the sandbox (action approvals), with Approve and Deny for one that waits on the owner.
  */
-new #[Layout('layouts::client')] #[Title('Task lane')] class extends DirectorPage
+new #[Layout('layouts::client')] #[Title('Task lane')] class extends ApprovalsPage
 {
     #[Locked]
     public string $jobId = '';
@@ -72,6 +73,7 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends DirectorPag
             return;
         }
         $this->hold('job', $this->jobId, (array) ($job['job'] ?? $job));
+        $this->loadApprovals(['job' => $this->jobId]);
 
         $intentId = (string) (($job['job'] ?? $job)['intent_id'] ?? '');
         if ($intentId !== '') {
@@ -101,6 +103,11 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends DirectorPag
             'cancel' => ($record['job_id'] ?? null) === $this->jobId,
             default => false,
         };
+    }
+
+    protected function followsApproval(array $change): bool
+    {
+        return ($change['record']['job_id'] ?? null) === $this->jobId;
     }
 
     protected function afterChanges(): void
@@ -393,7 +400,11 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends DirectorPag
 
         <div class="grid gap-x-10 gap-y-6 lg:grid-cols-[minmax(0,1fr)_19rem]">
             <div class="min-w-0 space-y-6">
-                {{-- What waits on you comes first: the decision, then landing. --}}
+                {{-- What waits on you comes first: a request beyond the sandbox, the decision, then landing. --}}
+                @foreach ($this->approvalsWaiting() as $approval)
+                    <x-client.action-approval :approval="$approval" :show-job="false" />
+                @endforeach
+
                 @if ($run && ($receipt !== [] || ! $this->landed()))
                     @if ($receipt !== [])
                         <div class="flex items-center gap-2 text-sm" data-test="lane-decision">
@@ -440,6 +451,17 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends DirectorPag
                             · {{ __('By') }}: {{ $landRecord['landed_by'] ?? '—' }}
                             · {{ __('At') }}: <x-client.time :at="$landRecord['landed_at'] ?? null" :fallback="'—'" />
                         </p>
+                    </x-client.section>
+                @endif
+
+                @php($otherApprovals = array_values(array_filter($this->approvals, fn (array $approval): bool => ($approval['status'] ?? null) !== 'needs_owner')))
+                @if ($otherApprovals !== [])
+                    <x-client.section :heading="__('Requests beyond the sandbox')" data-test="lane-approvals">
+                        <div class="space-y-3">
+                            @foreach ($otherApprovals as $approval)
+                                <x-client.action-approval :approval="$approval" :show-job="false" />
+                            @endforeach
+                        </div>
                     </x-client.section>
                 @endif
 

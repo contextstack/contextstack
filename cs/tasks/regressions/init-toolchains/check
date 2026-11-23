@@ -13,7 +13,7 @@ sys.path.insert(0, str(HERE.parent / "_lib"))
 from hermetic_env import hermetic_env
 from scratch import scratch_dir
 
-LAB = HERE.parents[2]
+CODE_ROOT = HERE.parents[2]
 problems = []
 
 
@@ -30,16 +30,18 @@ def write_atomic(path, data, mode):
 
 
 def lookup_script():
-    sys.path.insert(0, str(LAB / "scripts"))
-    import cs_init
-    return ";".join("command -v %s" % name for name in cs_init.TOOLCHAIN_BINARIES)
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
+    from _toolchains import LOGIN_LOOKUP
+    return LOGIN_LOOKUP
 
 
 def run_step(home, shell, env_extra=None, verbose=False):
     config = home / ".contextstack/config"
     config.mkdir(parents=True, exist_ok=True)
     env = hermetic_env()
-    env.update(HOME=str(home), SHELL=str(shell), CS_SERVICE_PATH="/usr/bin:/bin"); env.update(env_extra or {})
+    env.update(HOME=str(home), SHELL=str(shell), CS_SERVICE_PATH="/usr/bin:/bin",
+               CARGO_HOME=str(home / ".cargo"), RUSTUP_HOME=str(home / ".rustup"))
+    env.update(env_extra or {})
     program = (
         "def _write_atomic(path, data, mode):\n from pathlib import Path\n path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)\n path.write_bytes(data); path.chmod(mode)\n"
         "import sys; from pathlib import Path; from types import SimpleNamespace; "
@@ -54,7 +56,7 @@ def run_step(home, shell, env_extra=None, verbose=False):
         "init.detail = (lambda line: lines.append(line)) if %s else (lambda line: None); "
         "init.step_toolchains(); print('\\n'.join(lines))"
     ) % (
-        str(LAB / "scripts"),
+        str(CODE_ROOT / "scripts"),
         str(config),
         verbose,
         str(home),
@@ -94,7 +96,7 @@ def main():
 
         shell = shell_script(
             home,
-            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')"
+            "import sys\nassert sys.argv[1:] == ['-lc', %r]\nprint(%r, end='')"
             % (lookup, "".join(str(binaries / n) + "\n" for n in ("php", "node"))),
         )
         r = run_step(home, shell)
@@ -117,7 +119,7 @@ def main():
         destination.unlink()
         shell = shell_script(
             home,
-            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(on_path / "php") + "\n"),
+            "import sys\nassert sys.argv[1:] == ['-lc', %r]\nprint(%r, end='')" % (lookup, str(on_path / "php") + "\n"),
         )
         r = run_step(home, shell, env_extra={"CS_SERVICE_PATH": "%s:/usr/bin:/bin" % on_path})
         expect(not destination.exists() and r.stdout.strip() == "", "on service PATH: skip, no file")
@@ -137,7 +139,7 @@ def main():
              "init.cs = SimpleNamespace(HOME=Path(%r), CURRENT=Path(%r)); "
              "init.nr = SimpleNamespace(SYSTEM_PATH='/usr/bin:/bin', write_atomic=_write_atomic); "
              "init.say = print; init.detail = lambda l: None; init.step_toolchains()" % (
-                 str(LAB / "scripts"), str(config), str(home), str(home / ".contextstack/current"))],
+                 str(CODE_ROOT / "scripts"), str(config), str(home), str(home / ".contextstack/current"))],
             env=env, capture_output=True, text=True, timeout=20,
         )
         expect(destination.read_text() == before and "toolchains: login shell lookup failed" in r.stdout,
@@ -152,7 +154,7 @@ def main():
         destination.unlink(missing_ok=True)
         shell = shell_script(
             home,
-            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(home / "missing-php") + "\n"),
+            "import sys\nassert sys.argv[1:] == ['-lc', %r]\nprint(%r, end='')" % (lookup, str(home / "missing-php") + "\n"),
         )
         r = run_step(home, shell)
         expect(not destination.exists() and r.stdout.strip() == "", "missing binary skipped")
@@ -173,9 +175,9 @@ def main():
         destination.unlink(missing_ok=True)
         shell = shell_script(
             home,
-            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(uv_path) + "\n"),
+            "import sys\nassert sys.argv[1:] == ['-lc', %r]\nprint(%r, end='')" % (lookup, str(uv_path) + "\n"),
         )
-        r = run_step(home, shell)
+        r = run_step(home, shell, {"CS_SERVICE_PATH": str(uv_bin)})
         uv_expected = {"name": "uv", "bin": str(uv_bin), "python": str(uv_py)}
         expect(r.returncode == 0, "uv detection succeeds: " + r.stderr)
         expect(destination.is_file() and json.loads(destination.read_text()) == [uv_expected], "uv toolchain written")
@@ -198,21 +200,26 @@ def main():
         )
         rustc_path.chmod(0o755)
         cargo_path = cargo_bin / "cargo"
-        cargo_path.write_text("#!" + sys.executable + "\nraise SystemExit(0)\n")
-        cargo_path.chmod(0o755)
+        proxy = cargo_bin / "rustup"
+        rustc_path.rename(proxy)
+        rustc_path.symlink_to(proxy)
+        cargo_path.symlink_to(proxy)
         destination.unlink(missing_ok=True)
         shell = shell_script(
             home,
-            "import sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')" % (lookup, str(cargo_path) + "\n"),
+            "import sys\nassert sys.argv[1:] == ['-lc', %r]\nprint(%r, end='')" % (lookup, str(cargo_path) + "\n" + str(rustc_path) + "\n"),
         )
         r = run_step(home, shell)
         cargo_expected = {"name": "cargo", "bin": str(cargo_bin), "rustup": str(cargo_rustup),
                           "toolchain": str(cargo_tc), "registry": str(cargo_reg)}
         expect(r.returncode == 0, "cargo detection succeeds: " + r.stderr)
-        expect(destination.is_file() and json.loads(destination.read_text()) == [cargo_expected], "cargo toolchain written")
-        expect(r.stdout.strip() == "cargo: %s" % cargo_bin, "cargo line printed")
+        rustc_expected = {"name": "rustc", "bin": str(cargo_bin)}
+        expect(destination.is_file() and json.loads(destination.read_text()) == [cargo_expected, rustc_expected],
+               "cargo and rustc toolchains preserve rustup proxy names")
+        expect(r.stdout.splitlines() == ["cargo: %s" % cargo_bin, "rustc: %s" % cargo_bin],
+               "cargo and rustc lines printed")
 
-        sys.path.insert(0, str(LAB / "ops/bin"))
+        sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 
         import _toolchains
         stale = home / ".contextstack/config/toolchains.json"

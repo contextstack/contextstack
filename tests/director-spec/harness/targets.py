@@ -74,6 +74,9 @@ class RustTarget:
         code = self.tmp / "code"
         (code / "cs").mkdir(parents=True, exist_ok=True)
         (code / "cs/agents").symlink_to(Path(__file__).resolve().parents[3] / "cs/agents")
+        ops = code / "cs/ops/bin"
+        ops.mkdir(parents=True, exist_ok=True)
+        (ops / "executor-templates.json").symlink_to(Path(__file__).resolve().parents[3] / "cs/ops/bin/executor-templates.json")
         self.env["CS_CODE_ROOT"] = str(code)
         self.env["CS_LEAD_BUNDLE_DIR"] = str(Path(__file__).resolve().parents[3] / "cs/lead")
         # A stand-in gateway for source budgets, and its owner token in the temp HOME, where the real one would be.

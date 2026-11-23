@@ -7,7 +7,7 @@ longer existed) and its gateway prompted for the Keychain. The owner,
 
 In a fake HOME built as node-install-layout builds one (two releases, a
 director receiver), with `launchctl`, `curl` and `ssh` shims first on PATH,
-running the release's own `lab/scripts/cs`, the check must show:
+running the release's own `code_root/scripts/cs`, the check must show:
 
 1. `cs status --json` and `cs status` (one screen): the release, each
    service up or down with pid, last exit and a reason (the tunnel's exit 78
@@ -39,6 +39,6 @@ running the release's own `lab/scripts/cs`, the check must show:
    or shim call; `security` is never called. The real `~/.local/bin` and
    `~/Library/LaunchAgents` are untouched.
 
-Fails when `lab/scripts/cs` is absent. Needs uv and the
+Fails when `code_root/scripts/cs` is absent. Needs uv and the
 pinned uv-managed interpreter; else SKIP and why. About 25 s.
 Run: `tasks/regressions/cs-cli/check`.

@@ -23,14 +23,14 @@ class TickTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(scratch_dir(prefix='tick-units-')))
-        self.env = {**hermetic_env(), 'LAB_STATE_ROOT': str(self.root),
-                    'LAB_CONFIG_ROOT': str(self.root), 'LAB_CODE_ROOT': str(OPS.parents[1])}
+        self.env = {**hermetic_env(), 'CS_STATE_ROOT': str(self.root),
+                    'CS_CONFIG_ROOT': str(self.root), 'CS_CODE_ROOT': str(OPS.parents[1])}
         self.stack.enter_context(patch.dict(os.environ, self.env, clear=True))
         loader = importlib.machinery.SourceFileLoader('unit_tick', str(OPS / 'tick'))
         spec = importlib.util.spec_from_loader(loader.name, loader)
         self.m = importlib.util.module_from_spec(spec)
         loader.exec_module(self.m)
-        for key, value in dict(LAB=self.root, STATE=self.root, Q=self.root/'dispatch.jsonl',
+        for key, value in dict(CODE_ROOT=self.root, STATE=self.root, Q=self.root/'dispatch.jsonl',
                                LOCK=self.root/'dispatch.lock', LEDGER=self.root/'ledger.jsonl',
                                RUNS=self.root/'runs', RESLOCK=self.root/'resource-locks',
                                SPOOL_POLICY=self.root/'policy/spool.json', NODE=False).items():
@@ -63,6 +63,8 @@ class TickTests(unittest.TestCase):
         run = Mock(return_value=subprocess.CompletedProcess([], 1, 'progress\n{"ok":false,"pending":2,"failed":1,"accepted":3,"error":"offline"}', ''))
         self.assertEqual(self.m.spool_pass(run=run)['pending'], 2)
         self.assertEqual(self.m.job_pull_pass(run=run)['accepted'], 3)
+        self.assertEqual(self.m.SPOOL['error'], 'offline')
+        self.assertEqual(self.m.JOB_PULL['error'], 'offline')
         self.assertEqual(run.call_args.kwargs['timeout'], 300)
         for value in ['', 'bad']:
             run.return_value = subprocess.CompletedProcess([], 0, value, '')
@@ -74,6 +76,7 @@ class TickTests(unittest.TestCase):
             self.assertEqual(self.m.job_pull_pass(run=run)['error'], str(error))
         run.side_effect = None
         run.return_value = subprocess.CompletedProcess([], 1)
+        (self.root / 'terminal.json').touch()
         self.assertFalse(self.m.finalize_run(self.root, run=run))
         self.assertFalse(self.m.local_model_ready(run=run))
         run.return_value.returncode = 0
@@ -107,7 +110,7 @@ class TickTests(unittest.TestCase):
                    {'id':'live','state':'pending'}, {'id':'blocked','state':'pending','resource':'busy'},
                    {'id':'dead','state':'running','pid':0}, {'id':'ready','state':'pending'}])
         self.patch('pid_live', side_effect=lambda pid: pid==22)
-        self.patch('lab_count', return_value=0)
+        self.patch('runner_count', return_value=0)
         self.assertEqual([r['id'] for r in self.m.jobs()], ['ready'])
         self.assertEqual(self.m.occupied(), 1)
         self.assertEqual(self.m.recover_orphaned_jobs(), ['dead'])
@@ -118,25 +121,25 @@ class TickTests(unittest.TestCase):
     def test_child_environment_filters_mutation_and_binds_schedule_and_aliases(self):
         self.rows([{'id':'j','slot':'slot','schedule_date':'date','schedule_timezone':'UTC'}])
         self.m.POLICY_ENV.update(child_env=['PATH'], tool_prefix=None, browser_state='browser')
-        parent = {'PATH':'/bin','LAB_VIDEO_MUTATION':'1','LAB_CHILD_ENV':'bad','CS_JOB_ID':'wrong'}
+        parent = {'PATH':'/bin','CS_VIDEO_MUTATION':'1','CS_CHILD_ENV':'bad','CS_JOB_ID':'wrong'}
         result = self.m.child_env('j', ['youtube_playlist_mutation'], trial=2, env=parent)
         self.assertEqual(result['CS_JOB_ID'], 'j')
-        self.assertEqual(result['LAB_SCHEDULE_SLOT'], 'slot')
-        self.assertEqual(result['LAB_TRIAL'], '2')
+        self.assertEqual(result['CS_SCHEDULE_SLOT'], 'slot')
+        self.assertEqual(result['CS_TRIAL'], '2')
         self.assertEqual(result['CS_VIDEO_MUTATION'], '1')
-        self.assertEqual(result['LAB_BROWSER_STATE'], 'browser')
+        self.assertEqual(result['CS_BROWSER_STATE'], 'browser')
         result = self.m.child_env(env=parent)
-        self.assertNotIn('LAB_VIDEO_MUTATION', result)
+        self.assertNotIn('CS_VIDEO_MUTATION', result)
         self.assertNotIn('CS_JOB_ID', result)
         self.assertEqual(parent['CS_JOB_ID'], 'wrong')
 
     def test_heartbeat_writes_selected_path_and_swallows_filesystem_failure(self):
         target = self.root/'custom/beat'
-        self.m.write_heartbeat(env={'LAB_TICK_HEARTBEAT':str(target)})
+        self.m.write_heartbeat(env={'CS_TICK_HEARTBEAT':str(target)})
         self.assertRegex(target.read_text(), r'^\d{4}-.*Z\n$')
         self.m.write_heartbeat(env={})
         self.assertTrue((self.root/'tick-heartbeat').is_file())
-        self.m.write_heartbeat(env={'LAB_TICK_HEARTBEAT':str(target/'impossible')})
+        self.m.write_heartbeat(env={'CS_TICK_HEARTBEAT':str(target/'impossible')})
 
     def test_stale_locks_respect_two_second_boundary_and_live_nonempty_holder(self):
         root = self.root/'.git'
@@ -290,17 +293,35 @@ class TickTests(unittest.TestCase):
         self.assertEqual(self.m.local_model({'spec':'local.yaml'}),'local-coder')
 
     def test_trial_builders_bind_task_trial_environment_and_exact_pending_authority(self):
-        self.rows([{'id':'j','state':'pending','grant':{'id':'g'},'conversation_id':'c','turn_id':'t'}])
-        run=self.patch('run_teed',return_value=7)
-        self.patch('runner_path',return_value=Path('/fake/runner'))
-        self.assertEqual(self.m.one_trial('s.yaml',2,'task','j',['effect']),7)
-        self.assertEqual(run.call_args.args[0],['/fake/runner','run','-task','task','-trial','2','s.yaml'])
-        self.assertEqual(self.m.one_executor_trial('s.yaml','model: fake\nintent: hello\n','task',1,'j'),7)
-        payload=json.loads(run.call_args.kwargs['input'])
-        self.assertEqual(payload['conversation_id'],'c')
-        self.assertEqual(payload['grant'],{'id':'g'})
-        self.assertNotIn('intent', payload)
-        self.assertNotIn('exp', payload)
+        shared = {'task': 'task', 'spec': 's.yaml'}
+        wrong_authority = {'grant': {'id': 'other'}, 'conversation_id': 'other', 'turn_id': 'other'}
+        self.rows([
+            {**shared, **wrong_authority, 'id': 'sibling', 'state': 'pending'},
+            {**shared, **wrong_authority, 'id': 'j', 'state': 'running'},
+            {**shared, 'id': 'j', 'state': 'pending', 'grant': {'id': 'g'},
+             'conversation_id': 'c', 'turn_id': 't'},
+        ])
+        run = self.patch('run_teed', return_value=7)
+        effects = ['youtube_playlist_mutation']
+        self.assertEqual(self.m.one_trial('s.yaml', 2, 'task', 'j', effects), 7)
+        self.assertEqual(run.call_args.args[0],
+                         [str(OPS / 'run-api'), '-task', 'task', '-trial', '2', 's.yaml'])
+        env = run.call_args.kwargs['env']
+        self.assertEqual(env['CS_JOB_ID'], 'j')
+        self.assertEqual(env['CS_TRIAL'], '2')
+        self.assertEqual(env['CS_VIDEO_MUTATION'], '1')
+
+        self.assertEqual(self.m.one_executor_trial('s.yaml', 'model: fake\nintent: hello\n',
+                                                   'task', 1, 'j', effects), 7)
+        self.assertEqual(run.call_args.args[0], [str(OPS / 'executor')])
+        env = run.call_args.kwargs['env']
+        self.assertEqual(env['CS_JOB_ID'], 'j')
+        self.assertEqual(env['CS_VIDEO_MUTATION'], '1')
+        self.assertNotIn('CS_TRIAL', env)
+        self.assertEqual(json.loads(run.call_args.kwargs['input']), {
+            **shared, 'executor': 'fake', 'trial': 1, 'timeout_s': 300,
+            'conversation_id': 'c', 'turn_id': 't', 'grant': {'id': 'g'},
+        })
 
     def test_teed_process_returns_status_retains_stderr_and_appends_job_log(self):
         log=self.root/'node.log'

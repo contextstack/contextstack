@@ -3,7 +3,7 @@
   "stdout": "evidence_assert: quote or source_date is required\n",
   "files": {
     "_evidence/assertions.jsonl": null,
-    ".lab-calls.jsonl": "{\"args\": {\"source_url\": \"https://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"source_url\": \"https://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
   },
   "untouched": true
 }

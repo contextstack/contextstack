@@ -25,11 +25,11 @@ Every failure is one stderr line prefixed `cs-sandbox:`.
 
 ## Policy shapes
 
-Host policy (`cs/policy/sandbox.json`; `$CODE_ROOT` = `LAB_CODE_ROOT` or the policy file's grandparent dir, `$REPO_ROOT` = its parent, `$HOME`):
+Host policy (`cs/policy/sandbox.json`; `$CODE_ROOT` = `CS_CODE_ROOT` or the policy file's grandparent dir, `$REPO_ROOT` = its parent, `$HOME`):
 
     {"version": 1, "runtime_read": {"macos": ["$CODE_ROOT/tools/bin", "$REPO_ROOT/target/release",...],
      "linux": ["$CODE_ROOT/tools/bin", "$REPO_ROOT/target/release",...]},
-     "allow_net": ["none"], "write_env": {"LAB_BROWSER_STATE": ["$HOME/.contextstack"]},
+     "allow_net": ["none"], "write_env": {"CS_BROWSER_STATE": ["$HOME/.contextstack"]},
      "profiles": {"browser": {"read": {"macos": ["$HOME/.claude/skills/gstack",...], "linux": [...]}}},
      "sockets": {"browser-public": "$HOME/.contextstack/browser/sockets/public.sock"}}
 

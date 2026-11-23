@@ -1,5 +1,8 @@
 <?php
 
+use App\Client\DirectorClient;
+use App\Client\Exceptions\DirectorRefused;
+use App\Client\Exceptions\DirectorUnavailable;
 use App\Livewire\DirectorPage;
 use App\Livewire\Forms\BudgetForm;
 use Livewire\Attributes\Layout;
@@ -22,6 +25,21 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
     /** @var array<string, mixed> */
     #[Locked]
     public array $usage = [];
+
+    /**
+     * The project's heartbeat (`GET heartbeat`): `{interval_seconds, conversation_id}`, both null when off; null when
+     * the Director has no heartbeat (an older release answers 404) and the card stays hidden.
+     *
+     * @var array<string, mixed>|null
+     */
+    #[Locked]
+    public ?array $heartbeat = null;
+
+    public int|string $heartbeatMinutes = 60;
+
+    public string $heartbeatConversation = '';
+
+    public string $heartbeatProblem = '';
 
     public function mount(string $project): void
     {
@@ -52,6 +70,7 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
                 $this->hold('conversation', (string) $conversation['conversation_id'], $conversation);
             }
         }
+        $this->loadHeartbeat();
         $this->afterChanges();
     }
 
@@ -95,6 +114,82 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
     public function clearBudget(): void
     {
         $this->take($this->attempt(fn () => $this->budget->clear($this->director(), 'projects/'.rawurlencode($this->projectId).'/budget')));
+    }
+
+    public function saveHeartbeat(): void
+    {
+        $this->heartbeatProblem = '';
+        $leads = array_keys($this->leadConversations());
+        $this->validate([
+            'heartbeatMinutes' => ['required', 'integer', 'min:1', 'max:10080'],
+            'heartbeatConversation' => ['required', 'string', 'in:'.implode(',', $leads ?: [''])],
+        ], ['heartbeatConversation.required' => __('Choose the hosted lead that takes the next item.')]);
+
+        $this->writeHeartbeat(['interval_seconds' => (int) $this->heartbeatMinutes * 60, 'conversation_id' => $this->heartbeatConversation]);
+    }
+
+    public function stopHeartbeat(): void
+    {
+        $this->heartbeatProblem = '';
+        $this->writeHeartbeat(['interval_seconds' => null]);
+    }
+
+    /**
+     * The project's hosted lead conversations that are not archived: the heartbeat's possible targets.
+     *
+     * @return array<string, string> conversation id => title
+     */
+    public function leadConversations(): array
+    {
+        $leads = [];
+        foreach ($this->heldOf('conversation') as $conversation) {
+            if (! empty($conversation['lead']) && ($conversation['archived_at'] ?? null) === null) {
+                $id = (string) $conversation['conversation_id'];
+                $leads[$id] = filled($conversation['title'] ?? null) ? (string) $conversation['title'] : $id;
+            }
+        }
+
+        return $leads;
+    }
+
+    /**
+     * @param  array<string, mixed>  $body
+     */
+    private function writeHeartbeat(array $body): void
+    {
+        try {
+            $answer = $this->director()->put('projects/'.rawurlencode($this->projectId).'/heartbeat', $body, DirectorClient::newKey());
+        } catch (DirectorRefused $refused) {
+            $this->heartbeatProblem = $refused->explain();
+
+            return;
+        } catch (DirectorUnavailable $unavailable) {
+            $this->heartbeatProblem = $unavailable->getMessage();
+
+            return;
+        }
+
+        $this->heartbeat = $answer;
+        $this->fillHeartbeatForm();
+    }
+
+    private function loadHeartbeat(): void
+    {
+        try {
+            $this->heartbeat = $this->director()->get('projects/'.rawurlencode($this->projectId).'/heartbeat');
+        } catch (DirectorRefused|DirectorUnavailable) {
+            $this->heartbeat = null;
+
+            return;
+        }
+        $this->fillHeartbeatForm();
+    }
+
+    private function fillHeartbeatForm(): void
+    {
+        $seconds = $this->heartbeat['interval_seconds'] ?? null;
+        $this->heartbeatMinutes = is_int($seconds) && $seconds > 0 ? max(1, intdiv($seconds, 60)) : 60;
+        $this->heartbeatConversation = is_string($this->heartbeat['conversation_id'] ?? null) ? $this->heartbeat['conversation_id'] : (string) (array_key_first($this->leadConversations()) ?? '');
     }
 
     /**
@@ -144,6 +239,9 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
         <span data-test="project-name">{{ $project['name'] ?? __('Project') }}</span>
         <x-slot:actions>
             @if ($project)
+                <flux:button size="sm" variant="ghost" icon="queue-list" :href="route('backlog.index', $project['project_id'])" wire:navigate data-test="project-backlog">{{ __('Backlog') }}</flux:button>
+                <flux:button size="sm" variant="ghost" icon="scale" :href="route('decisions.index', $project['project_id'])" wire:navigate data-test="project-decision-log">{{ __('Decision log') }}</flux:button>
+                <flux:button size="sm" variant="ghost" icon="code-bracket-square" :href="route('lanes.create', ['project' => $project['project_id']])" wire:navigate data-test="project-new-lane">{{ __('New task lane') }}</flux:button>
                 <flux:button size="sm" variant="ghost" icon="plus" :href="route('intents.create', ['project' => $project['project_id']])" wire:navigate>{{ __('New task in this project') }}</flux:button>
                 <flux:button size="sm" variant="ghost" icon="chat-bubble-left-right" :href="route('conversations.create', ['project' => $project['project_id']])" wire:navigate>{{ __('New conversation in this project') }}</flux:button>
             @endif
@@ -209,6 +307,41 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
                         @endif
                     </form>
                 </x-client.section>
+
+                @if ($heartbeat !== null)
+                    @php($beating = is_int($heartbeat['interval_seconds'] ?? null))
+                    <x-client.section :heading="__('Heartbeat')" data-test="project-heartbeat">
+                        <p class="text-xs leading-5 text-zinc-500">{{ __('On a schedule, a hosted lead takes the next unblocked backlog item. It waits one interval first, never overlaps itself, and pauses while an item marked stop waits on you.') }}</p>
+                        <p class="text-sm" data-test="heartbeat-state">
+                            @if ($beating)
+                                {{ __('On: every :n min, in :conversation.', ['n' => intdiv($heartbeat['interval_seconds'], 60), 'conversation' => $this->leadConversations()[$heartbeat['conversation_id']] ?? $heartbeat['conversation_id']]) }}
+                            @else
+                                {{ __('Off.') }}
+                            @endif
+                        </p>
+                        @if ($this->leadConversations() === [])
+                            <p class="text-sm text-zinc-500">{{ __('Start a hosted lead conversation in this project to give the heartbeat somewhere to run.') }}</p>
+                        @else
+                            <form wire:submit="saveHeartbeat" class="flex flex-wrap items-end gap-2">
+                                <flux:input size="sm" wire:model="heartbeatMinutes" :label="__('Every (minutes)')" type="number" min="1" class="w-28" data-test="heartbeat-minutes" />
+                                <flux:select size="sm" wire:model="heartbeatConversation" :label="__('Lead')" class="min-w-0 flex-1" data-test="heartbeat-conversation">
+                                    @foreach ($this->leadConversations() as $id => $title)
+                                        <flux:select.option :value="$id" wire:key="lead-{{ $id }}">{{ $title }}</flux:select.option>
+                                    @endforeach
+                                </flux:select>
+                                <flux:button size="sm" type="submit" data-test="save-heartbeat">{{ $beating ? __('Update') : __('Turn on') }}</flux:button>
+                                @if ($beating)
+                                    <flux:button size="sm" type="button" variant="ghost" wire:click="stopHeartbeat" data-test="stop-heartbeat">{{ __('Turn off') }}</flux:button>
+                                @endif
+                            </form>
+                        @endif
+                        @error('heartbeatMinutes') <flux:text class="text-sm text-red-600">{{ $message }}</flux:text> @enderror
+                        @error('heartbeatConversation') <flux:text class="text-sm text-red-600">{{ $message }}</flux:text> @enderror
+                        @if ($heartbeatProblem !== '')
+                            <flux:text class="text-sm text-red-600" data-test="heartbeat-problem">{{ $heartbeatProblem }}</flux:text>
+                        @endif
+                    </x-client.section>
+                @endif
 
                 @if (is_array($usage['total'] ?? null))
                     <x-client.section :heading="__('Usage, all time')" data-test="project-usage">

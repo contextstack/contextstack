@@ -7,6 +7,7 @@ use App\Client\Exceptions\DirectorUnavailable;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Locked;
 use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
 use Illuminate\Support\Str;
 use Livewire\Component;
 
@@ -14,6 +15,8 @@ use Livewire\Component;
  * Start a coding lane: the Director's built-in coding lane (`POST intents` with `lane`, CLIENT-API "Built-in coding
  * lane intents"), the same definition `cs mcp start_task` uses. The Director writes the spec, system prompt, goal and
  * check; the app sends the title, the goal, the model, and the repo and lane name (or neither, for scratch work).
+ * A lane may belong to a project, and then carry the project's active decision log as context
+ * (`lane.context: ["decision_log"]` with the intent's `project_id`): the Director freezes a copy into the job.
  */
 new #[Layout('layouts::client')] #[Title('New task lane')] class extends Component
 {
@@ -30,6 +33,16 @@ new #[Layout('layouts::client')] #[Title('New task lane')] class extends Compone
     public string $lane = '';
 
     public bool $scratch = false;
+
+    #[Url(as: 'project', except: '')]
+    public string $projectId = '';
+
+    /** Attach the project's active decision log to the lane. */
+    public bool $decisionLog = false;
+
+    /** @var array<string, string> project id => name */
+    #[Locked]
+    public array $projects = [];
 
     #[Locked]
     public string $submitKey = '';
@@ -93,6 +106,15 @@ new #[Layout('layouts::client')] #[Title('New task lane')] class extends Compone
                 }
             }
             $this->repo = $this->repos[0] ?? '';
+
+            foreach ((array) ($director->get('projects')['projects'] ?? []) as $project) {
+                if (is_array($project) && is_string($project['project_id'] ?? null)) {
+                    $this->projects[$project['project_id']] = (string) ($project['name'] ?? $project['project_id']);
+                }
+            }
+            if ($this->projectId !== '' && ! isset($this->projects[$this->projectId])) {
+                $this->projectId = '';
+            }
         } catch (DirectorRefused $refused) {
             $this->problem = $refused->explain();
         } catch (DirectorUnavailable $unavailable) {
@@ -115,6 +137,7 @@ new #[Layout('layouts::client')] #[Title('New task lane')] class extends Compone
             'title' => ['required', 'string', 'max:200'],
             'goal' => ['required', 'string', 'max:200000'],
             'model' => ['required', 'string', 'max:128', 'regex:/^[a-z0-9][a-z0-9._-]{0,62}$/'],
+            'projectId' => ['nullable', 'string', 'max:128'],
         ];
         if (! $this->scratch) {
             $rules['repo'] = ['required', 'string', 'max:128', 'regex:/^[a-z0-9][a-z0-9._-]{0,62}$/'];
@@ -133,9 +156,13 @@ new #[Layout('layouts::client')] #[Title('New task lane')] class extends Compone
                 'model' => $this->model,
                 'repo' => $this->scratch ? null : $this->repo,
                 'lane' => $this->scratch ? null : $this->lane,
+                'context' => $this->projectId !== '' && $this->decisionLog ? ['decision_log'] : null,
             ], fn ($value) => $value !== null),
             'meta' => ['source' => 'client-web-lane'],
         ];
+        if ($this->projectId !== '') {
+            $body['project_id'] = $this->projectId;
+        }
 
         try {
             $answer = $director->write('intents', $body, $this->submitKey);
@@ -199,6 +226,22 @@ new #[Layout('layouts::client')] #[Title('New task lane')] class extends Compone
 
         <flux:input wire:model="title" :label="__('Title')" required />
         <flux:textarea wire:model="goal" :label="__('Goal')" rows="8" required />
+
+        @if ($projects !== [])
+            <div class="grid gap-4 sm:grid-cols-2">
+                <flux:select wire:model.live="projectId" :label="__('Project')" data-test="lane-project">
+                    <flux:select.option value="">{{ __('None') }}</flux:select.option>
+                    @foreach ($projects as $id => $name)
+                        <flux:select.option :value="$id" wire:key="project-{{ $id }}">{{ $name }}</flux:select.option>
+                    @endforeach
+                </flux:select>
+                @if ($projectId !== '')
+                    <div class="sm:pt-7">
+                        <flux:checkbox wire:model="decisionLog" :label="__('Attach the decision log')" :description="__('The agent gets a frozen copy of the project\'s active decisions.')" data-test="lane-decision-log" />
+                    </div>
+                @endif
+            </div>
+        @endif
 
         <flux:checkbox wire:model.live="scratch" :label="__('Scratch workspace (no repo worktree)')" />
 

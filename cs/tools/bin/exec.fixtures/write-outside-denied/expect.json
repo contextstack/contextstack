@@ -1,10 +1,10 @@
 {
   "exit": 1,
   "stdout": {
-    "regex": "Operation not permitted|Read-only file system"
+    "regex": "Operation not permitted|Read-only file system|Directory nonexistent"
   },
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"cmd\": [\"sh\", \"-c\", \"echo x > /tmp/tool-fixtures-denied && echo wrote\"]}, \"name\": \"exec\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"cmd\": \"echo x > \\\"$FIXTURE_OUTSIDE\\\" && echo wrote\"}, \"name\": \"exec\"}\n"
   },
   "untouched": true
 }

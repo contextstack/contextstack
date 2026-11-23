@@ -3,7 +3,7 @@
 The contract (Plan.CS.v2.1 §7 "Fixtures, enforced").
 Every tool in `tools/manifest.json` runs under contract fixtures beside the
 tool, `tools/bin/<name>.fixtures/<case>/`, exec'd exactly as the Go runner
-execs a tool (`internal/lab/run.go` Tool.Run): argv the tool path alone, cwd a
+execs a tool (`internal/code_root/run.go` Tool.Run): argv the tool path alone, cwd a
 fresh workspace, stdin the case's `args.json`, stdout and stderr combined,
 timeout max(descriptor `timeout_seconds`, 60) s, env the `policy/env.json`
 `always` names. Tools are never imported.
@@ -14,7 +14,7 @@ timeout max(descriptor `timeout_seconds`, 60) s, env the `policy/env.json`
 - A case pins exit code, combined output (exact, contains, or regex), the
   files the tool created or changed (exact, sha256, contains, or must not
   exist) and, with `untouched`, that nothing else in the workspace moved.
-  `.lab-calls.jsonl` is pinned where the tool writes it, so the doom-loop
+  `.cs-calls.jsonl` is pinned where the tool writes it, so the doom-loop
   hook's view of each call is part of the contract (okf writes none).
 - Fixtures never touch the network. web_fetch and web_search ship negative
   cases only (README.md in each dir says why); browser_fetch renders through

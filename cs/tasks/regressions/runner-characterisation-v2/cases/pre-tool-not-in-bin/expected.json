@@ -46,9 +46,12 @@
       "dir": "<RUNSTAMP>-fx-pre-tool-not-in-bin-fx-t1",
       "entries": [
         "check.json",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -57,7 +60,7 @@
     }
   ],
   "stderr": [
-    "lab: tasks/fx — pre_tool \"ghost\": not in hooks/bin"
+    "cs: tasks/fx — pre_tool \"ghost\": not in hooks/bin"
   ],
   "stdout": [
     "  tasks/fx                       t1  void stop=error: pre_tool \"ghost\": not in hooks/bin turns=0 tools=0 $0.0000"

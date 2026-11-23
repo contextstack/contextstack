@@ -86,6 +86,9 @@ def classify_stop(stop, events=()):
     if stop == "provider_unavailable":
         return error_object("provider_fault", code=stop, source="executor",
                             detail="Cursor could not reach its model; its quota may be used up — try another model")
+    if stop == "provider_edit_refused":
+        return error_object("provider_fault", code=stop, source="executor",
+                            detail="Cursor's edit tools repeatedly refused writes. Retry on a fallback template.")
     if stop == "interrupted":
         return error_object("interrupted", source="runner")
     if stop == "aborted":

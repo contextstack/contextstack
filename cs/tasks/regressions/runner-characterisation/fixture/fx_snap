@@ -1,4 +1,0 @@
-#!/usr/bin/env python3
-# Fixture-only image_out tool: names a PNG already in the workspace.
-import sys
-sys.stdout.write("shot.png")

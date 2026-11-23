@@ -66,27 +66,3 @@ class GitEnvironmentTests(unittest.TestCase):
                 self.assertLessEqual(set(env), set(_harvest_git.ENV_ALLOW) | {
                     "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_PAGER"})
                 self.assertEqual(env["HOME"], os.environ["HOME"])
-
-    def test_owner_tools_bootstrap_identity_once_and_harden_git(self):
-        # check-red-gate runs as a git hook: it must keep the environment git gives hooks (GIT_INDEX_FILE, author).
-        for path in (OPS / "estate-commit",):
-            with self.subTest(tool=path.name), patch.dict(os.environ, self.parent_env(), clear=True):
-                tool = runpy.run_path(str(path))
-                identity = "user.name\nOwner\0user.email\nowner@example.test\0"
-                with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, identity, "")) as run, \
-                     patch("subprocess.check_output", return_value=b"") as output:
-                    tool["staged_paths"]()
-                    tool["staged_paths"]()
-                    self.assertEqual(run.call_count, 1)
-                    bootstrap = run.call_args
-                    self.assertIn("--global", bootstrap.args[0])
-                    self.assertFalse(any(k.startswith("GIT_") for k in bootstrap.kwargs["env"]))
-                    for call in output.call_args_list:
-                        env = call.kwargs["env"]
-                        for role in ("AUTHOR", "COMMITTER"):
-                            self.assertEqual(env["GIT_" + role + "_NAME"], "Owner")
-                            self.assertEqual(env["GIT_" + role + "_EMAIL"], "owner@example.test")
-                        self.assertNotIn("GIT_DIR", env)
-                        self.assertNotIn("GIT_INDEX_FILE", env)
-                        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
-                        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")

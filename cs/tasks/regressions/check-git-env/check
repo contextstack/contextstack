@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check-git-env regression (goal.md): scripts/check never lets a rule inherit the caller's GIT_*.
 
-Runs scripts/check's rule 9 alone (LAB_SPILL_ONLY=1) against a fixture dest whose .lab-out is tracked, with GIT_DIR,
+Runs scripts/check's rule 9 alone (CS_SPILL_ONLY=1) against a fixture dest whose .cs-out is tracked, with GIT_DIR,
 GIT_INDEX_FILE and GIT_WORK_TREE pointed at a throwaway bare repo and index under a temp dir (never the real
 repository). The rule must find the dest's spill (its git ran against the dest), and the throwaway repo must be
 byte for byte unchanged. Without the scrub, git reads the throwaway's empty index and the spill is missed."""
@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import tempfile
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 CLEAN = {k: v for k, v in hermetic_env().items() if not k.startswith("GIT_")}
 problems = []
 
@@ -43,8 +43,8 @@ def main():
         dest = tmp / "dest"
         dest.mkdir()
         git("init", "-q", cwd=dest)
-        (dest / ".lab-out").write_text("spill\n")
-        git("add", ".lab-out", cwd=dest)
+        (dest / ".cs-out").write_text("spill\n")
+        git("add", ".cs-out", cwd=dest)
         git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "spill", cwd=dest)
         decoy = tmp / "decoy.git"  # what a hook's GIT_DIR would point at; a throwaway, never the real repo
         git("init", "-q", "--bare", str(decoy), cwd=tmp)
@@ -54,17 +54,17 @@ def main():
                        check=True)
         before = snapshot(decoy)
         env = dict(CLEAN, GIT_DIR=str(decoy), GIT_INDEX_FILE=str(index), GIT_WORK_TREE=str(tmp),
-                   GIT_PREFIX="lab/", LAB_SPILL_ONLY="1", LAB_SPILL_DESTS=str(dest),
-                   LAB_SPILL_RUNS_ROOT=str(tmp / "no-runs"), LAB_SPILL_PRUNE="2026-01-01T00:00:00")
-        r = subprocess.run(["bash", str(LAB / "scripts/check")], cwd=str(LAB), env=env, capture_output=True, text=True,
+                   GIT_PREFIX="code_root/", CS_SPILL_ONLY="1", CS_SPILL_DESTS=str(dest),
+                   CS_SPILL_RUNS_ROOT=str(tmp / "no-runs"), CS_SPILL_PRUNE="2026-01-01T00:00:00")
+        r = subprocess.run(["bash", str(CODE_ROOT / "scripts/check")], cwd=str(CODE_ROOT), env=env, capture_output=True, text=True,
                            timeout=120)
         out = r.stdout + r.stderr
-        expect(".lab-* tracked in dest %s" % dest in out and r.returncode == 1,
+        expect(".cs-* tracked in dest %s" % dest in out and r.returncode == 1,
                "with a hook's GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE set, rule 9 still reads the fixture dest and finds "
-               "its tracked .lab-out (exit %s): %s" % (r.returncode, out.strip().splitlines()[-1:] or out))
+               "its tracked .cs-out (exit %s): %s" % (r.returncode, out.strip().splitlines()[-1:] or out))
         expect(snapshot(decoy) == before, "the repository GIT_DIR named is untouched (config, refs, objects, index)")
-        expect(not any(ln.startswith(".lab-* is tracked") for ln in out.splitlines()),
-               "lab itself is judged by its own repository, not the decoy")
+        expect(not any(ln.startswith(".cs-* is tracked") for ln in out.splitlines()),
+               "code_root itself is judged by its own repository, not the decoy")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("check: check-git-env %d problem(s)" % len(problems))

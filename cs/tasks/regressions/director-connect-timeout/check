@@ -15,8 +15,8 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 import _director_client as dc  # noqa: E402
 
 problems = []
@@ -49,15 +49,15 @@ def client(url):
         token = config / "node.env"
         token.write_text("DC_TEST_TOKEN=test-token\n")
         token.chmod(0o600)
-        previous = os.environ.get("LAB_CONFIG_ROOT")
-        os.environ["LAB_CONFIG_ROOT"] = str(config)
+        previous = os.environ.get("CS_CONFIG_ROOT")
+        os.environ["CS_CONFIG_ROOT"] = str(config)
         try:
             return dc.Client(dc.receiver_config({"url": url, "node": "t", "token_env": "DC_TEST_TOKEN"}))
         finally:
             if previous is None:
-                os.environ.pop("LAB_CONFIG_ROOT", None)
+                os.environ.pop("CS_CONFIG_ROOT", None)
             else:
-                os.environ["LAB_CONFIG_ROOT"] = previous
+                os.environ["CS_CONFIG_ROOT"] = previous
 
 
 def main():
@@ -108,10 +108,10 @@ def main():
             "kind": "director", "url": "http://192.0.2.1:8790", "node": "t", "token_env": "DC_TEST_TOKEN"}}))
         (config / "node.env").write_text("DC_TEST_TOKEN=test-token\n")
         (config / "node.env").chmod(0o600)
-        env = {**hermetic_env(), 'LAB_CONFIG_ROOT': str(config), 'LAB_STATE_ROOT': str(state), 'PYTHONDONTWRITEBYTECODE': '1'}
+        env = {**hermetic_env(), 'CS_CONFIG_ROOT': str(config), 'CS_STATE_ROOT': str(state), 'PYTHONDONTWRITEBYTECODE': '1'}
         t0 = time.monotonic()
-        r = subprocess.run([sys.executable, str(LAB / "ops/bin/job-pull")], input="{}", text=True,
-                           capture_output=True, env=env, cwd=str(LAB), timeout=60)
+        r = subprocess.run([sys.executable, str(CODE_ROOT / "ops/bin/job-pull")], input="{}", text=True,
+                           capture_output=True, env=env, cwd=str(CODE_ROOT), timeout=60)
         took = time.monotonic() - t0
         try:
             out = json.loads(r.stdout.strip().splitlines()[-1])

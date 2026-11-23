@@ -81,7 +81,7 @@ def self_test():
     with scratch_dir(prefix="kit-layout-guard-") as raw:
         repo = Path(raw)
         files = {"lab/cmd/lab/main.go": "package main\n", "lab/ops/bin/tick": "stray\n", "cs/INVARIANTS.md": "x\n",
-                 "cs/ops/bin/tick": "x\n", "scripts/serve.py": 'LAB = OP.parent / "lab/ops/bin"\n',
+                 "cs/ops/bin/tick": "x\n", "scripts/serve.py": 'CODE_ROOT = OP.parent / "lab/ops/bin"\n',
                  "README.md": "see `lab/INVARIANTS.md`\nhistory: `git show 1234567:lab/ops/bin/x`\n",
                  "tools/src/a.rs": "//! Port of `lab/ops/bin/x` (removed by task-1)\n",
                  "cs/scripts/x": 'P = "/Users/me/sites/contextstack/lab/ops/bin/y"\nR = "~/sites/contextstack/lab/ledger/runs/r"\n',

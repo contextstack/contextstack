@@ -1,7 +1,7 @@
 """A coding agent's output while it runs. Not an op.
 
 The executor runs the agent in its streaming mode and reads stdout line by line: each line goes on to the
-executor's own stdout under the gateway (whose streamed lab-execute maps it to deltas), and its text to
+executor's own stdout under the gateway (whose streamed cli.run maps it to deltas), and its text to
 `<run_dir>/events.jsonl`. The reply goes to `messages.jsonl` as a `turn` event. Both files have the Rust
 runner's exact line shape (harness/src/runner.rs `Events`, `Cell::emit`), so downstream reads both paths alike.
 
@@ -267,6 +267,48 @@ class CursorAvailability:
         return None
 
 
+class CursorEditRefusals:
+    """Detect refusals from Cursor's native tool completion events."""
+
+    def __init__(self):
+        self.refusals = 0
+        self.paths = []
+        self.seen = set()
+        self.edited = False
+
+    def feed(self, raw):
+        if self.edited:
+            return None
+        event = _decode(raw) or {}
+        if (event.get("type"), event.get("subtype")) != ("tool_call", "completed"):
+            return None
+        for name, call in _d(event.get("tool_call")).items():
+            if name not in ("editToolCall", "writeToolCall", "multiEditToolCall"):
+                continue
+            result = _d(_d(call).get("result"))
+            if "success" in result and not result.get("error"):
+                self.edited = True
+                return None
+            if "Blocked by permissions configuration" not in json.dumps(result.get("error")):
+                continue
+            call_id = _s(event.get("call_id"))
+            if call_id:
+                if call_id in self.seen:
+                    continue
+                self.seen.add(call_id)
+            self.refusals += 1
+            path = redact(_s(_d(call.get("args")).get("path")))
+            if path and path not in self.paths:
+                self.paths.append(path)
+            if self.refusals >= 2:
+                return {
+                    "stop": "provider_edit_refused",
+                    "reason": "Cursor's edit tools repeatedly refused writes. Retry on a fallback template.",
+                    "refused_paths": self.paths.copy(),
+                }
+        return None
+
+
 class Mapper:
     """One run's stdout lines -> delta text, and the reply once the run ends."""
 
@@ -372,41 +414,68 @@ class Events:
     def __init__(self, run_dir):
         self.path, self.seq = Path(run_dir) / "events.jsonl", 0
 
-    def write(self, turn, delta=None, discard=False):
+    def write(self, turn, delta=None, discard=False, at=None, timestamp_source=None):
         payload = {"turn": turn, "partial": delta is not None, "delta": redact(delta) if isinstance(delta, str) else ""}
         if discard:
             payload["discard"] = True
         self.seq += 1
-        append(self.path, {"seq": self.seq, "kind": "model.output", "payload": payload}, durable=discard)
+        event = {"seq": self.seq, "kind": "model.output", "payload": payload}
+        if at is not None:
+            event.update(at=at, timestamp_source=timestamp_source)
+        append(self.path, event, durable=discard)
 
 
-def run_streaming(command, workspace, env, timeout, on_line, memory_cap_mb=None, on_evidence=None, on_idle=None):
+def run_streaming(command, workspace, env, timeout, on_line, memory_cap_mb=None, on_evidence=None, on_idle=None, trace=None, on_started=None):
     """_muse.run_process with stdout read line by line: `on_line(bytes)` sees each line as it arrives.
+    With a trace, on_line also receives the durable event timestamp and its source.
     Returning a dict with {"stop": "..."} from on_line requests early termination.
     Same outcomes: CompletedProcess, TimeoutExpired or Cancelled (SIGTERM) carrying the output so far."""
     check_environment(env)
     from _job_memory import prepare_job
     command, env, marker = prepare_job(command, env)
-    proc = subprocess.Popen(command, cwd=workspace, env=env, start_new_session=True, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    from _job_memory import JobProcesses
-    processes = JobProcesses(proc.pid, workspace, marker=marker)
-    if not hasattr(processes, "evidence"):
-        processes.evidence = []
-    monitor = None
-    if memory_cap_mb is not None and memory_cap_mb > 0:
-        from _job_memory import MemoryMonitor
+    started = trace.launch() if trace is not None else None
+    cancelled = False
 
-        monitor = MemoryMonitor(memory_cap_mb, proc.pid, processes)
-        monitor.start()
+    def cancel(_signum, _frame):
+        # Do not interrupt reader startup or cleanup: both must finish before
+        # the executor closes the turn and records its discard.
+        nonlocal cancelled
+        cancelled = True
+    previous = signal.signal(signal.SIGTERM, cancel)
+    try:
+        proc = subprocess.Popen(command, cwd=workspace, env=env, start_new_session=True, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        from _job_memory import JobProcesses
+        processes = JobProcesses(proc.pid, workspace, marker=marker)
+        if not hasattr(processes, "evidence"):
+            processes.evidence = []
+        monitor = None
+        if memory_cap_mb is not None and memory_cap_mb > 0:
+            from _job_memory import MemoryMonitor
+
+            monitor = MemoryMonitor(memory_cap_mb, proc.pid, processes)
+            monitor.start()
+    except BaseException:
+        signal.signal(signal.SIGTERM, previous)
+        raise
     out, err = [], []
     forced = {"meta": None}
+    trace_errors = []
+    exited = None
 
     def read_out():
         for raw in iter(proc.stdout.readline, b""):
             out.append(raw)
+            if trace is not None:
+                if trace_errors:
+                    continue
+                try:
+                    stamp = trace.event(raw)
+                except Exception as error:
+                    trace_errors.append(error)
+                    continue
             try:
-                asked = on_line(raw)
+                asked = on_line(raw, *stamp) if trace is not None else on_line(raw)
                 if forced["meta"] is None and asked:
                     forced["meta"] = asked if isinstance(asked, dict) else {"stop": str(asked)}
                     kill_group()
@@ -425,18 +494,12 @@ def run_streaming(command, workspace, env, timeout, on_line, memory_cap_mb=None,
         decode = lambda parts: b"".join(parts).decode("utf-8", errors="replace")
         return decode(out), decode(err)
 
-    cancelled = False
-
-    def cancel(_signum, _frame):
-        # Do not interrupt reader startup or cleanup: both must finish before
-        # the executor closes the turn and records its discard.
-        nonlocal cancelled
-        cancelled = True
-    previous = signal.signal(signal.SIGTERM, cancel)
     try:
         try:
             for t in readers:
                 t.start()
+            if on_started is not None:
+                on_started()
             deadline = time.monotonic() + timeout
             while True:
                 if cancelled:
@@ -451,18 +514,26 @@ def run_streaming(command, workspace, env, timeout, on_line, memory_cap_mb=None,
                     raise subprocess.TimeoutExpired(command, timeout)
                 try:
                     code = proc.wait(timeout=min(0.1, remaining))
+                    if trace is not None:
+                        exited = trace.clock()
                     break
                 except subprocess.TimeoutExpired:
                     pass
         except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
             kill_group()
             proc.wait()
+            if trace is not None:
+                exited = trace.clock()
             stdout, stderr = text()
+            if trace_errors:
+                raise trace_errors[0]
             if isinstance(error, subprocess.TimeoutExpired):
                 raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from None
             raise Cancelled(stdout, stderr) from None
         kill_group()
         stdout, stderr = text()
+        if trace_errors:
+            raise trace_errors[0]
         done = subprocess.CompletedProcess(command, code, stdout, stderr)
         done.job_process_evidence = processes.evidence
         meta = forced["meta"]
@@ -482,6 +553,8 @@ def run_streaming(command, workspace, env, timeout, on_line, memory_cap_mb=None,
             try:
                 kill_group()
                 proc.wait()
+                if trace is not None:
+                    trace.exited(started, exited or trace.clock(), proc.returncode)
             finally:
                 try:
                     try:

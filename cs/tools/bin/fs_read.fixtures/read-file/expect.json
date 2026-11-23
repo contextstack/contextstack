@@ -2,7 +2,7 @@
   "exit": 0,
   "stdout": "alpha\nbeta\ngamma\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"path\": \"a.txt\"}, \"name\": \"fs_read\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"path\": \"a.txt\"}, \"name\": \"fs_read\"}\n"
   },
   "untouched": true
 }

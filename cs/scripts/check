@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
-# lab check — the constitution as a linter. Subject to its own caps.
+# checkout check — the constitution as a linter. Subject to its own caps.
 set -u
 # No rule inherits the caller's git: a commit hook exports GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE (git may add
 # GIT_PREFIX, GIT_AUTHOR_*, ...), which turned fixture repos' git init/add/commit into writes to the real repository
 # (2026-11-10, tasks/regressions/check-git-env). Every git call finds its repo from its own -C or cwd.
 while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^GIT_')
-# Nor the caller's roots: once the ledger lives in ~/.contextstack/state, an operator shell exports LAB_STATE_ROOT, and
+# Nor the caller's roots: once the ledger lives in ~/.contextstack/state, an operator shell exports CS_STATE_ROOT, and
 # a rule that inherited it would write fixture rows into the real estate. Rules that need a root set their own.
-unset LAB_CODE_ROOT LAB_CONFIG_ROOT LAB_STATE_ROOT LAB_WORKSPACES_ROOT
+unset CS_CODE_ROOT CS_CONFIG_ROOT CS_STATE_ROOT CS_WORKSPACES_ROOT
 # cs resolves its installed estate and worker profiles through these overrides.
-unset CS_ROOT CS_INSTALL_ROOT CS_AGENTS_DIR CS_CODE_ROOT
+unset CS_ROOT CS_INSTALL_ROOT CS_AGENTS_DIR
 # Nor cs land's own commit bypass: its pre-commit runs this check, and a test of the land lock would inherit it.
 unset CS_LAND_COMMIT
 # Parallel fixtures need more startup headroom than standalone runs. Only harness
 # waits opt into this scale; behavioral deadlines remain unchanged.
 export CHECK_TIMEOUT_SCALE="${CHECK_TIMEOUT_SCALE:-3}"
 cd "$(dirname "$0")/.."
+# In a lane, use the granted pin for python3 shebangs as well as installer fixtures.
+if [ -n "${UV_PYTHON_INSTALL_DIR:-}" ] && [ -r .python-version ] && command -v uv >/dev/null 2>&1; then
+  if pinned_python=$(uv python find --offline --managed-python --no-project "$(cat .python-version)" 2>/dev/null) \
+    && [ -x "$pinned_python" ]; then
+    export PATH="$(dirname "$pinned_python"):$PATH"
+  fi
+fi
 python3 scripts/check_timeout.py || { echo "check: CHECK_TIMEOUT_SCALE must be a finite positive number" >&2; exit 1; }
 # The public curl | sh installer must stay plain POSIX sh (it runs before any Python exists).
 sh -n scripts/install.sh || { echo "check: scripts/install.sh no longer parses as POSIX sh" >&2; exit 1; }
+# BEGIN background check harness
 fail=0
 ops_cap_fail=0
 say() { echo "check: FAIL — $*"; fail=1; }
@@ -49,14 +57,10 @@ wait_rules() {
   _bg_pids=""
   _bg_logs=""
 }
-
-# Spec-queue isolation: rule 7 only, against LAB_SPEC_QUEUE_ROOT.
-if [ "${LAB_SPEC_QUEUE_ONLY:-}" = 1 ]; then
-  exit $?
-fi
+# END background check harness
 
 # 11–40 fire in parallel; each rule still runs.
-if [ "${LAB_SPILL_ONLY:-}" != 1 ]; then
+if [ "${CS_SPILL_ONLY:-}" != 1 ]; then
 # Only the full check scans the shared checkout; isolated fixtures must not inherit unrelated findings.
 # Scratch dirs inside the work tree race parallel scans and node-bundle walks (three red lands on 2026-11-12).
 in_tree=$(grep -rlE 'dir=(Path\.cwd\(\)|os\.getcwd\(\))' tasks/regressions 2>/dev/null | grep -v '/fixtures/' || true)
@@ -117,6 +121,7 @@ tasks/regressions/cli-pins-per-machine/check || say "per-machine CLI pins regres
 tasks/regressions/profiled-executor-roots/check || say "a profiled CLI template (opencode, pi, ...) with separate code, state, config and workspaces roots fails on a task outside the code root, lands under the code root, or keeps incomplete evidence"
 tasks/regressions/muse-executor/check || say "Muse credentials, process boundary, frozen context or terminal evidence regressed"
 tasks/regressions/evidence-backup-long-path/check || say "evidence backup accepts an unsafe long-path sender or loses retained evidence"
+tasks/regressions/director-backup/check || say "Director WAL snapshot, encrypted backup, restore or retention regressed"
 python3 ops/bin/_vitals_test.py || say "vitals parsers, resource guard, or job intake hold regressed"
 python3 ops/bin/_job_linux_test.py || say "Linux subreaper cleanup regressed"
 python3 ops/bin/_job_memory_test.py || say "per-job memory cap or pi harness cost/usage regressed"
@@ -128,6 +133,16 @@ tasks/regressions/transcript-redaction/check || say "a transcript, event, or tas
 # (each path is briefly missing), so in the batch it raced the rules that exec them: "cs-tools ... is not built",
 # a gateway case that could not spawn (2026-11-11). Serial, before the batch; no batch rule may run cargo.
 tasks/regressions/node-install/check || say "the node image no longer installs offline from a bundle, or a manifest tool needs more than the pinned interpreter"
+bg_rule "a regression has no full-check entry or documented exclusion" python3 scripts/check-regression-coverage.py
+bg_rule "landing loses owner changes, lane exclusivity, or gate cleanup" tasks/regressions/cs-land/check
+bg_rule "release activation failure does not restore the previous release" tasks/regressions/node-release-load-rollback/check
+bg_rule "release rollback does not restore the Director database" tasks/regressions/node-release-db-rollback/check
+bg_rule "landing confuses lane policy with unrelated changes on main" tasks/regressions/lane-policy/check
+bg_rule "the executor cannot import in an isolated estate" tasks/regressions/executor-import/check
+bg_rule "executor semantic preflight spends on a no-work trial" tasks/regressions/executor-semantic-preflight/check
+bg_rule "the hosted lead cannot replace a rejected credential" tasks/regressions/lead-host-credential/check
+bg_rule "shared checks admit absolute home paths in candidate output" tasks/regressions/no-absolute-home-output/check
+bg_rule "optional browser archive failure loses grounded output" tasks/regressions/browser-archive-fallback/check
 bg_rule "evidence-backup omits a post-1b run's terminal record (terminal.json, messages.jsonl, check.json, finalized.json)" \
   tasks/regressions/backup-omits-terminal-record/check
 bg_rule "failed background check output disappears or changes check status" \
@@ -136,14 +151,14 @@ bg_rule "an empty estate tick invents a cohort, prune review or historic labels"
   tasks/regressions/tick-empty-estate/check
 bg_rule "local model readiness accepts the wrong DGX serving alias" \
   tasks/regressions/spark2-readiness/check
-bg_rule "public Lab CLI execution bypasses deployment admission or its original evidence/grant checks" \
+bg_rule "public ContextStack CLI execution bypasses deployment admission or its original evidence/grant checks" \
   tasks/regressions/deployment-admission/check
 bg_rule "the gateway/models.json every release ships does not start a gateway on its own" \
   tasks/regressions/shipped-catalog-starts/check
 bg_rule "completed process-group cleanup signals again or hides denied signals" \
   tasks/regressions/muse-cleanup-once/check
 
-bg_rule "a task check can write the live lab control plane without an isolation guard" \
+bg_rule "a task check can write the live checkout control plane without an isolation guard" \
   tasks/regressions/live-control-plane-write/check
 bg_rule "commit message attribution stripping or gates regressed" \
   tasks/regressions/commit-message/check
@@ -176,6 +191,8 @@ bg_rule "a runner killed inside finalization loses the row, or finalize-run cann
   tasks/regressions/finalize-crash-loses-row/check
 bg_rule "finalize-run recovery contract regressed: lock, idempotent row and publication, kill-retry, tick sweep" \
   tasks/regressions/finalize-run-recovery/check
+bg_rule "CLI receipt finishing diverged from inline finishing or duplicated publication" \
+  tasks/regressions/machine-finisher/check
 bg_rule "an error stop no longer classifies, a non-error stop does, or a dispatch row lost its error object" \
   tasks/regressions/error-classes/check
 bg_rule "the spool lost at-least-once, idempotent or verify-before-ack delivery, or the low-disk admission stop" \
@@ -184,7 +201,7 @@ bg_rule "a fleet node needs a specs/, tasks/ or ledger/ checkout, loses a fact w
   tasks/regressions/estate-split/check
 bg_rule "a Director job whose runner exits without a row crashes tick or stays running, or the Director never learns why" \
   tasks/regressions/director-job-refused-spec/check
-bg_rule "an op reads or writes a state shelf under <lab>/ledger instead of the state root, or a relocated state root leaks back into the checkout" \
+bg_rule "an op reads or writes a state shelf under <code-root>/ledger instead of the state root, or a relocated state root leaks back into the checkout" \
   tasks/regressions/state-root-readers/check
 bg_rule "the runner no longer refuses a state or workspaces root inside the checkout, or reports a later finalize error instead of the run's own failure" \
   tasks/regressions/state-root/check
@@ -194,7 +211,7 @@ bg_rule "lab/ holds more than the archived Go runner, or a live file names a mov
   tasks/regressions/kit-layout-guard/check
 bg_rule "Director-layer knowledge came back below the Director: node code, a grant's ops or kit machinery names it (outline v1.5 decision 5; Director.Plan step 8)" \
   tasks/regressions/director-layer-only/check
-bg_rule "a checkout without lab/ledger recreates it (check-red-gate), crashes a reader, or loses a ledger-relative setup" \
+bg_rule "a checkout without cs/ledger recreates it (check-red-gate), crashes a reader, or loses a ledger-relative setup" \
   tasks/regressions/ledger-absent/check
 bg_rule "a shelf reader crashes on, counts, or acts on estate-cutover's estate_cutover rows: schedule-tick, node-listen's schedules, run-identity and the rest must read a cut-over root as its pre-cutover shelves" \
   tasks/regressions/estate-cutover-readers/check
@@ -206,7 +223,7 @@ bg_rule "a run's tmp under ~/.contextstack no longer resolves inside the agent p
   tasks/regressions/estate-ancestor-metadata/check --darwin-probe
 bg_rule "declared PHP is missing or toolchain access escapes its read-only directory" \
   tasks/regressions/lane-toolchain-php/check --darwin-probe
-bg_rule "uv or its Python install is missing, readable outside its grants, writable, or UV_CACHE_DIR escapes the run tmp" \
+bg_rule "uv cannot run the pinned Python offline, its host paths are writable, or the lane cache is unusable" \
   tasks/regressions/lane-toolchain-uv/check --darwin-probe
 bg_rule "cargo escapes its grants, writes the host registry or credentials, or build output leaves the workspace" \
   tasks/regressions/lane-toolchain-cargo/check --darwin-probe
@@ -240,6 +257,10 @@ bg_rule "a rule inherits the caller's GIT_DIR/GIT_INDEX_FILE (a commit hook's), 
   tasks/regressions/check-git-env/check
 bg_rule "cs init no longer detects login-shell toolchains, merges toolchains.json, or doctor reports a missing declared binary" \
   tasks/regressions/init-toolchains/check
+bg_rule "cs init stops adding login-shell toolchains, overwrites hand-set entries, or changes toolchains.json when the shell fails" \
+  tasks/regressions/toolchain-detect/check
+bg_rule "a node without agents.json reports an empty agent list (every job waits) instead of discovering its agents, or misreports the native harness" \
+  tasks/regressions/node-agents-discovery/check
 bg_rule "cs init no longer takes a fresh install to a finished first job (Director, gateway and node served, the node registered with its own Director without a printed token, a subscription CLI found by its status command, FileVault off warned) or a rerun changes something (install stage 0)" \
   tasks/regressions/cs-init/check
 bg_rule "an installed release fails its real-agent or lead trial without restoring the previous release" \
@@ -306,9 +327,11 @@ bg_rule "Seatbelt path literals must preserve UTF-8 and escape quotes, not JSON-
   tasks/regressions/sbpl-quote/check
 bg_rule "production Python emits Seatbelt rules" tasks/regressions/no-python-sbpl/check
 bg_rule "Rust Seatbelt profiles match the frozen baseline" tasks/regressions/e2-sbpl-baseline/check
+bg_rule "a retired experiment name is back in product code" tasks/regressions/retired-names/check
+bg_rule "the Rust harness exceeds its size cap (scripts/cs-size.py; public CI checks it too)" python3 ../scripts/cs-size.py
 bg_rule "the Director Client API contract (tests/director-spec --side client) regressed" ../tests/director-spec/run --side client --no-build
 bg_rule "the Director and node contracts (tests/director-spec --side both) regressed" ../tests/director-spec/run --side both --no-build
-bg_rule "the public export allowlist, lab/personal/secret scanners or no-push guarantee regressed" tasks/regressions/public-export/check
+bg_rule "the public export allowlist, historical/personal/secret scanners or no-push guarantee regressed" tasks/regressions/public-export/check
 bg_rule "native Rust Seatbelt switch changes frozen bytes" tasks/regressions/e2-native-switch/check
 bg_rule "the browser broker drives Chrome off its origin sets, or browser_session reaches more than its set's socket" \
   tasks/regressions/browser-broker/check
@@ -377,6 +400,10 @@ bg_rule "running lanes suppress interactive admission, a lane uses the reserved 
   tasks/regressions/turn-reserved-seat/check
 bg_rule "a coding-agent run stops streaming, or its events.jsonl/messages.jsonl leave the runner's shape" \
   tasks/regressions/executor-streaming/check
+bg_rule "installed CLI observed traces and live timestamps follow the tracing contract" \
+  tasks/regressions/trace-observed/check
+bg_rule "the end-to-end tracing suite (Step 0 gate: harness, gateway, finalize and Director traces checked by tracing/check-trace) regressed" \
+  tasks/regressions/trace-e2e/check
 bg_rule "a spinning coding-agent lane no longer stops early with stuck:* and a stuck.md autopsy" \
   tasks/regressions/stuck-lanes/check
 bg_rule "cursor-agent, antigravity, gemini-cli or codex lost its writable private runtime, key scrub or receipt" \
@@ -424,9 +451,7 @@ bg_rule "estate classifier reports a third bucket or mis-tiers grants, judgments
   tasks/regressions/estate-classify-tiers/check
 bg_rule "a rules-tier commit can pass a red check without check-red: or the operator-queue event" \
   tasks/regressions/check-red-rules-commit/check
-bg_rule "estate-commit mis-reads toplevel-relative git paths when lab/ is a monorepo subdirectory" \
-  tasks/regressions/estate-commit-monorepo-paths/check
-bg_rule "tick no longer sweeps a stale lab .git lock before job pull" \
+bg_rule "tick no longer sweeps a stale checkout .git lock before job pull" \
   tasks/regressions/tick-stale-git-lock/check
 bg_rule "missing Playwright or gstack browse is no longer a $0 preflight refusal" \
   tasks/regressions/lane-runtime-preflight/check
@@ -441,12 +466,12 @@ bg_rule "route_equiv still misses a named route with parameter segments" \
 bg_rule "a cloned Laravel vendor still needs autoloader edits or adds a megabyte" \
   tasks/regressions/setup-workspace-clone-vendor/check
 bg_rule "spill scan no longer refuses dest/fresh workspace or still walks pre-prune runs" \
-  tasks/regressions/lab-spill-scope/check
+  tasks/regressions/spill-scope/check
 bg_rule "a spec without model: is accepted by the runner, enqueue or rule 3, or the PINNED default/ladder drifted" \
   tasks/regressions/pin-default-model/check
 bg_rule "settled workspace prune loses its evidence row or fails reconstruction" \
   tasks/regressions/prune-workspaces/check
-bg_rule "a copied lab tree can hide ledger/*.jsonl under ledger/runs" \
+bg_rule "a copied checkout tree can hide ledger/*.jsonl under ledger/runs" \
   tasks/regressions/ledger-runs-jsonl-leak/check
 bg_rule "publish-evidence packs secrets or no longer round-trips the live walk" \
   tasks/regressions/publish-evidence-roundtrip/check
@@ -454,8 +479,8 @@ bg_rule "corpus setup still copies or symlinks vendor or exceeds a 50 MB workspa
   tasks/regressions/setup-workspace/check
 fi
 
-# 1–8 skipped when LAB_SPILL_ONLY=1 (rule 9 isolation).
-if [ "${LAB_SPILL_ONLY:-}" != 1 ]; then
+# 1–8 skipped when CS_SPILL_ONLY=1 (rule 9 isolation).
+if [ "${CS_SPILL_ONLY:-}" != 1 ]; then
 python3 scripts/ops-cap.py check || ops_cap_fail=1
 
 # 1b. Every op keeps its executable bit IN GIT: a sidecar'd op or a shebang
@@ -489,7 +514,7 @@ PY
 )
 [ -z "$rt_bad" ] || say "tool descriptor runtime missing or not its shebang: $(echo $rt_bad)"
 # 1d. Descriptors follow MCP's tool definition fields: inputSchema, never schema/input_schema/input;
-#     bin (a path, relative to the repo holding lab/ unless absolute) and args (strings) only with runtime exe,
+#     bin (a path, relative to the repo holding checkout/ unless absolute) and args (strings) only with runtime exe,
 #     which has bin and no file of its own in tools/bin (the runners exec bin + args, never the file pair).
 desc_bad=$(python3 - <<'PY'
 import json, os, glob
@@ -578,57 +603,57 @@ fi
 
 # 7. (Spec queue rule retired with the lab, 2026-11-13.)
 
-# 8. Authority is one-way: lab files never cite the vault.
+# 8. Authority is one-way: checkout files never cite the vault.
 if grep -rq 'markdown/ContextStack' PINNED.md INVARIANTS.md SCHEMA.md README.md CLAUDE.md OPERATOR.md specs/ prompts/ 2>/dev/null; then
-  say "a lab file cites the vault — authority flows lab→vault, never back"
+  say "a checkout file cites the vault — authority flows checkout→vault, never back"
 fi
 fi
 
-# 9. runtime spill stays untracked (lab, dest, post-prune workspaces).
-last_prune=${LAB_SPILL_PRUNE:-}
+# 9. runtime spill stays untracked (checkout, dest, post-prune workspaces).
+last_prune=${CS_SPILL_PRUNE:-}
 [ -z "$last_prune" ] && last_prune=$(head -1 ledger/last-prune 2>/dev/null || true)
 [ -z "$last_prune" ] && last_prune="2026-09-04T15:05:00"
-lab_spill() { [ -n "$(git -C "$1" ls-files -- .lab-out .lab-calls.jsonl .lab-doom-mark 2>/dev/null)" ]; }
-if lab_spill .; then
-  say ".lab-* is tracked — runtime spill was harvested; git rm --cached it"
+tracked_spill() { [ -n "$(git -C "$1" ls-files -- .cs-out .cs-calls.jsonl .cs-doom-mark 2>/dev/null)" ]; }
+if tracked_spill .; then
+  say ".cs-* is tracked — runtime spill was harvested; git rm --cached it"
 fi
-if [ -z "${LAB_SPILL_DESTS:-}" ] && [ -z "${LAB_SPILL_RUNS_ROOT:-}" ]; then
+if [ -z "${CS_SPILL_DESTS:-}" ] && [ -z "${CS_SPILL_RUNS_ROOT:-}" ]; then
   for notes in tasks/work/*/notes.md tasks/sweeps/*/notes.md; do
     [ -f "$notes" ] || continue
     repo=$(sed -n 's/^repo:[[:space:]]*//p' "$notes" | head -1)
-    [ -n "$repo" ] && [ -e "$repo/.git" ] && lab_spill "$repo" && say ".lab-* tracked in dest $repo"
+    [ -n "$repo" ] && [ -e "$repo/.git" ] && tracked_spill "$repo" && say ".cs-* tracked in dest $repo"
   done
   for d in tasks/work/*/setup; do
     [ -e "$d/.git" ] || continue
-    lab_spill "$d" && say ".lab-* tracked in $d"
+    tracked_spill "$d" && say ".cs-* tracked in $d"
   done
 fi
-for repo in ${LAB_SPILL_DESTS:-}; do
-  [ -e "$repo/.git" ] && lab_spill "$repo" && say ".lab-* tracked in dest $repo"
+for repo in ${CS_SPILL_DESTS:-}; do
+  [ -e "$repo/.git" ] && tracked_spill "$repo" && say ".cs-* tracked in dest $repo"
 done
-runs_root=${LAB_SPILL_RUNS_ROOT:-ledger/runs}
+runs_root=${CS_SPILL_RUNS_ROOT:-ledger/runs}
 if [ -d "$runs_root" ]; then
   while IFS= read -r d; do
     [ -e "$d/.git" ] || continue
-    { [ -e "$d/.lab-out" ] || [ -e "$d/.lab-calls.jsonl" ] || [ -e "$d/.lab-doom-mark" ]; } || continue
-    lab_spill "$d" && say ".lab-* tracked in $d"
+    { [ -e "$d/.cs-out" ] || [ -e "$d/.cs-calls.jsonl" ] || [ -e "$d/.cs-doom-mark" ]; } || continue
+    tracked_spill "$d" && say ".cs-* tracked in $d"
   done < <(find "$runs_root" -maxdepth 2 -type d -name workspace -newermt "$last_prune" 2>/dev/null)
 fi
-if [ "${LAB_SPILL_ONLY:-}" = 1 ]; then
+if [ "${CS_SPILL_ONLY:-}" = 1 ]; then
   [ "$fail" -eq 0 ] && echo "check: spill ok"
   exit "$fail"
 fi
 
 # 10. The ledger only grows. A working ledger smaller than HEAD's is a
 #     truncation in progress (2026-09-01: live file cut to 13 rows). Once the ledger has left the checkout for the
-# state root there is nothing here to compare, and lab/ledger must not come back.
+# state root there is nothing here to compare, and cs/ledger must not come back.
 if [ -n "$(git ls-tree --name-only HEAD -- ledger 2>/dev/null)" ] || [ -n "$(git ls-files -- ledger 2>/dev/null | head -1)" ]; then
   ledger_tracked=1
 else
   ledger_tracked=
 fi
 if [ -z "$ledger_tracked" ] && [ -e ledger ] && git rev-parse -q --verify HEAD >/dev/null 2>&1; then
-  say "lab/ledger reappeared after the ledger left the checkout: state lives in LAB_STATE_ROOT (~/.contextstack/state); remove it and find the writer"
+  say "cs/ledger reappeared after the ledger left the checkout: state lives in CS_STATE_ROOT (~/.contextstack/state); remove it and find the writer"
 fi
 if [ -d ledger ] && git rev-parse -q --verify HEAD >/dev/null 2>&1; then
   hn=$(git show HEAD:./ledger/ledger.jsonl 2>/dev/null | wc -l | tr -d ' ')
@@ -638,6 +663,7 @@ fi
 
 
 bg_rule "Cursor provider unavailability is bounded and retryable" tasks/regressions/cursor-provider-unavailable/check
+bg_rule "cursor-agent edit refusals no longer stop the run as provider_edit_refused with the refused paths" tasks/regressions/cursor-edit-refusal/check
 bg_rule "node toolchain discovery loses config precedence or wrapper targets" \
   tasks/regressions/lane-toolchain-php/discovery
 

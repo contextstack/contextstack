@@ -4,7 +4,7 @@ use cs_harness::cli::execute_from;
 
 #[tokio::test]
 async fn unknown_subcommand_prints_usage() {
-    match execute_from(["lab".into()].into_iter(), None).await {
+    match execute_from(["cs".into()].into_iter(), None).await {
         Err(err) => assert!(err.starts_with("usage:")),
         Ok(_) => panic!("expected usage error"),
     }
@@ -25,14 +25,14 @@ async fn unknown_flag_rejects_before_spec_load() {
 
 #[tokio::test]
 async fn multi_task_spec_requires_task_flag() -> Result<(), String> {
-    use estate_support::Lab;
-    let lab = Lab::build()?;
+    use estate_support::ContextStack;
+    let cs = ContextStack::build()?;
     let yaml = "id: multi\nmodel: fixture\nsystem: prompts/coder-min.md\ntools: []\nbudget: {turns: 1}\ntasks: [tasks/fx, tasks/fx]\ntrials: 1\nhypothesis: 'fixture'\n";
-    let path = lab.root.join("specs/two.yaml");
+    let path = cs.root.join("specs/two.yaml");
     std::fs::write(&path, yaml).map_err(|e| e.to_string())?;
     match execute_from(
         ["run".into(), "specs/two.yaml".into()].into_iter(),
-        Some(&lab.root),
+        Some(&cs.root),
     )
     .await
     {

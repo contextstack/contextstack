@@ -15,9 +15,9 @@ import sys
 import tempfile
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-V1, V2 = HERE.parent / 'runner-characterisation', HERE.parent / 'runner-characterisation-v2'
-sys.path.insert(0, str(V1))
+CODE_ROOT = HERE.parents[2]
+V2 = HERE.parent / 'runner-characterisation-v2'
+sys.path.insert(0, str(V2))
 import _harness as harness  # noqa: E402
 
 CASE = V2 / 'cases/happy-fs-write'
@@ -54,9 +54,9 @@ def run_once(binary, estate, gateway_cls):
 def runner(name, binary, scratch, gateway_cls):
     root = scratch / name
     root.mkdir()
-    estate = harness.build_estate(root, CASE, {}, LAB, V2)
+    estate = harness.build_estate(root, CASE, {}, CODE_ROOT, V2)
     (estate / 'scripts').mkdir()
-    shutil.copy2(LAB / 'scripts/node-bundle', estate / 'scripts/node-bundle')
+    shutil.copy2(CODE_ROOT / 'scripts/node-bundle', estate / 'scripts/node-bundle')
     base = run_once(binary, estate, gateway_cls)
     flip(estate / 'tools/bin/fs_write')
     tool = run_once(binary, estate, gateway_cls)
@@ -114,7 +114,7 @@ def exe_tool(estate, scratch):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--rust-bin', type=Path, default=LAB.parent / 'target/release/cs-harness')
+    ap.add_argument('--rust-bin', type=Path, default=CODE_ROOT.parent / 'target/release/cs-harness')
     args = ap.parse_args()
     if not args.rust_bin.is_file():
         ap.error('build the Rust runner first (cargo build --release -p cs-harness), or pass --rust-bin')

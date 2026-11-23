@@ -19,10 +19,10 @@ import time
 import urllib.error
 import urllib.request
 
-LAB = Path(__file__).resolve().parents[2] / "cs"
-REGRESSIONS = LAB / "tasks/regressions"
+CODE_ROOT = Path(__file__).resolve().parents[2] / "cs"
+REGRESSIONS = CODE_ROOT / "tasks/regressions"
 V2 = REGRESSIONS / "runner-characterisation-v2"
-sys.path.insert(0, str(REGRESSIONS / "runner-characterisation"))
+sys.path.insert(0, str(V2))
 import _harness
 
 
@@ -94,7 +94,7 @@ def executable(path, script):
 
 def fixture(root, *, seconds=30, tool=None, pre_tool=None, post_turn=None, model="fixture", usd=0):
     estate = _harness.build_estate(
-        root, V2 / "cases/happy-fs-write", {}, LAB, V2
+        root, V2 / "cases/happy-fs-write", {}, CODE_ROOT, V2
     )
     executable(estate / "tasks/fx/check", "exit 0\n")
     for name, script in (("pre_tool", pre_tool), ("post_turn", post_turn)):
@@ -376,7 +376,7 @@ def test_image_limit(root, binary, build):
 
 def gateway_binary():
     """The built cs-gateway (CSGATEWAY_BIN, else target/release, else target/debug); never the live install."""
-    repo = LAB.parent
+    repo = CODE_ROOT.parent
     candidates = [Path(os.environ["CSGATEWAY_BIN"])] if os.environ.get("CSGATEWAY_BIN") else [
         repo / "target/release/cs-gateway", repo / "target/debug/cs-gateway"]
     for path in candidates:
@@ -489,9 +489,20 @@ def launch_once(binary, estate, endpoint):
 
 
 def record(run):
-    """terminal.json without its timing and per-run names, plus the transcript with the run named generically."""
-    terminal = {k: v for k, v in read_json(run / "terminal.json").items() if k not in VOLATILE}
-    messages = (run / "messages.jsonl").read_text().replace(run.name, "<RUN>")
+    """Compare terminal evidence after normalising per-run names and timing."""
+    raw_terminal = read_json(run / "terminal.json")
+    terminal = {k: v for k, v in raw_terminal.items() if k not in VOLATILE}
+    trace = terminal["harness_trace"]
+    spans = [json.loads(line) for line in (run / "trace.jsonl").read_text().splitlines()]
+    finalization, root = spans[-2:]
+    assert finalization["kind"] == "finalization" and root["kind"] == "run", spans
+    assert trace["started"] == root["start"] and trace["finalization_started"] == finalization["start"], trace
+    assert trace["identity"]["run_id"] == run.name == root["trace_id"], root
+    assert root["attributes"] == {"machine": trace["machine"], **trace["identity"]}, root
+    del trace["started"], trace["finalization_started"]
+    trace["identity"]["run_id"] = "<RUN>"
+    workspace = json.dumps(raw_terminal["workspace"], ensure_ascii=False)[1:-1]
+    messages = (run / "messages.jsonl").read_text().replace(workspace, "<WORKSPACE>").replace(run.name, "<RUN>")
     transcript = (run / "transcript.md").read_text().replace(run.name, "<RUN>")
     return terminal, messages, transcript
 

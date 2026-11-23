@@ -26,7 +26,7 @@ def stage_frozen_inputs(items, workspace):
             raise ValueError("frozen input source must be an absolute regular file")
         dest = Path(str(item["dest"]))
         if (dest.is_absolute() or not dest.parts or ".." in dest.parts
-                or dest.parts[0] == ".git" or any(part.startswith(".lab-") for part in dest.parts)
+                or dest.parts[0] == ".git" or any(part.startswith(".cs-") for part in dest.parts)
                 or str(dest) in destinations):
             raise ValueError("frozen input destination is unsafe or duplicate")
         expected = str(item["sha256"])

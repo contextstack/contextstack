@@ -33,15 +33,15 @@ def sandbox_command(command, workspace, real_home, readonly_paths=(), extra=(), 
         raise ValueError("workspace cannot contain the personal home")
     if any(not Path(p).resolve().is_relative_to(ws) for p in readonly_paths):
         raise ValueError("protected configuration must be inside workspace")
-    from _estate_io import native_sandbox_request, render_native_sandbox, sandbox_runtime_lab
-    lab = sandbox_runtime_lab()
+    from _estate_io import native_sandbox_request, render_native_sandbox, sandbox_runtime_code_root
+    code_root = sandbox_runtime_code_root()
     request = native_sandbox_request(command[0], workspace, workspace, real_home,
                                      read_links=(Path(real_home) / "Library/Keychains",),
                                      read_roots=read_roots, env=os.environ, caller=dict(extra or {}))
     request.update(variant="adapter" if adapter is not None else "muse",
                    readonly_paths=[str(Path(p).resolve()) for p in readonly_paths],
                    adapter=adapter)
-    profile = render_native_sandbox(lab, lab / "policy/sandbox.json", request)
+    profile = render_native_sandbox(code_root, code_root / "policy/sandbox.json", request)
     return ["/usr/bin/sandbox-exec", "-p", profile.decode("utf-8"), *map(str, command)]
 
 
@@ -67,18 +67,29 @@ def run_process(command, workspace, env, timeout, input_text=None, on_started=No
     check_environment(env)
     from _job_memory import prepare_job
     command, env, marker = prepare_job(command, env)
-    proc = subprocess.Popen(command, cwd=workspace, env=env, start_new_session=True,
-                            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    from _job_memory import JobProcesses
-    processes = JobProcesses(proc.pid, workspace, marker=marker)
-    if not hasattr(processes, "evidence"):
-        processes.evidence = []
-    monitor = None
-    if memory_cap_mb is not None and memory_cap_mb > 0:
-        from _job_memory import MemoryMonitor
+    cancelled = False
 
-        monitor = MemoryMonitor(memory_cap_mb, proc.pid, processes)
+    def defer_cancel(_signum, _frame):
+        nonlocal cancelled
+        cancelled = True
+
+    previous = signal.signal(signal.SIGTERM, defer_cancel)
+    try:
+        proc = subprocess.Popen(command, cwd=workspace, env=env, start_new_session=True,
+                                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        from _job_memory import JobProcesses
+        processes = JobProcesses(proc.pid, workspace, marker=marker)
+        if not hasattr(processes, "evidence"):
+            processes.evidence = []
+        monitor = None
+        if memory_cap_mb is not None and memory_cap_mb > 0:
+            from _job_memory import MemoryMonitor
+
+            monitor = MemoryMonitor(memory_cap_mb, proc.pid, processes)
+    except BaseException:
+        signal.signal(signal.SIGTERM, previous)
+        raise
     killed = False
     def kill_group():
         nonlocal killed
@@ -88,15 +99,18 @@ def run_process(command, workspace, env, timeout, input_text=None, on_started=No
         killed = True
     def cancel(_signum, _frame):
         raise KeyboardInterrupt()
-    previous = signal.signal(signal.SIGTERM, cancel)
     try:
         if monitor is not None:
             monitor.start()
         if on_started is not None:
             on_started()
         try:
+            signal.signal(signal.SIGTERM, cancel)
+            if cancelled:
+                raise KeyboardInterrupt()
             stdout, stderr = proc.communicate(input_text, timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            signal.signal(signal.SIGTERM, defer_cancel)
             kill_group()
             # communicate retains output read before the timeout. Reading pipes
             # directly loses it and can hang on a surviving child's open pipe.
@@ -114,6 +128,7 @@ def run_process(command, workspace, env, timeout, input_text=None, on_started=No
                 setattr(done, "forced_stop", meta["stop"])
         return done
     finally:
+        signal.signal(signal.SIGTERM, defer_cancel)
         try:
             if monitor is not None:
                 monitor.close()

@@ -68,8 +68,8 @@ temp dir) are its two administrative acts.
 
 - **Rust target:** a temp `--data-dir` (its own SQLite, objects and local credential), a temp HOME, an environment
   of PATH alone, `127.0.0.1` only. The server is stopped when the suite ends.
-- **Node side:** each case gets its own `LAB_CONFIG_ROOT`, `LAB_STATE_ROOT` and `LAB_WORKSPACES_ROOT` under the
-  suite's temp dir and a fixture token; the caller's environment (including a `LAB_STATE_ROOT` pointing at the
+- **Node side:** each case gets its own `CS_CONFIG_ROOT`, `CS_STATE_ROOT` and `CS_WORKSPACES_ROOT` under the
+  suite's temp dir and a fixture token; the caller's environment (including a `CS_STATE_ROOT` pointing at the
   real ledger) is not passed on.
 - No real tokens, keys or databases; no model calls; nothing listens beyond loopback. `--keep` leaves the temp
   dir (server log, node roots) for inspection; otherwise it is removed.

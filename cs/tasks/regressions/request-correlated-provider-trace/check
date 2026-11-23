@@ -1,4 +1,0 @@
-#!/bin/sh
-set -eu
-cd "$(dirname "$0")/../../../../modelgateway"
-go test ./internal/httputil ./internal/gateway/providers ./internal/gateway/server -run 'TestRequestTrace|TestCompatExplicitDeadline|TestCompatDeadlineCancellation|TestAgentBudgetSurvivesServerWriteTimeout|TestNemotronToolEnvelopeBoundary' -count=1

@@ -8,12 +8,12 @@ from scratch import scratch_dir
 import json, os, shutil, socket, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / 'scripts'))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / 'scripts'))
 from check_timeout import timeout
-GW = LAB.parent / 'gateway'
+GW = CODE_ROOT.parent / 'gateway'
 from bindings import validate
-validate(LAB/'ops/bin/executor-templates.json', GW/'models.json')
+validate(CODE_ROOT/'ops/bin/executor-templates.json', GW/'models.json')
 with scratch_dir(prefix='admission-boundary-') as raw:
     # Missing and duplicate aliases must fail before any provider process starts.
     actual = json.loads((GW/'models.json').read_text())
@@ -27,13 +27,13 @@ with scratch_dir(prefix='admission-boundary-') as raw:
         fixture = Path(raw)/'bindings-mutant.json'
         fixture.write_text(json.dumps(mutant))
         try:
-            validate(LAB/'ops/bin/executor-templates.json', fixture)
+            validate(CODE_ROOT/'ops/bin/executor-templates.json', fixture)
         except AssertionError as error:
             assert 'claude-code-sonnet-patch' in str(error)
         else:
             raise AssertionError(kind + ' admission binding accepted')
-    root = Path(raw); estate = root/'lab'; ops = estate/'ops/bin'; ops.mkdir(parents=True)
-    for source in (LAB/'ops/bin').iterdir():
+    root = Path(raw); estate = root/'code_root'; ops = estate/'ops/bin'; ops.mkdir(parents=True)
+    for source in (CODE_ROOT/'ops/bin').iterdir():
         if source.is_file(): shutil.copy2(source, ops/source.name)
     from native_runtime import stage_native_runtime
     stage_native_runtime(ops)
@@ -43,10 +43,10 @@ with scratch_dir(prefix='admission-boundary-') as raw:
     (root/'home').mkdir()
     env['HOME'] = str(root/'home')
     binary = root/'csgateway'
-    shutil.copy2(os.environ.get('CSGATEWAY_BIN') or LAB.parent/'target/release/cs-gateway',binary)  # the Rust gateway check builds
+    shutil.copy2(os.environ.get('CSGATEWAY_BIN') or CODE_ROOT.parent/'target/release/cs-gateway',binary)  # the Rust gateway check builds
     with socket.socket() as sock:
         sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
-    config = {'lab_executor':str(ops/'_executor.py'),'deployments':[
+    config = {'cli_executor':str(ops/'_executor.py'),'deployments':[
         {'id':'fixture','provider':'cli','models':['test-echo','alias'],
          'max_concurrent':1,'max_queued':0,'max_wait_ms':0}]}
     (root/'models.json').write_text(json.dumps(config))
@@ -57,10 +57,11 @@ with scratch_dir(prefix='admission-boundary-') as raw:
               'cost_class':'free_local','cost_usd':0,'cost_per_1k':0,'auth':'none'}
     (ops/'executor-templates.json').write_text(json.dumps({'test-echo':template,'alias':template}))
     env.update(CSGATEWAY_CREDENTIALS='off',CSGATEWAY_PORT=str(port),CSGATEWAY_DISCOVERY_HEALTH='off',CSGATEWAY_AUTH_REQUIRED='false',CSAGENT_MODELS_CONFIG=str(root/'models.json'),
-               CSGATEWAY_LAB_ENDPOINT=f'http://127.0.0.1:{port}/v1/ai/lab-execute')
-    env['LAB_JOB_ID']='public-env-fixture'
+               CSGATEWAY_CLI_ENDPOINT=f'http://127.0.0.1:{port}/v1/agent/cli.run')
+    env['CS_JOB_ID']='public-env-fixture'
+    env['CS_RUNNER_BIN'] = str(CODE_ROOT.parent / 'target/release/cs-harness')
     (estate/'ledger').mkdir(exist_ok=True)
-    (estate/'ledger/dispatch.jsonl').write_text(json.dumps({'event':'pending','id':env['LAB_JOB_ID'],'lane':'probe','task':'tasks/demo','grant':''})+'\n')
+    (estate/'ledger/dispatch.jsonl').write_text(json.dumps({'event':'pending','id':env['CS_JOB_ID'],'lane':'probe','task':'tasks/demo','grant':''})+'\n')
     log=(root/'gateway.log').open('w+')
     server=subprocess.Popen([str(binary)],cwd=root,env=env,stdout=log,stderr=log)
     child=None
@@ -94,9 +95,9 @@ with scratch_dir(prefix='admission-boundary-') as raw:
         assert child.returncode==0,(output,error)
         result=json.loads(output);run=estate/result['transcript']
         assert (run/'stimulus/goal.md').read_bytes()==(task/'goal.md').read_bytes()
-        assert json.loads((run/'stimulus/manifest.json').read_text())['source']['job_id']==env['LAB_JOB_ID']
+        assert json.loads((run/'stimulus/manifest.json').read_text())['source']['job_id']==env['CS_JOB_ID']
         assert (run/'evidence/manifest.json').is_file()
-        assert len(list((estate/'ledger/runs').iterdir()))==1,'refused alias launched a worker'
+        assert len(list((estate/'ledger/runs').glob('*/workspace')))==1,'refused alias launched a worker'
         # Admission is not permission to land: original grant refusal survives HTTP.
         bad=subprocess.run([sys.executable,str(ops/'executor')],cwd=estate,env=env,
                            input=json.dumps({**order,'dest':str(root/'destination')}),text=True,capture_output=True,timeout=timeout(10))
@@ -111,4 +112,4 @@ with scratch_dir(prefix='admission-boundary-') as raw:
         try:server.wait(timeout=timeout(15))
         except subprocess.TimeoutExpired:server.kill();server.wait()
         log.close()
-print('check: public Lab executor uses gateway admission without bypassing evidence or grants')
+print('check: public CLI executor uses gateway admission without bypassing evidence or grants')

@@ -8,11 +8,12 @@ run dir also holds `terminal.json` (the runner's terminal record),
 check result) and `finalized.json`; none of them reached the DGX, so the
 M4 held the only copy.
 
-The check takes a post-1b run dir's entries from the v2 fixture
+The check takes a run dir's entries from the v2 fixture
 `happy-fs-write` (what both runners leave after finalize-run), builds that
 dir, and runs the real op through GNU rsync with the op's own filter (a
 fake ssh; the remote target is a local dir). Every entry except
-`workspace/` and `finalize.lock` must arrive, and nothing else.
+`workspace/`, `finalize.lock`, and `execution.lock` must arrive, including
+`execution-receipt.json`.
 
 Run: `tasks/regressions/backup-omits-terminal-record/check`. Skips (exit 0,
 one line) when no GNU rsync 3.x is installed: the op refuses then anyway.

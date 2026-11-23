@@ -4,7 +4,7 @@
 //! Sources are shown for what they are:
 //! - **pay as you go** (`api`): tokens and the dollars actually charged;
 //! - **subscription**: tokens, and the allowance the agent last reported, with whether it was reached;
-//! - **local** (`free_local`): tokens only; no cost.
+//! - **local** (`free_local`): tokens and any actual provider charge.
 //!
 //! An estimated API price (`est_usd`) is never shown: it is not a charge.
 
@@ -177,9 +177,11 @@ impl Bucket {
             out.insert((*key).into(), json!(n));
         }
         out.insert("reported_models".into(), json!(self.models));
+        if kind == "pay_as_you_go" || self.charged > 0 {
+            out.insert("charged_usd".into(), budget::usd(self.charged));
+        }
         match kind {
             "pay_as_you_go" => {
-                out.insert("charged_usd".into(), budget::usd(self.charged));
                 out.insert(
                     "charge_unreported_runs".into(),
                     json!(self.charge_unreported),
@@ -205,6 +207,9 @@ impl Bucket {
     }
 
     fn shown(&self, kind: &str) -> String {
+        if kind != "pay_as_you_go" && self.charged > 0 {
+            return format!("{kind}: {} charged", budget::dollars(self.charged));
+        }
         match kind {
             "pay_as_you_go" => format!("pay as you go: {} charged", budget::dollars(self.charged)),
             "subscription" => match &self.allowance {
@@ -301,7 +306,7 @@ fn rows(db: &Connection, span: &Span, only: &Only) -> rusqlite::Result<Vec<Row>>
 fn render_group(buckets: &BTreeMap<&'static str, Bucket>) -> Map<String, Value> {
     let mut out = Map::new();
     let runs: i64 = buckets.values().map(|b| b.runs).sum();
-    let charged = buckets.get("pay_as_you_go").map_or(0, |b| b.charged);
+    let charged = buckets.values().map(|b| b.charged).sum();
     out.insert("runs".into(), json!(runs));
     out.insert("charged_usd".into(), budget::usd(charged));
     let kinds: Map<String, Value> = buckets
@@ -445,6 +450,21 @@ mod tests {
         let l = local.render("local");
         assert!(!l.contains_key("charged_usd") && l["shown"] == "local: usage only, no cost");
     }
+    #[test]
+    fn reported_charges_count_in_local_and_subscription_totals() {
+        let mut buckets = BTreeMap::new();
+        for (kind, charge) in [("local", 0.25), ("subscription", 0.125)] {
+            let mut bucket = Bucket::default();
+            bucket.add(
+                &json!({"charged_usd": charge, "provider_reported_usd": charge}),
+                "2026-11-21T00:00:00Z",
+            );
+            assert_eq!(bucket.render(kind)["charged_usd"], json!(charge));
+            buckets.insert(kind, bucket);
+        }
+        assert_eq!(render_group(&buckets)["charged_usd"], json!(0.375));
+    }
+
     #[test]
     fn lead_usage_rollup_excludes_foreign_runs() -> rusqlite::Result<()> {
         use crate::access::{Client, Kind};

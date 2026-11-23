@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from _estate_io import hardened_git_env, state_dir, append_jsonl, sha256_bytes
@@ -64,9 +64,9 @@ def tree_hash(workspace):
     return digest.hexdigest()
 
 
-def ledger_index(lab):
+def ledger_index(code_root):
     index = {}
-    path = state_dir(lab) / "ledger.jsonl"
+    path = state_dir(code_root) / "ledger.jsonl"
     if not path.is_file():
         return index
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -107,7 +107,7 @@ def evidence_ready(run_dir):
 def workspace_base(workspace):
     if not (workspace / ".git").exists():
         return ""
-    for ref in ("refs/lab/base", "HEAD"):
+    for ref in ("refs/cs/base", "HEAD"):
         result = git(workspace, "rev-parse", "--verify", ref)
         if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", result.stdout.strip()):
             return result.stdout.strip()
@@ -191,9 +191,9 @@ def reconstruct(source_repo, base_sha, diff_path):
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def safe_workspace(lab, run_dir):
+def safe_workspace(code_root, run_dir):
     workspace = (run_dir / "workspace").resolve()
-    runs = (state_dir(lab) / "runs").resolve()
+    runs = (state_dir(code_root) / "runs").resolve()
     if workspace.parent.parent != runs or workspace.name != "workspace":
         raise ValueError("refusing workspace path " + str(workspace))
     if not workspace.is_dir() or workspace.is_symlink():
@@ -201,7 +201,7 @@ def safe_workspace(lab, run_dir):
     return workspace
 
 
-def prune_one(lab, run_dir, row, apply):
+def prune_one(code_root, run_dir, row, apply):
     workspace = run_dir / "workspace"
     if not workspace.is_dir() or workspace.is_symlink():
         return {"status": "missing"}
@@ -223,7 +223,7 @@ def prune_one(lab, run_dir, row, apply):
     if not apply:
         return {"status": "would_prune", "bytes": size, "base_sha": base_sha,
                 "evidence_sha": evidence_sha}
-    workspace = safe_workspace(lab, run_dir)
+    workspace = safe_workspace(code_root, run_dir)
     ready, base_sha, evidence_sha = evidence_ready(run_dir)
     verify = os.environ.get("PRUNE_VERIFY", "1") != "0" and size < 32 * 1024 * 1024
     if verify:
@@ -245,13 +245,13 @@ def prune_one(lab, run_dir, row, apply):
         "family": family_of(run_dir.name),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    append_jsonl(state_dir(lab) / "workspace-pruned.jsonl", row_out,
+    append_jsonl(state_dir(code_root) / "workspace-pruned.jsonl", row_out,
                  sort_keys=True, compact=True, sync=True, encoding="utf-8")
     return {"status": "pruned", **row_out}
 
 
-def selected_runs(lab, family):
-    root = state_dir(lab) / "runs"
+def selected_runs(code_root, family):
+    root = state_dir(code_root) / "runs"
     if not root.is_dir():
         return []
     out = []
@@ -271,8 +271,8 @@ def main():
     except json.JSONDecodeError:
         print(json.dumps({"error": "invalid JSON on stdin"}))
         return 1
-    if not isinstance(args, dict) or set(args) - {"apply", "family", "lab"}:
-        print(json.dumps({"error": "expected optional apply, family, lab"}))
+    if not isinstance(args, dict) or set(args) - {"apply", "family", "code_root"}:
+        print(json.dumps({"error": "expected optional apply, family, code_root"}))
         return 1
     apply = args.get("apply", False)
     if not isinstance(apply, bool):
@@ -282,14 +282,14 @@ def main():
     if family is not None and family not in FAMILIES:
         print(json.dumps({"error": "unknown family"}))
         return 1
-    lab = Path(args["lab"]).resolve() if args.get("lab") else LAB
-    index = ledger_index(lab)
+    code_root = Path(args["code_root"]).resolve() if args.get("code_root") else CODE_ROOT
+    index = ledger_index(code_root)
     counts = {"pruned": 0, "unsettled": 0, "unreconstructable": 0, "missing": 0,
               "would_prune": 0, "would_publish": 0}
     bytes_freed = 0
     listed = []
-    for run_dir in selected_runs(lab, family):
-        result = prune_one(lab, run_dir, index.get(run_dir.name), apply)
+    for run_dir in selected_runs(code_root, family):
+        result = prune_one(code_root, run_dir, index.get(run_dir.name), apply)
         status = result["status"]
         counts[status] = counts.get(status, 0) + 1
         if status == "pruned":

@@ -15,8 +15,8 @@ _clean_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_clean_env)
 
-LAB = Path(__file__).resolve().parents[3]
-loader = importlib.machinery.SourceFileLoader("tick_executor_correlation", str(LAB / "ops/bin/tick"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+loader = importlib.machinery.SourceFileLoader("tick_executor_correlation", str(CODE_ROOT / "ops/bin/tick"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 tick = importlib.util.module_from_spec(spec)
 loader.exec_module(tick)
@@ -56,10 +56,10 @@ with scratch_dir(prefix="tick-correlation-") as raw:
                              "corpus-dark-factory-landscape-sweep", 1)
     assert row == {}, "historical matching receipt was reused"
 
-source = (LAB / "ops/bin/tick").read_text(encoding="utf-8")
+source = (CODE_ROOT / "ops/bin/tick").read_text(encoding="utf-8")
 assert "before = ledger_size()" in source
 assert "row = execution_row(rel, sid, before)" in source
-print("check: tick binds scheduled CLI and Lab jobs to fresh execution rows")
+print("check: tick binds scheduled CLI and ContextStack jobs to fresh execution rows")
 
 # Director job 1789261515218486000 carried a grant, but the CLI
 # work order discarded it and froze grant.state=absent, preventing repair.

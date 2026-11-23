@@ -3,7 +3,7 @@
   "stdout": "evidence_assert: source_url must be HTTPS\n",
   "files": {
     "_evidence/assertions.jsonl": null,
-    ".lab-calls.jsonl": "{\"args\": {\"quote\": \"The fixture fact is stable.\", \"source_url\": \"http://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"quote\": \"The fixture fact is stable.\", \"source_url\": \"http://93.184.216.34/fixture\"}, \"name\": \"evidence_assert\"}\n"
   },
   "untouched": true
 }

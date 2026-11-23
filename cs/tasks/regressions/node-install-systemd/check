@@ -2,7 +2,7 @@
 """node-install-systemd regression (goal.md): Linux units from the same service defs as launchd plists.
 
 Renders into a temp HOME. systemctl on PATH is a recorder. Never the real systemctl, launchctl, or
-~/.contextstack. Runs on macOS (NODE_INSTALL_PLATFORM). env -u LAB_STATE_ROOT -u CSGATEWAY_ENDPOINT.
+~/.contextstack. Runs on macOS (NODE_INSTALL_PLATFORM). env -u CS_STATE_ROOT -u CSGATEWAY_ENDPOINT.
 """
 import importlib.machinery
 import importlib.util
@@ -48,7 +48,7 @@ def load_mod(name, path):
 def spawn_env(home, path, **more):
     env = {**hermetic_env()}
     env["HOME"] = str(home)
-    env.pop("LAB_STATE_ROOT", None)
+    env.pop("CS_STATE_ROOT", None)
     env.pop("CSGATEWAY_ENDPOINT", None)
     env["PATH"] = path
     env["NODE_INSTALL_USER_PATH"] = "%s/.local/bin:/usr/bin:/bin" % home
@@ -75,7 +75,7 @@ def lay_out(home, php):
     shutil.copy2(KIT / "policy/spool.json", kit / "policy/spool.json")
     shutil.copy2(KIT / "policy/env.json", kit / "policy/env.json")
     (rel / "gateway").mkdir()
-    (rel / "gateway/models.json").write_text('{"lab_executor": "/dev/null"}\n')
+    (rel / "gateway/models.json").write_text('{"cli_executor": "/dev/null"}\n')
     (rel / "bin").mkdir()
     for name in ("cs-gateway", "cs-harness", "cs-sandbox", "cs-tools", "cs-director"):
         p = rel / "bin" / name
@@ -232,7 +232,7 @@ def compare_renders(home, php):
         expect(plist.get("WorkingDirectory") == svc.cwd, "%s WorkingDirectory shared" % svc.label)
         expect(restart == "on-failure" and wanted == "default.target",
                "%s Restart=on-failure WantedBy=default.target" % svc.label)
-        expect("LAB_STATE_ROOT" in env and "LAB_CONFIG_ROOT" in env or svc.label in (
+        expect("CS_STATE_ROOT" in env and "CS_CONFIG_ROOT" in env or svc.label in (
             "com.contextstack.director-rs", "com.contextstack.client-web"),
                "%s carries the shared env (or director/client-web's own)" % svc.label)
     expect(TOKEN not in unit_text and APP_KEY not in unit_text and "APP_KEY=" not in unit_text,

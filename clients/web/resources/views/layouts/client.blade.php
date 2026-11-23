@@ -68,11 +68,13 @@
                             <x-client.rail-link :href="route('lanes.index')" icon="code-bracket-square" :label="__('Task lanes')" />
                             <x-client.rail-link :href="route('intents.index')" icon="queue-list" :label="__('Tasks')" />
                             <x-client.rail-link :href="route('projects.index')" icon="folder" :label="__('Projects')" />
+                            <x-client.rail-link :href="route('approvals')" icon="shield-check" :label="__('Approvals')" data-test="nav-approvals" />
                             <div class="my-1.5 h-px w-6 bg-black/10 dark:bg-white/10"></div>
                             <x-client.rail-link :href="route('fleet')" icon="server-stack" :label="__('Machines')" />
                             <x-client.rail-link :href="route('usage')" icon="chart-bar" :label="__('Usage')" />
                             <x-client.rail-link :href="route('sources')" icon="banknotes" :label="__('Source budgets')" />
                             <div class="flex-1"></div>
+                            <x-client.rail-link :href="route('devices')" icon="device-phone-mobile" :label="__('Devices')" data-test="nav-devices" />
                             <x-client.rail-link :href="route('connect')" icon="cog-6-tooth" :label="__('Settings')" />
                         </nav>
 

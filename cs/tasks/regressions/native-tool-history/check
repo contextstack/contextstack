@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-lab_root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
-cd "$lab_root"
-go test ./internal/lab -run 'TestRunNativeToolHistory$|TestGateway' -count=1
-cd ../modelgateway
-LAB_TOOL_HISTORY_ROOT="$lab_root" go test ./internal/gateway/providers ./internal/gateway/server -run 'TestNativeToolHistory|TestLabGatewayNativeToolHistory' -count=1

@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 
 import importlib.machinery
 import importlib.util
@@ -18,8 +19,8 @@ import time
 
 HERE = Path(__file__).resolve().parent
 FIX = HERE / "fixtures"
-LAB = HERE.parents[2]
-OPS = LAB / "ops/bin"
+CODE_ROOT = HERE.parents[2]
+OPS = CODE_ROOT / "ops/bin"
 sys.path.insert(0, str(OPS))
 from _est import parse_usage  # noqa: E402
 from _cli_budget import Admission, native_result  # noqa: E402
@@ -102,12 +103,12 @@ except ValueError:
 
 # The envelope keeps protocol 1's six keys and adds the reported fields only when the row has them.
 with scratch_dir(prefix="agent-usage-") as raw:
-    os.environ["LAB_STATE_ROOT"] = raw
+    os.environ["CS_STATE_ROOT"] = raw
     loader = importlib.machinery.SourceFileLoader("finalize_run", str(OPS / "finalize-run"))
     spec = importlib.util.spec_from_loader("finalize_run", loader)
     fin = importlib.util.module_from_spec(spec)
     loader.exec_module(fin)
-    del os.environ["LAB_STATE_ROOT"]
+    del os.environ["CS_STATE_ROOT"]
     base = {"est_usd": 0.05, "est_basis": "api_list", "cost_usd": 0, "cost_class": "subscription",
             "model": "claude-code-sonnet"}
     plain = fin.envelope_usage(base, Path(raw))
@@ -121,12 +122,12 @@ with scratch_dir(prefix="agent-usage-") as raw:
 
 # End to end through the executor: a fake codex prints the recorded stream; the row carries what it reported.
 with scratch_dir(prefix="agent-usage-exec-") as raw:
-    lab = Path(raw) / "lab"
-    ops, task, fake = lab / "ops/bin", lab / "tasks/fixture", lab / "fake"
-    for path in (ops, task, lab / "ledger", fake):
+    code_root = Path(raw) / "code_root"
+    ops, task, fake = code_root / "ops/bin", code_root / "tasks/fixture", code_root / "fake"
+    for path in (ops, task, code_root / "ledger", fake):
         path.mkdir(parents=True, exist_ok=True)
-    for name in ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py",
-                 "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_provider_limits.py", "_est.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py",
+    for name in ("_dispatch.py", "_lifecycle_evidence.py", "_estate_io.py", "_roots.py", "_executor.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py",
+                 "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_provider_limits.py", "_est.py", "_grant.py", "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py",
                  "capture-stimulus", "publish-evidence", "harvest", "_run_record.py", "_env_policy.py", "_errors.py", "finalize-run"):
         shutil.copy2(OPS / name, ops / name)
     from native_runtime import stage_native_runtime
@@ -134,8 +135,8 @@ with scratch_dir(prefix="agent-usage-exec-") as raw:
     for module in sorted(OPS.glob("_*.py")):  # direct imports between ops/bin modules: ship every sibling module
         if not (ops / module.name).exists():
             shutil.copy2(module, ops / module.name)
-    (lab / "ESTATE").write_text("dev\n")  # finalize-run's node identity
-    day = lab.parent / "codex-home/sessions" / time.strftime("%Y/%m/%d")
+    (code_root / "ESTATE").write_text("dev\n")  # finalize-run's node identity
+    day = code_root.parent / "codex-home/sessions" / time.strftime("%Y/%m/%d")
     day.mkdir(parents=True)
     roll = next((FIX / "codex-home/sessions/2026/11/09").glob("rollout-*.jsonl"))
     shutil.copy2(roll, day / roll.name.replace("2026-11-09", time.strftime("%Y-%m-%d")))
@@ -150,14 +151,17 @@ with scratch_dir(prefix="agent-usage-exec-") as raw:
     (task / "goal.md").write_text("Do nothing.\n", encoding="utf-8")
     (task / "check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (task / "check").chmod(0o755)
-    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("LAB_", "GIT_"))}
-    result = subprocess.run([sys.executable, str(ops / "_executor.py")], cwd=lab, text=True, capture_output=True,
+    env = {k: v for k, v in hermetic_env().items() if not k.startswith(("CS_", "GIT_"))}
+    home = code_root.parent / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("[user]\nname = Usage Fixture\nemail = usage@example.invalid\n")
+    result = subprocess.run(cli_command(sys.executable, ops / "_executor.py"), cwd=code_root, text=True, capture_output=True,
                             timeout=60, input=json.dumps({"executor": "fake-codex", "task": "tasks/fixture",
                                                           "exp": "task-fixture", "trial": 1, "timeout_s": 20}),
-                            env={**env, "CODEX_HOME": str(lab.parent / "codex-home"),
-                                 "CS_TOOLS_BIN": str(LAB.parent / "target/release/cs-tools")})
+                            env={**env, "HOME": str(home), "CODEX_HOME": str(code_root.parent / "codex-home"),
+                                 "CS_TOOLS_BIN": str(CODE_ROOT.parent / "target/release/cs-tools")})
     assert "Traceback" not in result.stderr, result.stderr
-    rows = [json.loads(line) for line in (lab / "ledger/ledger.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (code_root / "ledger/ledger.jsonl").read_text().splitlines()]
     assert len(rows) == 1 and rows[0]["cli_exit"] == 0, (rows, result.stdout, result.stderr)
     row = rows[0]
     assert tokens(row) == (350, 513, 225408, None, 236) and row["reported_model"] == "gpt-6.1-sol", row

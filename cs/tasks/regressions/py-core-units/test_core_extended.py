@@ -204,28 +204,28 @@ class EstateIoTransportTests(unittest.TestCase):
     def test_estate_id_and_aliases_follow_cutover_record(self):
         with scratch_dir(prefix="est-est-") as raw:
             root = Path(raw)
-            lab = root / "lab"
+            code_root = root / "code_root"
             state = root / "state"
-            lab.mkdir()
+            code_root.mkdir()
             state.mkdir()
-            (lab / "INVARIANTS.md").write_text("#\n", encoding="utf-8")
-            (lab / "ESTATE").write_text("prod\n", encoding="utf-8")
+            (code_root / "INVARIANTS.md").write_text("#\n", encoding="utf-8")
+            (code_root / "ESTATE").write_text("prod\n", encoding="utf-8")
             record = {"schema": "estate-cutover-v2", "estate": "prod", "aliases": ["dev"]}
             (state / _estate_io.CUTOVER_V2).write_text(json.dumps(record), encoding="utf-8")
-            env = {**hermetic_env(), "LAB_CODE_ROOT": str(lab), "LAB_STATE_ROOT": str(state)}
+            env = {**hermetic_env(), "CS_CODE_ROOT": str(code_root), "CS_STATE_ROOT": str(state)}
             with patch.dict(os.environ, env, clear=True):
-                self.assertEqual(_estate_io.estate_id(lab), "prod")
-                self.assertEqual(_estate_io.estate_aliases(lab), ("dev",))
-                self.assertTrue(_estate_io.estate_matches(lab, "dev"))
+                self.assertEqual(_estate_io.estate_id(code_root), "prod")
+                self.assertEqual(_estate_io.estate_aliases(code_root), ("dev",))
+                self.assertTrue(_estate_io.estate_matches(code_root, "dev"))
                 self.assertEqual(_estate_io.cutover_record(state), record)
 
     def test_estate_id_refuses_invalid_estate_file(self):
         with scratch_dir(prefix="est-badid-") as raw:
-            lab = Path(raw) / "lab"
-            lab.mkdir()
-            (lab / "ESTATE").write_text("INVALID\n", encoding="utf-8")
+            code_root = Path(raw) / "code_root"
+            code_root.mkdir()
+            (code_root / "ESTATE").write_text("INVALID\n", encoding="utf-8")
             with self.assertRaises(ValueError):
-                _estate_io.estate_id(lab)
+                _estate_io.estate_id(code_root)
 
     def test_pid_live_tracks_child_process(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -331,7 +331,7 @@ class EstateIoRelocatedAndFailureTests(unittest.TestCase):
             code.mkdir()
             config.mkdir()
             (code / "INVARIANTS.md").write_text("#\n", encoding="utf-8")
-            env = {**hermetic_env(), "LAB_CODE_ROOT": str(code), "LAB_CONFIG_ROOT": str(config)}
+            env = {**hermetic_env(), "CS_CODE_ROOT": str(code), "CS_CONFIG_ROOT": str(config)}
             with patch.dict(os.environ, env, clear=True):
                 self.assertEqual(Path(_estate_io.estate_dir(code)).resolve(), Path(config).resolve())
 
@@ -352,9 +352,9 @@ class EstateIoRelocatedAndFailureTests(unittest.TestCase):
             (code / "INVARIANTS.md").write_text("#\n", encoding="utf-8")
             env = {
                 **hermetic_env(),
-                "LAB_CODE_ROOT": str(code),
-                "LAB_CONFIG_ROOT": str(config),
-                "LAB_STATE_ROOT": str(state),
+                "CS_CODE_ROOT": str(code),
+                "CS_CONFIG_ROOT": str(config),
+                "CS_STATE_ROOT": str(state),
             }
             with patch.dict(os.environ, env, clear=True):
                 row = _estate_io.estate_row(shelf, {"estate": "dev", "n": 1})

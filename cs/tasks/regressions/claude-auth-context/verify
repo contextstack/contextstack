@@ -3,7 +3,7 @@ import importlib.machinery,importlib.util,json,os,subprocess,tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-here=Path(__file__).resolve().parent;lab=here.parents[2]
+here=Path(__file__).resolve().parent;code_root=here.parents[2]
 loader=importlib.machinery.SourceFileLoader('auth_probe',str(here/'claude'))
 spec=importlib.util.spec_from_loader(loader.name,loader);module=importlib.util.module_from_spec(spec);loader.exec_module(module)
 expected=['/usr/bin/security','find-generic-password','-s','Claude Code-credentials']
@@ -23,6 +23,6 @@ for code in (0,44):
   assert d['keychain_find_exit']==code and 'NEVER_EXPORT' not in json.dumps(d)
   (Path(raw)/'auth-context.json').write_text(json.dumps(d))
   subprocess.run([str(here/'check')],cwd=raw,check=True)
-templates=json.loads((lab/'ops/bin/executor-templates.json').read_text());probe=templates['claude-auth-context-probe'].copy();real=templates['claude-code-sonnet-planner'].copy()
+templates=json.loads((code_root/'ops/bin/executor-templates.json').read_text());probe=templates['claude-auth-context-probe'].copy();real=templates['claude-code-sonnet-planner'].copy()
 assert Path(probe.pop('binary')).name=='claude';assert real.pop('binary')=='claude';assert probe==real
 print('check: fake auth child exports only bounded metadata; lookup never prints credentials; real planner unchanged')

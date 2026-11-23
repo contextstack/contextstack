@@ -37,11 +37,11 @@ def write_release(home, rid):
     if env_src.is_file():
         shutil.copy2(env_src, kit / "policy/env.json")
     (rel / "gateway").mkdir(parents=True, exist_ok=True)
-    (rel / "gateway/models.json").write_text("{\"lab_executor\": \"/dev/null\"}\n")
+    (rel / "gateway/models.json").write_text("{\"cli_executor\": \"/dev/null\"}\n")
     (rel / "bin").mkdir(parents=True)
     for name in ("cs-gateway", "cs-harness", "cs-director"):
         path = rel / "bin" / name
-        path.write_text("#!/bin/sh\n")
+        path.write_text("#!/bin/sh\necho 0\n" if name == "cs-director" else "#!/bin/sh\n")
         path.chmod(0o755)
     (kit / ".venv/bin/python3").write_text("#!/bin/sh\n")
     (kit / ".venv/bin/python3").chmod(0o755)
@@ -87,7 +87,7 @@ with tempfile.TemporaryDirectory(prefix="node-release-load-") as raw:
     (home / ".contextstack/state/director").chmod(0o700)
     seed_db(db, "v1")
     env = {**hermetic_env(), "HOME": str(home), "NODE_INSTALL_PLATFORM": "macos", "NODE_INSTALL_USER_PATH": "/usr/bin:/bin"}
-    env.pop("LAB_STATE_ROOT", None)
+    env.pop("CS_STATE_ROOT", None)
     env.pop("CSGATEWAY_ENDPOINT", None)
     os.environ.update(env)
     mod, ns = load_modules()
@@ -116,6 +116,34 @@ with tempfile.TemporaryDirectory(prefix="node-release-load-") as raw:
     current = os.readlink(home / ".contextstack/current")
     expect(current.endswith(OLD), "current symlink returned to the previous release", current)
     expect(db_marker(db) == "v1", "director database restored after load failure")
+
+    derive = mod.derive_models
+
+    def broken_models(rid):
+        if rid == NEW:
+            raise OSError("fixture models write failed")
+        return derive(rid)
+
+    with patch.object(mod, "derive_models", side_effect=broken_models):
+        try:
+            mod.activate(NEW, {}, load=False)
+        except (mod.Refused, OSError) as error:
+            expect("fixture models write failed" in str(error), "activation reports its write failure")
+    expect(mod.current_id() == OLD, "models write failure restores current")
+
+    scripts = mod.RELEASES / NEW / "cs/scripts"
+    (scripts / "cs_smoke.py").touch()
+    (scripts / "cs").write_text("print(%r)" % json.dumps({"ok": False, "checks": []}))
+    with patch.object(mod, "unload_agent"), patch.object(mod, "load_agent", return_value="bootstrapped"):
+        try:
+            mod.activate(NEW, {"smoke": True}, load=True)
+        except mod.Refused as error:
+            expect("smoke failed" in str(error), "failed smoke refuses activation")
+    record = mod.load_record()
+    expect(mod.current_id() == OLD, "failed smoke restores current")
+    expect(NEW not in record["history"] and record["previous"] != NEW, "failed smoke is excluded from rollback history")
+    expect(NEW in record.get("failed_releases", []), "smoke failure is recorded")
+    expect(not mod.rollback_target(record, OLD), "rollback cannot choose the failed release")
 
 if problems:
     print("node-release-load-rollback: %d failed" % len(problems))

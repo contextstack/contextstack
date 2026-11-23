@@ -3,12 +3,13 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
 from scratch import scratch_dir
+from cli_execution import command as cli_command
 
 import ast,json,os,re,shutil,subprocess,sys,tempfile
 from pathlib import Path
-LAB=Path(__file__).resolve().parents[3]
-source=(LAB/'ops/bin/_executor.py').read_text()
-sys.path.insert(0,str(LAB/'ops/bin'))
+CODE_ROOT=Path(__file__).resolve().parents[3]
+source=(CODE_ROOT/'ops/bin/_executor.py').read_text()
+sys.path.insert(0,str(CODE_ROOT/'ops/bin'))
 import _executor
 credential=_executor.CRED_ENV
 def require_explicit_environments(text):
@@ -23,19 +24,19 @@ for expression in ['subprocess.run(["true"])','subprocess.Popen(["true"])','subp
  else:raise AssertionError('unfiltered process launch accepted: '+expression)
 require_explicit_environments('subprocess.run(["true"], env=child_env)')
 require_explicit_environments('subprocess.CompletedProcess([],124); subprocess.TimeoutExpired([],1)')
-require_explicit_environments(source + "\n" + (LAB/"ops/bin/_muse_adapter.py").read_text())
-assert 'child_env = allowlist_env(' in source and 'partial(estate_run_op, env=child_env)' in source
+require_explicit_environments(source + "\n" + (CODE_ROOT/"ops/bin/_muse_adapter.py").read_text())
+assert 'child_env = allowlist_env(' in source and 'partial(estate_run_op, env=trusted_op_env(child_env))' in source
 assert '{**os.environ' not in source
 with scratch_dir(prefix='env-allowlist-') as raw:
- root=Path(raw);lab=root/'lab';ops=lab/'ops/bin';ops.mkdir(parents=True)
- for item in (LAB/'ops/bin').iterdir():
+ root=Path(raw);code_root=root/'code_root';ops=code_root/'ops/bin';ops.mkdir(parents=True)
+ for item in (CODE_ROOT/'ops/bin').iterdir():
   if item.is_file():shutil.copy2(item,ops/item.name)
  from native_runtime import stage_native_runtime
  stage_native_runtime(ops)
- (lab/'ESTATE').write_text('dev\n')  # finalize-run's node identity
+ (code_root/'ESTATE').write_text('dev\n')  # finalize-run's node identity
  env={k:v for k,v in os.environ.items() if k in ['PATH','HOME','USER','TMPDIR','LANG']}
  env.update({k:'fake-credential-for-fixture' for k in ['OPENAI_API_KEY','GROQ_API_KEY','TEST_SECRET','TEST_TOKEN','PASSWORD','CREDENTIAL','AWS_ACCESS_KEY_ID','SSH_AUTH_SOCK']})
- env['UNLISTED_VALUE']='must-not-inherit';env['LAB_SCHEDULE_DATE']='2026-09-09'
+ env['UNLISTED_VALUE']='must-not-inherit';env['CS_SCHEDULE_DATE']='2026-09-09'
  home=root/'home';bins=home/'.local/bin';bins.mkdir(parents=True);env['HOME']=str(home)
  env['PATH']=str(bins)+os.pathsep+env.get('PATH','')
  (home/'.gitconfig').write_text('[user]\n name = Env Fixture\n email = fixture@example.test\n')
@@ -47,28 +48,28 @@ with scratch_dir(prefix='env-allowlist-') as raw:
  template={'binary':sys.executable,'args':['-c',"import json,os;open('model-env.json','w').write(json.dumps(dict(os.environ)));open('hello.txt','w').write('hello')"], 'cost_class':'free_local','cost_usd':0,'cost_per_1k':0,'auth':'none'}
  (ops/'executor-templates.json').write_text(json.dumps({'test-echo':template}))
  for mode in ['normal','preflight']:
-  task=lab/'tasks'/mode;task.mkdir(parents=True);(task/'setup').mkdir()
+  task=code_root/'tasks'/mode;task.mkdir(parents=True);(task/'setup').mkdir()
   (task/'setup/seed.txt').write_text('copy setup path')
   (task/'goal.md').write_text('Exercise the environment boundary.\n')
   (task/'check').write_text('#!'+sys.executable+'\nimport json,os\nprint(json.dumps(dict(os.environ)))\nopen("check-env.json","w").write(json.dumps(dict(os.environ)))\n')
   (task/'check').chmod(0o755)
   if mode=='preflight':
    (task/'preflight').write_text('#!'+sys.executable+'\nimport json,os\nopen("preflight-env.json","w").write(json.dumps(dict(os.environ)))\nprint(json.dumps({"run":False,"reason":"fixture no work"}))\nraise SystemExit(3)\n');(task/'preflight').chmod(0o755)
-  env.update(LAB_JOB_ID='env-'+mode,LAB_TRIAL='1',LAB_VIDEO_MUTATION='0')
-  (lab/'ledger').mkdir(exist_ok=True)
-  (lab/'ledger/dispatch.jsonl').write_text(json.dumps({'id':env['LAB_JOB_ID'],'event':'pending','lane':'probe','task':str(task),'grant':''})+'\n')
-  r=subprocess.run([sys.executable,str(ops/'_executor.py')],input=json.dumps({'executor':'test-echo','task':str(task),'exp':'task-env','trial':1,'timeout_s':30}),cwd=lab,env=env,text=True,capture_output=True,timeout=45)
+  env.update(CS_JOB_ID='env-'+mode,CS_TRIAL='1',CS_VIDEO_MUTATION='0')
+  (code_root/'ledger').mkdir(exist_ok=True)
+  (code_root/'ledger/dispatch.jsonl').write_text(json.dumps({'id':env['CS_JOB_ID'],'event':'pending','lane':'probe','task':str(task),'grant':''})+'\n')
+  r=subprocess.run(cli_command(sys.executable, ops/'_executor.py'),input=json.dumps({'executor':'test-echo','task':str(task),'exp':'task-env','trial':1,'timeout_s':30}),cwd=code_root,env=env,text=True,capture_output=True,timeout=45)
   if r.returncode:
-   logs=[p.read_text() for p in (lab/'ledger/runs').glob('*/cli.log')]
+   logs=[p.read_text() for p in (code_root/'ledger/runs').glob('*/cli.log')]
    raise AssertionError(('executor failed',mode,r.returncode,r.stderr,r.stdout,logs))
-  receipt=json.loads(r.stdout.splitlines()[-1]);run=lab/receipt['transcript'];ws=run/'workspace'
+  receipt=json.loads(r.stdout.splitlines()[-1]);run=code_root/receipt['transcript'];ws=run/'workspace'
   for dump in ws.glob('*-env.json'):
    recorded=json.loads(dump.read_text());bad=[key for key in recorded if credential.search(key)]
    assert not bad,('credential names reached child',mode,dump.name,bad)
    assert 'UNLISTED_VALUE' not in recorded,(mode,dump.name)
-   assert recorded.get('LAB_JOB_ID')==env['LAB_JOB_ID'] and recorded.get('LAB_VIDEO_MUTATION')=='0',(mode,dump.name,'lost scoped context')
+   assert recorded.get('CS_JOB_ID')==env['CS_JOB_ID'] and recorded.get('CS_VIDEO_MUTATION')=='0',(mode,dump.name,'lost scoped context')
   assert (ws/'check-env.json').is_file()
-  assert json.loads((run/'stimulus/manifest.json').read_text())['source']['job_id']==env['LAB_JOB_ID'],'frozen dispatch binding lost'
+  assert json.loads((run/'stimulus/manifest.json').read_text())['source']['job_id']==env['CS_JOB_ID'],'frozen dispatch binding lost'
   assert (ws/('model-env.json' if mode=='normal' else 'preflight-env.json')).is_file()
   assert 'fake-credential-for-fixture' not in r.stdout and 'fake-credential-for-fixture' not in r.stderr
  children=[json.loads(line) for line in audit.read_text().splitlines()]

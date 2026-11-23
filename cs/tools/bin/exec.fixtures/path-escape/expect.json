@@ -1,8 +1,8 @@
 {
   "exit": 1,
-  "stdout": "path escapes workspace: /etc/passwd\n",
+  "stdout": "Path escapes workspace: '/etc/passwd'. Use paths relative to your workspace.\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"cmd\": [\"cat\", \"/etc/passwd\"]}, \"name\": \"exec\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"cmd\": [\"cat\", \"/etc/passwd\"]}, \"name\": \"exec\"}\n"
   },
   "untouched": true
 }

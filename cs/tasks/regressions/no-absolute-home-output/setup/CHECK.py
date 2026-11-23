@@ -23,7 +23,7 @@ def git(root, *args):
 def source(root, check):
     return subprocess.run(
         ["/bin/sh", "-c", '. "$1"', "check", str(SUBJECT)],
-        cwd=root, env={**os.environ, "HOME": HOME, "LAB_CHECK": str(check)},
+        cwd=root, env={"PATH": os.defpath, "HOME": HOME, "CS_CHECK": str(check)},
         capture_output=True, text=True,
     )
 

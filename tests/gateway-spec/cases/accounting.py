@@ -1,15 +1,17 @@
 """Accounting: decimal amount string, estimate versus charged, the three cost
 classes, provider-reported charges, $0 on every error, budget fields accepted
 not enforced except budget.max_usd on api calls (area spend)."""
+import json
+
 from harness.gateway import model_call
 from harness.run import absent, case, eq, sub
 from harness import upstreams
 
 
-def cost(t, name, usage=(3, 2), charged=None, mock=None):
+def cost(t, name, usage=(3, 2), charged=None, mock=None, **fields):
     (mock or t.vllm).chat[name] = {"json": upstreams.chat_completion(usage=usage, cost=charged)}
     # Reservation prices max_output; raise the request ceiling so settlement stays within it.
-    b = t.gw.call(model_call(name, budget={"max_output_tokens": max(usage[1], 4096)})).json
+    b = t.gw.call(model_call(name, budget={"max_output_tokens": max(usage[1], 4096)}, **fields)).json
     eq(b["status"], "ok", name + " status")
     return b
 
@@ -55,12 +57,43 @@ def rounding(t):
 @case("accounting")
 def provider_reported_charge(t):
     """usage.cost from the provider: charged and charged_usd carry it; est_usd stays the estimate."""
+    from cases.spend import spent
+
+    before, _ = spent(t.gw)
     b = cost(t, "fake-paid", usage=(100, 100), charged=0.5)
     eq(b["cost"], {"currency": "USD", "amount": "0.002000", "class": "api", "charged": 0.5, "est_usd": 0.002, "charged_usd": 0.5, "over_reservation": True}, "cost")
-    b = cost(t, "vllm-big", usage=(100, 100), charged=0.25)
+    b = cost(t, "vllm-big", usage=(100, 100), charged=0.25, run_id="reported-local")
     eq(b["cost"], {"currency": "USD", "amount": "0.000000", "class": "free_local", "charged": 0.25, "est_usd": 0, "charged_usd": 0.25}, "free_local with a reported charge")
+    b = cost(t, "fake-sub", usage=(100, 100), charged=0.125, run_id="reported-sub")
+    sub(b["cost"], {"class": "subscription", "charged": 0.125, "charged_usd": 0.125}, "subscription charge")
+    for run_id, charge in [("reported-local", 0.25), ("reported-sub", 0.125)]:
+        path = t.gw.home / ".contextstack/gateway/traces" / (run_id + ".jsonl")
+        spans = [json.loads(line) for line in path.read_text().splitlines()]
+        settlements = [span["attributes"] for span in spans if span["kind"] == "settlement"]
+        eq(len(settlements), 1, run_id + " settlement count")
+        sub(settlements[0], {"charged_usd": charge, "basis": "provider_reported", "partial": False}, run_id)
+    eq(spent(t.gw)[0], round(before + 0.875, 6), "all three routes debit the provider budget")
     b = cost(t, "fake-paid", usage=(100, 100), charged=0)
     eq(b["cost"], {"currency": "USD", "amount": "0.002000", "class": "api", "charged": 0, "est_usd": 0.002, "charged_usd": 0}, "reported zero charge wins")
+
+
+@case("accounting", gw=None)
+def subscription_stream_fault_preserves_reported_charge(t):
+    """A charge received before the stream fails still settles against spend."""
+    from cases.spend import spent
+
+    gw = t.gateway("acct-subscription-fault", limits=None)
+    frames = upstreams.chat_stream(["hello"], usage=(3, 2), cost=0.25)[:-1]
+    t.vllm.chat["fake-sub"] = {"sse": frames + [{"cut": True}]}
+    got = gw.call(model_call("fake-sub", stream=True, run_id="sub-fault")).sse()
+    eq(got[-1]["kind"], "error", "terminal fault")
+    sub(got[-1]["cost"], {"charged": 0.25, "charged_usd": 0.25}, "terminal cost")
+    eq(spent(gw), (0.25, 0.25), "reported charge debited once")
+    path = gw.home / ".contextstack/gateway/traces/sub-fault.jsonl"
+    spans = [json.loads(line) for line in path.read_text().splitlines()]
+    settlements = [span["attributes"] for span in spans if span["kind"] == "settlement"]
+    eq(len(settlements), 1, "settlement count")
+    sub(settlements[0], {"basis": "provider_reported", "partial": True, "charged_usd": 0.25}, "partial settlement")
 
 
 @case("accounting")
@@ -95,7 +128,7 @@ def budget_fields_not_enforced(t):
 
 @case("accounting", gw=None)
 def stream_partial_output_settles_on_fault(t):
-    """After streamed text, a transport fault still settles priced tokens (capped by admission) and logs partial=1; the error chunk stays $0."""
+    """After streamed text, a transport fault settles priced tokens once and reports that charge on its terminal error chunk."""
     from cases.spend import limits, spent
 
     gw = t.gateway("acct-partial-stream", limits=limits(1))
@@ -103,11 +136,35 @@ def stream_partial_output_settles_on_fault(t):
     t.vllm.default_chat = {"sse": frames}
     got = gw.call(model_call("fake-paid", stream=True, budget={"max_usd": "1"})).sse()
     eq([f["kind"] for f in got], ["delta", "delta", "error"], "kinds")
-    eq(got[-1]["cost"], {"currency": "USD", "amount": "0.000000"}, "error chunk $0")
     day, _ = spent(gw)
     eq(day > 0, True, "source spend counted")
     eq("partial=1" in gw.log_text(), True, "partial USAGE")
     eq(len(t.run.calls(t.vllm)), 1, "no retry after output started")
+    eq(round(got[-1]["cost"].get("charged_usd"), 6), day, "terminal charge equals settled spend")
+
+
+@case("accounting", gw=None)
+def paid_stream_deadline_after_output_reports_settled_charge(t):
+    """A paid stream that exceeds its deadline after output settles once and reports the settled charge on its terminal error chunk."""
+    from cases.spend import limits, spent
+    from cases.upstream_retry import usage_rows
+
+    request_id = "paid-deadline-after-output"
+    gw = t.gateway("acct-paid-stream-deadline", limits=limits(1))
+    frames = upstreams.chat_stream(["hello"], terminal=False) + [{"sleep": 1}]
+    t.vllm.default_chat = {"sse": frames}
+    got = gw.call(model_call(
+        "fake-paid",
+        stream=True,
+        request_id=request_id,
+        budget={"max_usd": "1", "timeout_ms": 200},
+    )).sse()
+    eq([f["kind"] for f in got], ["delta", "error"], "kinds")
+    day, _ = spent(gw)
+    eq(day > 0, True, "source spend counted")
+    eq(len(usage_rows(gw, request_id)), 1, "one partial settlement")
+    eq(len(t.run.calls(t.vllm)), 1, "no retry after output started")
+    eq(round(got[-1]["cost"].get("charged_usd"), 6), day, "terminal charge equals settled spend")
 
 @case("accounting", gw=None)
 def stream_client_disconnect_settles_partial(t):

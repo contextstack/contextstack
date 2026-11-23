@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ledger-absent regression (goal.md, P4/P6): no lab/ledger is recreated; readers tolerate its absence."""
+"""ledger-absent regression (goal.md, P4/P6): no cs/ledger is recreated; readers tolerate its absence."""
 import importlib.machinery
 import importlib.util
 import json
@@ -13,8 +13,8 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
-for k in [k for k in os.environ if k.startswith(("GIT_", "LAB_"))]:
+CODE_ROOT = Path(__file__).resolve().parents[3]
+for k in [k for k in os.environ if k.startswith(("GIT_", "CS_"))]:
     del os.environ[k]
 problems = []
 
@@ -35,42 +35,42 @@ def load(name, path):
 
 with scratch_dir(prefix="ledger-absent-") as raw:
     tmp = Path(os.path.realpath(raw))
-    lab, state = tmp / "lab", tmp / "state"
-    shutil.copytree(LAB / "ops/bin", lab / "ops/bin", ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copytree(LAB / "scripts", lab / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
-    (lab / "specs").mkdir()
-    (lab / "INVARIANTS.md").write_text("fixture\n")
-    (lab / "ESTATE").write_text("dev\n")
+    code_root, state = tmp / "code_root", tmp / "state"
+    shutil.copytree(CODE_ROOT / "ops/bin", code_root / "ops/bin", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(CODE_ROOT / "scripts", code_root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+    (code_root / "specs").mkdir()
+    (code_root / "INVARIANTS.md").write_text("fixture\n")
+    (code_root / "ESTATE").write_text("dev\n")
     state.mkdir()
 
-    gate = load("check_red_gate_absent", lab / "scripts/check-red-gate")
+    gate = load("check_red_gate_absent", code_root / "scripts/check-red-gate")
     try:
-        gate.append_event(lab, {"event": "fixture"})
+        gate.append_event(code_root, {"event": "fixture"})
         refused = ""
     except SystemExit as error:
         refused = str(error)
-    expect("LAB_STATE_ROOT" in refused and not (lab / "ledger").exists(),
-           "check-red-gate refuses to recreate lab/ledger: %s" % refused[:160])
+    expect("CS_STATE_ROOT" in refused and not (code_root / "ledger").exists(),
+           "check-red-gate refuses to recreate cs/ledger: %s" % refused[:160])
 
-    ident = load("estate_identity_absent", lab / "scripts/estate-identity.py")
-    expect(ident.check(lab).get("skip", "").startswith("no lab/ledger"), "estate-identity skips a checkout without lab/ledger")
+    ident = load("estate_identity_absent", code_root / "scripts/estate-identity.py")
+    expect(ident.check(code_root).get("skip", "").startswith("no cs/ledger"), "estate-identity skips a checkout without cs/ledger")
 
-    task = lab / "tasks/sweeps/fixture"
+    task = code_root / "tasks/sweeps/fixture"
     task.mkdir(parents=True)
     os.symlink("../../../ledger/setups/dark-factory", task / "setup")
     (state / "setups/dark-factory").mkdir(parents=True)
-    sys.path.insert(0, str(lab / "ops/bin"))
+    sys.path.insert(0, str(code_root / "ops/bin"))
     import _estate_io
-    expect(_estate_io.link_target(lab, task / "setup") == lab / "ledger/setups/dark-factory",
+    expect(_estate_io.link_target(code_root, task / "setup") == code_root / "ledger/setups/dark-factory",
            "a ledger-relative setup link keeps its checkout target without a state root")
-    os.environ["LAB_STATE_ROOT"] = str(state)
-    expect(_estate_io.link_target(lab, task / "setup") == state / "setups/dark-factory"
-           and _estate_io.lab_path(lab, "ledger/setups/dark-factory") == state / "setups/dark-factory"
-           and _estate_io.lab_path(lab, "tasks/x") == lab / "tasks/x",
-           "with LAB_STATE_ROOT, ledger/... resolves under the state root; other paths are unchanged")
-    del os.environ["LAB_STATE_ROOT"]
+    os.environ["CS_STATE_ROOT"] = str(state)
+    expect(_estate_io.link_target(code_root, task / "setup") == state / "setups/dark-factory"
+           and _estate_io.code_path(code_root, "ledger/setups/dark-factory") == state / "setups/dark-factory"
+           and _estate_io.code_path(code_root, "tasks/x") == code_root / "tasks/x",
+           "with CS_STATE_ROOT, ledger/... resolves under the state root; other paths are unchanged")
+    del os.environ["CS_STATE_ROOT"]
 
-text = (LAB / "scripts/check").read_text()
-expect("lab/ledger reappeared" in text, "scripts/check carries the rule against lab/ledger coming back")
+text = (CODE_ROOT / "scripts/check").read_text()
+expect("cs/ledger reappeared" in text, "scripts/check carries the rule against cs/ledger coming back")
 print("check: ledger-absent %d problem(s)" % len(problems))
 sys.exit(1 if problems else 0)

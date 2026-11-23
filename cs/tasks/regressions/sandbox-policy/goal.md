@@ -8,7 +8,7 @@ runner, and `run.go` `Tool.Run` only prepends its whitespace-split words to the 
 
 The check must show, against isolated estates only:
 
-1. `CS_TOOL_PREFIX`, `CS_SANDBOX_BIN` and `LAB_BROWSER_STATE` are in the runner's `defaultChildEnv`,
+1. `CS_TOOL_PREFIX`, `CS_SANDBOX_BIN` and `CS_BROWSER_STATE` are in the runner's `defaultChildEnv`,
    `policy/env.json` `always` and `_env_policy.DEFAULT_ENV`, so hooks and nested
    children see the same switch. `../env-policy` keeps the three lists equal.
 2. The committed policy loads, and every manifest tool's descriptor carries a
@@ -18,7 +18,7 @@ The check must show, against isolated estates only:
    nor `{macos, linux}` lists (phase 3b; the committed file carries both), an unknown
    `allow_net`, and the removed `tmp_in_workspace` (the wrapper owns a per-call tmp).
    An optional `write_env` must be `{VAR: [absolute roots]}`. Only `browser_fetch`
-   requests one (`LAB_BROWSER_STATE`), and the host confines it to `$HOME/.contextstack`.
+   requests one (`CS_BROWSER_STATE`), and the host confines it to `$HOME/.contextstack`.
    An optional `profiles` is `{browser: {"read": paths}}`; only `browser_fetch`
    requests a profile, and the committed host lists `browser`. An optional `sockets` is
    `{name: absolute path}`, names `[a-z0-9][a-z0-9-]*`; only `browser_session` requests
@@ -26,11 +26,11 @@ The check must show, against isolated estates only:
 4. Resolution. A present policy is validated first. A preset `CS_TOOL_PREFIX`,
    even an empty one, passes through. With no policy, nothing is set. With a policy
    and a wrapper (`CS_SANDBOX_BIN`, else `target/release`, else `target/debug`
-   beside the lab), the prefix is `<wrapper> --policy <lab>/policy/sandbox.json --`.
+   beside the code_root), the prefix is `<wrapper> --policy <code-root>/policy/sandbox.json --`.
    With no wrapper, `SandboxPolicyError` (unless `CS_SANDBOX_DEV_UNCONFINED=1`: then
    nothing is set and stderr says tools run unconfined). A wrapper
    path containing whitespace is refused. When the policy's `write_env` lists
-   `LAB_BROWSER_STATE`, it is passed through when set, else `$HOME/.contextstack/lab/
+   `CS_BROWSER_STATE`, it is passed through when set, else `$HOME/.contextstack/code_root/
    browser-state`, and run-spec and tick hand it on; otherwise nothing is set.
 5. run-spec hands the runner the prefix, passes a preset through, and exits 2 on a
    malformed policy before any cell runs. tick's `run_spec` does the same and turns

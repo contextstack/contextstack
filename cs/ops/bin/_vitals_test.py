@@ -2,6 +2,7 @@
 """Unit tests for _vitals parsers and the resource guard. Run: python ops/bin/_vitals_test.py"""
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -116,7 +117,9 @@ class VitalsTest(unittest.TestCase):
         client = Client()
         offered = [{"job_id": "job1", "bundle_sha256": "a" * 64, "spec": "spec.yaml", "task": "task",
                     "files": [{"path": "spec.yaml", "sha256": "b" * 64, "bytes": 1, "mode": 420}]}]
-        state = Path(HERE / "fixtures/vitals")
+        scratch = tempfile.TemporaryDirectory(prefix="vitals-intake-")
+        self.addCleanup(scratch.cleanup)
+        state = Path(scratch.name)
         with mock.patch("_node_intake.intake_blocked", return_value={"reason": "memory_low"}):
             accepted, queued, failed = take(client, offered, state)
             self.assertEqual(accepted, [])

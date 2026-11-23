@@ -11,7 +11,7 @@ mutations = (
     ".write_text(", ".write_bytes(", ".unlink(", "rmtree(",
     ".mkdir(", ".chmod(",
 )
-guard = "refusing live lab root"
+guard = "refusing live code_root root"
 
 checks = []
 for pat in ("tasks/*/check", "tasks/work/*/check", "tasks/regressions/*/check",
@@ -37,7 +37,7 @@ for check in sorted(checks):
 
 if failures:
     for check in failures:
-        print(f"check: {check} can write the live lab control plane without an early guard")
+        print(f"check: {check} can write the live code_root control plane without an early guard")
     sys.exit(1)
 
 print("check: live control-plane task isolation ok")

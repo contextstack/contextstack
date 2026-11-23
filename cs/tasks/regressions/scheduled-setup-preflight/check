@@ -17,8 +17,8 @@ _clean_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_clean_env)
 
-LAB = Path(__file__).resolve().parents[3]
-loader = importlib.machinery.SourceFileLoader("preflight_tick", str(LAB / "ops/bin/tick"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+loader = importlib.machinery.SourceFileLoader("preflight_tick", str(CODE_ROOT / "ops/bin/tick"))
 module_spec = importlib.util.spec_from_loader("preflight_tick", loader)
 tick = importlib.util.module_from_spec(module_spec)
 loader.exec_module(tick)
@@ -32,14 +32,14 @@ with scratch_dir(prefix="scheduled-setup-preflight-") as raw:
     (task / "goal.md").write_text("fixture\n", encoding="utf-8")
     (task / "setup").symlink_to(root / "missing-setup")
     refused = subprocess.run(
-        [str(LAB / "ops/bin/setup-preflight")],
+        [str(CODE_ROOT / "ops/bin/setup-preflight")],
         input=json.dumps({"task": str(task), "require_ready": False}),
         text=True, capture_output=True,
      env={**hermetic_env()})
     assert refused.returncode != 0
     assert "task check is missing or not executable" in refused.stderr
     assert "refusing at $0" in refused.stderr
-    tick.LAB = root
+    tick.CODE_ROOT = root
     tick.Q = root / "ledger/dispatch.jsonl"
     tick.LOCK = root / "ledger/dispatch.lock"
     tick.LEDGER = root / "ledger/ledger.jsonl"
@@ -51,7 +51,6 @@ with scratch_dir(prefix="scheduled-setup-preflight-") as raw:
     }
     tick.sweep_stale_locks = lambda: []
     tick.write_heartbeat = lambda: None
-    tick.estate_commit_pass = lambda: None
     tick.void_watch_pass = lambda: None
     tick.recover_orphaned_jobs = lambda: []
     tick.shadow_pass = lambda *args, **kwargs: {}
@@ -89,7 +88,7 @@ with scratch_dir(prefix="workspace-preparation-") as raw:
     ops = root / "kit/ops/bin"
     ops.mkdir(parents=True)
     for name in ("setup-refresh", "setup-preflight", "_workspace_setup.py", "_estate_io.py", "_roots.py"):
-        shutil.copy2(LAB / "ops/bin" / name, ops / name)
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, ops / name)
     dest = root / "destination"
     dest.mkdir()
     def git(*args):
@@ -103,7 +102,7 @@ with scratch_dir(prefix="workspace-preparation-") as raw:
     head = git("rev-parse", "HEAD")
     (dest / "vendor").mkdir()
     (dest / "vendor/dependency.php").write_text("dependency\n")
-    (dest / ".lab-private").write_text("private\n")
+    (dest / ".cs-private").write_text("private\n")
     task = root / "task"
     task.mkdir()
     setup = root / "prepared"
@@ -113,7 +112,7 @@ with scratch_dir(prefix="workspace-preparation-") as raw:
     (task / "check").chmod(0o755)
     (task / "notes.md").write_text("repo: " + str(dest) + "\nsetup: " + str(setup) + "\n")
     (root / "state").mkdir()
-    env = {**hermetic_env(), "LAB_STATE_ROOT": str(root / "state")}
+    env = {**hermetic_env(), "CS_STATE_ROOT": str(root / "state")}
     def prepare(name, payload):
         result = subprocess.run([str(ops / name)], input=json.dumps(payload),
                                 text=True, capture_output=True, env=env)
@@ -122,13 +121,12 @@ with scratch_dir(prefix="workspace-preparation-") as raw:
     refreshed = prepare("setup-refresh", {"task": str(task)})
     assert refreshed["head"] == head
     assert (setup / "hello.txt").read_text() == "original\n"
-    assert not (setup / ".lab-private").exists() and not (setup / "vendor").exists()
+    assert not (setup / ".cs-private").exists() and not (setup / "vendor").exists()
     installs = list((root / "state/setups/installs").glob("*/vendor/dependency.php"))
     assert len(installs) == 1 and installs[0].read_text() == "dependency\n"
     assert installs[0].stat().st_mode & 0o222 == 0
     ready = prepare("setup-preflight", {"task": str(task), "expected_head": head})
     assert ready["ready"] and ready["head"] == head
     prepare("setup-refresh", {"task": str(task)})
-    assert not (ops / "_corpus_contract.py").exists()
 
 print("check: missing scheduled check input is a preflight_refused zero-turn refusal")

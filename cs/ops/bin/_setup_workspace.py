@@ -10,7 +10,7 @@ from _workspace_setup import (INSTALLS, clone_tree, install_tag, patterns,
                                seed_installs, thaw_tree)
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 FRAMEWORK = ("app", "bootstrap", "config", "database", "routes", "tests", "resources", "storage", "public")
 RUNTIME_DIRS = (
     "storage/framework/sessions",
@@ -28,16 +28,16 @@ def git(cwd, *args, env=None):
                           env=merged)
 
 
-def clone_installs(workspace, setup, lab=LAB):
-    tag = seed_installs(setup, lab)
-    cache = state_dir(lab) / "setups/installs" / tag
+def clone_installs(workspace, setup, code_root=CODE_ROOT):
+    tag = seed_installs(setup, code_root)
+    cache = state_dir(code_root) / "setups/installs" / tag
     for name in INSTALLS:
         dest = Path(workspace) / name
         if dest.exists() or dest.is_symlink():
             continue
         source = cache / name
         if not source.exists() and (Path(setup) / name).is_dir():
-            seed_installs(setup, lab)
+            seed_installs(setup, code_root)
         if source.exists() or source.is_symlink():
             clone_tree(source, dest)
             thaw_tree(dest)
@@ -63,7 +63,7 @@ def _copy_tree(setup, workspace):
                     symlinks=True)
 
 
-def materialize(setup, workspace, task=None, lab=LAB, env=None):
+def materialize(setup, workspace, task=None, code_root=CODE_ROOT, env=None):
     setup, workspace = Path(setup).resolve(), Path(workspace)
     if workspace.exists():
         if any(workspace.iterdir()):
@@ -71,7 +71,7 @@ def materialize(setup, workspace, task=None, lab=LAB, env=None):
         workspace.rmdir()
     workspace.parent.mkdir(parents=True, exist_ok=True)
     # An ordinary setup directory must never discover a containing checkout.
-    rev = git(setup, "rev-parse", "refs/lab/base", env=env) if (setup / ".git").exists() else None
+    rev = git(setup, "rev-parse", "refs/cs/base", env=env) if (setup / ".git").exists() else None
     if rev is not None and rev.returncode:
         rev = git(setup, "rev-parse", "HEAD", env=env)
     commit = rev.stdout.strip() if rev is not None else ""
@@ -99,7 +99,7 @@ def materialize(setup, workspace, task=None, lab=LAB, env=None):
             from _harvest_git import git as harvest_git
             harvest_git(workspace, "config", "core.sparseCheckout", "true")
             harvest_git(workspace, "read-tree", "-m", commit)
-    clone_installs(workspace, setup, lab)
+    clone_installs(workspace, setup, code_root)
     if (workspace / "artisan").is_file() or (workspace / "composer.json").is_file():
         for rel in RUNTIME_DIRS:
             (workspace / rel).mkdir(parents=True, exist_ok=True)

@@ -65,13 +65,13 @@ def invalid_executables(t):
 
 
 @case("process", gw=None)
-def lab_executor_validated(t):
-    """lab_executor must be an absolute path to a regular file."""
-    for name, value, needle in (("lab-rel", "fake_cli.py", "Lab executor path must be absolute"),
-                                ("lab-missing", str(t.run.tmp / "missing.py"), "no such file or directory"),
-                                ("lab-dir", str(t.run.tmp), "Lab executor must be a regular file")):
+def cli_executor_validated(t):
+    """cli_executor must be an absolute path to a regular file."""
+    for name, value, needle in (("code_root-rel", "fake_cli.py", "CLI executor path must be absolute"),
+                                ("code_root-missing", str(t.run.tmp / "missing.py"), "no such file or directory"),
+                                ("code_root-dir", str(t.run.tmp), "CLI executor must be a regular file")):
         c = t.run.config()
-        c["lab_executor"] = value
+        c["cli_executor"] = value
         refuses(t, name, needle, c)
 
 

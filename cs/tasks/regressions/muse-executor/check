@@ -13,7 +13,7 @@ from hermetic_env import hermetic_env
 ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
 names = ('_executor.py', '_toolchains.py', '_lanes.py', '_lane_policy.py', '_job_memory.py', '_vitals.py', 'executor-templates.json', '_muse.py', '_agent_stream.py', '_cli_native.py', '_muse_adapter.py',
-         'muse-profile.json', '_est.py', '_grant.py', '_corpus_contract.py', '_workspace_setup.py',
+         'muse-profile.json', '_est.py', '_grant.py', '_workspace_setup.py',
          '_frozen_inputs.py', 'capture-stimulus', 'capture-stimulus.json',
          'publish-evidence', '_harvest_git.py', 'harvest', 'finalize-run')
 with scratch_dir(prefix='muse-regression-') as raw:
@@ -31,7 +31,8 @@ with scratch_dir(prefix='muse-regression-') as raw:
         if source.is_file():
             shutil.copy2(source, fixture/source.name)
     for name in ('test_boundary.py', 'test_ancestors.py', 'test_capture.py', 'test_parser.py', 'test_background.py', 'test_muse_operator.py'):
-        env = {k: v for k, v in hermetic_env().items() if not k.startswith(('GIT_', 'LAB_', 'META_', 'MUSE_', 'TBH_'))}
+        env = {k: v for k, v in hermetic_env().items() if not k.startswith(('GIT_', 'CS_', 'META_', 'MUSE_', 'TBH_'))}
+        env['PYTHONPATH'] = str(HERE.parent / '_lib')
         env['CS_SANDBOX_BIN'] = str(ROOT.parent / 'target/release/cs-sandbox')
         subprocess.run([sys.executable, name], cwd=fixture, env=env, check=True, timeout=300)
 print('check: Muse credential, sandbox, frozen identity and terminal lifecycle')

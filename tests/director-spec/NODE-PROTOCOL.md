@@ -331,8 +331,11 @@ schedule's revision after the change). The answer is `200 {"control": <message a
   starts it afterwards, including a job it has not pulled yet (it keeps the cancelled `job_id`, so a later
   `GET jobs` listing it is not run). It reports `stopped`, then reports the job over as usual with `job_terminal`
   (`row_line.state` `cancelled`). A job that was already over is `already_finished`. A run that cannot be stopped is
-  `refused`, with the reason in `detail`. Stopping covers both execution paths: the runner process, and a
-  subscription coding agent the gateway is running for the job.
+  `refused`, with the reason in `detail`. The node signals the machine launcher, which forwards the signal to the
+  harness. For a CLI work order, the harness calls `POST /v1/agent/cli.run/{execution_id}/cancel` on the gateway and
+  waits for its terminal reply. The gateway stops the CLI process tree. A hosted turn relays cancellation to
+  its session host, which stops the active CLI. The machine finalizes any execution
+  receipt after the harness exits. The harness uses `CSGATEWAY_CLI_ENDPOINT` to locate the gateway.
 
 **The Director's side.** A cancel for a job whose `job_terminal` is acked while the message is still `requested`
 is settled by the Director: `applied`, outcome `already_finished`, detail saying the job ended first. It leaves the
@@ -383,7 +386,11 @@ A run's progress while it runs, as numbered events. `run_id` follows the rule in
 | `kind` | `[a-z][a-z0-9_.]{0,63}`; the protocol does not interpret it (the runner's are `delta`, then `stop`, as the gateway's stream chunks) |
 | `partial` | boolean. `true`: output in progress, which the run's finished result replaces |
 | `payload` | a JSON object of at most 64 KiB serialised |
-| `at` | optional: when the node recorded it |
+| `at` | optional on input. The node forwards the producer's UTC timestamp with its original fractional seconds. If the producer supplied no time, the adapter uses its own UTC receive time. |
+| `timestamp_source` | the node emits `producer` or `adapter_receive`. The run's own `trace.jsonl` keeps the same marker on each event span. |
+
+The Director records its own receive time separately as `received_at`. It preserves the incoming `at`. For older
+runner lines without a timestamp, the forwarding adapter takes its receive time when it reads the line.
 
 At most 500 events per call, sorted by `seq`. The answer is `200`:
 
@@ -412,6 +419,8 @@ dropped.
 {"active": [{"job_id": "01JC…", "run_id": "…", "state": "running", "started_at": "…"},
             {"job_id": "01JD…", "run_id": null, "state": "queued", "started_at": null}],
  "node_version": "cs 2026.11.10",
+ "release": {"id": "20261116-167146d2b", "protocol": 2},
+ "agent_capabilities": {"templates": ["codex"], "preferred": "codex", "harness": true},
  "vitals": {"memory_total_bytes": 128849018880, "memory_available_bytes": 8589934592,
             "memory_pressure": "normal", "swap_total_bytes": 0, "swap_used_bytes": 0,
             "disk_free_bytes": 50000000000},
@@ -425,6 +434,21 @@ The Director exposes these on `GET nodes` and `GET repos` in the Client API.
 
 `active` is every job the node holds that has not ended: `state` `queued` or `running`, at most 1000. `run_id` and
 `started_at` may be null. `node_version` is optional text up to 200 bytes.
+
+
+**`release` (optional).** The installed release this node runs and the protocol version of this report:
+`{"id": "<release-id>", "protocol": 2}`. `id` is the active ContextStack release name (`20261116-167146d2b`, or
+`dev` for a checkout). `protocol` is the node's protocol version (`1` or `2`).
+
+**`agent_capabilities` (optional).** Executor templates the node can run today and whether it can run jobs through
+the native harness (models not named in `executor-templates.json`): `{"templates": ["codex", …], "preferred":
+"<template>" | null, "harness": true | false}`. Template names only: never paths, tokens or login locations. The
+Director offers a job whose spec `model` names an executor template only to a node that reports that template, and
+offers harness models only when `harness` is true. A job whose node lacks the template is created `waiting` with
+`budget.reason` `executor_unavailable` until the node reports a fit; submitting to a named node that already
+reported the lack is refused. `harness_models` is an optional list of non-CLI model names from this node's
+gateway `/v1/models?available_only=false`. The Director requires both a catalog match and `harness: true`
+when a client explicitly selects `harness:<gateway-model>`.
 
 **`vitals` (optional).** A snapshot of machine health: each field is a non-negative integer or null, and
 `memory_pressure` is optional text up to 40 bytes (`normal`, `warn`, `critical`, or the node's own label). Absent
@@ -547,3 +571,18 @@ follows the Client API refusal codes (`428`, `422`). Each recorded change emits 
 Registration and job creation are administrative, not node calls (the reference: `director:node-register`,
 `director:node-dispatch`; `cs-director node register`, `job create`). Moving a schedule between nodes, budgets and
 reservations, conversations, and replay of a run's events to a node are not in protocol 2 (§8).
+
+### Native harness action approval (protocol 2)
+
+For an accepted job, `POST jobs/JOB/action-approvals` with `run_id`,
+`requesting_model`, `argv`, `needs`, `write_paths`, `reason` and lane
+`context` creates or retrieves the same request for that job and run.
+The node supplies the frozen goal, lane diff and resolved filesystem context.
+The response is the approval record. Poll with
+`POST jobs/JOB/action-approvals/ID/poll` and `{"run_id":"RUN"}`.
+
+Use `/claim` with the same run body to consume approval before starting
+the exact argv, then `/outcome` with `run_id` and `exit_code`. A repeated
+claim returns 409 even if its response was lost. A repeated matching
+outcome is accepted. The Director records an unknown outcome until the
+node confirms it. Request, claim and outcome are bound to the owning node.

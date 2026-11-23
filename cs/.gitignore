@@ -5,11 +5,11 @@
 tasks/**/setup
 tasks/**/setup/
 tasks/work/*/want/
-.lab-out/
-.lab-tmp/
-.lab-calls.jsonl
-.lab-doom-mark
-.lab-session
+.cs-out/
+.cs-tmp/
+.cs-calls.jsonl
+.cs-doom-mark
+.cs-session
 _evidence/
 __pycache__/
 tools/defuddle/node_modules/

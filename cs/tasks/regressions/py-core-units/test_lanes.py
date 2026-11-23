@@ -120,13 +120,13 @@ class LanesTests(unittest.TestCase):
         self.assertIsNone(lanes.commit_lane(ws, 'noop', main=self.main, lane='safe'))
         self.g('config', '--unset', 'user.email')
         self.g('config', '--unset', 'user.name')
-        (ws / '.lab-private').write_text('excluded')
+        (ws / '.cs-private').write_text('excluded')
         (ws / 'new').write_text('included')
         oid = lanes.commit_lane(ws, 'subject\n\nbody', main=self.main, lane='safe')
         self.assertEqual(self.g('show', '-s', '--format=%B', oid), 'subject\n\nbody')
         self.assertEqual(self.g('show', '-s', '--format=%an <%ae>', oid),
                          'contextstack lane <lane@example.test>')
-        self.assertNotIn('.lab-private', self.g('ls-tree', '-r', '--name-only', oid))
+        self.assertNotIn('.cs-private', self.g('ls-tree', '-r', '--name-only', oid))
 
     def test_green_gate_commits_with_owner_identity_full_message_and_cleanup(self):
         ws = self.lane()
@@ -187,10 +187,11 @@ class LanesTests(unittest.TestCase):
         self.lane()
         before = self.g('rev-parse', 'HEAD')
         self.g('merge', '--squash', 'lane/safe')
-        self.assertTrue(lanes._recover_leftover_squash(self.main))
+        self.assertTrue(lanes._recover_leftover_squash(self.main, dead_lock=True))
         self.assert_clean(before)
         self.assertFalse(lanes._recover_leftover_squash(self.main))
         self.g('merge', '--squash', 'lane/safe')
+        (self.main / '.git/cs-land.lock').write_text('999999999\n')
         self.assertEqual(lanes.land('repo', 'safe')[0], 0)
 
     def test_dirty_main_is_refused_without_discarding_owner_work(self):
@@ -333,11 +334,11 @@ class LanesTests(unittest.TestCase):
             real_popen = subprocess.Popen
             def popen(command, *args, **kw):
                 return proc if command[0] == '/bin/sh' else real_popen(command, *args, **kw)
-            with patch.object(lanes.subprocess, 'Popen', side_effect=popen):
+            with patch.object(lanes.subprocess, 'Popen', side_effect=popen), patch('_process_group.stop_group') as stop:
                 code, result = lanes.land('repo', 'safe')
+            stop.assert_called_once_with(proc)
             self.assertEqual(code, 2 if interrupt else 1)
             self.assertEqual(signal.getsignal(signal.SIGINT), original)
-            proc.kill.assert_called()
             self.assert_clean(before)
 
     def test_secret_history_scan_cache_and_allowlist_pin_names_without_contents(self):
@@ -403,7 +404,6 @@ class LanesTests(unittest.TestCase):
         (self.main / 'owner').write_text('pending')
         self.g('add', 'owner')
         self.assertFalse(lanes._recover_leftover_squash(self.main))
-        self.assertIn('reset --hard HEAD', lanes._leftover_squash_recovery(self.main))
         self.assertTrue((self.main / 'owner').exists())
         self.g('reset', '--hard', 'HEAD')
         lock = self.main / '.git/cs-land.lock'
@@ -412,6 +412,79 @@ class LanesTests(unittest.TestCase):
             self.assertEqual(lanes._land_lock_holder(self.main), os.getpid() if contents.isdigit() else None)
         (self.main / '.git/MERGE_HEAD').write_text(self.g('rev-parse', 'HEAD') + '\n')
         self.assertFalse(lanes._recover_leftover_squash(self.main))
+
+    def test_cli_job_owns_lane_through_machine_finish(self):
+        import _api_run
+
+        self.lane()
+        spec = self.root / "spec.yaml"
+        spec.write_text("repo: repo\nlane: safe\n")
+        finished = []
+
+        def execute(*args, order, **kwargs):
+            binding = json.loads(order)["order"]["_cs_lane_binding"]
+            with lanes.lane_execution(self.main, "safe", binding):
+                self.assertIn("busy", lanes.land("repo", "safe")[1]["reason"])
+            return 0, json.dumps({"run_id": "fixture", "detail": {"stderr": "", "receipt": {}}}), False
+
+        def finish(*args, input, **kwargs):
+            binding = json.loads(input)["lane_binding"]
+            with lanes.lane_execution(self.main, "safe", binding):
+                self.assertIn("busy", lanes.land("repo", "safe")[1]["reason"])
+            finished.append(True)
+            return subprocess.CompletedProcess([], 0)
+
+        with patch("_yaml.load", return_value={"repo": "repo", "lane": "safe"}), \
+             patch("_node_env.node_env", return_value={}), patch.object(_api_run, "execute_harness", side_effect=execute):
+            real_run = subprocess.run
+            with patch.object(_api_run.subprocess, "run", side_effect=lambda argv, *args, **kwargs:
+                              finish(argv, *args, **kwargs) if str(argv[0]).endswith("/machine-finish")
+                              else real_run(argv, *args, **kwargs)):
+                self.assertEqual(_api_run.launch_cli(self.root, "runner", json.dumps({"spec": spec.name})), 0)
+        self.assertEqual(finished, [True])
+        with lanes.lane_lock(self.cfg, "safe"):
+            pass
+
+    def test_harness_job_keeps_toolchain_grants_and_lane_reservation(self):
+        import _api_run
+
+        workspace = self.lane()
+        spec = self.root / "spec.yaml"
+        spec.write_text("repo: repo\nlane: safe\n")
+        gitdir = lanes.assert_lane_git_pointer(workspace, self.main, "safe")
+        scratch = None
+
+        def execute(*args, env):
+            nonlocal scratch
+            self.assertEqual(json.loads(env["CS_HARNESS_LANE"])["path"], str(workspace))
+            grants = json.loads(env["CS_HARNESS_SANDBOX"])
+            self.assertEqual(grants["path"], str(gitdir))
+            self.assertIn(str(self.main / ".git/objects"), grants["read_roots"])
+            toolchain = json.loads(env["CS_HARNESS_TOOLCHAIN_ENV"])
+            self.assertEqual(env["PATH"], toolchain["PATH"])
+            self.assertEqual(toolchain["GIT_OPTIONAL_LOCKS"], "0")
+            scratch = Path(toolchain["UV_CACHE_DIR"]).parent
+            self.assertEqual(scratch.parent, workspace)
+            self.assertTrue(scratch.is_dir())
+            self.assertIn("busy", lanes.land("repo", "safe")[1]["reason"])
+            return 0, json.dumps({"run_dir": str(self.root / "fixture")}), None
+
+        def finish(*args, foreground, lane_binding):
+            self.assertTrue(foreground)
+            self.assertFalse(scratch.exists())
+            with lanes.lane_execution(self.main, "safe", lane_binding):
+                self.assertIn("busy", lanes.land("repo", "safe")[1]["reason"])
+            row = {"task": "fixture", "trial": 1, "verdict": "pass", "stop": "done",
+                   "turns": 1, "tool_calls": 0, "cost_usd": 0}
+            return {"row": row}, subprocess.CompletedProcess([], 0, '{"state":"finalized"}', "")
+
+        with patch("_yaml.load", return_value={"repo": "repo", "lane": "safe"}), \
+             patch("_node_env.node_env", return_value={}), \
+             patch.object(_api_run, "execute_harness", side_effect=execute), \
+             patch.object(_api_run, "finish_request", side_effect=finish):
+            self.assertEqual(_api_run.launch(self.root, "runner", [spec.name]), 0)
+        with lanes.lane_lock(self.cfg, "safe"):
+            pass
 
     def test_second_landing_cannot_take_live_kernel_lock(self):
         import fcntl

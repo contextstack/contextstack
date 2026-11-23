@@ -1,0 +1,1 @@
+{"cmd": "cd docs && cat fact.txt 2>&1 | tail -n 1"}

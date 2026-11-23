@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from _workspace_setup import metadata
@@ -26,7 +26,7 @@ def git(cwd, *args):
 
 def resolve(value):
     path = Path(str(value))
-    return path if path.is_absolute() else LAB / path
+    return path if path.is_absolute() else CODE_ROOT / path
 
 
 def playwright_revision_ok(cache, revision):
@@ -41,12 +41,12 @@ def playwright_revision_ok(cache, revision):
 def lane_runtime_missing():
     """Refuse at $0 when this estate declared tagged runtime and it is absent.
 
-    Isolated fixture copies of lab have neither PLAYWRIGHT_BROWSERS_PATH nor
+    Isolated fixture copies of code_root have neither PLAYWRIGHT_BROWSERS_PATH nor
     ../.estate/runtime; they must not consult a host cache or fetch a browser.
     """
-    estate = LAB.parent / ".estate/runtime"
+    estate = CODE_ROOT.parent / ".estate/runtime"
     env_cache = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-    env_browse = os.environ.get("LAB_BROWSE")
+    env_browse = os.environ.get("CS_BROWSE")
     if env_cache:
         cache = Path(env_cache)
     elif (estate / "ms-playwright").is_dir():
@@ -81,9 +81,9 @@ def main():
     if not consumer.is_symlink():
         raise ValueError("scheduled task setup link is missing")
     declared = str(request.get("setup") or metadata(task).get("setup") or "").strip()
-    from _estate_io import lab_path, link_target  # setups under <lab>/ledger live in the state root
-    linked = link_target(LAB, consumer).resolve(strict=False)
-    prepared = (lab_path(LAB, declared) if declared else linked).resolve(strict=False)
+    from _estate_io import code_path, link_target  # setups under <code-root>/ledger live in the state root
+    linked = link_target(CODE_ROOT, consumer).resolve(strict=False)
+    prepared = (code_path(CODE_ROOT, declared) if declared else linked).resolve(strict=False)
     if linked != prepared:
         raise ValueError("scheduled task setup link does not target its prepared setup")
     if not request.get("require_ready", True):
@@ -95,7 +95,7 @@ def main():
     expected = str(request.get("expected_head") or "").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", expected):
         raise ValueError("expected_head must be one Git object id")
-    actual = git(prepared, "rev-parse", "refs/lab/base")
+    actual = git(prepared, "rev-parse", "refs/cs/base")
     if actual != expected:
         raise ValueError("prepared setup base does not match destination HEAD")
     if git(prepared, "rev-parse", "HEAD") != expected:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Fixture-only tool for the runner characterisation cases. Not a lab tool:
+# Fixture-only tool for the runner characterisation cases. Not a code_root tool:
 # it exists so the fixtures can exercise the tool contract (stdin JSON, cwd,
 # combined output, clipping, non-zero exit, timeouts, a SIGKILL) without depending on
 # what a real tool happens to print.

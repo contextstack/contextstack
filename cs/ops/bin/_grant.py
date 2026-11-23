@@ -7,8 +7,8 @@ from pathlib import Path
 from _estate_io import estate_id, estate_matches, state_dir  # dev grants continue on workstation through the alias
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
-GRANTS = LAB / "grants"
+CODE_ROOT = HERE.parent.parent
+GRANTS = CODE_ROOT / "grants"
 STATUSES = {"active", "revoked"}
 RFC3339_UTC = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$"
@@ -52,7 +52,7 @@ def resolved(raw):
     if not str(path):
         return None
     if not path.is_absolute():
-        path = LAB / path
+        path = CODE_ROOT / path
     return path.resolve()
 
 
@@ -321,7 +321,7 @@ def load_file(path, gid):
 def live_error(grant, commit=False):
     if not grant:
         return "grant not found"
-    if grant.get("estate") is not None and not estate_matches(LAB, grant["estate"]):
+    if grant.get("estate") is not None and not estate_matches(CODE_ROOT, grant["estate"]):
         return "grant estate mismatch"
     if grant.get("status") != "active":
         return "revoked"
@@ -338,12 +338,12 @@ def remedy(code, grant=None, gid=""):
     grant = grant or {}
     name = str(grant.get("id") or gid or "").strip() or "grant"
     try:
-        lab = estate_id(LAB)
+        estate = estate_id(CODE_ROOT)
     except (ValueError, OSError, FileNotFoundError):
-        lab = "?"
+        estate = "?"
     if code == "grant estate mismatch":
         ge = str(grant.get("estate") or "").strip() or "?"
-        return "grant %s is estate: %s; this lab is %s; run on %s." % (name, ge, lab, ge)
+        return "grant %s is estate: %s; this estate is %s; run on %s." % (name, ge, estate, ge)
     if code == "expired":
         return "grant %s expired; renew by tag." % name
     if code in ("grant not found", "grant id mismatch"):
@@ -363,12 +363,12 @@ def remedy(code, grant=None, gid=""):
     return "%s; renew by tag." % code
 
 
-def record_refusal(lab, *, code, message, grant=None, gid="", context=None):
+def record_refusal(code_root, *, code, message, grant=None, gid="", context=None):
     """Append a refusal receipt; return its id for factory_gap evidence."""
     from _estate_io import append_jsonl
     import time
-    lab = Path(lab)
-    shelf = state_dir(lab) / "refusals.jsonl"
+    code_root = Path(code_root)
+    shelf = state_dir(code_root) / "refusals.jsonl"
     shelf.parent.mkdir(parents=True, exist_ok=True)
     rid = str(time.time_ns())
     row = {
@@ -420,7 +420,7 @@ def schedule_error(schedule):
             return "schedule %s: a node schedule cannot name a destination root (no clone workspace yet)." % schedule.get("id")
         error = live_error(dict(grant, estate=None))
         return remedy(error, grant=grant, gid=gid) if error else ""
-    if not estate_matches(LAB, grant["estate"]):
+    if not estate_matches(CODE_ROOT, grant["estate"]):
         return remedy("grant estate mismatch", grant=grant, gid=gid)
     error = live_error(grant, commit=bool(schedule.get("root")))
     if error:

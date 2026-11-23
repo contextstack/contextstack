@@ -11,44 +11,37 @@ cancel {job_id}: the marker <state>/node/cancelled/<job> is written first, so jo
 admission and every trial skip the job from then on. Then, from the dispatch shelf:
   over already (a terminal row)    already_finished (or stopped, when the row is this cancel's own)
   not pulled, or queued            a terminal row {state: cancelled} under dispatch.lock: stopped
-  running                          tick's children are stopped: for a gateway work order (the `executor` op) first
-                                   POST <CSGATEWAY_LAB_ENDPOINT>/<job>/cancel (GATEWAY_CANCEL, below), then SIGTERM;
-                                   the runner finalizes (terminal_state cancelled, cancel_reason SIGTERM), and after
-                                   LAB_CANCEL_GRACE_S (30) anything left gets SIGKILL. tick writes the terminal row
+  running                          SIGTERM to the machine launcher, which forwards it to the harness.
+                                   The harness cancels its CLI work order through the gateway. After
+                                   CS_CANCEL_GRACE_S anything left gets SIGKILL. tick writes the terminal row
                                    {state: cancelled} (or this module does, when tick is gone): stopped
 Then spool-send delivers job_terminal (row_line.state cancelled) after the outcome is reported.
 schedule_change {schedule_id, expect_revision, set}: applied only at the expected revision (_node_schedules).
 Any other kind is refused.
 
-GATEWAY_CANCEL is the node side of the gateway's cancel call, stubbed in the tests: POST
-<endpoint>/<LAB_JOB_ID>/cancel {"reason"} (Bearer CSGATEWAY_AUTH_TOKEN when set) → 200 {"cancelled": bool}; 404 or
-no answer means nothing to cancel there. Closing the executor op's request also stops the work order today.
 """
 import fcntl
-from _node_env import node_env
 import json
 import os
 import re
 import signal
 import subprocess
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 from _estate_io import write_atomic
 
 from _director_client import DirectorUnreachable
 from _dispatch import TERMINAL, qid
-from _estate_io import append_jsonl, pid_live, read_jsonl
+from _estate_io import append_jsonl, read_jsonl
+from _job_identity import _pid_identity, _signal_pid
 from _job_reason import reason_of
 from _node_spool import spool_job_terminal
 from _roots import outbox_dir
 
 CONTROL_ID = re.compile(r"ctl_[0-9a-z]{26}")  # lowercase base32 (director-rs: a ULID)
 JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
-GRACE_S = float(os.environ.get("LAB_CANCEL_GRACE_S") or 30)
-GATEWAY_CANCEL = "{endpoint}/{job_id}/cancel"
+GRACE_S = float(os.environ.get("CS_CANCEL_GRACE_S") or 30)
 META = ("spec", "task", "schedule_id", "slot", "schedule_slot", "schedule_date", "schedule_timezone", "grant", "lane")
 
 
@@ -171,14 +164,19 @@ def cancel(state, job_id, cid):
                 return "applied", "stopped", "stopped earlier by this cancel", None
             return "applied", "already_finished", "the job was already %s" % over.get("state"), None
         running = next((r for r in reversed(rows) if r.get("state") == "running"), None)
-        if running is None or not pid_live(int(running.get("pid") or 0)):
+        tick = int((running or {}).get("pid") or 0)
+        stored = (running or {}).get("pid_identity")
+        identity = tuple(stored) if isinstance(stored, list) else stored
+        current = _pid_identity(tick) if tick else None
+        if current is not None and identity is None:
+            return "refused", "refused", "cannot verify the running dispatcher's identity", None
+        if current is None or current != identity:
             where = "queued" if rows else "not pulled yet"
             close(state, job_id, cid, rows[-1] if rows else {}, "cancelled: %s; it will not run" % where)
             return "applied", "stopped", "the job was %s; it will never run here" % where, None
-        tick = int(running["pid"])
-    detail = stop_children(tick, job_id)
+    detail = stop_children(tick, identity)
     deadline = time.time() + 30
-    while time.time() < deadline and pid_live(tick) and not terminal_row(shelf, job_id):
+    while time.time() < deadline and _pid_identity(tick) == identity and not terminal_row(shelf, job_id):
         time.sleep(0.2)
     if not terminal_row(shelf, job_id):
         with locked(state):
@@ -221,52 +219,78 @@ def close(state, job_id, cid, prior, stop):
     spool_job_terminal(outbox_dir(), shelf, row)
 
 
-def children(pid):
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
-    found = []
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) >= 2 and parts[1] == str(pid) and parts[0].isdigit():
-            found.append((int(parts[0]), parts[2] if len(parts) > 2 else ""))
-    return found
+def process_rows():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid="], capture_output=True, text=True, check=True).stdout
+    return {pid: (parent, group) for pid, parent, group in
+            (map(int, line.split()) for line in out.splitlines())}
 
 
-def gateway_cancel(job_id):
-    """The gateway's work-order cancel (GATEWAY_CANCEL above); returns a word for the detail."""
-    endpoint = os.environ.get("CSGATEWAY_LAB_ENDPOINT", "http://127.0.0.1:9200/v1/ai/lab-execute").rstrip("/")
-    request = urllib.request.Request(GATEWAY_CANCEL.format(endpoint=endpoint, job_id=job_id), method="POST",
-                                     data=json.dumps({"reason": "director cancel"}).encode(),
-                                     headers={"Content-Type": "application/json"})
-    token = node_env().get("CSGATEWAY_AUTH_TOKEN")
-    if token:
-        request.add_header("Authorization", "Bearer " + token)
-    try:
-        with urllib.request.urlopen(request, timeout=5) as answer:
-            return "gateway cancelled" if json.loads(answer.read() or b"{}").get("cancelled") else "gateway had none"
-    except urllib.error.HTTPError as error:
-        return "gateway had none" if error.code == 404 else "gateway cancel HTTP %d" % error.code
-    except (OSError, ValueError) as error:
-        return "gateway cancel unavailable (%s)" % error
+def launcher_targets(tick, identity):
+    """Bracket membership with identities and pin each member across escalation."""
+    if _pid_identity(tick) != identity:
+        return []
+    rows = process_rows()
+    launchers = {pid for pid, (parent, _) in rows.items() if parent == tick}
+    candidates = {pid: _pid_identity(pid) for pid, (_, group) in rows.items()
+                  if pid in launchers or group in launchers and rows[group][1] == group}
+    verified = process_rows()
+    if _pid_identity(tick) != identity:
+        return []
+    groups = {}
+    for pid in launchers:
+        if verified.get(pid) != rows[pid] or candidates[pid] is None or _pid_identity(pid) != candidates[pid]:
+            continue
+        # API runners can share tick's group. Signal only the direct child then.
+        groups[pid] = {pid: candidates[pid]}
+    for pid, birth in candidates.items():
+        group = rows[pid][1]
+        if (pid not in groups and group in groups and rows[group][1] == group
+                and birth is not None and verified.get(pid, (None, None))[1] == group
+                and _pid_identity(pid) == birth):
+            groups[group][pid] = birth
+    return [(pid if rows[pid][1] == pid else None, members) for pid, members in groups.items()]
 
 
-def stop_children(tick, job_id):
-    """SIGTERM tick's children (a gateway work order is cancelled there first), SIGKILL what outlives the grace."""
-    notes, kids = [], children(tick)
-    if any("/executor" in cmd for _, cmd in kids):
-        notes.append(gateway_cancel(job_id))
-    for pid, _ in kids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    deadline = time.time() + GRACE_S
-    while time.time() < deadline and any(pid_live(pid) for pid, _ in kids):
+def signal_launcher(members, sig):
+    sent = [_signal_pid(pid, birth, sig) for pid, birth in members.items()]
+    return any(sent)
+
+
+def escalation_members(group, members):
+    """Pick up forks during grace while a verified member still anchors the group."""
+    if group is None:
+        return members
+
+    def anchors(rows):
+        return {pid for pid, birth in members.items()
+                if rows.get(pid, (None, None))[1] == group and _pid_identity(pid) == birth}
+
+    rows = process_rows()
+    before = anchors(rows)
+    if not before:
+        return members
+    candidates = {pid: _pid_identity(pid) for pid, (_, pgid) in rows.items() if pgid == group}
+    verified = process_rows()
+    if not before.intersection(anchors(verified)):
+        return members
+    return {**members, **{pid: birth for pid, birth in candidates.items()
+                          if pid not in members and verified.get(pid, (None, None))[1] == group
+                          and birth is not None and _pid_identity(pid) == birth}}
+
+
+def stop_children(tick, identity):
+    """Keep waiting on verified members even after their launcher exits."""
+    stopped = [(group, members) for group, members in launcher_targets(tick, identity)
+               if signal_launcher(members, signal.SIGTERM)]
+    deadline = time.monotonic() + GRACE_S
+    left = [(group, members) for group, members in stopped if signal_launcher(members, 0)]
+    while left and time.monotonic() < deadline:
         time.sleep(0.2)
-    left = [pid for pid, _ in kids if pid_live(pid)]
-    for pid in left:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    notes.append("SIGTERM to %d process(es)%s" % (len(kids), ", SIGKILL to %d after %ds" % (len(left), GRACE_S) if left else ""))
-    return "running; " + "; ".join(notes) if kids else "running; between trials, no further trial starts"
+        left = [(group, members) for group, members in left if signal_launcher(members, 0)]
+    killed = sum(signal_launcher(escalation_members(group, members), signal.SIGKILL) for group, members in left)
+    if not stopped:
+        return "running; between trials, no further trial starts"
+    detail = "running; SIGTERM to %d process(es)" % len(stopped)
+    if killed:
+        detail += ", SIGKILL to %d after %gs" % (killed, GRACE_S)
+    return detail

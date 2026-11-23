@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_lib"))
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 ROOT=Path(__file__).resolve().parents[4]
 PI=[{'type':'agent_start'}, {'type':'message_end','message':{'role':'assistant','stopReason':'stop','usage':{'input':1}}}, {'type':'agent_end','messages':[{'role':'assistant','stopReason':'stop','usage':{'input':1}}]}, {'type':'agent_settled'}]
 OP=[{'type':'step_start','sessionID':'s','part':{'type':'step-start'}},{'type':'step_finish','sessionID':'s','part':{'type':'step-finish','reason':'stop'}}]
@@ -36,11 +37,11 @@ def run_case(case):
   binary=root/'fake-cli';data={'pi':PI,'opencode':OP,'opencode-go':OP2,'grok':GROK}[name]
   script='#!'+sys.executable+'\nREAL_HOME='+repr(str(home))+'\nNAME='+repr(name)+'\nMODE='+repr(mode)+'\nDATA='+repr(data)+'\n'+r'''import os,sys,json,time,signal,sqlite3,subprocess
 from pathlib import Path
-ws=Path.cwd(); marker=ws/'.lab-tmp/calls';marker.parent.mkdir(exist_ok=True)
+ws=Path.cwd(); marker=ws/'.cs-tmp/calls';marker.parent.mkdir(exist_ok=True)
 with marker.open('a') as f:f.write('call\n')
 if '--version' in sys.argv:print('fixture' if MODE!='version' else 'wrong');sys.exit()
 home=Path(os.environ['HOME'])
-assert home==ws/'.lab-tmp/cli-home'
+assert home==ws/'.cs-tmp/cli-home'
 assert 'ANTHROPIC_API_KEY' not in os.environ
 for path in [Path(REAL_HOME)/'escape',ws.parent/'escape',home/'pinned.json']:
  try:path.write_text('forbidden')
@@ -85,8 +86,8 @@ if MODE=='exit':sys.exit(3)
 '''
   binary.write_text(script);binary.chmod(0o755)
   cfg=root/'config';cfg.mkdir();(cfg/'ESTATE').write_text('dev\n')
-  env={k:v for k,v in hermetic_env().items() if not k.startswith(('LAB_','GIT_','META_','MUSE_','XAI_','GROK_'))}
-  env.update(LAB_CONFIG_ROOT=str(cfg),HOME=str(home),ANTHROPIC_API_KEY='private-canary',OPENCODE_CONFIG='/foreign',
+  env={k:v for k,v in hermetic_env().items() if not k.startswith(('CS_','GIT_','META_','MUSE_','XAI_','GROK_'))}
+  env.update(CS_CONFIG_ROOT=str(cfg),HOME=str(home),ANTHROPIC_API_KEY='private-canary',OPENCODE_CONFIG='/foreign',
                GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1',GIT_AUTHOR_NAME='fixture',GIT_AUTHOR_EMAIL='f@l',
                GIT_COMMITTER_NAME='fixture',GIT_COMMITTER_EMAIL='f@l')
   profiles=json.loads((ops/'cli-profiles.json').read_text());p=profiles[name]
@@ -101,7 +102,7 @@ if MODE=='exit':sys.exit(3)
   (task/'goal.md').write_text('Write answer.txt containing done.\n')
   (task/'check').write_text('#!/bin/sh\n[ "$(cat answer.txt)" = done ]\n');(task/'check').chmod(0o755)
   if key is not None:env[KEYS[name]]=key
-  r=subprocess.run([sys.executable,str(ops/'_executor.py')],cwd=estate,env=env,input=json.dumps({'executor':name,'task':str(task),'timeout_s':1 if mode=='timeout' else 15}),text=True,capture_output=True,timeout=40)
+  r=subprocess.run(cli_command(sys.executable, ops/'_executor.py'),cwd=estate,env=env,input=json.dumps({'executor':name,'task':str(task),'timeout_s':1 if mode=='timeout' else 15}),text=True,capture_output=True,timeout=40)
   rows=[json.loads(s) for s in (estate/'ledger/ledger.jsonl').read_text().splitlines()]
   assert len(rows)==1,(case,r.stdout,r.stderr)
   row=rows[0];run=estate/row['transcript'];ws=run/'workspace'
@@ -118,7 +119,7 @@ if MODE=='exit':sys.exit(3)
   else:
    assert r.returncode and row['verdict']!='pass' and not row.get('branch'),(case,row)
    if key is not None or mode in ('expired','api','malformed-auth','binary','nodb'):
-    assert not row['cli_invoked'] and not (ws/'.lab-tmp/calls').exists(),(case,row)
+    assert not row['cli_invoked'] and not (ws/'.cs-tmp/calls').exists(),(case,row)
    if mode=='timeout':
     time.sleep(3.2);assert not (ws/'survivor').exists()
   assert not (home/'escape').exists() and not (run/'escape').exists()

@@ -1,7 +1,31 @@
 {
   "runtime": "python3",
-  "sandbox": {"net": "none"},
-  "provenance": "output clip ported from pi packages/coding-agent/src/core/tools/truncate.ts (2000 lines / 50KB). On clip, full stdout+stderr spills to workspace .lab-out/<n>.txt. Subprocess timeout is LAB_TOOL_TIMEOUT_SECONDS from the runner (minus 3s) so exec can emit `exec: timed out after N s` (exit 124) before the runner's wall clock.",
-  "description": "Run a command (argv array, no shell) in the workspace. Absolute paths and '..' in argv are denied. Host writes are denied: macOS sandbox-exec (file-write* only under cwd); Linux equivalent is `bwrap --ro-bind / / --bind $PWD $PWD --chdir $PWD` (bubblewrap). There is NO shell: `cd` and `&&` do not work as argv — for compound commands or subdirectories use {cmd: [\"sh\", \"-c\", \"cd subdir && make test\"]}. Args: {cmd: [...]}. Output is truncated to 2000 lines or 50KB (whichever is hit first); when clipped, the full output is written to .lab-out/<n>.txt and that path is named in the observation so it can be fs_read back.",
-  "inputSchema": {"type": "object", "properties": {"cmd": {"type": "array", "items": {"type": "string"}}}, "required": ["cmd"]}
+  "sandbox": {
+    "net": "none"
+  },
+  "provenance": "output clip ported from pi packages/coding-agent/src/core/tools/truncate.ts (2000 lines / 50KB). On clip, full stdout+stderr spills to workspace .cs-out/<n>.txt. Subprocess timeout is CS_TOOL_TIMEOUT_SECONDS from the runner (minus 3s) so exec can emit `exec: timed out after N s` (exit 124) before the runner's wall clock.",
+  "description": "Run a command inside the workspace sandbox. Pass {\"cmd\":[\"ls\",\"docs\"]} for direct argv, or {\"cmd\":\"cd docs && ls | head\"} (also accepts a bare JSON string) for /bin/sh syntax. With argv, use workspace-relative paths or absolute paths inside the workspace or read-only repository view. Parent traversal in argv is denied. Output over 2000 lines or 50KB is clipped and the full output is saved under .cs-out/.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "cmd": {
+        "anyOf": [
+          {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "string",
+            "minLength": 1
+          }
+        ]
+      }
+    },
+    "required": [
+      "cmd"
+    ]
+  }
 }

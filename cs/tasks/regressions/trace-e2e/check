@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Step 0 tracing gate against the real run producers and checker."""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from urllib.request import ProxyHandler, build_opener, install_opener
+from datetime import datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+sys.path[:0] = [str(HERE.parent / "_lib"), str(HERE.parents[2] / "ops/bin")]
+from scratch import scratch_dir
+
+import estate
+from director_fixture import director, finish_job, report_run, start_job, start_work, work_trace
+
+REPO = estate.REPO
+BASE = """id: trace-case
+model: {model}
+system: prompts/coder-min.md
+tools: {tools}
+context: []
+mcp: []
+post_turn: []
+pre_tool: []
+budget: {{turns: {turns}, tool_calls: {calls}, usd: {usd}, seconds: {seconds}}}
+tasks: [tasks/fx]
+trials: 1
+hypothesis: trace-e2e
+"""
+
+
+def spec(model="fake-paid", *, turns=2, calls=0, usd=1, seconds=15):
+    return BASE.format(model=model, turns=turns, calls=calls, usd=usd, seconds=seconds,
+                       tools="[fx_tool]" if calls else "[]")
+
+
+def check_trace(stack, spans, run_dir, result, *, missing=(), findings=(), **extra):
+    merged = stack.scratch / "merged.jsonl"
+    merged.write_text("".join(json.dumps(s) + "\n" for s in spans))
+    metadata = stack.scratch / "metadata.json"
+    estate.write_json(metadata, {"run_directories": {run_dir.name: str(run_dir)}, **extra})
+    proc = subprocess.run([sys.executable, str(REPO / "tracing/check-trace"), str(merged), str(metadata)],
+                          env=stack.env, capture_output=True, text=True, timeout=15)
+    assert proc.returncode in (0, 1), proc.stderr or proc.stdout
+    actual = json.loads(proc.stdout)
+    expected_exit = int(result == "incomplete")
+    actual_kinds = {item["kind"] for item in actual["findings"]}
+    assert (proc.returncode, actual["result"], actual["missing"], actual_kinds) == (
+        expected_exit, result, sorted(missing), set(findings)), actual
+    return actual["findings"]
+
+
+def spans_of(spans, kind):
+    return [s for s in spans if s["kind"] == kind]
+
+
+def one(spans, kind, **attributes):
+    matches = [s for s in spans_of(spans, kind)
+               if all(s["attributes"].get(k) == v for k, v in attributes.items())]
+    assert len(matches) == 1, f"expected one {kind} {attributes}, found {matches}"
+    return matches[0]
+
+
+def sends(spans):
+    return one(spans, "model_call")["attributes"]["sends"]
+
+
+def clean_run(stack, config):
+    run = stack.run_spec(config)
+    spans, _ = stack.merge_trace(run)
+    check_trace(stack, spans, run, "complete")
+    assert one(spans, "run")["outcome"] == "finalized"
+    one(spans, "finalization")
+    return run, spans
+
+
+def retry(stack, label):
+    run, spans = clean_run(stack, spec())
+    one(spans, "turn", turn=1)
+    one(spans, "model_call")
+    assert [s["outcome"] for s in spans_of(spans, "provider_attempt")] == ["retryable_failure", "success"]
+    assert all(s["duration_ms"] > 0 for s in spans_of(spans, "provider_attempt"))
+    one(spans, "settlement", partial=False)
+    one(spans, "finalization", verdict="pass")
+    if label == "H":
+        attempt = one(spans, "provider_attempt", attempt=2)
+        exchange = one(spans, "gateway_exchange")
+        check_trace(stack, estate.drop_branch(spans, attempt["span_id"]), run, "incomplete",
+                    missing=[f"2: {run.name}/request {exchange['attributes']['request_id']} send 1 attempt 2"])
+    elif label == "V":
+        pointer = one(spans, "model_call")["attributes"]["content"]["reply"]
+        path = run / pointer["file"]
+        lines = path.read_bytes().splitlines(keepends=True)
+        lines[pointer["line"] - 1] = b"tampered\n"
+        path.write_bytes(b"".join(lines))
+        check_trace(stack, spans, run, "complete_with_findings", findings=["content_hash_mismatch"])
+    elif label == "W":
+        harness_count = len(estate.jsonl(run / "trace.jsonl"))
+        for span in spans[harness_count:]:
+            span["attributes"]["machine"] = "clock-skew-fixture"
+            for key in ("start", "end"):
+                timestamp = datetime.fromisoformat(span[key].replace("Z", "+00:00"))
+                span[key] = (timestamp + timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
+        check_trace(stack, spans, run, "complete_with_findings", findings=["clock_skew"])
+
+
+def refusal(stack):
+    _, spans = clean_run(stack, spec(usd=0.000001))
+    exchange = one(spans, "gateway_exchange", attempts_started=0)
+    assert exchange["outcome"] == "refused_before_provider_contact", exchange
+    assert exchange["attributes"]["refusal_code"], exchange
+    assert not spans_of(spans, "provider_attempt") and not spans_of(spans, "settlement")
+
+
+def slow_stream(stack):
+    _, spans = clean_run(stack, spec())
+    attempt = one(spans, "provider_attempt")
+    opened = one(spans, "connection_open")
+    assert attempt["duration_ms"] >= 400, attempt
+    start, connected = (datetime.fromisoformat(s.replace("Z", "+00:00"))
+                        for s in (attempt["start"], opened["start"]))
+    assert 0 <= (connected - start).total_seconds() < 0.25, (attempt, opened)
+
+
+def slow_tool(stack):
+    _, spans = clean_run(stack, spec(turns=2, calls=1))
+    tool = one(spans, "tool_process")
+    turn = one(spans, "turn")
+    assert turn["duration_ms"] >= tool["duration_ms"] >= 200, (turn, tool)
+    assert one(spans, "model_call")["duration_ms"] < tool["duration_ms"]
+
+
+def missing_run(stack):
+    run, _ = clean_run(stack, spec())
+    # Rule 5 allows the node's finalized direct runs as inventory.
+    check_trace(stack, [], run, "incomplete", finalized_runs=[{"run_id": run.name}],
+                missing=[f"5: run {run.name} trace with coverage"])
+
+
+def missing_turn(stack):
+    run, spans = clean_run(stack, spec(turns=3, calls=3))
+    turn = one(spans, "turn", turn=2)
+    check_trace(stack, estate.drop_branch(spans, turn["span_id"]), run, "incomplete",
+                missing=[f"4: {run.name}/turn 2", f"4: {run.name}/terminal tool_calls"])
+
+
+def paid_partial(stack, label):
+    with director(stack.scratch, label) as ctx:
+        node, job_id = start_job(ctx)
+        run = stack.run_spec(spec(seconds=5 if label == "J" else 15), job_id=job_id)
+        spans, _ = stack.merge_trace(run, exchanges=1)
+        inventory, charge = report_run(ctx, node, job_id, run)
+    exchange = one(spans, "gateway_exchange", attempts_started=2 if label == "G" else 1,
+                   client_saw_output=True, billing_source="pay_as_you_go")
+    assert exchange["outcome"] == {"G": "stream_fault", "J": "deadline"}[label], exchange
+    if label == "G":
+        assert one(spans, "provider_attempt", attempt=1)["outcome"] == "retryable_failure"
+    one(spans, "usage", partial=True)
+    settled = one(spans, "settlement", partial=True)["attributes"]["charged_usd"]
+    counter = json.loads((stack.gw_home / ".contextstack/gateway/spend.json").read_text())
+    budget = sum(Decimal(str(s["day_usd"])) for s in counter["sources"].values())
+    assert Decimal(str(settled)) == budget > 0, (settled, counter)
+
+    job = {"job_id": job_id, "charged_usd": charge}
+    terminal_charge = one(spans, "run")["attributes"]["terminal"]["charged_usd"]
+    assert Decimal(str(settled)) == Decimal(str(terminal_charge)) == Decimal(str(charge)), (
+        f"gateway settled {settled}, harness reported {terminal_charge}, Director settled {charge}"
+    )
+    check_trace(stack, spans, run, "complete", finalized_runs=[inventory], settled_jobs=[job])
+
+
+def unknown_tool(stack):
+    _, spans = clean_run(stack, spec(calls=1))
+    tool = one(spans, "tool_call")
+    assert tool["outcome"] == "unknown_tool" and tool["attributes"]["error"], tool
+    assert one(spans, "run")["attributes"]["terminal"]["tool_calls"] == 1
+    assert not spans_of(spans, "tool_process")
+
+
+def unreachable(stack):
+    _, spans = clean_run(stack, spec())
+    one(spans, "turn", turn=1)
+    assert sends(spans) == [{"send_index": 1, "outcome": "connection_failed"}]
+    assert not spans_of(spans, "gateway_exchange")
+
+
+def no_wallet_charge(stack, model, billing):
+    run = stack.run_spec(spec(model))
+    spans, _ = stack.merge_trace(run)
+    exchange = one(spans, "gateway_exchange", billing_source=billing, wallet_charge_usd=0)
+    assert exchange["outcome"] == "completed", exchange
+    usage = one(spans, "usage", partial=False)
+    if billing == "subscription":
+        assert usage["attributes"]["estimated_usd"] > 0, usage
+    assert not spans_of(spans, "settlement")
+    terminal = one(spans, "run")["attributes"]["terminal"]
+    assert terminal["charged_usd"] == 0, terminal
+    check_trace(stack, spans, run, "complete")
+
+
+def reported_subscription(stack):
+    with director(stack.scratch, "P") as ctx:
+        node, job_id = start_job(ctx)
+        run = stack.run_spec(spec("fake-sub"), job_id=job_id)
+        spans, _ = stack.merge_trace(run)
+        one(spans, "gateway_exchange", billing_source="subscription",
+            provider_charge_usd=0.02, wallet_charge_usd=0.02)
+        one(spans, "settlement", partial=False, basis="provider_reported", charged_usd=0.02)
+        terminal = json.loads((run / "terminal.json").read_text())
+        assert terminal["cost_usd"] == terminal["provider_reported_usd"] == 0.02, terminal
+        assert terminal["est_usd"] > 0 and terminal["est_basis"] == "rate", terminal
+        inventory, charge = report_run(ctx, node, job_id, run, expected_usage={
+            "charged_usd": 0.02, "provider_reported_usd": 0.02,
+            "est_usd": terminal["est_usd"], "est_basis": "rate",
+        })
+        assert Decimal(str(charge)) == Decimal("0.02"), charge
+        check_trace(stack, spans, run, "complete", finalized_runs=[inventory],
+                    settled_jobs=[{"job_id": job_id, "charged_usd": charge}])
+
+
+def late_delivery(stack, label):
+    fallback = label == "O"
+    run = stack.run_spec(spec("box-model" if fallback else "fake-paid", seconds=2))
+    index = 2 if fallback else 1
+    spans, _ = stack.merge_trace(run, exchanges=index)
+    finding_kinds = ["delivery_unconfirmed"]
+    if not fallback:
+        finding_kinds.append("spend_discrepancy")
+    findings = check_trace(stack, spans, run, "complete_with_findings", findings=finding_kinds)
+    expected = [{"send_index": 1, "outcome": "delivered"}] if fallback else []
+    assert sends(spans) == expected + [{"send_index": index, "outcome": "unknown"}], sends(spans)
+    request_id = one(spans, "model_call")["attributes"]["request_id"]
+    assert findings[0] == {"kind": "delivery_unconfirmed", "trace_id": run.name,
+                           "request_id": request_id, "send_index": index, "gateway_found": True}, findings
+    if not fallback:
+        settled = Decimal(str(one(spans, "settlement", partial=True,
+                                  basis="reservation_estimate")["attributes"]["charged_usd"]))
+        assert settled > 0
+        assert findings[1] == {"kind": "spend_discrepancy", "trace_id": run.name,
+                               "request_ids": [request_id], "settled_usd": str(settled),
+                               "terminal_usd": "0"}, findings
+    if fallback:
+        assert [s["attributes"]["send_index"] for s in spans_of(spans, "gateway_exchange")] == [2, 1]
+        assert one(spans, "gateway_exchange", send_index=1)["outcome"] == "refused_before_provider_contact"
+
+
+def observed(stack):
+    from action_approval import cli_test
+    run = cli_test(stack, go=stack.scenario == "U")
+    spans, _ = stack.merge_trace(run)
+    check_trace(stack, spans, run, "complete")
+    assert one(spans, "run", coverage="observed")["outcome"] == "finalized"
+    one(spans, "cli_process", exit_status=0, received_events=3, usage_reported=True)
+    assert len(spans_of(spans, "cli_event")) == 3
+    one(spans, "cli_usage", source="claude_code_native")
+    terminal = json.loads((run / "terminal.json").read_text())
+    assert terminal["est_usd"] > 0 and terminal["est_basis"] == "api_list" and terminal["cost_usd"] == 0, terminal
+    assert one(spans, "cli_work_order", job_id="trace-cli")["outcome"] == "child_exit"
+    one(spans, "finalization", verdict="pass")
+
+
+def cancelled_cli(stack):
+    run = stack.run_cli(cancel=True)
+    spans, _ = stack.merge_trace(run)
+    assert one(spans, "cli_work_order", job_id="trace-cancel")["outcome"] == "cancelled"
+    one(spans, "finalization", verdict="fail")
+
+
+def work(stack, label):
+    with director(stack.scratch, label) as ctx:
+        node, client, task, job_id, origin = start_work(ctx)
+        run = stack.run_spec(spec(), job_id=job_id)
+        spans, _ = stack.merge_trace(run)
+        one(spans, "finalization", verdict="pass")
+        inventory, _ = report_run(ctx, node, job_id, run)
+        trace = work_trace(ctx, node, client, task, run.name, origin, intervene=label == "T")
+        check_trace(stack, spans, run, "complete", finalized_runs=[inventory], work_traces=[trace])
+        if label == "S":
+            del trace["jobs"][1]["decisions"]
+            check_trace(stack, spans, run, "incomplete",
+                        missing=[f"5w: task {task} job {job_id} decision"],
+                        finalized_runs=[inventory], work_traces=[trace])
+
+
+def native_lane(stack, *, read_only=False):
+    from _director_client import Client
+    from _node_intake import take
+    from _vitals import agent_capabilities
+    sys.path.insert(0, str(REPO / "cs/scripts"))
+    from cs_mcp import Director, Tools
+    from unittest.mock import patch
+
+    root = stack.estate
+    checkout = stack.scratch / "main"
+    checkout.mkdir()
+
+    def git(cwd, *args):
+        return subprocess.check_output(["git", *args], cwd=cwd, env=stack.env, text=True).strip()
+
+    git(checkout, "init", "-q", "-b", "main")
+    git(checkout, "config", "user.name", "Trace Fixture")
+    git(checkout, "config", "user.email", "trace@example.invalid")
+    (checkout / "facts.txt").write_text("committed snapshot fact\n")
+    (checkout / "outside").symlink_to("../")
+    git(checkout, "add", "facts.txt", "outside")
+    git(checkout, "commit", "-qm", "base")
+    (checkout / "facts.txt").write_text("dirty checkout fact\n")
+    base = git(checkout, "rev-parse", "HEAD")
+    repos = stack.scratch / "repos.json"
+    estate.write_json(repos, {"sample": str(checkout)})
+    for name in ("fs_read.json", "fs_write.json", "fs_write", "_calllog.py", "exec.json",
+                 "request_action", "request_action.json"):
+        shutil.copy2(REPO / "cs/tools/bin" / name, root / "tools/bin" / name)
+    shutil.copy2(REPO / "cs/tools/bin/exec", root / "tools/bin/exec")
+    tools_bin = os.environ.get("CS_TOOLS_BIN") or REPO / "target/release/cs-tools"
+    for name in ("fs_read.json", "fs_edit.json", "repo_search.json"):
+        descriptor = json.loads((REPO / "cs/tools/bin" / name).read_text())
+        estate.write_json(root / "tools/bin" / name, dict(descriptor, bin=str(tools_bin)))
+    if read_only:
+        # Use this fixture's interpreter inside the sandbox, even when it lives outside /usr.
+        python = Path(sys.executable).resolve()
+        policy_path = root / "policy/sandbox.json"
+        policy = json.loads(policy_path.read_text())
+        for paths in policy["runtime_read"].values():
+            paths.extend([str(Path(sys.base_prefix).resolve()), str(python)])
+        estate.write_json(policy_path, policy)
+        for name in ("exec", "fs_write"):
+            tool_path = root / "tools/bin" / name
+            _, _, body = tool_path.read_text().partition("\n")
+            tool_path.write_text(f"#!{python}\n{body}")
+    else:
+        fake_bin = stack.scratch / "cargo-bin"
+        fake_bin.mkdir()
+        cargo = fake_bin / "cargo"
+        cargo.write_text('#!/bin/sh\ntest "$CARGO_NET_OFFLINE" = true && echo fixture-cargo\n')
+        cargo.chmod(0o755)
+        estate.write_json(repos.with_name("toolchains.json"),
+                          [{"name": "cargo", "bin": str(fake_bin), "rustup": str(fake_bin),
+                            "toolchain": str(fake_bin)}])
+    # The lane case pins environment wiring. The repo-view case exercises OS confinement.
+    env = dict(stack.child_env, CS_RUNNER_BIN=str(estate.runner_bin()), CS_REPOS_FILE=str(repos),
+               CS_TOOLS_BIN=os.environ.get("CS_TOOLS_BIN") or str(REPO / "target/release/cs-tools"),
+               CS_TOOL_PREFIX="")
+    with director(stack.scratch, "Z" if read_only else "Y") as ctx:
+        node = ctx.node2()
+        receiver = {"url": ctx.target.url, "installation": node.installation}
+        node_client = Client(receiver, token=node.token)
+        with patch.dict(os.environ, env, clear=True):
+            caps = agent_capabilities(root)
+            assert "local-coder" in caps["agent_capabilities"]["harness_models"], caps
+            assert node.status([], **caps).status == 200
+            client = Director(ctx.target.url, ctx.target.data / "local-credential")
+            lead = Tools(client, node.name)
+            if read_only:
+                submitted = lead.start_task(
+                    "Native researcher", "Read facts.txt from the snapshot and write answer.md.",
+                    model="harness:local-coder", agent="researcher", repo="sample",
+                    check="grep -qx 'committed snapshot fact' answer.md",
+                    budget={"turns": 4, "tool_calls": 16, "seconds": 30})
+                assert submitted["workspace"] == {"repo": "sample", "read_only": True}, submitted
+            else:
+                submitted = lead.start_task(
+                    "Native lane", "Fix the code in the lane.", model="harness:local-coder",
+                    agent="coder", repo="sample", lane="native",
+                    check="cargo --version && git status --short && git diff && git log -1 --format=%s"
+                          " && grep -qx 'edited by native harness' result.txt",
+                    budget={"turns": 3, "tool_calls": 5, "seconds": 30})
+            assert submitted["model"] == "harness:local-coder", submitted
+            job_id = submitted["job_id"]
+            offers = node_client.call("GET", "jobs")["jobs"]
+            accepted, queued, failures = take(node_client, offers, root / "ledger")
+            assert (accepted, queued, failures) == ([job_id], [job_id], [])
+        # Tick owns routing and terminal recording. The fixture has no other runners.
+        entry = ("import runpy, sys; sys.path.insert(0, 'ops/bin'); "
+                 "tick = runpy.run_path('ops/bin/tick')['main']; "
+                 "tick.__globals__['runner_count'] = lambda: 0; tick()")
+        proc = subprocess.run([sys.executable, "-c", entry], env=env, cwd=root,
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode:
+            diagnostics = [path.read_text() for name in ("check.json", "finalize.error")
+                           for path in (root / "ledger/runs").glob("*/" + name)]
+            raise AssertionError((proc.stdout, proc.stderr, diagnostics))
+        if read_only:
+            assert git(checkout, "branch", "--list") == "* main"
+            assert git(checkout, "worktree", "list", "--porcelain").count("worktree ") == 1
+            assert (checkout / "facts.txt").read_text() == "dirty checkout fact\n"
+            assert not list((root / "ledger").glob("read-only-*"))
+        else:
+            lane = stack.scratch / "native"
+            assert git(lane, "branch", "--show-current") == "lane/native"
+            assert git(lane, "show", "HEAD:result.txt") == "edited by native harness"
+        assert git(checkout, "rev-parse", "HEAD") == base and not (checkout / "result.txt").exists()
+        terminal = next(r for r in estate.jsonl(root / "ledger/dispatch.jsonl")
+                        if r.get("id") == job_id and r.get("state") == "done")
+        assert terminal["verdict"] == "pass", terminal
+        run = root / "ledger/runs" / terminal["run_id"]
+        assert json.loads((run / "finalized.json").read_text())["verdict"] == "pass"
+        inventory, _ = report_run(ctx, node, job_id, run)
+        reported = client.get("runs/" + run.name)
+        assert reported["verdict"] == "pass" and reported["usage"]["output_tokens"] > 0, reported
+        spans, _ = stack.merge_trace(run, exchanges=4 if read_only else 3)
+        check_trace(stack, spans, run, "complete", finalized_runs=[inventory])
+        if read_only:
+            metrics = one(spans, "run")["attributes"]["terminal"]
+            assert metrics["turns"] == 4, metrics
+            assert metrics["tool_errors"] == {"exec": 3, "fs_read": 1, "fs_write": 1, "repo_search": 3}, metrics
+            assert metrics["deliverables"] == {"answer.md": True}, metrics
+            assert (run / "workspace/answer.md").read_text() == "committed snapshot fact\n"
+            return
+
+        # Retry a failed template attempt through the native harness on the same lane.
+        retry_caps = caps["agent_capabilities"]
+        assert node.status([], agent_capabilities={**retry_caps, "templates": ["codex"]}).status == 200
+        lead = Tools(client, node.name)
+        failed = lead.start_task("Retry native lane", "Write result.txt.", model="codex",
+                                 agent="coder", repo="sample", lane="native")
+        first = failed["job_id"]
+        assert node.accept(first).status == 200
+        finish_job(ctx, node, first, state="error", stop="fixture failure", error="fixture failure")
+        retried = lead.retry_task(first, model="harness:local-coder")
+        assert retried["intent_id"] == failed["intent_id"] and retried["model"] == "harness:local-coder"
+        spec = lead._job_file(retried["job_id"], "spec.yaml").decode()
+        assert '\nmodel: "local-coder"\n' in spec and "fs_write" in spec and "\nlane: native\n" in spec
+
+
+
+def action_approval(stack):
+    import action_approval as actions
+    go = stack.scenario == "action-go"
+    run = actions.run(stack, spec(calls=4).replace("[fx_tool]", "[request_action]"), go)
+    spans, _ = stack.merge_trace(run, exchanges=2)
+    check_trace(stack, spans, run, "complete")
+
+
+CASES = {
+    "A": retry, "B": refusal, "C": slow_stream, "D": slow_tool, "E": missing_run,
+    "F": missing_turn, "G": paid_partial, "H": retry, "I": unknown_tool, "J": paid_partial,
+    "K": unreachable, "L": late_delivery,
+    "M": lambda stack: no_wallet_charge(stack, "local-coder", "free_local"),
+    "N": lambda stack: no_wallet_charge(stack, "fake-sub", "subscription"),
+    "O": late_delivery, "P": reported_subscription, "R": work, "S": work, "T": work, "U": observed, "V": retry, "W": retry, "X": cancelled_cli, "Y": native_lane,
+    "Z": lambda stack: native_lane(stack, read_only=True),
+    "action-go": action_approval, "action-no-go": action_approval, "action-cli-no-go": observed,
+}
+
+
+def main():
+    install_opener(build_opener(ProxyHandler({})))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("scenarios", nargs="*", metavar="SCENARIO")
+    args = parser.parse_args()
+    selected = args.scenarios or sorted(CASES)
+    failed = []
+    for label in selected:
+        if label not in CASES:
+            parser.error(f"unknown scenario {label}")
+        try:
+            with scratch_dir(prefix=f"trace-e2e-{label}-") as scratch:
+                with estate.Stack(scratch, "A" if label in {"H", "V", "W"} else label,
+                                  box=label == "O", no_gateway=label == "K") as stack:
+                    scenario = CASES[label]
+                    if scenario in (retry, paid_partial, late_delivery, work):
+                        scenario(stack, label)
+                    else:
+                        scenario(stack)
+            print(f"{label}: PASS", flush=True)
+        except (Exception, SystemExit) as error:
+            failed.append(label)
+            print(f"{label}: FAIL {error}", file=sys.stderr, flush=True)
+    return int(bool(failed))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

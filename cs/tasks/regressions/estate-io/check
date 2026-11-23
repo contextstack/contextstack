@@ -17,8 +17,8 @@ _fixture_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_fixture_env)
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / "ops/bin"))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 from _estate_io import (append_jsonl, basename, call_op, digest, git, iter_jsonl,
                         pid_live, read_jsonl, run_op, sha256_bytes, utc_time)
 from _dispatch import TERMINAL, first_terminal, first_terminal_states, qid, spec_value
@@ -164,17 +164,6 @@ with scratch_dir(prefix="estate-transport-") as raw:
                     if not compact:
                         expected = expected.replace(':', ': ').replace(',', ', ')
                     assert shelf.read_bytes() == b"prefix\n" + expected.encode() + b"\n"
-    # The real estate wrapper creates its parent and delegates once. A shared
-    # helper shadowed by the wrapper's name must not disable audit receipts.
-    import importlib.machinery
-    import importlib.util
-    loader = importlib.machinery.SourceFileLoader("estate_append_fixture", str(LAB / "ops/bin/estate-commit"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    estate = importlib.util.module_from_spec(spec)
-    loader.exec_module(estate)
-    audit = root / "new-parent/audit.jsonl"
-    estate.append_jsonl(audit, {"event": "fixture"})
-    assert audit.read_bytes() == b'{"event":"fixture"}\n'
     raises(FileNotFoundError, lambda: append_jsonl(root / "absent/rows", {}, sort_keys=True,
                                                   compact=True, sync=True, encoding="utf-8"))
     child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)

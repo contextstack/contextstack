@@ -11,9 +11,11 @@ mod fpconv;
 mod fs_edit;
 mod fs_read;
 mod jail;
+mod node_install_lock;
 mod okf;
 mod py;
 mod pyjson;
+mod repo_search;
 mod yaml_json;
 
 use py::Failure;
@@ -27,6 +29,7 @@ use std::process::ExitCode;
 #[derive(Clone, Copy)]
 enum Tool {
     FsRead,
+    RepoSearch,
     FsEdit,
     Okf,
     YamlJson,
@@ -35,6 +38,7 @@ enum Tool {
 impl Tool {
     fn from_name(name: &str) -> Option<Self> {
         match name {
+            "repo_search" => Some(Self::RepoSearch),
             "fs_read" => Some(Self::FsRead),
             "fs_edit" => Some(Self::FsEdit),
             "okf" => Some(Self::Okf),
@@ -45,6 +49,7 @@ impl Tool {
 
     fn name(self) -> &'static str {
         match self {
+            Self::RepoSearch => "repo_search",
             Self::FsRead => "fs_read",
             Self::FsEdit => "fs_edit",
             Self::Okf => "okf",
@@ -73,8 +78,11 @@ fn select(argv: &[OsString]) -> Option<(Tool, usize)> {
 /// Python's order: decode stdin, record the call, then run the tool.
 fn run(tool: Tool, input: &[u8]) -> Result<Vec<u8>, Failure> {
     let args = pyjson::load(input)?;
-    calllog::record(tool.name(), &args);
+    if !matches!(tool, Tool::RepoSearch) {
+        calllog::record(tool.name(), &args);
+    }
     match tool {
+        Tool::RepoSearch => repo_search::run(&args),
         Tool::FsRead => fs_read::run(&args),
         Tool::FsEdit => fs_edit::run(&args),
         // main hands okf and yaml-json off before this point: no call log, their own exits.
@@ -95,10 +103,19 @@ fn emit(stdout: &[u8], stderr: &[u8], code: u8) -> ExitCode {
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = env::args_os().collect();
+    if argv.get(1).is_some_and(|arg| arg == "node-install-lock") {
+        return match node_install_lock::run(&argv[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("node-install: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let Some((tool, first_arg)) = select(&argv) else {
         let _ = writeln!(
             io::stderr(),
-            "usage: cs-tools fs_read|fs_edit|okf < args.json, or cs-tools yaml-json FILE (or invoke through a symlink named for the tool)"
+            "usage: cs-tools fs_read|fs_edit|repo_search|okf < args.json, or cs-tools yaml-json FILE (or invoke through a symlink named for the tool)"
         );
         return ExitCode::from(2);
     };

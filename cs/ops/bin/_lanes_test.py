@@ -69,7 +69,7 @@ class LaneCasTest(unittest.TestCase):
 
 class TrackedSecretLaneTest(unittest.TestCase):
     def test_tracked_secret_names_require_explicit_allowlist(self):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "LAB_"))}
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "CS_"))}
         env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="test",
                    GIT_AUTHOR_EMAIL="test@example.com", GIT_COMMITTER_NAME="test",
                    GIT_COMMITTER_EMAIL="test@example.com")

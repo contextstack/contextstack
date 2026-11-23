@@ -1,5 +1,4 @@
-//! Workspace confinement. The Python tools apply only the lexical rule; the port also resolves
-//! symlinks and refuses any existing path that lands outside the workspace (the cwd).
+//! Workspace confinement for Rust tools. The workspace is the canonical working directory.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -7,9 +6,46 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-/// The Python tools' rule: an absolute path or a `..` component escapes.
-pub fn lexically_escapes(p: &str) -> bool {
-    p.starts_with('/') || p.split('/').any(|part| part == "..")
+pub const WORKSPACE_OPEN_DENIED: &str = "path escapes workspace or changed before open";
+
+/// Reject parent components, and admit absolute paths only under an allowed canonical root.
+pub fn lexically_escapes(p: &str, repo: Option<&Path>) -> bool {
+    if p.split('/').any(|part| part == "..") {
+        return true;
+    }
+    let path = Path::new(p);
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(workspace) = env::current_dir().and_then(fs::canonicalize) else {
+        return true;
+    };
+    for ancestor in path.ancestors() {
+        match fs::canonicalize(ancestor) {
+            Ok(target) => {
+                return !target.starts_with(&workspace)
+                    && !repo.is_some_and(|root| target.starts_with(root));
+            }
+            // New files may have missing parents. A dangling link is an existing
+            // entry with an unknown destination and must not be skipped.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && fs::symlink_metadata(ancestor)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+            Err(_) => return true,
+        }
+    }
+    true
+}
+
+/// The sandbox launcher may expose a second tree for reads.
+pub fn repo_view() -> Option<std::path::PathBuf> {
+    env::var_os("CS_REPO_VIEW").and_then(|path| fs::canonicalize(path).ok())
+}
+
+pub fn read_resolves_outside(path: &Path, repo: Option<&Path>) -> bool {
+    resolves_outside(path)
+        && !repo.is_some_and(|root| fs::canonicalize(path).is_ok_and(|p| p.starts_with(root)))
 }
 
 /// True when `p` exists and, with every symlink resolved, lies outside the resolved workspace.
@@ -43,14 +79,24 @@ fn open_checked(path: &Path, writable: bool) -> io::Result<File> {
 
 fn open_checked_after(path: &Path, writable: bool, after_check: impl FnOnce()) -> io::Result<File> {
     let workspace = fs::canonicalize(env::current_dir()?)?;
+    let repo = (!writable).then(repo_view).flatten();
+    open_resolved_after(
+        path,
+        writable,
+        |p| p.starts_with(&workspace) || repo.as_ref().is_some_and(|root| p.starts_with(root)),
+        after_check,
+    )
+}
+
+fn open_resolved_after(
+    path: &Path,
+    writable: bool,
+    allowed: impl Fn(&Path) -> bool,
+    after_check: impl FnOnce(),
+) -> io::Result<File> {
     let target = fs::canonicalize(path)?;
-    let denied = || {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "path escapes workspace or changed before open",
-        )
-    };
-    if !target.starts_with(&workspace) {
+    let denied = || io::Error::new(io::ErrorKind::PermissionDenied, WORKSPACE_OPEN_DENIED);
+    if !allowed(&target) {
         return Err(denied());
     }
     let expected = fs::symlink_metadata(&target)?;
@@ -69,7 +115,7 @@ fn open_checked_after(path: &Path, writable: bool, after_check: impl FnOnce()) -
     let opened = file.metadata()?;
     let checked = fs::canonicalize(path)?;
     let current = fs::symlink_metadata(&checked)?;
-    if !checked.starts_with(&workspace)
+    if !allowed(&checked)
         || !opened.is_file()
         || opened.dev() != expected.dev()
         || opened.ino() != expected.ino()
@@ -83,6 +129,11 @@ fn open_checked_after(path: &Path, writable: bool, after_check: impl FnOnce()) -
 
 pub fn open_for_read(path: &Path) -> io::Result<File> {
     open_checked(path, false)
+}
+
+/// Open a regular file confined to the canonical repository snapshot root.
+pub fn open_in_repo(path: &Path, root: &Path) -> io::Result<File> {
+    open_resolved_after(path, false, |p| p == path && p.starts_with(root), || {})
 }
 
 /// Does not truncate: the caller must validate identity before changing contents.
@@ -126,12 +177,12 @@ mod tests {
 
     #[test]
     fn lexical_rule_matches_python() {
-        assert!(lexically_escapes("/etc/passwd"));
-        assert!(lexically_escapes("../x"));
-        assert!(lexically_escapes("a/../b"));
-        assert!(!lexically_escapes("a/..b"));
-        assert!(!lexically_escapes("a.txt"));
-        assert!(!lexically_escapes(""));
+        assert!(lexically_escapes("/etc/passwd", None));
+        assert!(lexically_escapes("../x", None));
+        assert!(lexically_escapes("a/../b", None));
+        assert!(!lexically_escapes("a/..b", None));
+        assert!(!lexically_escapes("a.txt", None));
+        assert!(!lexically_escapes("", None));
     }
 
     #[test]

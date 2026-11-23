@@ -252,6 +252,7 @@ pub struct Plan {
     /// The bundle's `bundle_sha256`, as given (before any reservation is written into its spec).
     pub digest: String,
     scope: crate::reservations::JobScope,
+    work_reason: Option<String>,
 }
 
 impl Plan {
@@ -305,6 +306,7 @@ impl Plan {
             digest: bundle_sha(&files),
             files,
             scope: crate::reservations::JobScope::default(),
+            work_reason: None,
         })
     }
 
@@ -327,6 +329,10 @@ impl Plan {
     /// Metadata after Director-owned defaults have been applied.
     pub fn meta(&self) -> &Map<String, Value> {
         &self.meta
+    }
+
+    pub fn set_work_reason(&mut self, reason: Option<String>) {
+        self.work_reason = reason;
     }
 
     /// Fill the form's empty check for uploaded bundles and `from_job` compatibility.
@@ -359,6 +365,27 @@ impl Plan {
         crate::stamp::intent(store, &mut self.files, &self.spec, intent, replaceable)
     }
 
+    pub fn refuse_if_node_lacks_capability(
+        &self,
+        store: &Store,
+        db: &Connection,
+        node: &str,
+    ) -> Result<(), String> {
+        if let Some(model) = crate::capabilities::model_in_spec(store, &self.files, &self.spec) {
+            let harness = self
+                .meta
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(|name| name.strip_prefix("harness:"));
+            if harness.is_some_and(|name| name != model) {
+                return Err("harness model in metadata differs from spec.model".into());
+            }
+            crate::capabilities::refuse_dispatch(db, node, &model, harness.is_some())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Record the job inside the caller's transaction: offered, with any reservation written into its spec, or
     /// `waiting` when a budget has no room (`reservations.rs`). Returns its id.
     pub fn insert(
@@ -377,17 +404,37 @@ impl Plan {
             self.trials,
             &mut files,
         )?;
+        let node_name: String = tx
+            .query_row(
+                "SELECT name FROM nodes WHERE id = ?1",
+                params![self.node_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
         let state = if placed.waits() { "waiting" } else { "offered" };
         tx.execute(
             "INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, grant_id, grant_sha256, meta, state,
-                               created_at, intent_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                               created_at, intent_id, work_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![job_id, self.node_id, self.spec, self.task, self.trials, bundle_sha(&files), self.grant,
-                    self.grant_sha, Value::Object(self.meta.clone()).to_string(), state, now_utc(), intent],
+                    self.grant_sha, Value::Object(self.meta.clone()).to_string(), state, now_utc(), intent,
+                    self.work_reason.as_deref()],
         )
         .map_err(|e| e.to_string())?;
         record_files(tx, &job_id, &files).map_err(|e| e.to_string())?;
         crate::reservations::record(tx, &job_id, &placed)?;
+        if !placed.waits()
+            && let Some(wait) = crate::capabilities::capability_wait(
+                store,
+                tx,
+                self.node_id,
+                &files,
+                &self.spec,
+                &node_name,
+            )
+        {
+            crate::capabilities::hold_capability(tx, &job_id, &wait)?;
+        }
         touch(tx, Record::Job, &job_id).map_err(|e| e.to_string())?;
         Ok(job_id)
     }
@@ -431,10 +478,10 @@ pub fn files(db: &Connection, job_id: &str) -> Result<Vec<Value>, rusqlite::Erro
 /// This node's offered and accepted jobs, oldest first, with Director-owned turn identity.
 pub fn for_node(db: &Connection, node_id: i64) -> Result<Vec<Value>, rusqlite::Error> {
     let mut stmt = db.prepare(
-        "SELECT job_id, spec, task, trials, bundle_sha256, grant_id, grant_sha256, meta FROM jobs
+        "SELECT job_id, spec, task, trials, bundle_sha256, grant_id, grant_sha256, meta, state FROM jobs
          WHERE node_id = ?1 AND state IN ('offered', 'accepted') ORDER BY rowid",
     )?;
-    let rows: Vec<(String, Value)> = stmt
+    let rows: Vec<(String, Value, bool)> = stmt
         .query_map(params![node_id], |r| {
             let meta: String = r.get(7)?;
             Ok((
@@ -445,11 +492,22 @@ pub fn for_node(db: &Connection, node_id: i64) -> Result<Vec<Value>, rusqlite::E
                        "grant": r.get::<_, Option<String>>(5)?, "grant_sha256": r.get::<_, Option<String>>(6)?,
                        "meta": serde_json::from_str::<Value>(&meta).ok().filter(Value::is_object)
                            .unwrap_or_else(|| json!({}))}),
+                r.get::<_, String>(8)? == "offered",
             ))
         })?
         .collect::<Result<_, _>>()?;
+    let status = crate::capabilities::node_status(db, node_id).unwrap_or(Value::Null);
     rows.into_iter()
-        .map(|(id, mut job)| {
+        .filter(|(_, job, offered)| {
+            let harness = job["meta"]["model"]
+                .as_str()
+                .and_then(|model| model.strip_prefix("harness:"));
+            !offered
+                || harness.is_none_or(|model| {
+                    crate::capabilities::validate_harness_model(model, &status, "node").is_ok()
+                })
+        })
+        .map(|(id, mut job, _)| {
             job["files"] = Value::Array(files(db, &id)?);
             // Intent metadata is caller-controlled; only the turns table grants turn identity.
             let turn: Option<(String, String)> = db

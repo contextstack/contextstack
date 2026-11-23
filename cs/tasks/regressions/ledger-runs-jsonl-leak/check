@@ -8,7 +8,7 @@ import os
 import tempfile
 from pathlib import Path
 
-LIVE = Path(os.environ.get("LAB_SPILL_RUNS_ROOT") or Path(__file__).resolve().parents[3] / "ledger/runs")
+LIVE = Path(os.environ.get("CS_SPILL_RUNS_ROOT") or Path(__file__).resolve().parents[3] / "ledger/runs")
 
 
 def leaks(root):
@@ -28,7 +28,7 @@ def leaks(root):
 
 
 with scratch_dir(prefix="ledger-runs-jsonl-") as raw:
-    planted = Path(raw) / "20260905-copied-lab" / "ledger"
+    planted = Path(raw) / "20260905-copied-code_root" / "ledger"
     planted.mkdir(parents=True)
     (planted / "ledger.jsonl").write_text("{}\n")
     assert leaks(Path(raw)), "planted ledger jsonl under a run was not detected"

@@ -1,0 +1,17 @@
+{
+  "runtime": "python3",
+  "timeout_seconds": 120,
+  "sandbox": {"net": "none"},
+  "description": "Ask the Director to review one exact command that requires additional sandbox permission. Use exec for ordinary sandboxed commands. For a registry or documentation download, use argv [\"/usr/bin/curl\", \"-q\", \"--\", \"https://host/path\"]. For local test sockets, request network:loopback. For a write_paths request, provide the specific absolute paths. If the action is waiting on the owner, continue without it if possible. Repeating the exact request during this run checks the same approval.",
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+      "needs": {"type": "array", "items": {"enum": ["network", "network:loopback", "write_paths", "delete"]}, "minItems": 1, "uniqueItems": true},
+      "write_paths": {"type": "array", "items": {"type": "string"}},
+      "reason": {"type": "string", "minLength": 1}
+    },
+    "required": ["argv", "needs", "reason"]
+  }
+}

@@ -59,4 +59,4 @@ The template run dir is real: the default Rust runner (or
 `$CS_RUNNER_BIN`) runs the create-file task against a scripted fake
 gateway with a stub `finalize-run` that exits 3, so `terminal.json` and
 the body-only transcript are on disk and nothing is finalized. Every test
-copies that estate. Never touches `lab/ledger`. About 9 s.
+copies that estate. Never touches `cs/ledger`. About 9 s.

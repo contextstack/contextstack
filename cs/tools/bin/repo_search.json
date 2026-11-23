@@ -1,0 +1,16 @@
+{
+  "runtime": "exe",
+  "bin": "target/release/cs-tools",
+  "args": ["repo_search"],
+  "sandbox": {"net": "none"},
+  "description": "Search the workspace or read-only repository snapshot. Mode files finds names containing a literal substring. Mode text finds lines containing literal text in small UTF-8 files. Returns up to 20 results with absolute paths you can pass to fs_read. Pass a relative or absolute directory inside the search root, or omit path to search the whole tree.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "mode": {"type": "string", "enum": ["files", "text"]},
+      "query": {"type": "string", "description": "Literal, case-sensitive substring."},
+      "path": {"type": "string", "description": "Optional absolute directory inside the search root or directory relative to it."}
+    },
+    "required": ["mode", "query"]
+  }
+}

@@ -1,6 +1,6 @@
 # cs-tools
 
-The CS core tools as one multi-call Rust binary (Plan.CS.v2.1 §7, phase 5): `fs_read` and `fs_edit`, byte-for-byte ports of the Python tools formerly in `lab/tools/bin/` (historical source: `git show 69c507d9b:lab/tools/bin/fs_read`), and `okf`, the port of the lab's only Ruby tool (historical source: `git show e539803ef:lab/tools/bin/okf`), so a node needs no Ruby. Also `yaml-json`, an ops helper. Not in the runner: exec'd like any tool, so the sandbox and fixtures cover it.
+The CS core tools as one multi-call Rust binary (Plan.CS.v2.1 §7, phase 5): `fs_read` and `fs_edit`, byte-for-byte ports of the Python tools formerly in `cs/tools/bin/` (historical source: `git show 69c507d9b:cs/tools/bin/fs_read`), and `okf`, the port of the cs's only Ruby tool (historical source: `git show e539803ef:cs/tools/bin/okf`), so a node needs no Ruby. Also `yaml-json`, an ops helper. Not in the runner: exec'd like any tool, so the sandbox and fixtures cover it.
 
 ## Contract
 
@@ -11,7 +11,7 @@ The CS core tools as one multi-call Rust binary (Plan.CS.v2.1 §7, phase 5): `fs
 
 Cwd is the workspace, JSON args on stdin. Anything else selected: usage on stderr, exit 2.
 
-- `fs_read`/`fs_edit`: success on stdout, exit 0; refusal is the Python `sys.exit` text on stderr, exit 1. Both append `{"args":..., "name":...}` to `.lab-calls.jsonl` with `json.dumps(sort_keys=True)` bytes. `fs_edit`'s diff is CPython's `difflib` (`src/difflib.rs`); `int`/`str`/truthiness are Python's.
+- `fs_read`/`fs_edit`: success on stdout, exit 0; refusal is the Python `sys.exit` text on stderr, exit 1. Both append `{"args":..., "name":...}` to `.cs-calls.jsonl` with `json.dumps(sort_keys=True)` bytes. `fs_edit`'s diff is CPython's `difflib` (`src/difflib.rs`); `int`/`str`/truthiness are Python's.
 - `okf {action: stamp|migrate|lint|stale, root?, version?, from?, to?, now?}` (`src/okf/`): Ruby's `JSON.generate` lines on stdout; `fail!` is `{"ok":false,"error":...}` on stderr, exit 1; lint failures print the report and exit 1. No call log, as the Ruby wrote none.
 - `yaml-json FILE` (`src/yaml_json.rs`): stdout of `ruby -ryaml -rjson -e 'puts JSON.generate(YAML.safe_load( File.read(ARGV[0])))' FILE` (Ruby 4.0, Psych 5.3.1, json 2.18: Grisu2 floats in `src/fpconv.rs`). A Ruby exception is `yaml-json: <message> (<Class>)` on stderr, exit 1 (dates, times, symbols: `DisallowedClass`; any alias: `AliasesNotEnabled`). Not model-facing, so no `cs/tools/bin` descriptor: ops helpers exec it via `cs/ops/bin/_yaml.py` (`CS_TOOLS_BIN` overrides `<repo>/target/release/cs-tools`; copied test estates set it).
 

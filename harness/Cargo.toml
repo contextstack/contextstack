@@ -16,9 +16,12 @@ name = "cs-harness"
 path = "src/main.rs"
 
 [dependencies]
+cs-child-signals.workspace = true
+hex.workspace = true
 chrono.workspace = true
+cs-http-client.workspace = true
 reqwest.workspace = true
-rustix = { version = "1.1", features = ["process"] }
+rustix = { version = "1.1", features = ["process", "system"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

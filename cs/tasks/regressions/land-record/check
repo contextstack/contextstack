@@ -1,4 +1,4 @@
 #!/bin/sh
 set -eu
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-exec env -u LAB_STATE_ROOT python3 "$here/verify.py"
+exec env -u CS_STATE_ROOT python3 "$here/verify.py"

@@ -92,7 +92,9 @@ def stream_partial_output_no_retry(t):
     """After streamed output has started, a disconnect is not retried."""
     frames = upstreams.chat_stream(["partial"], terminal=False) + [{"cut": True}]
     t.vllm.default_chat = {"sse": frames}
-    t.gw.call(model_call("local-coder", stream=True))
+    chunks = t.gw.call(model_call("local-coder", stream=True)).sse()
+    eq(chunks[0]["content"], "partial", "output before disconnect")
+    eq(chunks[-1]["error"]["code"], "gateway.transport_failed", "terminal failure")
     eq(len(t.run.calls(t.vllm)), 1, "one upstream stream open")
 
 
@@ -118,11 +120,11 @@ def retries_bill_success_once(t):
     from cases.spend import limits, spent
 
     for stream in (False, True):
-        for failure in (408, 409, 425, 429, 500, 502, 503, 504, 529, "reset"):
+        for failure in (408, 409, 425, 429, 500, 502, 503, 504, 529):
             name = "retry-bill-%s-%s" % (stream, failure)
             gw = t.gateway(name, limits=limits(1))
             # Deliberately different failed-attempt numbers catch accidental merging.
-            fail = {"drop": True} if failure == "reset" else {
+            fail = {
                 "status": failure, "headers": {"Retry-After": "0"},
                 "json": upstreams.chat_completion(usage=(9000, 8000), cost=0.9),
             }
@@ -147,7 +149,7 @@ def retries_bill_success_once(t):
 
 
 @case("accounting", gw=None)
-def timeout_records_no_attempt_usage(t):
+def timeout_settles_reservation_without_attempt_usage(t):
     """The shared request deadline is a local transport fault, not a retryable per-attempt timeout."""
     from cases.spend import limits, spent
 
@@ -164,7 +166,10 @@ def timeout_records_no_attempt_usage(t):
         eq(b["error"]["code"], "gateway.transport_failed", name + " timeout")
         eq(len(t.run.calls(t.vllm)) - before, 1, name + " deadline prevents retry")
         eq(usage_rows(gw, name), [], name + " no usage")
-        eq(spent(gw), (0, 0), name + " no spend")
+        charge = b["cost"]["charged_usd"]
+        assert charge > 0, name
+        eq(b["cost"]["est_usd"], charge, name + " reservation estimate")
+        eq(spent(gw), (round(charge, 6),) * 2, name + " persisted settlement")
 
 
 @case("accounting", gw=None)
@@ -186,3 +191,56 @@ def partial_attempt_is_labeled_and_never_retried(t):
     eq(len(rows), 1, "one partial usage record including drop cleanup")
     eq(rows[0].startswith("provider=vllm model=fake-paid in=37 out=19 cost=0.000560 "), True, "metered partial tokens")
     eq(rows[0].endswith(" partial=1"), True, "explicit partial label")
+
+
+@case("translation")
+def close_before_headers_retries(t):
+    """Free local unary and streaming POSTs recover on the second attempt."""
+    for stream in (False, True):
+        name = "close-before-headers-%s" % stream
+        success = ({"sse": upstreams.chat_stream(["recovered"], usage=(37, 19))}
+                   if stream else {"json": upstreams.chat_completion(text="recovered", usage=(37, 19))})
+        t.vllm.chat["local-coder"] = sequence([{"drop": True}, success])
+        before = len(t.run.calls(t.vllm))
+        reply = t.gw.call(model_call("local-coder", stream=stream, request_id=name))
+        if stream:
+            chunks = reply.sse()
+            eq(chunks[0]["content"], "recovered", "stream output")
+            eq(chunks[-1]["kind"], "stop", "stream terminal")
+        else:
+            sub(reply.json, {"status": "ok", "message": {"content": "recovered"}}, "unary reply")
+        eq(len(t.run.calls(t.vllm)) - before, 2, "upstream calls")
+        rows = [row for row in t.gw.log_rows("provider_http_trace") if row.get("request_id") == name]
+        eq(len(rows), 2, "two HTTP attempt traces")
+        sub(rows[0], {"attempt": 1, "stream": stream, "failed": True, "connection_lost": True}, "failed attempt")
+        eq("http_status" in rows[0], False, "no response headers")
+        sub(rows[1], {"attempt": 2, "stream": stream, "failed": False, "http_status": 200}, "successful attempt")
+
+
+@case("translation")
+def repeated_close_before_headers_exhausts_retries(t):
+    """A free local POST is retried at most twice."""
+    t.vllm.chat["local-coder"] = {"drop": True}
+    reply = t.gw.call(model_call("local-coder")).json
+    eq(reply["error"]["code"], "gateway.provider_transient", "lost response")
+    eq(len(t.run.calls(t.vllm)), 3, "bounded retry")
+
+
+@case("accounting", gw=None)
+def reset_after_post_settles_without_retry(t):
+    """A connection lost after receiving the POST is a billable attempt."""
+    from cases.spend import limits, spent
+
+    for stream in (False, True):
+        gw = t.gateway("reset-paid-%s" % stream, limits=limits(1))
+        t.vllm.chat["fake-paid"] = sequence([
+            {"drop": True}, {"json": upstreams.chat_completion(text="unexpected retry")},
+        ])
+        before = len(t.run.calls(t.vllm))
+        reply = gw.call(model_call("fake-paid", stream=stream))
+        body = reply.sse()[-1] if stream else reply.json
+        eq(body["error"]["code"], "gateway.transport_failed", "lost response")
+        eq(len(t.run.calls(t.vllm)) - before, 1, "POST is never replayed")
+        charge = body["cost"]["charged_usd"]
+        assert charge > 0
+        eq(spent(gw), (round(charge, 6),) * 2, "persisted settlement")

@@ -14,10 +14,10 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from hermetic_env import hermetic_env
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-REPO = LAB.parent
-BROKER = LAB / "ops/bin/browser-broker"
-TOOL = LAB / "tools/bin/browser_session"
+CODE_ROOT = HERE.parents[2]
+REPO = CODE_ROOT.parent
+BROKER = CODE_ROOT / "ops/bin/browser-broker"
+TOOL = CODE_ROOT / "tools/bin/browser_session"
 FAKE = HERE / "fake-chrome"
 WRAPPER = Path(os.environ.get("CS_SANDBOX_BIN") or REPO / "target/release/cs-sandbox")
 SETS = {"public": ["https://example.com"], "other": ["https://other.example"]}
@@ -138,9 +138,9 @@ def refuses(root, cfg, needle, what, extra=(), env=None):
 def wrapped(policy, ws, argv, stdin="", reports=None):
     cmd = [str(WRAPPER), "--policy", str(policy), "--cwd", str(ws)]
     cmd += ["--report-dir", str(reports)] if reports else []
-    env = {k: v for k, v in hermetic_env().items() if k != "LAB_BROWSER_BROKER_EXEC"}
+    env = {k: v for k, v in hermetic_env().items() if k != "CS_BROWSER_BROKER_EXEC"}
     return subprocess.run(cmd + ["--", *map(str, argv)], input=stdin, capture_output=True, text=True,
-                          timeout=60, env=dict(env, LAB_CODE_ROOT=str(LAB)))
+                          timeout=60, env=dict(env, CS_CODE_ROOT=str(CODE_ROOT)))
 
 
 def broker_contract(root, cfg, log):
@@ -263,7 +263,7 @@ def confinement(root, cfg, log):
         expect(ready is not None, "broker restarts for the confinement half")
         ws = root / "ws"
         ws.mkdir()
-        host = json.loads((LAB / "policy/sandbox.json").read_text())
+        host = json.loads((CODE_ROOT / "policy/sandbox.json").read_text())
         host.update(allow_net=["none"], sockets={"browser-public": str(root / "sockets/public.sock"),
                                                  "browser-other": str(root / "sockets/other.sock"),
                                                  "browser-absent": str(root / "sockets/absent.sock")})

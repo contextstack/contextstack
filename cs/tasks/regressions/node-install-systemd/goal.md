@@ -20,6 +20,6 @@ never real `~/.contextstack` or `~/.config/systemd`):
 5. Unquoted `WorkingDirectory=`, `User=` and log paths are validated (refused, not quoted). An `ExecStart` word containing `%` or a space is quoted. A bad value is a clear `Refused`, not a traceback.
 
 Runs on macOS: pure rendering plus a fake systemctl.
-`env -u LAB_STATE_ROOT -u CSGATEWAY_ENDPOINT`.
+`env -u CS_STATE_ROOT -u CSGATEWAY_ENDPOINT`.
 
 Run: `tasks/regressions/node-install-systemd/check`

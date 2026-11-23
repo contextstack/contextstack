@@ -11,7 +11,7 @@
         "type": "string",
         "enum": ["corpus-*", "exp-*", "flowchart/director", "probes", "other"]
       },
-      "lab": {"type": "string"}
+      "code_root": {"type": "string"}
     },
     "required": [],
     "additionalProperties": false

@@ -3,11 +3,11 @@
 
 A temp code root (every op copied, one spec, one task) with the checkout's built Rust runner copied to where
 the default selector looks (<code root>/../target/release/cs-harness), a fake gateway whose /v1/health names
-itself, and no runner selector, no LAB_*_ROOT and no credentials in the environment. `run-spec` runs the
+itself, and no runner selector, no CS_*_ROOT and no credentials in the environment. `run-spec` runs the
 one cell; the row's executed_by must name the Rust runner at that path with that binary's sha256 and the
 gateway's implementation and version, and `run-identity` must report the same. Static half: the real
 selector's default (_runner, no env) and node-release's install default are the Rust runner. Never touches
-the real state root or lab/ledger; no model call leaves the machine.
+the real state root or cs/ledger; no model call leaves the machine.
 """
 import hashlib
 import http.server
@@ -21,9 +21,9 @@ import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-sys.path.insert(0, str(LAB / "ops/bin"))
-sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation-v2"))
+CODE_ROOT = HERE.parents[2]
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
+sys.path.insert(0, str(CODE_ROOT / "tasks/regressions/runner-characterisation-v2"))
 import _runner  # noqa: E402
 from _fake_gateway import dumps, ok_body  # noqa: E402
 
@@ -84,7 +84,7 @@ class Gateway:
 
 
 def estate(scratch):
-    e = scratch / "lab"
+    e = scratch / "code_root"
     for d in ("specs", "tasks/fx", "ops/bin", "prompts"):
         (e / d).mkdir(parents=True)
     (e / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
@@ -93,19 +93,19 @@ def estate(scratch):
     (e / "tasks/fx/goal.md").write_text("fixture\n", encoding="utf-8")
     (e / "tasks/fx/check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (e / "tasks/fx/check").chmod(0o755)
-    shutil.copy2(LAB / "prompts/coder-min.md", e / "prompts/coder-min.md")
-    for p in (LAB / "ops/bin").iterdir():
+    shutil.copy2(CODE_ROOT / "prompts/coder-min.md", e / "prompts/coder-min.md")
+    for p in (CODE_ROOT / "ops/bin").iterdir():
         if p.is_file():
             shutil.copy2(p, e / "ops/bin" / p.name)
     return e
 
 
 def static_defaults():
-    chosen = _runner.runner_path(LAB, {})
-    expect(chosen == _runner.default_runner(LAB).absolute() and _runner.runner_kind(LAB, chosen) == "rust",
-           "selector: no CS_RUNNER_BIN/LAB_RUNNER_BIN chooses the Rust runner (target/release/cs-harness)", str(chosen))
+    chosen = _runner.runner_path(CODE_ROOT, {})
+    expect(chosen == _runner.default_runner(CODE_ROOT).absolute() and _runner.runner_kind(CODE_ROOT, chosen) == "rust",
+           "selector: no CS_RUNNER_BIN chooses the Rust runner (target/release/cs-harness)", str(chosen))
     # node-release's install defaults live in its helpers (_node_layout, _node_services) since the systemd split.
-    sys.path.insert(0, str(LAB / "scripts"))
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
     import _node_layout
     import _node_services
     expect(_node_layout.DEFAULTS.get("runner") == "rust" and _node_services.RUNNER_BIN.get("rust") == "cs-harness",
@@ -114,7 +114,7 @@ def static_defaults():
 
 
 def run_default(scratch):
-    built = _runner.default_runner(LAB)
+    built = _runner.default_runner(CODE_ROOT)
     if not built.is_file():
         expect(False, "the default Rust runner is built (cargo build --release -p cs-harness at the repo root)", str(built))
         return
@@ -154,7 +154,7 @@ def run_default(scratch):
 
 
 def main():
-    live = LAB / "ledger"
+    live = CODE_ROOT / "ledger"
     existed = live.exists()
     scratch = Path(tempfile.mkdtemp(prefix="runner-identity-", suffix=".noindex"))
     try:
@@ -162,7 +162,7 @@ def main():
         run_default(scratch)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    expect(live.exists() == existed, "lab/ledger neither created nor removed")
+    expect(live.exists() == existed, "cs/ledger neither created nor removed")
     print("check: runner-identity %d failed" % len(FAILED))
     return 1 if FAILED else 0
 

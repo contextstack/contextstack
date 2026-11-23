@@ -16,8 +16,8 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-REPO = LAB.parent
+CODE_ROOT = HERE.parents[2]
+REPO = CODE_ROOT.parent
 WRAPPER = Path(os.environ.get("CS_SANDBOX_BIN") or REPO / "target/release/cs-sandbox")
 RUNTIME_READ = {
     "macos": ["/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/private/var/select", "/dev"],

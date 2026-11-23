@@ -150,6 +150,19 @@ def intake_blocked(state):
 
 def take(client, offered, state):
     """Queue and accept each offered job once; returns (accepted ids, newly queued ids, failures)."""
+    if not offered:
+        return [], [], []
+    # This is the same state directory that holds dispatch.jsonl.
+    state.mkdir(parents=True, exist_ok=True)
+    with (state / "restart-intake.lock").open("a") as intake:
+        try:
+            fcntl.flock(intake, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return [], [], []
+        return _take(client, offered, state)
+
+
+def _take(client, offered, state):
     accepted, queued, failed = [], [], []
     if intake_blocked(state):
         return accepted, queued, failed

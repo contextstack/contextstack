@@ -1,0 +1,149 @@
+//! Additional grants for one invocation. The caller consumes the Director claim before launch.
+
+use crate::{
+    cli::Widening,
+    failure::{Failure, unenforceable},
+    policy::{Effective, HostPolicy, Net},
+};
+use std::path::{Path, PathBuf};
+
+pub fn apply(
+    effective: &mut Effective,
+    grant: &Widening,
+    host: &HostPolicy,
+    tool: &Path,
+    args: &[String],
+) -> Result<Vec<PathBuf>, Failure> {
+    if grant.network && grant.loopback {
+        return Err(unenforceable("conflicting action network widenings"));
+    }
+    if grant.network || grant.loopback {
+        let net = if grant.loopback {
+            Net::Loopback
+        } else {
+            Net::All
+        };
+        if !host.allow_net.contains(&net) && !host.allow_net.contains(&Net::All) {
+            return Err(unenforceable(
+                "host policy does not support a network widening",
+            ));
+        }
+        effective.net = net;
+    }
+    let mut deny_unlink = Vec::new();
+    for path in &grant.write_paths {
+        // Bind the existing exact path. Refuse a renamed or symlinked target rather than
+        // widening to a different path or to the parent of a file that does not exist.
+        if !path.is_absolute()
+            || path.parent().is_none()
+            || path.canonicalize().as_ref().ok() != Some(path)
+        {
+            return Err(unenforceable(format!(
+                "action write target is not a canonical existing path: {}",
+                path.display()
+            )));
+        }
+        // The call's parent is the job scratch directory for action invocations.
+        // Scratch files can be replaced or unlinked just like files in the workspace.
+        if !grant.delete
+            && !path.starts_with(&effective.workspace)
+            && effective
+                .tmp
+                .parent()
+                .is_none_or(|tmp| !path.starts_with(tmp))
+        {
+            if cfg!(target_os = "linux") && !path.is_file() && !creates_directory(tool, args, path)
+            {
+                return Err(unenforceable(
+                    "on Linux, a writable directory bind also requires a delete grant",
+                ));
+            }
+            deny_unlink.push(path.clone());
+        }
+        effective.read.push(path.clone());
+        effective.write.push(path.clone());
+    }
+    Ok(deny_unlink)
+}
+
+// Linux cannot distinguish unlink from write on a bind. The standalone mkdir command only
+// creates a direct child of the bound directory and does not remove or replace anything.
+fn creates_directory(tool: &Path, args: &[String], parent: &Path) -> bool {
+    let [separator, target] = args else {
+        return false;
+    };
+    let trusted = [Path::new("/bin/mkdir"), Path::new("/usr/bin/mkdir")];
+    separator == "--" && trusted.contains(&tool) && Path::new(target).parent() == Some(parent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widening_changes_only_the_selected_effective_policy() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let root = temp.path().canonicalize().map_err(|e| e.to_string())?;
+        let workspace = root.join("work");
+        let job_tmp = root.join("job-tmp");
+        let call_tmp = job_tmp.join("call");
+        let write = root.join("granted");
+        std::fs::create_dir(&workspace).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&call_tmp).map_err(|e| e.to_string())?;
+        std::fs::write(&write, "").map_err(|e| e.to_string())?;
+        let host: HostPolicy =
+            serde_json::from_str(r#"{"version":1,"runtime_read":[],"allow_net":["none","all"]}"#)
+                .map_err(|e| e.to_string())?;
+        let baseline = || {
+            crate::policy::intersect(
+                &host,
+                &crate::policy::Request::default(),
+                &workspace,
+                &call_tmp,
+                &root,
+                &root,
+                &|_: &str| None,
+            )
+            .map(|(effective, _)| effective)
+            .map_err(|e| e.message().to_owned())
+        };
+        let mut approved = baseline()?;
+        let deny_unlink = apply(
+            &mut approved,
+            &Widening {
+                network: true,
+                loopback: false,
+                delete: false,
+                write_paths: vec![write.clone()],
+            },
+            &host,
+            Path::new("/bin/echo"),
+            &[],
+        )
+        .map_err(|e| e.message().to_owned())?;
+        assert_eq!(approved.net, Net::All);
+        assert!(approved.write.contains(&write));
+        assert_eq!(deny_unlink, std::slice::from_ref(&write));
+        let ordinary = baseline()?;
+        let mut loopback = baseline()?;
+        let scratch_unlinks = apply(
+            &mut loopback,
+            &Widening {
+                network: false,
+                loopback: true,
+                delete: false,
+                write_paths: vec![job_tmp.clone()],
+            },
+            &host,
+            Path::new("/bin/echo"),
+            &[],
+        )
+        .map_err(|e| e.message().to_owned())?;
+        assert_eq!(scratch_unlinks, Vec::<PathBuf>::new());
+        assert_eq!(loopback.net, Net::Loopback);
+        assert!(loopback.write.contains(&job_tmp));
+        assert_eq!(ordinary.net, Net::None);
+        assert!(!ordinary.write.contains(&write));
+        Ok(())
+    }
+}

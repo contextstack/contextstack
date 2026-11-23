@@ -47,7 +47,7 @@ for example in ('x = "(allow default)"', 'x = f"(deny file-write* {path})"',
                 'profile.write_text(profile.read_text() + suffix)',
                 'rules.append(rule)', 'cmd[2] += suffix'):
     assert violations(example), example
-assert not violations('profile.write_bytes(render_native_sandbox(lab, policy, request))')
+assert not violations('profile.write_bytes(render_native_sandbox(code_root, policy, request))')
 assert not violations('from urllib.parse import quote\nx = quote(value)')
 # No allowlist: URL/shell quoting is legitimate and does not emit policy text.
 failures = []

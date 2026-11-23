@@ -6,7 +6,7 @@
   "run_dirs_distinct": true,
   "runs": [],
   "stderr": [
-    "lab: specs/fx.yaml: invalid: budget.turns, model (required; PINNED.md pinned: is the default to copy), tasks, trials"
+    "cs: specs/fx.yaml: invalid: budget.turns, model (required; PINNED.md pinned: is the default to copy), tasks, trials"
   ],
   "stdout": []
 }

@@ -12,11 +12,9 @@ request, and every op the runner invoked (name, cwd, env names, stdin).
 The binary under test is `$CS_RUNNER_BIN`. Unset, it is the default Rust
 runner, `../target/release/cs-harness` (scripts/check builds it; ADR 0011),
 and the working tree's real tools, hooks, ops and prompt are copied into each
-estate. Pointing `$CS_RUNNER_BIN` at a Go `lab` build runs the identical
-cases against the archived Go runner.
+estate. `$CS_RUNNER_BIN` overrides the Rust harness binary.
 
-This set started as a byte-for-byte copy of `../runner-characterisation`
-(contract v1, pinned to the pre-1b runner). One case changes or is added
+This set started as a copy of the fixtures for the pre-1b runner. One case changes or is added
 per extraction in the §4 interface inventory: finalization (`terminal.json`,
 `messages.jsonl`, `finalize-run`, exit status), the task × trial loop
 (`run-spec`), `-step` (`pre_tool` hook, `step-confirm`), transcript

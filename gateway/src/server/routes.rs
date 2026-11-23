@@ -1,4 +1,4 @@
-//! The read-only routes, inventory refresh and Lab work orders.
+//! The read-only routes, inventory refresh and CLI work orders.
 
 use super::{Body, Peer, error, json};
 use crate::gateway::{Gateway, Snapshot};
@@ -41,19 +41,24 @@ pub async fn health(gw: &Arc<Gateway>) -> Response<Body> {
 
 /// GET /v1/budgets: each pay-as-you-go source's budget state (off, active, exhausted). The sources are
 /// the catalog's keyed endpoints, the providers of api-class models, and any configured budget.
-pub fn budgets(gw: &Arc<Gateway>) -> Response<Body> {
+pub async fn budgets(gw: &Arc<Gateway>) -> Response<Body> {
     let snap = gw.current();
     let inv = snap.inventory();
     let keyed = crate::catalog::embedded()
         .into_iter()
         .filter(|e| e.requires_key)
         .map(|e| e.name);
-    let api = inv
+    let api: Vec<_> = inv
         .all()
         .iter()
         .filter(|e| !e.is_cli() && e.cost_class == crate::inventory::API)
-        .map(|e| e.provider.clone());
-    json(200, &gw.spend.report(keyed.chain(api)))
+        .map(|e| e.provider.clone())
+        .collect();
+    let guard = Arc::clone(&gw.spend);
+    match tokio::task::spawn_blocking(move || guard.report(keyed.chain(api))).await {
+        Ok(report) => json(200, &report),
+        Err(e) => error(500, &e.to_string(), "budgets_read_failed"),
+    }
 }
 
 /// The most a budgets document may be.
@@ -97,10 +102,12 @@ pub async fn put_budgets(gw: &Arc<Gateway>, peer: Peer, req: Request<Incoming>) 
             );
         }
     };
-    match gw.spend.replace(&body) {
+    let guard = Arc::clone(&gw.spend);
+    let result = tokio::task::spawn_blocking(move || guard.replace(&body)).await;
+    match result.unwrap_or_else(|e| Err(crate::spend::SetError::Failed(e.to_string()))) {
         Ok(()) => {
             crate::log::row(&json!({"event": "budgets_set"}));
-            budgets(gw)
+            budgets(gw).await
         }
         Err(crate::spend::SetError::Invalid(e)) => {
             error(400, &format!("invalid budgets: {e}"), "invalid_budgets")

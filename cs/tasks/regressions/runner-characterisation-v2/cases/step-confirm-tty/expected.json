@@ -4,8 +4,8 @@
     {
       "cwd": "<ESTATE>",
       "env_names": [
+        "CS_STEP_TTY",
         "HOME",
-        "LAB_STEP_TTY",
         "LANG",
         "PATH",
         "TMPDIR"
@@ -20,8 +20,8 @@
     {
       "cwd": "<ESTATE>",
       "env_names": [
+        "CS_STEP_TTY",
         "HOME",
-        "LAB_STEP_TTY",
         "LANG",
         "PATH",
         "TMPDIR"
@@ -52,8 +52,8 @@
     {
       "cwd": "<ESTATE>",
       "env_names": [
+        "CS_STEP_TTY",
         "HOME",
-        "LAB_STEP_TTY",
         "LANG",
         "PATH",
         "TMPDIR"
@@ -66,8 +66,8 @@
     {
       "cwd": "<ESTATE>",
       "env_names": [
+        "CS_STEP_TTY",
         "HOME",
-        "LAB_STEP_TTY",
         "LANG",
         "PATH",
         "TMPDIR"
@@ -96,10 +96,9 @@
           "kind": "generic",
           "model_tier_hint": "fake"
         },
-        "job_id": "lab",
         "messages": [
           {
-            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n",
+            "content": "--- prompts/coder-min.md ---\nYou are a coding agent working alone in a workspace directory.\n\n- Use the tools to inspect and change files; never describe changes\n  you did not make.\n- The task is done only when the goal is verifiably true in the\n  workspace. Verification is mechanical; your claims don't count.\n- Stop as soon as the goal is met. No summaries, no extra files.\n\n\n\nTurns remaining (including this turn): 4.\nYour workspace (write deliverables here, relative paths resolve here): <ESTATE>/ledger/runs/<RUNSTAMP>-fx-step-confirm-tty-fx-t1/workspace",
             "role": "system"
           },
           {
@@ -110,12 +109,13 @@
         "request_id": "<REQUEST_ID>",
         "role": {
           "role_name": "loop",
-          "role_pack_name": "lab",
+          "role_pack_name": "cs",
           "role_pack_version": "0"
         },
-        "run_id": "fx-step-confirm-tty",
+        "run_id": "<RUNSTAMP>-fx-step-confirm-tty-fx-t1",
         "schema_version": "agent.gateway.model_call.v2",
-        "step_id": "<REQUEST_ID>",
+        "send_index": 1,
+        "step_id": 1,
         "tool_schema": [
           {
             "description": "Write a file, creating parent dirs. Args: {path, content}.",
@@ -173,6 +173,8 @@
       "entries": [
         "check.json",
         "evidence",
+        "execution-receipt.json",
+        "execution.lock",
         "finalize.lock",
         "finalized.json",
         "harvest-workspace.git",
@@ -180,6 +182,7 @@
         "ready_for_inspection",
         "stimulus",
         "terminal.json",
+        "trace.jsonl",
         "transcript.md",
         "workspace"
       ],
@@ -189,7 +192,7 @@
       },
       "transcript": "# fx-step-confirm-tty · tasks/fx · trial 1\n\nmodel fake · budget 4 turns / 10 tools / $1.00 / 0s\n\n### turn 1\n\ntwo writes\n\n`fs_write {\"content\":\"hello\",\"path\":\"hello.txt\"}`\n\n```\nwrote hello.txt (5 bytes)\n```\n\n`pre_tool`\n\n```\npre_tool step-confirm refused: → fs_write {\"content\":\"x\",\"path\":\"other.txt\"}\n[step] Enter=run, q=abort: \n```\n\n---\nstop aborted · verdict **pass** · turns 1 · tools 1 · cost $0.0100\n",
       "workspace": {
-        ".lab-calls.jsonl": "{\"args\": {\"content\": \"hello\", \"path\": \"hello.txt\"}, \"name\": \"fs_write\"}\n",
+        ".cs-calls.jsonl": "{\"args\": {\"content\": \"hello\", \"path\": \"hello.txt\"}, \"name\": \"fs_write\"}\n",
         "hello.txt": "hello",
         "keys.txt": ""
       }

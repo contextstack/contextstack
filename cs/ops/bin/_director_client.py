@@ -137,6 +137,12 @@ class Client:
         request.add_header("Authorization", "Bearer " + self.token)
         request.add_header("Accept", "application/json")
         sent = self.protocol
+        shared_path = PROTOCOL1_PATH.fullmatch(path.split("?")[0])
+        where = "director %s %s" % (method, path)
+        # A concurrent request can discover the downgrade after a listener
+        # duty has checked the protocol. Guard the version used on the wire.
+        if sent == FALLBACK and not shared_path:
+            raise ProtocolRefused("%s: the director speaks node protocol 1 only" % where)
         request.add_header(PROTOCOL_HEADER, str(sent))
         if self.installation:
             request.add_header(INSTALLATION_HEADER, self.installation)
@@ -145,12 +151,11 @@ class Client:
         for name, value in (headers or {}).items():
             if value is not None:
                 request.add_header(name, value)
-        where = "director %s %s" % (method, path)
         try:
             with OPENER.open(request, timeout=timeout or self.timeout) as response:
                 self._check_answer(where, response.headers)
                 answered = response.headers.get(PROTOCOL_HEADER)
-                if answered == str(FALLBACK) and sent == PROTOCOL and PROTOCOL1_PATH.fullmatch(path.split("?")[0]):
+                if answered == str(FALLBACK) and sent == PROTOCOL and shared_path:
                     self.protocol = FALLBACK  # a protocol-1 Director answered a call that means the same in 1
                 elif answered != str(sent):
                     raise ProtocolRefused("%s: the answer does not name node protocol %d (%s: %r)"
@@ -168,7 +173,7 @@ class Client:
                 supported = (error.headers.get(SUPPORTED_HEADER) or "").replace(" ", "").split(",")
                 if sent == PROTOCOL and str(FALLBACK) in supported and str(PROTOCOL) not in supported:
                     self.protocol = FALLBACK
-                    if PROTOCOL1_PATH.fullmatch(path.split("?")[0]):
+                    if shared_path:
                         raise _Downgrade() from error  # asked again in 1; a protocol-2 call has no meaning there
                     raise ProtocolRefused("%s: the director speaks node protocol 1 only" % where) from error
                 raise ProtocolRefused("%s: HTTP 426, the director speaks node protocol %s, this node %d"

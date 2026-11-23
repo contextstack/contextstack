@@ -71,7 +71,8 @@ def pid_reuse_contract():
                     pass
             assert decoy.poll() is None, 'failed-sample fallback killed reused PID'
             # A changed identity between STOP and KILL must be checked again.
-            with patch.object(identity, '_pid_identity', side_effect=[birth, stale]), \
+            with patch.object(identity.platform, 'system', return_value='Linux'), \
+                 patch.object(identity, '_pid_identity', side_effect=[birth, stale]), \
                  patch.object(identity.os, 'kill') as kill:
                 assert identity._signal_pid(decoy.pid, birth, signal.SIGSTOP)
                 assert not identity._signal_pid(decoy.pid, birth, signal.SIGKILL)

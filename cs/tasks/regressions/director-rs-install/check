@@ -26,10 +26,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "node-install-layout"))
 import _bundle  # noqa: E402
 
-LAB = _bundle.LAB
-sys.path.insert(0, str(LAB / "scripts"))
+CODE_ROOT = _bundle.CODE_ROOT
+sys.path.insert(0, str(CODE_ROOT / "scripts"))
 from check_timeout import timeout as check_timeout
-INSTALL = LAB / "scripts/node-install"
+INSTALL = CODE_ROOT / "scripts/node-install"
 A, B, C = "20990101-aaaaaaaaa", "20990102-bbbbbbbbb", "20990103-ccccccccc"
 LABEL = "com.contextstack.director-rs"
 TOKEN = "csn_FAKEnodetoken0123456789abcdef"  # a stand-in: never a real token
@@ -71,11 +71,11 @@ def tree(root):
 
 def bins_with_director(tmp, name):
     bins = _bundle.fake_bins(tmp / name)
-    real = LAB.parent / "target/release/cs-director"
+    real = CODE_ROOT.parent / "target/release/cs-director"
     if os.access(real, os.X_OK):
         bins["cs-director"] = real
     else:
-        (tmp / name / "director-rs").write_text("#!/bin/sh\necho director-rs \"$@\"\n")
+        (tmp / name / "director-rs").write_text("#!/bin/sh\n[ \"$1\" = --schema-version ] && echo 0\n")
         (tmp / name / "director-rs").chmod(0o755)
         bins["cs-director"] = tmp / name / "director-rs"
     return bins, bins["cs-director"] == real
@@ -98,7 +98,7 @@ def part_bundle(tmp, uv):
     expect(not any(b["name"] == "director-rs" for b in meta["binaries"]) and not (tmp / "b-plain/release/bin/director-rs").exists(),
            "a bundle without it names no director-rs (never 'required, not bundled' on a node)")
     other = "linux-x86_64" if nb.host_target() != "linux-x86_64" else "linux-aarch64"
-    r = subprocess.run([sys.executable, str(LAB / "scripts/node-bundle"), "build", "--director-rs", "--target", other,
+    r = subprocess.run([sys.executable, str(CODE_ROOT / "scripts/node-bundle"), "build", "--director-rs", "--target", other,
                         str(tmp / "b-other")], capture_output=True, text=True, env=_bundle.dead_network_env(tmp / "nohome"))
     expect(r.returncode != 0 and "--director-rs" in r.stderr and not (tmp / "b-other").exists(),
            "build --director-rs for another target: refused before writing: %s" % r.stderr[-200:])
@@ -165,7 +165,10 @@ def part_serve(tmp, uv, managed):
     data = root / "state/director"
     bins, real = bins_with_director(tmp, "fakebin-serve")
     _bundle.bundle(tmp / "bundle-a", uv, A, bins)
-    _bundle.bundle(tmp / "bundle-b", uv, B, bins, extra={"RELEASE-B": "b\n"})
+    legacy = tmp / "legacy-director"
+    legacy.write_text("#!/bin/sh\nexit 1\n")
+    legacy.chmod(0o755)
+    _bundle.bundle(tmp / "bundle-b", uv, B, {**bins, "cs-director": legacy}, extra={"RELEASE-B": "b\n"})
     _bundle.bundle(tmp / "bundle-c", uv, C, _bundle.fake_bins(tmp / "fakebin-c"))  # no director-rs
     for rid in (A, B, C):
         _bundle.seed_python(home, rid, managed)
@@ -224,7 +227,10 @@ def part_serve(tmp, uv, managed):
     r, rep = node_install(home, "install", str(tmp / "bundle-b"), "--director-rs-listen", "127.0.0.1:8780",
                           "--director-rs-listen", "127.0.0.2:8780", "--no-load")
     expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + B and tree(data) == kept,
-           "install B: current -> B, the Director's data dir unchanged (bytes, mtime, mode)")
+           "install B: current -> B, the Director's data dir unchanged (bytes, mtime, mode): %s" %
+           (rep.get("refused") or {k: v for k, v in tree(data).items() if kept.get(k) != v}))
+    expect("warning: Director schema support is unknown for release " + B in r.stderr,
+           "install B: warns when the Director cannot report its schema")
     check_plist(home, root, ("127.0.0.1:8780", "127.0.0.2:8780"))
     r, rep = node_install(home, "rollback", "--no-load")
     expect(r.returncode == 0 and os.readlink(root / "current") == "releases/" + A and tree(data) == kept,
@@ -360,7 +366,7 @@ def main():
         return 0
     real = Path.home()
     watched = [real / ".local/bin", real / "Library/LaunchAgents"]
-    before = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    before = [_bundle.directory_snapshot(w) for w in watched]
     agents = _bundle.real_agents()
     tmp = Path(tempfile.mkdtemp(prefix="director-rs-install-", suffix=".noindex"))
     try:
@@ -369,7 +375,7 @@ def main():
         part_node(tmp, uv, managed)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    after = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    after = [_bundle.directory_snapshot(w) for w in watched]
     expect(before == after, "the real ~/.local/bin and ~/Library/LaunchAgents are unchanged")
     leak = _bundle.launchd_untouched(agents)
     expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")

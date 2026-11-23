@@ -300,7 +300,7 @@ fn pairing_a_device() -> Res {
     assert_eq!(status, 403, "a code works once");
 
     let (status, me) = d.client("GET", "/api/v1/client/me", Some(&device), &Value::Null)?;
-    assert_eq!((status, &me["owner"]), (200, &json!(false)));
+    assert_eq!((status, &me["owner"]), (200, &json!(true)));
     assert_eq!(
         d.client("GET", "/api/v1/client/nodes", Some(&device), &Value::Null)?
             .0,
@@ -310,12 +310,8 @@ fn pairing_a_device() -> Res {
         ("POST", "/api/v1/client/pairings"),
         ("GET", "/api/v1/client/credentials"),
     ] {
-        let (status, body) = d.client(method, path, Some(&device), &json!({"name": "x"}))?;
-        assert_eq!(
-            (status, body["code"].as_str()),
-            (403, Some("owner_only")),
-            "{method} {path}"
-        );
+        let (status, _) = d.client(method, path, Some(&device), &json!({"name": "x"}))?;
+        assert_eq!(status, 200, "{method} {path}");
     }
     let id = paired["credential_id"].as_str().ok_or("id")?;
     let (status, _) = d.client(
@@ -553,6 +549,8 @@ fn tls_when_configured() -> Res {
                 "ec",
                 "-pkeyopt",
                 "ec_paramgen_curve:prime256v1",
+                "-pkeyopt",
+                "ec_param_enc:named_curve",
                 "-nodes",
                 "-days",
                 "1",

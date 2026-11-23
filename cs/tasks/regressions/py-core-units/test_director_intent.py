@@ -1,4 +1,4 @@
-"""Director task links survive Python run records without requiring lab identifiers."""
+"""Director task links survive Python run records without requiring code_root identifiers."""
 import json
 from pathlib import Path
 import sys

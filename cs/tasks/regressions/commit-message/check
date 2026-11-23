@@ -5,8 +5,8 @@ import shutil
 import subprocess
 import sys
 
-LAB = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(LAB / 'tasks/regressions/_lib'))
+CODE_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(CODE_ROOT / 'tasks/regressions/_lib'))
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
@@ -15,7 +15,7 @@ with scratch_dir(prefix='commit-message-') as raw:
     hooks = root / 'scripts/hooks'
     hooks.mkdir(parents=True)
     hook = hooks / 'commit-msg'
-    shutil.copy2(LAB / 'scripts/hooks/commit-msg', hook)
+    shutil.copy2(CODE_ROOT / 'scripts/hooks/commit-msg', hook)
     for name in ('ops-cap.py', 'check-red-gate'):
         (root / 'scripts' / name).write_text(
             'from pathlib import Path\n'

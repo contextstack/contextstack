@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """state-root-readers (CS phase 6 step 10). goal.md has the contract.
 
-  static    no op under ops/bin (nor a tools/bin tool) builds a path as <lab> / "ledger/..." any more: every shelf
-            goes through _estate_io.state_dir (or _roots); repo-tier tools that commit or classify the
-            git path ledger/ (estate-commit) are the named exception
-  relocate  with LAB_STATE_ROOT outside the checkout, run-identity reads
-            the relocated ledger and never creates <lab>/ledger
+  static    no op under ops/bin (nor a tools/bin tool) builds a path as <code-root> / "ledger/..." any more: every shelf
+            goes through _estate_io.state_dir or _roots, with a guarded fallback for older estate copies
+  relocate  with CS_STATE_ROOT outside the checkout, run-identity reads
+            the relocated ledger and never creates <code-root>/ledger
 """
 import json
 import os
@@ -16,9 +15,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
-EXEMPT = {"estate-commit", "_roots.py", "_estate_io.py"}
-PAT = re.compile(r'''(Path\([A-Za-z_.]+\)|\b(?:LAB|lab|api\.LAB|root)\b)\s*/\s*["']ledger(?:/[^"'\n]*)?["']''')
+CODE_ROOT = Path(__file__).resolve().parents[3]
+EXEMPT = {"_roots.py", "_estate_io.py"}
+PAT = re.compile(r'''(Path\([A-Za-z_.]+\)|\b(?:CODE_ROOT|code_root|api\.CODE_ROOT|root)\b)\s*/\s*["']ledger(?:/[^"'\n]*)?["']''')
 FAILED = []
 
 
@@ -30,8 +29,8 @@ def expect(cond, label, detail=""):
 
 def static():
     found = []
-    tools = [t for t in (LAB / "tools/bin").iterdir() if t.is_file()]  # model tools too (P3)
-    for p in sorted(list((LAB / "ops/bin").iterdir()) + tools):
+    tools = [t for t in (CODE_ROOT / "tools/bin").iterdir() if t.is_file()]  # model tools too (P3)
+    for p in sorted(list((CODE_ROOT / "ops/bin").iterdir()) + tools):
         if not p.is_file() or p.name in EXEMPT or p.name.endswith(".json"):
             continue
         try:
@@ -40,16 +39,16 @@ def static():
             continue
         found += ["%s:%d" % (p.name, i + 1) for i, l in enumerate(lines) if not l.lstrip().startswith("#") and PAT.search(l)
                   and '__import__("pathlib")' not in l  # the guarded fallback: default layout where _estate_io predates state_dir
-                  and 'LAB_STATE_ROOT' not in l]  # a tool's default when no state root is set (the checkout layout)
-    expect(not found, "static: no shelf path is built under <lab>/ledger outside _estate_io/_roots", found)
+                  and 'CS_STATE_ROOT' not in l]  # a tool's default when no state root is set (the checkout layout)
+    expect(not found, "static: no shelf path is built under <code-root>/ledger outside _estate_io/_roots", found)
 
 
 def relocate(scratch):
-    code, state = scratch / "lab", scratch / "state"
+    code, state = scratch / "code_root", scratch / "state"
     (code / "ops").mkdir(parents=True)
-    shutil.copytree(LAB / "ops/bin", code / "ops/bin", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(CODE_ROOT / "ops/bin", code / "ops/bin", ignore=shutil.ignore_patterns("__pycache__"))
     for name in ("INVARIANTS.md",):
-        shutil.copy2(LAB / name, code / name)
+        shutil.copy2(CODE_ROOT / name, code / name)
     (code / "ESTATE").write_text("relocated\n")
     (code / "specs").mkdir()
     state.mkdir()
@@ -58,7 +57,7 @@ def relocate(scratch):
     (state / "dispatch.jsonl").write_text(json.dumps({"ts": "2026-11-10T00:00:00Z", "id": "1", "spec": "specs/fx.yaml",
                                                        "state": "pending", "pid": 0, "lane": "production"}) + "\n")
     (state / "schedules.jsonl").write_text("")
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(scratch), "LAB_STATE_ROOT": str(state),
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(scratch), "CS_STATE_ROOT": str(state),
            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
 
     def op(name, payload=None):
@@ -72,7 +71,7 @@ def relocate(scratch):
     rc, out, err = op("run-identity")
     expect(rc == 0 and out.get("run_id") == "fx-run" and out.get("source") == "row",
            "relocate: run-identity reads the relocated ledger", (out, err))
-    expect(not (code / "ledger").exists(), "relocate: <lab>/ledger was never created",
+    expect(not (code / "ledger").exists(), "relocate: <code-root>/ledger was never created",
            sorted(p.name for p in code.iterdir()))
 
 

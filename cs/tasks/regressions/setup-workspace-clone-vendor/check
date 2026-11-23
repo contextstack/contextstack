@@ -16,8 +16,8 @@ _fixture_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_fixture_env)
 
-LAB = Path(__file__).resolve().parents[3]
-CHECKLIB = LAB / "scripts/checklib.sh"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+CHECKLIB = CODE_ROOT / "scripts/checklib.sh"
 LIMIT = 1024 * 1024
 WRAPPER = '''#!/bin/sh
 . "$CHECKLIB_PATH"
@@ -56,11 +56,11 @@ def detach_volume(mount):
 
 
 checklib = CHECKLIB.read_text(encoding="utf-8")
-assert ".lab-composer-base.php" not in checklib
+assert ".cs-composer-base.php" not in checklib
 assert "auto_prepend_file" not in checklib
-assert ".lab-pest.php" not in checklib
+assert ".cs-pest.php" not in checklib
 
-sys.path.insert(0, str(LAB / "ops/bin"))
+sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
 from _setup_workspace import forget_worktree, materialize  # noqa: E402
 
 with scratch_dir(prefix="setup-workspace-clone-vendor-") as raw:
@@ -74,7 +74,7 @@ with scratch_dir(prefix="setup-workspace-clone-vendor-") as raw:
         git(origin, "config", "user.email", "fixture@example.test")
         git(origin, "config", "user.name", "Fixture")
         write(origin / "composer.lock", '{"packages":[]}\n')
-        write(origin / "composer.json", '{"name":"lab/fixture"}\n')
+        write(origin / "composer.json", '{"name":"code_root/fixture"}\n')
         artisan = write(
             origin / "artisan",
             "#!/usr/bin/env php\n"
@@ -117,10 +117,10 @@ with scratch_dir(prefix="setup-workspace-clone-vendor-") as raw:
         git(origin, "commit", "-qm", "base")
         head = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "HEAD"], text=True, env={**hermetic_env()}).strip()
 
-        lab = vol / "lab"
-        setup = lab / "ledger/setups/corpus"
+        code_root = vol / "code_root"
+        setup = code_root / "ledger/setups/corpus"
         subprocess.run(["git", "clone", "--quiet", str(origin), str(setup)], check=True, env={**hermetic_env()})
-        git(setup, "update-ref", "refs/lab/base", head)
+        git(setup, "update-ref", "refs/cs/base", head)
         write(
             setup / "vendor/autoload.php",
             "<?php\n"
@@ -161,21 +161,21 @@ with scratch_dir(prefix="setup-workspace-clone-vendor-") as raw:
         (setup / "vendor" / "pkg").mkdir(parents=True)
         (setup / "vendor" / "pkg" / "blob").write_bytes(b"V" * (32 * 1024 * 1024))
 
-        task = lab / "tasks/work/corpus-cell"
+        task = code_root / "tasks/work/corpus-cell"
         task.mkdir(parents=True)
         (task / "goal.md").write_text("cell\n")
         (task / "notes.md").write_text("writes: app/*,tests/*\n")
         (task / "setup").symlink_to(setup)
 
         before = shutil.disk_usage(vol).used
-        ws = lab / "ledger/runs/run-1/workspace"
-        materialize(task / "setup", ws, task=task, lab=lab)
+        ws = code_root / "ledger/runs/run-1/workspace"
+        materialize(task / "setup", ws, task=task, code_root=code_root)
         physical = shutil.disk_usage(vol).used - before
         assert physical < LIMIT, "cloned vendor added %s physical bytes" % physical
         assert (ws / "vendor").is_dir() and not (ws / "vendor").is_symlink()
         assert (ws / "app" / "Providers" / "AppServiceProvider.php").is_file()
 
-        env = {k: v for k, v in hermetic_env().items() if k != "LAB_CHECK"}
+        env = {k: v for k, v in hermetic_env().items() if k != "CS_CHECK"}
         env["CHECKLIB_PATH"] = str(CHECKLIB)
         wrapper = ws / "check"
         wrapper.write_text(WRAPPER, encoding="utf-8")
@@ -187,10 +187,10 @@ with scratch_dir(prefix="setup-workspace-clone-vendor-") as raw:
         assert result.returncode == 0, text
         assert "check: ok" in result.stdout, text
         assert "autoload missed workspace App" not in text, text
-        assert not (ws / ".lab-composer-base.php").exists()
-        assert not (ws / ".lab-pest.php").exists()
+        assert not (ws / ".cs-composer-base.php").exists()
+        assert not (ws / ".cs-pest.php").exists()
 
-        cache = next((lab / "ledger/setups/installs").glob("*/vendor"))
+        cache = next((code_root / "ledger/setups/installs").glob("*/vendor"))
         (ws / "vendor" / "pkg" / "blob").write_bytes(b"W" * 1024)
         assert (cache / "pkg" / "blob").read_bytes()[:1] == b"V"
         forget_worktree(ws)

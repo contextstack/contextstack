@@ -1,8 +1,8 @@
 {
   "exit": 1,
-  "stdout": "path escapes workspace: ../a.txt\n",
+  "stdout": "path escapes workspace: ../a.txt\nYour workspace is <ws>; write there or use a relative path such as a.txt.\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"edits\": [{\"newText\": \"b\", \"oldText\": \"a\"}], \"path\": \"../a.txt\"}, \"name\": \"fs_edit\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"edits\": [{\"newText\": \"b\", \"oldText\": \"a\"}], \"path\": \"../a.txt\"}, \"name\": \"fs_edit\"}\n"
   },
   "untouched": true
 }

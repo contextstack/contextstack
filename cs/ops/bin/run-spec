@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """run-spec — run every cell of a spec (tasks x trials) and print the summary.
 
-Operator-called, never palette. `lab run` executes one
-cell; this op is the whole-spec iteration that left the runner, with the
-banner and TOTAL lines the runner used to print. Input JSON on stdin
+Operator-called, never palette. Runs and finishes each cell through run-api,
+with the usual banner, cell summaries and TOTAL line. Input JSON on stdin
 {"spec": "specs/x.yaml", "task"?: dir, "trials"?: n}, or for a human at a
-terminal: run-spec <spec.yaml> [-task dir]. Each cell is `<runner> run -task T
--trial n <spec>` (runner: $CS_RUNNER_BIN or $LAB_RUNNER_BIN, else ../target/release/cs-harness; cwd
-the lab root) with LAB_CHILD_ENV = the spec's `env:` request resolved against
-policy/env.json (_env_policy); the node's LAB_*_ROOT are validated first
+terminal: run-spec <spec.yaml> [-task dir]. Each cell uses `run-api -task T
+-trial n <spec>` (runner: $CS_RUNNER_BIN, else ../target/release/cs-harness; cwd
+the code root) with CS_CHILD_ENV = the spec's `env:` request resolved against
+policy/env.json (_env_policy); the node's CS_*_ROOT are validated first
 (_roots), and CS_TOOL_PREFIX is set from policy/sandbox.json (_sandbox_policy), with
 one sandbox report dir per cell (cell_prefix).
 A refused root, request or sandbox policy exits 2 naming it, before any cell runs;
@@ -20,9 +19,8 @@ pass < want, else 0.
 import json, os, re, subprocess, sys
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[2]
+CODE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _runner import runner_path
 from _env_policy import EnvPolicyError, child_env_value, resolve  # noqa: E402
 from _roots import RootsError, roots, sandbox_reports_dir  # noqa: E402
 from _sandbox_policy import SandboxPolicyError, browser_state_value, cell_prefix, tool_prefix_value  # noqa: E402
@@ -61,18 +59,18 @@ def main():
     spec = str(req.get("spec") or "")
     if not spec:
         raise SystemExit("run-spec: usage: run-spec <spec.yaml> [-task dir], or JSON {spec, task?, trials?} on stdin")
-    text = (LAB / spec).read_text(encoding="utf-8")
+    text = (CODE_ROOT / spec).read_text(encoding="utf-8")
     tasks = [req["task"]] if req.get("task") else spec_tasks(text)
     trials = int(req.get("trials") or spec_value(text, "trials") or 1)
-    runner = str(runner_path(LAB))  # _runner: CS_RUNNER_BIN, then LAB_RUNNER_BIN, else the Rust runner
+    launcher = str(CODE_ROOT / "ops/bin/run-api")
     try:  # the node's roots (_roots) and the spec's env: request, both validated here, before anything launches
         roots()
-        allowed = child_env_value(resolve(LAB, text))
-        env = dict(os.environ, LAB_CHILD_ENV=allowed, CS_CHILD_ENV=allowed)
-        state = browser_state_value(LAB, env)  # policy write_env lists it: the state root's default unless set
+        allowed = child_env_value(resolve(CODE_ROOT, text))
+        env = dict(os.environ, CS_CHILD_ENV=allowed)
+        state = browser_state_value(CODE_ROOT, env)  # policy write_env lists it: the state root's default unless set
         if state is not None:
-            env["LAB_BROWSER_STATE"] = state
-        prefix = tool_prefix_value(LAB)  # None: unconfined (no policy); missing wrapper is SandboxPolicyError
+            env["CS_BROWSER_STATE"] = state
+        prefix = tool_prefix_value(CODE_ROOT)  # None: unconfined (no policy); missing wrapper is SandboxPolicyError
         if prefix is not None:
             env["CS_TOOL_PREFIX"] = prefix
         reports = str(sandbox_reports_dir())
@@ -86,9 +84,9 @@ def main():
     passed, want, pending = 0, len(tasks) * trials, False
     for task in tasks:
         for n in range(1, trials + 1):
-            cmd = [runner, "run", "-task", task, "-trial", str(n), spec]
+            cmd = [launcher, "-task", task, "-trial", str(n), spec]
             cell = dict(env, CS_TOOL_PREFIX=cell_prefix(prefix, os.environ, reports)) if prefix is not None else env
-            rc = subprocess.run(cmd, cwd=str(LAB), env=cell).returncode
+            rc = subprocess.run(cmd, cwd=str(CODE_ROOT), env=cell).returncode
             passed += rc == 0
             pending = pending or rc == 3
     print("  TOTAL %d/%d pass — rows in ledger/ledger.jsonl" % (passed, want), flush=True)

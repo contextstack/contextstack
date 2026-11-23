@@ -152,18 +152,18 @@ def stream_openai_compat_unary_answer(t):
 
 @case("streaming")
 def stream_openai_compat_bad_args(t):
-    """Streamed tool arguments that assemble to non-JSON fail the call as the unary path does: after the deltas, one error chunk runtime_fault gateway.provider_failed, $0, no partial tool calls."""
-    t.vllm.default_chat = {"json": upstreams.chat_completion("", finish="tool_calls", tool_calls=[
-        {"id": "c", "type": "function", "function": {"name": "fs.read", "arguments": "{\"path\": "}}])}
+    """Malformed arguments preserve the tool call and usage in both reply modes."""
+    args = '{"path": '
+    call = {"id": "c", "type": "function", "function": {"name": "fs.read", "arguments": args}}
+    expected = [{"id": "c", "name": "fs.read", "args": {}, "invalid_arguments": True}]
+    t.vllm.default_chat = {"json": upstreams.chat_completion("", finish="tool_calls", tool_calls=[call])}
     sub(t.gw.call(model_call("local-coder", tool_schema=TOOLS)).json,
-        {"status": "error", "error": {"code": "gateway.provider_failed"}, "cost": {"amount": "0.000000"}}, "unary")
+        {"status": "ok", "tool_calls": expected}, "unary")
     t.vllm.default_chat = {"sse": upstreams.chat_stream(["x"], finish="tool_calls", tool_deltas=[
-        {"index": 0, "id": "c", "function": {"name": "fs.read", "arguments": "{\"path\": "}}])}
+        {"index": 0, "id": "c", "function": {"name": "fs.read", "arguments": args}}])}
     got = t.gw.call(model_call("local-coder", stream=True, tool_schema=TOOLS)).sse()
-    eq([f["kind"] for f in got], ["delta", "error"], "kinds")
-    sub(got[-1], {"index": 0, "cost": {"currency": "USD", "amount": "0.000000"},
-                  "error": {"class": "runtime_fault", "code": "gateway.provider_failed", "recoverable": False}}, "error chunk")
-    eq("tool_calls" in got[-1], False, "no partial tool calls")
+    eq([f["kind"] for f in got], ["delta", "stop"], "kinds")
+    eq(got[-1]["tool_calls"], expected, "flagged args in stop")
 
 
 @case("streaming")
@@ -243,3 +243,12 @@ def stream_unsupported_refused(t):
     eq(f["error"]["message"], "spec-box: streaming unsupported (protocol or endpoint declaration); call unary", "message")
     eq(t.run.calls(m), [], "no upstream request")
     sub(gw.call(model_call("box-model")).json, {"status": "ok", "model": "box-model"}, "unary serves")
+
+
+@case("streaming")
+def wire_documents_json_before_schema_acceptance(t):
+    """The wire guide agrees with stream_schema_mismatch_is_envelope."""
+    from pathlib import Path
+
+    wire = (Path(__file__).resolve().parents[3] / "gateway" / "WIRE.md").read_text()
+    assert "Malformed JSON and schema mismatches return a JSON error envelope" in wire

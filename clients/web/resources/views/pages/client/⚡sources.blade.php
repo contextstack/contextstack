@@ -9,9 +9,9 @@ use Livewire\Attributes\Title;
 
 /*
  * Source budgets (CLIENT-API.md §12.5): the gateway's budget per pay-as-you-go source, read through the Director. A
- * source with no budget is off ("off, set a budget to use"), which is not the same as "budget used up". Only the
- * Director's owner may set or turn one off; the Director answers a paired device 403 owner_only, and this page
- * shows that refusal as it is. Budget writes replace what they name, so they carry no key.
+ * source with no budget is off ("off, set a budget to use"), which is not the same as "budget used up". Only an owner
+ * (the Director's machine or a paired device) may set or turn one off; any other credential gets 403 owner_only, and
+ * this page shows that refusal as it is. Budget writes replace what they name, so they carry no key.
  */
 new #[Layout('layouts::client')] #[Title('Source budgets')] class extends DirectorPage
 {
@@ -111,7 +111,7 @@ new #[Layout('layouts::client')] #[Title('Source budgets')] class extends Direct
 
     @if ($owner === false)
         <flux:callout icon="lock-closed" data-test="device-note">
-            <flux:callout.text>{{ __('This device is paired, not the owner. It can read source budgets; the Director refuses a paired device that sets one (403 owner_only).') }}</flux:callout.text>
+            <flux:callout.text>{{ __('This credential is not the owner\'s. It can read source budgets; the Director refuses it setting one (403 owner_only).') }}</flux:callout.text>
         </flux:callout>
     @endif
 

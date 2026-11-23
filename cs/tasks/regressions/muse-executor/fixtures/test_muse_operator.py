@@ -1,5 +1,6 @@
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
+from cli_execution import command as cli_command
 """Independent behavioral acceptance through the real executor; no network."""
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
@@ -14,9 +15,9 @@ import tempfile
 SOURCE = Path.cwd()
 VERSION = "Muse Code 1.0.3 (1.0.3-R2198.1)"
 NATIVE_SHA = "4c0f960028b603174af7df7bd5051d8c35d6c1aa372a37d18bc770926a0577a7"
-FILES = ("_executor.py", "_toolchains.py", "_harvest_git.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_vitals.py", "executor-templates.json", "_muse.py", "_muse_adapter.py",
+FILES = ("_executor.py", "_toolchains.py", "_harvest_git.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_vitals.py", "executor-templates.json", "_muse.py", "_muse_adapter.py", "_machine_finish.py",
          "muse-profile.json", "capture-stimulus", "capture-stimulus.json",
-         "_est.py", "_grant.py", "_corpus_contract.py", "_workspace_setup.py", "_frozen_inputs.py",
+         "_est.py", "_grant.py", "_workspace_setup.py", "_frozen_inputs.py",
          "publish-evidence", "harvest", "finalize-run")
 AUTH = {"schema_version": 2, "providers": {"meta": {
     "mechanism": "oauth", "storage": "keychain", "obtained_via": "device_code",
@@ -48,6 +49,7 @@ def run_case(mode="ok", key=None):
         for name in FILES:
             shutil.copy2(SOURCE/"ops/bin"/name, ops/name)
         home = root/"personal-home"; (home/".config/muse").mkdir(parents=True)
+        (home/".gitconfig").write_text("[user]\n\tname = Muse Fixture\n\temail = muse@example.invalid\n")
         (home/"hidden-personal-context").write_text("private-context-canary")
         (home/"Library/Keychains").mkdir(parents=True)
         auth = json.loads(json.dumps(AUTH))
@@ -59,7 +61,7 @@ def run_case(mode="ok", key=None):
         script = "#!"+sys.executable+"\n" + "MODE="+repr(mode)+"\n" + "REAL_HOME="+repr(str(home))+"\n" + "FIXTURE="+repr(fixture)+"\n" + "VERSION="+repr(VERSION)+"\n" + r'''import json,os,signal,subprocess,sys,time
 from pathlib import Path
 ws=Path.cwd()
-marker=ws/'.lab-muse/native-calls'
+marker=ws/'.cs-muse/native-calls'
 marker.parent.mkdir(exist_ok=True)
 with marker.open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
 if '--version' in sys.argv:
@@ -78,7 +80,7 @@ assert sys.argv[sys.argv.index('--worktree')+1]=='off'
 assert '--no-session-log' in sys.argv and '--disable-web-tools' in sys.argv
 assert not any(k.startswith(('META_','MUSE_','TBH_')) for k in os.environ)
 actual_home=Path(os.environ['HOME']).resolve()
-assert actual_home == ws/'.lab-tmp/muse',actual_home
+assert actual_home == ws/'.cs-tmp/muse',actual_home
 library=actual_home/'Library'; keychain=library/'Keychains'
 assert keychain.is_symlink() and keychain.resolve()==Path(REAL_HOME)/'Library/Keychains'
 try: keychain.unlink()
@@ -131,18 +133,20 @@ if MODE=='exit': sys.exit(7)
             import sys as _sys
             _sys.path.insert(0, str(ops))
             from _cli_pins import ensure_pin
-            ensure_pin('muse-code', binary, VERSION, env={'LAB_CONFIG_ROOT': str(cfg)})
+            ensure_pin('muse-code', binary, VERSION, env={'CS_CONFIG_ROOT': str(cfg)})
             recorded = json.loads((cfg/'cli-pins.json').read_text())['muse-code']['sha256']
             assert recorded == sha, 'machine pin did not record the fixture binary'
             binary.write_text(script+'\n# changed after pin\n')
         task=estate/'tasks/work/case';(task/'setup').mkdir(parents=True)
         (task/'goal.md').write_text('Write answer.txt containing done.\n')
         (task/'check').write_text('#!/bin/sh\n[ "$(cat answer.txt)" = done ]\n');(task/'check').chmod(0o755)
-        env={k:v for k,v in hermetic_env().items() if not k.startswith(('GIT_','LAB_','META_','MUSE_','TBH_'))}
+        env={k:v for k,v in hermetic_env().items() if not k.startswith(('GIT_','CS_','META_','MUSE_','TBH_'))}
         env['HOME']=str(home)
-        env['LAB_CONFIG_ROOT']=str(cfg)
+        env['XDG_CONFIG_HOME']=str(home/".config")
+        env['CS_CONFIG_ROOT']=str(cfg)
+        env['CS_SANDBOX_BIN']=os.environ['CS_SANDBOX_BIN']
         if key is not None: env['META_API_KEY']=key
-        result=subprocess.run([sys.executable,str(ops/'_executor.py')],cwd=estate,env=env,
+        result=subprocess.run(cli_command(sys.executable, ops/'_executor.py'),cwd=estate,env=env,
             input=json.dumps({'executor':'muse-code','task':str(task),'exp':'task-999','timeout_s':2 if mode=='timeout' else 10}),
             text=True,capture_output=True,timeout=45)
         rows=[json.loads(s) for s in (estate/'ledger/ledger.jsonl').read_text().splitlines()]
@@ -152,9 +156,9 @@ if MODE=='exit': sys.exit(7)
         assert not any(p.is_symlink() for p in run.rglob('Keychains')), ('Keychain link left in run evidence', mode)
         assert 'identity-canary' not in (run/'cli.log').read_text()
         assert row['cost_usd']==0 and row['cost_class']=='subscription'
-        assert row['est_basis']=='chars' and row['est_rate_known'] is False, (mode,row)
+        assert row['est_basis']=='unpriced' and row['est_usd']==0 and row['est_rate_known'] is False, (mode,row)
         if mode=='ok' and key is None:
-            assert result.returncode==0 and row['verdict']=='pass', (row,result.stderr)
+            assert result.returncode==0 and row['verdict']=='pass', (row,result.stderr,(run/'cli.log').read_text())
             recorded = json.loads((cfg/'cli-pins.json').read_text())['muse-code']
             assert recorded['sha256']==sha and not (estate/'cli-pins.json').exists(), recorded
             assert row['auth_source']=='oauth_keychain' and row['auth_verified'] is True

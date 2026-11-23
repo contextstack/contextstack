@@ -135,14 +135,14 @@ pub fn relative(path: &Path, root: &Path) -> String {
     rel.to_string_lossy().into_owned()
 }
 
-/// `markdown_files`: the sorted corpus, `.git` and `.lab-*` components excluded.
+/// `markdown_files`: the sorted corpus, `.git` and `.cs-*` components excluded.
 pub fn markdown_files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     walk(root, &mut found);
     found.retain(|p| {
         let rel = relative(p, root);
         !rel.split('/')
-            .any(|part| part == ".git" || part.starts_with(".lab-"))
+            .any(|part| part == ".git" || part.starts_with(".cs-"))
     });
     found.sort_by_cached_key(|p| path_key(p));
     found
@@ -237,15 +237,15 @@ mod tests {
         });
     }
     #[test]
-    fn markdown_walk_skips_dot_git_and_lab_prefixes() {
+    fn markdown_walk_skips_dot_git_and_spill_prefixes() {
         in_workspace(|ws| {
             let corpus = ws.join("c");
             fs::create_dir_all(corpus.join(".git/objects"))
                 .unwrap_or_else(|e| panic!("mkdir: {e}"));
             fs::write(corpus.join(".git/objects/x.md"), "secret\n")
                 .unwrap_or_else(|e| panic!("write: {e}"));
-            fs::create_dir(corpus.join(".lab-hidden")).unwrap_or_else(|e| panic!("mkdir: {e}"));
-            fs::write(corpus.join(".lab-hidden/h.md"), "h\n")
+            fs::create_dir(corpus.join(".cs-hidden")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            fs::write(corpus.join(".cs-hidden/h.md"), "h\n")
                 .unwrap_or_else(|e| panic!("write: {e}"));
             fs::write(corpus.join("visible.md"), "v\n").unwrap_or_else(|e| panic!("write: {e}"));
             let files = markdown_files(&corpus);

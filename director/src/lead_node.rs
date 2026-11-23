@@ -188,22 +188,36 @@ pub fn issue_credential(
     }
     // Mint first, then revoke the older ones: a failed mint leaves the machine's current credential working. If this
     // answer is lost, the machine's next call with its old credential gets 401 and it fetches again.
-    let minted = match access::mint_lead(&state.store, "hosted-lead", conversation_id, None) {
+    let actor = format!("node:{node_id}");
+    let minted = match access::mint_lead(&state.store, "hosted-lead", conversation_id, None, &actor)
+    {
         Ok(v) => v,
         Err(e) => return refusal(422, "invalid_request", &e, Value::Null),
     };
     let Some(new_id) = minted["credential_id"].as_str().map(str::to_string) else {
         return internal(&"minted lead credential has no id".to_string());
     };
-    {
-        let db = state.store.db();
-        if let Err(e) = db.execute(
-            "UPDATE credentials SET revoked_at = ?1
-             WHERE kind = 'lead' AND conversation_id = ?2 AND revoked_at IS NULL AND id != ?3",
-            params![now_utc(), conversation_id, new_id],
-        ) {
-            return internal(&e.to_string());
+    let revoked = state
+        .store
+        .db()
+        .prepare(
+            "UPDATE credentials SET revoked_at = ?1, revoked_by = ?4
+         WHERE kind = 'lead' AND conversation_id = ?2 AND revoked_at IS NULL AND id != ?3
+         RETURNING id",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![now_utc(), conversation_id, new_id, actor], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    match revoked {
+        Ok(ids) => {
+            for id in ids {
+                state.hub.revoked(&id);
+            }
         }
+        Err(e) => return internal(&e),
     }
     json(201, &minted)
 }

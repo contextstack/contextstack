@@ -6,7 +6,7 @@
   "run_dirs_distinct": true,
   "runs": [],
   "stderr": [
-    "lab: specs/fx.yaml lists 2 tasks: pass -task <dir>, or run the whole spec with ops/bin/run-spec"
+    "cs: specs/fx.yaml lists 2 tasks: pass -task <dir>, or run the whole spec with ops/bin/run-spec"
   ],
   "stdout": []
 }

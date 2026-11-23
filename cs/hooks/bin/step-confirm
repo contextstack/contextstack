@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # pre_tool hook: a human at a terminal confirms each tool call. stdin is the
 # call {name, args}; Enter runs it (exit 0), q aborts the run (exit 2), anything
-# else runs it. The terminal is /dev/tty, or $LAB_STEP_TTY: a fifo, or a regular
+# else runs it. The terminal is /dev/tty, or $CS_STEP_TTY: a fifo, or a regular
 # file consumed one line per call so a fixture can script "\nq\n" (the prompt
 # then goes to stderr). No terminal that opens, or a script that ran out: exit 2
 # with a message — a step-confirm in a dispatched spec aborts, never runs blind.
 import json, os, stat, sys
 
 call = json.load(sys.stdin)
-path = os.environ.get("LAB_STEP_TTY") or "/dev/tty"
+path = os.environ.get("CS_STEP_TTY") or "/dev/tty"
 prompt = "→ %s %s\n[step] Enter=run, q=abort: " % (
     call.get("name"), json.dumps(call.get("args"), separators=(",", ":"), sort_keys=True))
 try:

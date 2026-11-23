@@ -30,7 +30,7 @@ def skip_workspace_member(rel):
     """Secrets and caches never enter tree_hash or the inspection archive."""
     path = Path(rel)
     name = path.name.lower()
-    if any(part in SKIP_DIRS or part.startswith(".lab-") or part.startswith(".env")
+    if any(part in SKIP_DIRS or part.startswith(".cs-") or part.startswith(".env")
            for part in path.parts):
         return True
     if name.startswith(".env") or ".sqlite" in name:

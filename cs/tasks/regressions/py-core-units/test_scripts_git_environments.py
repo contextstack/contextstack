@@ -66,15 +66,15 @@ class ScriptsGitEnvironmentTests(unittest.TestCase):
     def test_estate_identity_git_calls_are_hardened(self):
         identity = load("estate-identity.py")
         with scratch_dir(prefix="identity-git-") as raw:
-            lab = Path(raw)
-            (lab / "ledger").mkdir()
-            (lab / "ledger/estate-cutover.json").write_text(json.dumps({
+            code_root = Path(raw)
+            (code_root / "ledger").mkdir()
+            (code_root / "ledger/estate-cutover.json").write_text(json.dumps({
                 "schema": "estate-cutover-v1", "estate": "fixture", "historical_prefixes": {}}))
-            (lab / "ledger/rows.jsonl").write_text('{"estate":"fixture"}\n')
+            (code_root / "ledger/rows.jsonl").write_text('{"estate":"fixture"}\n')
             parent = self.hostile_env()
             with patch.dict(os.environ, parent, clear=True), patch.object(identity, "estate_id", return_value="fixture"), patch.object(
                     identity.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"")) as run:
-                self.assertTrue(identity.check(lab)["ok"])
+                self.assertTrue(identity.check(code_root)["ok"])
                 self.assertEqual(len(run.call_args_list), 3)
                 self.assert_clean_calls(run.call_args_list)
                 self.assertEqual(dict(os.environ), parent)

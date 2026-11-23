@@ -5,7 +5,7 @@ The tool speaks one JSON line to ops/bin/browser-broker over the unix socket cs-
 (CS_SOCKET_BROWSER_<SET>). It never speaks CDP and has no network. The set comes from the name it runs
 under: browser_session is `public`; a set is added as a symlink tools/bin/browser_<set> -> browser_session
 with its own descriptor asking for socket browser-<set> (the wrapper reads <name>.json beside the name).
-LAB_BROWSER_BROKER_EXEC (fixtures only) names a program that answers the same line on stdin/stdout.
+CS_BROWSER_BROKER_EXEC (fixtures only) names a program that answers the same line on stdin/stdout.
 """
 import hashlib
 import json
@@ -24,7 +24,7 @@ TIMEOUT = 120
 
 def ask(set_name, request):
     line = json.dumps(request, sort_keys=True).encode() + b"\n"
-    fake = os.environ.get("LAB_BROWSER_BROKER_EXEC")
+    fake = os.environ.get("CS_BROWSER_BROKER_EXEC")
     if fake:
         done = subprocess.run([fake], input=line, capture_output=True, timeout=TIMEOUT)
         raw = done.stdout

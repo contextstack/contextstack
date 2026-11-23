@@ -31,7 +31,7 @@ def load(name):
 
 with scratch_dir(prefix="turn-priority-") as tmp:
     state = Path(tmp)
-    os.environ['LAB_STATE_ROOT'] = tmp
+    os.environ['CS_STATE_ROOT'] = tmp
     import _node_intake as intake
     from _estate_io import read_jsonl, append_jsonl
     from _turn_priority import select, is_turn

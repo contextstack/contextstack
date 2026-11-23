@@ -19,6 +19,7 @@
       "fs_read",
       "fs_write",
       "okf",
+      "repo_search",
       "search",
       "web_fetch",
       "web_search"
@@ -29,7 +30,7 @@
   },
   "requires_manual": {
     "browser_fetch": [
-      "gstack browse (LAB_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)",
+      "gstack browse (CS_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)",
       "Playwright chromium_headless_shell-1208 (PLAYWRIGHT_BROWSERS_PATH or .estate/runtime/ms-playwright)"
     ],
     "defuddle_extract": [
@@ -50,7 +51,7 @@
       "requires": [
         "Playwright chromium_headless_shell-1208 (PLAYWRIGHT_BROWSERS_PATH or .estate/runtime/ms-playwright)",
         "curl",
-        "gstack browse (LAB_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)"
+        "gstack browse (CS_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)"
       ]
     },
     {
@@ -97,7 +98,8 @@
       ],
       "requires": [
         "bwrap",
-        "sandbox-exec"
+        "sandbox-exec",
+        "sh"
       ]
     },
     {
@@ -138,11 +140,32 @@
       "reached_from": [
         "check",
         "dispatcher",
+        "operator_doc",
         "operator_roots"
       ],
       "requires": [
         "target/release/cs-tools"
       ]
+    },
+    {
+      "name": "repo_search",
+      "descriptor": "tools/bin/repo_search.json",
+      "runtime": "exe",
+      "reached_from": [
+        "operator_roots"
+      ],
+      "requires": [
+        "target/release/cs-tools"
+      ]
+    },
+    {
+      "name": "request_action",
+      "descriptor": "tools/bin/request_action.json",
+      "runtime": "python3",
+      "reached_from": [
+        "operator_doc"
+      ],
+      "requires": []
     },
     {
       "name": "search",

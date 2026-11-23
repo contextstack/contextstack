@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Run and finish one API/DGX cell on the machine."""
+import sys
+from pathlib import Path
+
+from _api_run import launch
+from _runner import runner_path
+
+root = Path(__file__).resolve().parents[2]
+sys.exit(launch(root, str(runner_path(root)), sys.argv[1:]))

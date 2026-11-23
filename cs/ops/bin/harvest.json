@@ -1,5 +1,5 @@
 {
-  "description": "Operator harvest: commit the run workspace onto lab/<task>-<runid>. Never add .lab-*. Not a model tool.",
+  "description": "Operator harvest: commit the run workspace onto cs/<task>-<runid>. Never add .cs-*. Not a model tool.",
   "schema": {
     "type": "object",
     "properties": {

@@ -13,7 +13,7 @@
       "$REPO_ROOT/target/debug",
       "/opt/homebrew", "/usr", "/bin", "/sbin", "/System", "/Library",
       "/private/etc", "/private/var/select", "/private/var/db/timezone", "/dev",
-      "$HOME/.local/share/uv/python", "$TOOL_PYTHON",
+      "$HOME/.local/bin/uv", "$HOME/.local/share/uv/python", "$TOOL_PYTHON",
       "$HOME/Library/Application Support/Herd/config/nvm/versions/node/v22.21.1"
     ],
     "linux": [
@@ -30,11 +30,11 @@
       "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
       "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
       "/etc/ssl", "/etc/ca-certificates", "/etc/pki", "/etc/alternatives", "/etc/mime.types",
-      "$HOME/.local/share/uv/python", "$TOOL_PYTHON"
+      "$HOME/.local/bin/uv", "$HOME/.local/share/uv/python", "$TOOL_PYTHON"
     ]
   },
   "allow_net": ["none", "all"],
-  "write_env": {"LAB_BROWSER_STATE": ["$HOME/.contextstack"]},
+  "write_env": {"CS_BROWSER_STATE": ["$HOME/.contextstack"]},
   "profiles": {
     "browser": {"read": {
       "macos": ["$HOME/.claude/skills/gstack", "$HOME/Library/Caches/ms-playwright"],

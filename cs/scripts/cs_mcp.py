@@ -158,19 +158,27 @@ def yaml_str(text):
 
 
 def validate_model(model):
-    """Executor names are identifiers, never YAML supplied by the caller."""
+    """Validate syntax locally. The Director checks the target node’s harness catalog."""
+    if agents.harness_model(model):
+        return model
     if not isinstance(model, str) or not NAME.fullmatch(model):
-        raise Refused("invalid model: expected an executor template name without whitespace or YAML metacharacters")
+        raise Refused("invalid model: expected an executor template or harness:<gateway-model>")
     known = agents.known_models() or set()
     if model not in known:
-        raise Refused("unknown model %r: expected an executor template name" % model)
+        raise Refused("unknown model %r: expected an executor template or harness:<gateway-model>" % model)
     return model
 
 
 def lane_spec(name, model, budget, hypothesis, workspace):
     validate_model(model)
     b = dict(BUDGET, **{k: v for k, v in (budget or {}).items() if k in BUDGET})
-    lines = ["id: lane-%s" % name, "model: %s" % model, "system: prompts/system.md", "context: []", "tools: []",
+    native = bool(agents.harness_model(model))
+    spec_model = yaml_str(model[8:]) if native else model
+    tools = "[]"
+    if native:
+        tools = ("[fs_read, fs_write, fs_edit, exec, repo_search, run_check]"
+                 if "lane" in workspace else "[fs_read, fs_write, exec]")
+    lines = ["id: lane-%s" % name, "model: %s" % spec_model, "system: prompts/system.md", "context: []", "tools: " + tools,
              "mcp: []", "budget: {turns: %d, tool_calls: %d, usd: %s, seconds: %d}"
              % (int(b["turns"]), int(b["tool_calls"]), float(b["usd"]), int(b["seconds"])),
              "tasks: [tasks/%s]" % name, "trials: 1", "hypothesis: %s" % yaml_str(hypothesis)]
@@ -214,6 +222,8 @@ def job_brief(job, intent=None, run=None):
              "finished_at": job.get("finished_at")}
     if job.get("error"):
         brief["error"] = job["error"]
+    if job.get("failure"):
+        brief["failure"] = job["failure"]
     if job.get("live_run_ids") and not job.get("run_ids"):
         brief["live_run_id"] = job["live_run_ids"][-1]
     if job.get("cancel"):
@@ -284,7 +294,7 @@ class Tools:
                 break
         except (AttributeError, TypeError, urllib.error.URLError, ValueError, json.JSONDecodeError):
             pass
-        state_root = os.environ.get("LAB_STATE_ROOT")
+        state_root = os.environ.get("CS_STATE_ROOT")
         if state_root and node == self.node:
             rows = agents._limits_rows(None, state_root) or rows
         return rows
@@ -300,7 +310,7 @@ class Tools:
         except (AttributeError, TypeError, urllib.error.URLError, ValueError, json.JSONDecodeError):
             pass
         # This machine's own limit state is newer than its last status report: it replaces that node's rows.
-        state_root = os.environ.get("LAB_STATE_ROOT")
+        state_root = os.environ.get("CS_STATE_ROOT")
         local = agents._limits_rows(None, state_root) if state_root and self.node else []
         if local:
             out = [r for r in out if r.get("node") != self.node] + [dict(r, node=self.node) for r in local]
@@ -328,22 +338,26 @@ class Tools:
 
     def _submit_lane(self, title, goal, node, model, check, repo, lane, budget, system, task_type, profile, tags,
                      project_id=None, extra_meta=None, lane_label=None, spec_text=None, task_path=None, submit_key=None,
-                     intent_id=None):
+                     intent_id=None, repo_view=False, decision_context=None):
         validate_model(model)
         name = slug(lane or title)
         task = task_path or "tasks/" + name
-        if bool(repo) != bool(lane):
+        if not repo_view and bool(repo) != bool(lane):
             raise Refused("repo and lane go together: give both (an isolated branch and working copy) or neither (a scratch workspace)")
         for value in (repo, lane):
             if value and not NAME.fullmatch(value):
                 raise Refused("%r is not a lane or repo name (%s)" % (value, NAME.pattern))
-        workspace = {"repo": repo, "lane": lane} if repo else {}
+        workspace = {"repo": repo, "repo_read_only": "true"} if repo_view else ({"repo": repo, "lane": lane} if repo else {})
         files = {"spec.yaml": ((spec_text or lane_spec(name, model, budget, title, workspace)).encode(), 420),
                  "prompts/system.md": ((system or SYSTEM).encode(), 420),
                  task + "/goal.md": (goal.encode(), 420),
                  task + "/check": (as_script(check).encode(), 493)}
+        if decision_context is not None:
+            files[task + "/context/decision-log.md"] = (decision_context, 420)
         meta = {k: str(v) for k, v in (("source", "cs-mcp"), ("lane", lane or name), ("repo", repo), ("agent", model), ("model", model),
                                         ("task_type", task_type)) if v}
+        if repo_view:
+            meta["repo_read_only"] = "true"
         meta.update(tags)
         if extra_meta:
             meta.update({k: str(v) for k, v in extra_meta.items() if v is not None})
@@ -361,14 +375,43 @@ class Tools:
                "node": node, "model": model, "task": task}
         if profile:
             out.update(agent=profile["name"], agent_sha256=profile["sha256"])
-        if workspace:
+        if repo_view:
+            out["workspace"] = dict(repo=repo, read_only=True)
+        elif workspace:
             out["workspace"] = dict(workspace, branch="lane/" + lane, note="the node runs the agent in the repo's "
                                     "worktree <repo parent>/<lane> (config/repos.json) and commits on the lane branch when the check passes")
         _report_lead_watch(out.get("job_id"), lane_label or lane or name)
         return out
 
+    def backlog(self, project_id, action="list", status=None):
+        path = "projects/%s/backlog" % q(project_id)
+        if action == "next" and status is None:
+            return self.d.get(path + "/next_unblocked")
+        if action != "list":
+            raise Refused("use list with an optional status or next without a status")
+        return self.d.get(path + ("?" + urllib.parse.urlencode({"status": status}) if status else ""))
+
+    def backlog_update(self, project_id, item_id=None, key=None, **fields):
+        path = "projects/%s/backlog" % q(project_id)
+        if item_id is not None:
+            path += "/%s/update" % q(item_id)
+        return self.d.post(path, fields, key=key)
+
+    def decision_log(self, project_id, status=None, search=None):
+        query = urllib.parse.urlencode({k: v for k, v in (("status", status), ("q", search)) if v is not None})
+        path = "projects/%s/decision_log" % q(project_id)
+        return self.d.get(path + ("?" + query if query else ""))
+
+    def record_decision(self, project_id, action, entry_id=None, key=None, **fields):
+        path = "projects/%s/decision_log" % q(project_id)
+        if action in ("revise", "supersede", "retire") and entry_id:
+            path += "/%s/%s" % (q(entry_id), action)
+        elif action != "create" or entry_id is not None:
+            raise Refused("use create, or give an entry_id with revise, supersede or retire")
+        return self.d.post(path, fields, key=key)
+
     def start_task(self, title, goal, node=None, model=None, check=None, repo=None, lane=None, budget=None,
-                   system=None, task_type=None, project_id=None, agent=None, dispatch_id=None):
+                   system=None, task_type=None, project_id=None, agent=None, dispatch_id=None, context=None):
         if dispatch_id is not None and (not isinstance(dispatch_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", dispatch_id)):
             raise Refused("dispatch_id must be 1-128 characters of A-Z a-z 0-9 . _ : -")
@@ -379,7 +422,8 @@ class Tools:
             raise Refused("budget must be an object")
         agents.check_budget(budget)
         given["model"] = model or (profile["model"] if profile else "cursor-sol")
-        if profile and profile["lane"] != bool(repo):
+        repo_view = bool(profile and profile["writes"] is False and repo and not lane)
+        if profile and not repo_view and profile["lane"] != bool(repo):
             raise Refused("agent needs a lane worktree" if profile["lane"] else "agent needs a scratch workspace")
         validate_model(given["model"])
         node = node or self.node
@@ -394,9 +438,11 @@ class Tools:
             raise Refused("no node: pass node, or run cs mcp --node NAME")
         # The Director resolves profile defaults. Only model selection stays here for provider limits.
         name = slug(lane or title)
-        form = dict(title=title, goal=goal, model=model, agent=agent, repo=repo, lane=lane)
+        form = dict(title=title, goal=goal, agent=agent, repo=repo, lane=lane)
+        if explicit_model or not profile or model != prior:
+            form["model"] = model
         for key, value in (("check", check), ("budget", budget), ("system", system),
-                           ("task_type", task_type)):
+                           ("task_type", task_type), ("context", context)):
             if value is not None:
                 form[key] = value
         intent = {"node": node, "lane": form, "meta": {"source": "cs-mcp"}}
@@ -415,10 +461,12 @@ class Tools:
                "task": answer["intent"].get("task") or "tasks/" + name}
         if profile:
             out.update(agent=agent, agent_sha256=meta.get("agent_sha256"))
-        if repo:
+        if repo_view:
+            out["workspace"] = dict(repo=repo, read_only=True)
+        elif repo:
             out["workspace"] = dict(repo=repo, lane=lane, branch="lane/" + lane,
                                     note="the node runs the agent in the repo's worktree <repo parent>/<lane> (config/repos.json) and commits on the lane branch when the check passes")
-        if repo and requested_lane != lane:
+        if repo and not repo_view and requested_lane != lane:
             out["lane_renamed"] = {"from": requested_lane, "to": lane}
         _report_lead_watch(out.get("job_id"), lane or name)
         if skipped or prior != model:
@@ -465,7 +513,8 @@ class Tools:
         if not lane:
             lm = re.search(r"^lane:\s*(\S+)", spec, re.M)
             lane = lm.group(1) if lm else None
-        if not repo:
+        repo_view = prior_meta.get("repo_read_only") == "true"
+        if not repo or repo_view:
             lane = None  # scratch jobs also carry a display lane in meta
         goal_path = task + "/goal.md"
         check_path = task + "/check"
@@ -479,18 +528,36 @@ class Tools:
         node = job.get("node") or self.node
         limits = self._provider_limits_for_node(node)
         chosen, from_model = agents.pick_retry_model(
-            prior_model, profile, limits, model, allow_fallback=bool(allow_fallback))
+            prior_model, profile, limits, model, allow_fallback=bool(allow_fallback),
+            edit_refused=(job.get("failure") or {}).get("code") == "provider_edit_refused")
         root = str(prior_meta.get("retry_root") or job_id)
         extra = {"retry_of": job_id, "retry_root": root, "attempt": attempt + 1}
         task_type = prior_meta.get("task_type")
         tags = {k: prior_meta[k] for k in ("agent", "agent_sha256") if k in prior_meta}
         validate_model(chosen)
         spec = re.sub(r"^intent:.*\n?", "", spec, flags=re.M)  # Director stamps the same intent
-        spec = re.sub(r"^model:.*$", lambda _: "model: " + chosen, spec, count=1, flags=re.M)
+        native = bool(agents.harness_model(chosen))
+        spec_model = yaml_str(chosen[8:]) if native else chosen
+        spec = re.sub(r"^model:.*$", lambda _: "model: " + spec_model, spec, count=1, flags=re.M)
+        if native != bool(agents.harness_model(prior_model)):
+            tools = "[]"
+            if native:
+                if profile and profile.get("name") == "coder":
+                    tools = "[fs_read, fs_write, fs_edit, exec, repo_search, run_check, request_action]"
+                elif profile and not profile["writes"] and not repo_view:
+                    tools = "[fs_read]"
+                else:
+                    tools = "[fs_read, fs_write, exec]"
+            spec = re.sub(r"^tools:.*$", "tools: " + tools, spec, count=1, flags=re.M)
+        decision_context = None
+        if prior_meta.get("context") == "decision_log":
+            decision_context = self._job_file(job_id, task + "/context/decision-log.md")
+            extra["context"] = "decision_log"
         out = self._submit_lane(title or "retry", goal, node, chosen, check, repo, lane, None,
                                 system, task_type, profile, tags, extra_meta=extra,
                                 project_id=intent.get("project_id"), spec_text=spec, task_path=task,
-                                submit_key="retry-lane:" + str(job_id), intent_id=job["intent_id"])
+                                submit_key="retry-lane:" + str(job_id), intent_id=job["intent_id"], repo_view=repo_view,
+                                decision_context=decision_context)
         out["retry_of"] = job_id
         out["prior_model"] = prior_model
         if from_model and from_model != chosen:
@@ -795,21 +862,65 @@ def S(kind, about, **more):
 
 ID = S("string", "a job id (job_id from start_task or list_tasks)")
 TOOLS = [
-    ("start_task", "Start a task: one job for an agent to do in its own isolated branch and working copy on a node. "
+    ("start_task", "Start a task on a node in a scratch workspace or an isolated lane. "
      "Returns the task and job ids.",
      {"title": S("string", "short title for the task"), "goal": S("string", "the task, in markdown: what done looks like"),
       "dispatch_id": S("string", "stable retry key: 1-128 characters [A-Za-z0-9._:-]; reuse only for the same request"),
       "node": S("string", "node name (default: this machine's node)"),
       "agent": S("string", "an agent profile from list_agents: its model, system prompt, check, budget and task_type "
                  "become the defaults (explicit arguments win)"),
-      "model": S("string", "executor template: cursor-sol (default), cursor-codex, cursor-agent, claude-code-opus, ..."),
+      "model": S("string", "executor template (default cursor-sol) or harness:<gateway-model>, e.g. harness:local-coder"),
       "check": S("string", "the check script run in the workspace after the agent; exit 0 = pass (default: no check)"),
-      "repo": S("string", "repo name from config/repos.json; with lane, the agent works in that lane's isolated copy"),
+      "repo": S("string", "repo name from config/repos.json. With lane, use its isolated copy. A read-only profile can give repo alone to read the configured main line"),
       "lane": S("string", "lane name ([a-z0-9._-]): branch lane/<lane>, worktree beside the repo's main line"),
-      "budget": S("object", "{turns, tool_calls, usd, seconds}; 0 = unlimited (default turns 300, seconds 3600, at most 3600)"),
+      "budget": S("object", "{turns, tool_calls, usd, seconds}; 0 = unlimited. Default turns: 120 for harness coder "
+                  "jobs, otherwise 300 unless the profile sets a budget. Default and maximum seconds: 3600."),
       "system": S("string", "agent system prompt for the job (default: a short worker prompt)"),
       "task_type": S("string", "bugfix, feature, refactor, test, review, docs, ops or research (a meta tag)"),
-      "project_id": S("string", "a Director project to charge")}, ["title", "goal"]),
+      "project_id": S("string", "a Director project to charge and source the decision log from"),
+      "context": S("array", "Optional job context. Pass [\"decision_log\"] with project_id.",
+                   items={"type": "string", "enum": ["decision_log"]})}, ["title", "goal"]),
+    ("backlog", "List project backlog items or find the highest-priority next item with all blockers clear.",
+     {"project_id": S("string", "the Director project id"),
+      "action": S("string", "defaults to list", enum=["list", "next"]),
+      "status": S("string", "filter the list by status", enum=["next", "now", "blocked", "done", "dropped"])},
+     ["project_id"]),
+    ("backlog_update", "Create or update a project backlog item. Set status to dropped to retire an item.",
+     {"project_id": S("string", "the Director project id"),
+      "item_id": S("string", "omit to create"),
+      "revision": S("integer", "current revision, required for updates"),
+      "title": S("string", "required on create"),
+      "body": S("string", "Markdown"),
+      "status": S("string", "defaults to next on create", enum=["next", "now", "blocked", "done", "dropped"]),
+      "priority": S("integer", "smaller numbers sort first"),
+      "blocked_on": S("array", "all blockers, or [] to clear", items={
+          "type": "object", "properties": {"kind": {"enum": ["owner", "job", "item", "external"]},
+                                           "ref": {"type": "string"}},
+          "required": ["kind", "ref"], "additionalProperties": False}),
+      "blocked_reason": S("string", "explain what's blocking the item"),
+      "stop": S("boolean", "pause heartbeat while an owner blocker is present"),
+      "intent_ids": S("array", "linked intent IDs", items={"type": "string"}),
+      "job_ids": S("array", "linked job IDs", items={"type": "string"}),
+      "decision_log_entry_ids": S("array", "linked decision log entry IDs", items={"type": "string"}),
+      "key": S("string", "optional stable idempotency key")}, ["project_id"]),
+    ("decision_log", "Read a project's decision log as Markdown, with structured entries.",
+     {"project_id": S("string", "the Director project id"),
+      "status": S("string", "filter by status", enum=["active", "superseded", "retired"]),
+      "search": S("string", "case-insensitive text to search for")}, ["project_id"]),
+    ("record_decision", "Create, revise, supersede or retire a project decision log entry.",
+     {"project_id": S("string", "the Director project id"),
+      "action": S("string", "operation", enum=["create", "revise", "supersede", "retire"]),
+      "entry_id": S("string", "required for changes to an existing entry"),
+      "revision": S("integer", "current entry revision, required for changes"),
+      "decision": S("string", "one-line decision, required on create"),
+      "why": S("string", "rationale, required on create"),
+      "alternatives": S("array", "options considered and why they were rejected", items={
+          "type": "object", "properties": {"option": {"type": "string"}, "why_not": {"type": "string"}},
+          "required": ["option", "why_not"], "additionalProperties": False}),
+      "reopen_when": S("array", "conditions to reconsider", items={"type": "string"}),
+      "sources": S("array", "ADR paths, dates or links", items={"type": "string"}),
+      "superseded_by": S("string", "replacement entry id, required for supersede"),
+      "key": S("string", "optional stable idempotency key")}, ["project_id", "action"]),
     ("find_task", "Recover an accepted task by dispatch_id; returns intents and jobs (empty if absent).",
      {"dispatch_id": S("string", "the start_task dispatch_id")}, ["dispatch_id"]),
     ("list_agents", "The agent profiles start_task's agent= names: name, description, model, writes, and whether the profile writes.", {}, []),
@@ -849,10 +960,11 @@ TOOLS = [
     ("clear_needs_you", "Clear attention after the owner answered your message or the issue is resolved.", {}, []),
     ("retry_task", "Start another job on the same task, with the prior attempt prepended to the goal "
      "(one retry per task; refuses jobs that passed their check). "
-     "Keeps the prior job's model unless model= names another template. "
+     "Keeps the prior job's model unless model= names another executor template or harness:<gateway-model>, or provider_edit_refused "
+     "moves the retry to the next available profile fallback. "
      "When that model is usage-limited, refuses unless allow_fallback=true (then follows the agent profile fallback "
      "chain and reports model_fallback).",
-     {"job_id": ID, "model": S("string", "executor template (default: the prior job's model)"),
+     {"job_id": ID, "model": S("string", "executor template or harness:<gateway-model> (defaults to the prior model)"),
       "allow_fallback": S("boolean", "when the chosen model is limited, follow the profile fallback chain (default false)"),
       "note": S("string", "extra context for the agent")}, ["job_id"]),
 ]

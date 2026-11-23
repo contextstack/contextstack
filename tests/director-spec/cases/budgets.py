@@ -349,11 +349,7 @@ def _(ctx):
     rows = {r["source"]: r for r in a.json["budgets"]["sources"]}
     ctx.expect(rows["openai"]["state"] == "off" and rows["openai"]["shown"] == "off, set a budget to use",
                "a source with no budget is off", rows)
-    puts = len([s for s in g.seen if s[0] == "PUT"])
-    refused(ctx, phone.call("PUT", "source-budgets", body={"sources": {"openai": {"usd": 5}}}), 403, "owner_only",
-            "a device setting a source budget")
-    ctx.expect(len([s for s in g.seen if s[0] == "PUT"]) == puts, "nothing reached the gateway")
-    a = c.call("PUT", "source-budgets", body={"sources": {"openai": {"usd": 5, "period": "day"}}})
+    a = phone.call("PUT", "source-budgets", body={"sources": {"openai": {"usd": 5, "period": "day"}}})
     ctx.expect(a.status == 200, "the owner sets a source budget", a)
     rows = {r["source"]: r for r in a.json["budgets"]["sources"]}
     ctx.expect(rows["openai"]["state"] == "active" and rows["openai"]["shown"] == "active: $5.00 left", "active", rows)
@@ -493,15 +489,12 @@ def _(ctx):
     c, phone = owner(ctx), device(ctx)
     g = ctx.target.gateway
     g.limits, g.spent = {"sources": {"anthropic": {"usd": 3, "period": "month"}}}, {}
-    a = c.call("PUT", "source-budgets/openai", body={"usd": "5", "period": "day"})
+    a = phone.call("PUT", "source-budgets/openai", body={"usd": "5", "period": "day"})
     ctx.expect(a.status == 200, "PUT one source", a)
     ctx.expect(g.limits["sources"] == {"anthropic": {"usd": 3.0, "period": "month"},
                                        "openai": {"usd": 5.0, "period": "day"}}, "the others are kept", g.limits)
     rows = {r["source"]: r for r in a.json["budgets"]["sources"]}
     ctx.expect(rows["openai"]["state"] == "active", "answered with the new report", rows)
-    refused(ctx, phone.call("PUT", "source-budgets/openai", body={"usd": 1, "period": "day"}), 403, "owner_only",
-            "a device")
-    refused(ctx, phone.call("DELETE", "source-budgets/openai"), 403, "owner_only", "a device turning one off")
     refused(ctx, c.call("PUT", "source-budgets/openai", body={"usd": 1, "period": "week"}), 422, "invalid_request",
             "a period the gateway does not have")
     refused(ctx, c.call("PUT", "source-budgets/a%20b", body={"usd": 1, "period": "day"}), 422, "invalid_request",
@@ -509,7 +502,7 @@ def _(ctx):
     # The shared budget, then a source turned off under it: it gets $0, so the shared budget does not cover it.
     a = c.call("PUT", "source-budgets/%2A", body={"usd": 10, "period": "month"})
     ctx.expect(a.status == 200 and a.json["budgets"]["total"]["usd"] == 10, "the shared budget", a)
-    a = c.call("DELETE", "source-budgets/anthropic")
+    a = phone.call("DELETE", "source-budgets/anthropic")
     rows = {r["source"]: r for r in a.json["budgets"]["sources"]}
     ctx.expect(a.status == 200 and rows["anthropic"]["state"] == "off"
                and g.limits["sources"]["anthropic"]["usd"] == 0, "off under a shared budget", g.limits)
@@ -533,3 +526,23 @@ def _(ctx):
     ctx.expect(a.status == 200 and raced and set(g.limits["sources"]) == {"openai", "openrouter", "anthropic"},
                "the other writer's change is kept", g.limits)
     ctx.expect(g.seen[-1] == ("PUT", g.owner_token), "written with the owner token", g.seen[-1][0])
+
+
+@case(C, "budgets", "lead-lane-retry-ignores-conversation-budget")
+def _(ctx):
+    from cases.client import lead
+
+    n, o = ctx.node2(), owner(ctx)
+    cv = conv.created(ctx, o, n)
+    cid = cv["conversation_id"]
+    limited = o.call("PUT", f"conversations/{cid}/budget", body={"usd": "0.01"})
+    ctx.expect(limited.status == 200, "conversation has a small budget", limited)
+    l = lead(ctx, o, cv)
+    body = {"node": n.name, "spec": "spec.yaml", "task": "tasks/t",
+            "files": files_with(l, spec(1))}
+    initial = l.call("POST", "intents", body=body, key=new_key())
+    ctx.expect(initial.status == 201, "lead submits a lane", initial)
+    intent = initial.json["intent"]["intent_id"]
+    retry = l.call("POST", f"intents/{intent}/jobs", body=body, key=new_key())
+    ctx.expect(retry.status == 201 and retry.json["budget"]["state"] == "free",
+               "lane retry has no conversation reservation", retry)

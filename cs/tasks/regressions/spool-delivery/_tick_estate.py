@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
+CODE_ROOT = Path(__file__).resolve().parents[3]
 STUB_OK = "#!/bin/sh\necho '{\"ok\":true,\"skip\":\"fixture\"}'\n"
 SPEC = """id: %s
 model: %s
@@ -29,15 +29,15 @@ def build(root, spool=None, local_ready=True):
         (root / d).mkdir(parents=True, exist_ok=True)
     (root / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
     (root / "ESTATE").write_text("dev\n", encoding="utf-8")
-    shutil.copy2(LAB / "prompts/coder-min.md", root / "prompts/coder-min.md")
-    shutil.copy2(LAB / "policy/env.json", root / "policy/env.json")
+    shutil.copy2(CODE_ROOT / "prompts/coder-min.md", root / "prompts/coder-min.md")
+    shutil.copy2(CODE_ROOT / "policy/env.json", root / "policy/env.json")
     (root / "tasks/fx/goal.md").write_text("fixture\n", encoding="utf-8")
     (root / "tasks/fx/check").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (root / "tasks/fx/check").chmod(0o755)
-    for p in (LAB / "ops/bin").iterdir():
+    for p in (CODE_ROOT / "ops/bin").iterdir():
         if p.is_file():
             shutil.copy2(p, root / "ops/bin" / p.name)
-    for name in ("estate-commit", "corpus-audit", "void-watch", "shadow-cycle"):
+    for name in ("corpus-audit", "void-watch", "shadow-cycle"):
         (root / "ops/bin" / name).write_text(STUB_OK, encoding="utf-8")
         (root / "ops/bin" / name).chmod(0o755)
     (root / "ops/bin/local-model-ready").write_text("#!/bin/sh\nexit %d\n" % (0 if local_ready else 1), encoding="utf-8")

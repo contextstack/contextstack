@@ -189,7 +189,7 @@ fn writes_stay_inside_the_workspace_and_a_private_tmp_dir() -> Result<(), String
         std::fs::read_to_string(fx.workspace.join("sub/out.txt")).map_err(io)?,
         "made"
     );
-    assert!(!fx.workspace.join(".lab-tmp").exists());
+    assert!(!fx.workspace.join(".cs-tmp").exists());
     let mode = fx.run(&["/bin/sh", "-c", "/usr/bin/stat -f %Lp \"$TMPDIR\""])?;
     assert_eq!(text(&mode.stdout), "700\n", "{}", text(&mode.stderr));
     assert_eq!(fx.leftover_tmp()?, Vec::<PathBuf>::new());
@@ -221,21 +221,21 @@ fn write_env_writes_under_the_allowed_root_and_is_narrowed_outside_it() -> Resul
     let fx = fixture("[\"none\"]")?;
     let state_root = fx.root.join("state-root");
     let policy = format!(
-        r#"{{"version": 1, "runtime_read": {RUNTIME_READ}, "allow_net": ["none"], "write_env": {{"LAB_X": ["{}"]}}}}"#,
+        r#"{{"version": 1, "runtime_read": {RUNTIME_READ}, "allow_net": ["none"], "write_env": {{"CS_X": ["{}"]}}}}"#,
         state_root.display()
     );
     std::fs::write(&fx.policy, policy).map_err(io)?;
     // The policy's grandparent (the default code root) holds the state root here; name one apart.
     let code_root = fx.root.join("code");
     let tool = fx.tool_with_descriptor(
-        "printf w > \"$LAB_X/f.txt\"",
-        r#"{"sandbox": {"write_env": ["LAB_X"]}}"#,
+        "printf w > \"$CS_X/f.txt\"",
+        r#"{"sandbox": {"write_env": ["CS_X"]}}"#,
     )?;
-    let granted_dir = fx.root.join("state-root/lab/state");
+    let granted_dir = fx.root.join("state-root/cs/state");
     let granted = fx
         .command()
-        .env("LAB_X", &granted_dir)
-        .env("LAB_CODE_ROOT", &code_root)
+        .env("CS_X", &granted_dir)
+        .env("CS_CODE_ROOT", &code_root)
         .arg("--")
         .arg(&tool)
         .output()
@@ -249,8 +249,8 @@ fn write_env_writes_under_the_allowed_root_and_is_narrowed_outside_it() -> Resul
     let outside_dir = fx.outside.join("state");
     let narrowed = fx
         .command()
-        .env("LAB_X", &outside_dir)
-        .env("LAB_CODE_ROOT", &code_root)
+        .env("CS_X", &outside_dir)
+        .env("CS_CODE_ROOT", &code_root)
         .arg("--report-dir")
         .arg(&reports)
         .arg("--")
@@ -261,7 +261,7 @@ fn write_env_writes_under_the_allowed_root_and_is_narrowed_outside_it() -> Resul
     assert!(!outside_dir.exists());
     let report = only_report(&reports)?;
     assert_eq!(report["narrowed"][0]["capability"], "write_env");
-    assert_eq!(report["narrowed"][0]["requested"], "LAB_X");
+    assert_eq!(report["narrowed"][0]["requested"], "CS_X");
     Ok(())
 }
 
@@ -932,5 +932,26 @@ fn probe_reports_seatbelt_without_limits() -> Result<(), String> {
     assert_eq!(value["limits"]["memory"], false);
     assert_eq!(value["limits"]["processes"], false);
     assert_eq!(value["limits"]["wall_clock"], "caller");
+    Ok(())
+}
+
+#[test]
+fn action_write_widening_applies_to_one_invocation_only() -> Result<(), String> {
+    let fx = fixture("[\"none\"]")?;
+    let path = fx.outside.join("secret.txt");
+    let path_text = path.to_string_lossy();
+    let argv = ["/bin/sh", "-c", "printf updated > \"$1\"", "sh", &path_text];
+    assert!(!fx.run(&argv)?.status.success());
+    let grant = serde_json::json!({"network":false,"delete":false,"write_paths":[path]});
+    let allowed = fx
+        .command()
+        .args(["--action-widening", &grant.to_string(), "--"])
+        .args(argv)
+        .output()
+        .map_err(io)?;
+    assert!(allowed.status.success(), "{}", text(&allowed.stderr));
+    assert!(!fx.run(&["/bin/rm", &path_text])?.status.success());
+    assert!(!fx.run(&argv)?.status.success());
+    assert_eq!(std::fs::read_to_string(&path).map_err(io)?, "updated");
     Ok(())
 }

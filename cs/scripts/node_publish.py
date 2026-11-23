@@ -17,7 +17,7 @@ SHA = re.compile(r'[a-f0-9]{64}')
 def publish(bundle, destination, channel):
     bundle, destination = Path(bundle), Path(destination)
     meta = json.loads((bundle / 'bundle.json').read_text())
-    target, version, commit = meta['target'], meta['release'], meta['lab_commit']
+    target, version, commit = meta['target'], meta['release'], meta['code_commit']
     if not isinstance(version, str) or not VERSION.fullmatch(version):
         raise ValueError('invalid release version')
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):

@@ -35,6 +35,8 @@ pub struct TransportDetail {
     pub message: String,
     /// Connection-level failures that may succeed on retry.
     pub network: bool,
+    deadline: bool,
+    connection_lost: bool,
 }
 
 impl TransportDetail {
@@ -43,14 +45,18 @@ impl TransportDetail {
         Self {
             message: message.into(),
             network: false,
+            deadline: false,
+            connection_lost: false,
         }
     }
 
-    /// Connection reset, refused, timeout at the socket, and similar.
+    /// A retryable transport failure before the provider response.
     pub fn network(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             network: true,
+            deadline: false,
+            connection_lost: false,
         }
     }
 }
@@ -100,22 +106,6 @@ impl CallError {
         }
     }
 
-    /// Upstream HTTP status to a class (legacy callers without headers).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn status(status: u16, message: String) -> Self {
-        Self::upstream(status, message, None, "")
-    }
-
-    /// Upstream non-2xx with optional `Retry-After` and body text for quota/context signals.
-    pub fn upstream(status: u16, message: String, retry_after_ms: Option<i64>, body: &str) -> Self {
-        let class = classify_upstream(status, body);
-        Self::Classified {
-            class,
-            message,
-            retry_after_ms,
-        }
-    }
-
     /// Upstream non-2xx: wire text is short; `body` is for classification and logging only.
     pub fn upstream_http(
         status: u16,
@@ -148,6 +138,53 @@ impl CallError {
         Self::Transport(TransportDetail::local(message))
     }
 
+    pub fn deadline(message: impl Into<String>) -> Self {
+        Self::Transport(TransportDetail {
+            message: message.into(),
+            network: false,
+            deadline: true,
+            connection_lost: false,
+        })
+    }
+
+    pub fn connection_lost(message: String) -> Self {
+        Self::Transport(TransportDetail {
+            connection_lost: true,
+            ..TransportDetail::local(message)
+        })
+    }
+
+    pub fn connection_lost_before_headers(message: String) -> Self {
+        Self::Transport(TransportDetail {
+            connection_lost: true,
+            ..TransportDetail::network(message)
+        })
+    }
+
+    pub fn without_transport_retry(mut self) -> Self {
+        if let Self::Transport(detail) = &mut self {
+            detail.network = false;
+        }
+        self
+    }
+
+    pub fn is_connection_lost(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(TransportDetail {
+                connection_lost: true,
+                ..
+            })
+        )
+    }
+
+    pub fn is_deadline(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(TransportDetail { deadline: true, .. })
+        )
+    }
+
     /// Retry hint carried from the upstream response.
     pub fn retry_after_ms(&self) -> Option<i64> {
         match self {
@@ -163,7 +200,7 @@ impl CallError {
             ProviderQuotaExhausted, ProviderRequestRejected, ProviderTransient,
             StreamingUnsupported,
         };
-        let (class, message, routed, retry_after_ms) = match self {
+        let (class, message, retry_after_ms) = match self {
             Self::ProviderFailed(message) => {
                 return WireError::runtime("gateway.provider_failed", message);
             }
@@ -171,9 +208,11 @@ impl CallError {
                 class,
                 message,
                 retry_after_ms,
-            } => (Some(*class), message, false, *retry_after_ms),
-            Self::Routing { class, message } => (Some(*class), message, true, None),
-            Self::Transport(TransportDetail { message, network }) => {
+            } => (*class, message, *retry_after_ms),
+            Self::Routing { class, message } => (*class, message, None),
+            Self::Transport(TransportDetail {
+                message, network, ..
+            }) => {
                 return if *network {
                     WireError::retryable("gateway.provider_transient", message)
                 } else {
@@ -182,27 +221,16 @@ impl CallError {
             }
         };
         let mut wire = match class {
-            Some(ProviderTransient) if !routed => {
-                WireError::retryable("gateway.provider_transient", message)
-            }
-            Some(ProviderRequestRejected) => {
+            ProviderTransient => WireError::retryable("gateway.provider_transient", message),
+            ProviderRequestRejected => {
                 WireError::fatal("gateway.provider_request_rejected", message)
             }
-            Some(ProviderQuotaExhausted) => {
-                WireError::fatal("gateway.provider_quota_exhausted", message)
-            }
-            Some(ProviderAuth) => WireError::fatal("gateway.provider_auth", message),
-            Some(ProviderNotConfigured) => {
-                WireError::fatal("gateway.provider_not_configured", message)
-            }
-            Some(CapacityExhausted) => WireError::retryable("gateway.capacity_exhausted", message),
-            Some(PolicyDenied) => WireError::fatal("gateway.policy_denied", message),
-            Some(StreamingUnsupported) => {
-                WireError::fatal("gateway.streaming_unsupported", message)
-            }
-            Some(ProviderTransient) | None => {
-                WireError::runtime("gateway.transport_failed", message)
-            }
+            ProviderQuotaExhausted => WireError::fatal("gateway.provider_quota_exhausted", message),
+            ProviderAuth => WireError::fatal("gateway.provider_auth", message),
+            ProviderNotConfigured => WireError::fatal("gateway.provider_not_configured", message),
+            CapacityExhausted => WireError::retryable("gateway.capacity_exhausted", message),
+            PolicyDenied => WireError::fatal("gateway.policy_denied", message),
+            StreamingUnsupported => WireError::fatal("gateway.streaming_unsupported", message),
         };
         wire.retry_after_ms = retry_after_ms;
         wire
@@ -390,35 +418,29 @@ mod tests {
 
     #[test]
     fn mapping_follows_the_wire_table() {
-        let w = CallError::status(503, "x".into()).to_wire();
+        let w = CallError::upstream_http(503, "test", None, "").to_wire();
         assert_eq!(
             (w.class, w.code, w.recoverable),
             ("retryable_gateway", "gateway.provider_transient", true)
         );
-        let w = CallError::status(401, "x".into()).to_wire();
+        let w = CallError::upstream_http(401, "test", None, "").to_wire();
         assert_eq!(
             (w.class, w.code),
             ("fatal_session", "gateway.provider_auth")
         );
-        let w = CallError::upstream(400, "bad".into(), None, "").to_wire();
+        let w = CallError::upstream_http(400, "test", None, "").to_wire();
         assert_eq!(
             (w.class, w.code, w.recoverable),
             ("fatal_session", "gateway.provider_request_rejected", false)
         );
-        let w = CallError::upstream(
+        let w = CallError::upstream_http(
             429,
-            "quota".into(),
+            "test",
             None,
             r#"{"error":{"type":"insufficient_quota"}}"#,
         )
         .to_wire();
         assert_eq!(w.code, "gateway.provider_quota_exhausted");
-        let w = CallError::Routing {
-            class: FailureClass::ProviderTransient,
-            message: "x".into(),
-        }
-        .to_wire();
-        assert_eq!(w.code, "gateway.transport_failed");
         let w = CallError::Routing {
             class: FailureClass::CapacityExhausted,
             message: "x".into(),
@@ -478,7 +500,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("2"));
         assert_eq!(parse_retry_after(&h), Some(2000));
-        let w = CallError::upstream(503, "x".into(), parse_retry_after(&h), "").to_wire();
+        let w = CallError::upstream_http(503, "test", parse_retry_after(&h), "").to_wire();
         assert_eq!(w.retry_after_ms, Some(2000));
     }
 }

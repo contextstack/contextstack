@@ -20,11 +20,14 @@ class Skipped(RuntimeError):
 
 
 def service_wait(init, seconds=SERVICE_WAIT_SECONDS):
-    """None when the Director and the gateway endpoint the executor posts work orders to both answer; otherwise
+    """None when the Director and the gateway endpoint the harness posts CLI work orders to both answer; otherwise
     a failure reason. Right after a release switch the services restart, and a trial job started before then
     fails with 'connection refused' although the release is fine."""
     from urllib.parse import urlparse
-    endpoint = urlparse(os.environ.get("CSGATEWAY_LAB_ENDPOINT", "http://127.0.0.1:9200/v1/ai/lab-execute"))
+    parse_node_env = getattr(init.cs, "parse_node_env", lambda _: {})
+    settings = parse_node_env(init.cs.CONFIG / "node.env")
+    endpoint = urlparse(os.environ.get("CSGATEWAY_CLI_ENDPOINT") or settings.get("CSGATEWAY_CLI_ENDPOINT")
+                        or "http://127.0.0.1:9200/v1/agent/cli.run")
     health = "%s://%s/v1/health" % (endpoint.scheme, endpoint.netloc)
     end, director, gateway = time.monotonic() + seconds, False, False
     while time.monotonic() < end and not (director and gateway):

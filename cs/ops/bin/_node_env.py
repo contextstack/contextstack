@@ -2,7 +2,7 @@
 
 Legacy node.env accepts shell-style quoted assignments, but no shell is run:
 expansions and command substitutions are literal data. Children load the same
-file through LAB_CONFIG_ROOT instead of inheriting its secret values.
+file through CS_CONFIG_ROOT instead of inheriting its secret values.
 """
 import os
 import re
@@ -15,7 +15,7 @@ ASSIGNMENT = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 def node_env(path=None):
     """Read assignments without evaluating shell code or mutating os.environ."""
     if path is None:
-        config = Path(os.environ.get("LAB_CONFIG_ROOT") or Path(__file__).resolve().parents[2])
+        config = Path(os.environ.get("CS_CONFIG_ROOT") or Path(__file__).resolve().parents[2])
         path = config / "node.env"
     try:
         text = Path(path).read_text(encoding="utf-8")

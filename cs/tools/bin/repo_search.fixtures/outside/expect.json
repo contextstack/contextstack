@@ -1,0 +1,5 @@
+{
+  "exit": 1,
+  "stdout": "Cannot search \"../\" outside the repository view or through a symlink. Use a relative or absolute directory inside the repository view.\n",
+  "untouched": true
+}

@@ -53,6 +53,14 @@ pub struct Request {
     /// Echoed.
     #[serde(default, deserialize_with = "nullable")]
     pub request_id: String,
+    /// Optional run trace identity.
+    pub job_id: Option<String>,
+    /// Trace ID for the run.
+    pub run_id: Option<String>,
+    /// Turn number. Legacy callers have also sent a string.
+    pub step_id: Option<serde_json::Value>,
+    /// Send number within the model call.
+    pub send_index: Option<u64>,
     /// Attribution fallback for `wire_request` rows.
     #[serde(default, deserialize_with = "nullable")]
     pub role: Role,
@@ -65,6 +73,8 @@ pub struct Request {
     /// Tool declarations.
     #[serde(default, deserialize_with = "nullable")]
     pub tool_schema: Vec<Box<RawValue>>,
+    /// Optional OpenAI-compatible tool selection.
+    pub tool_choice: Option<serde_json::Value>,
     /// Deadline and sampling.
     #[serde(default, deserialize_with = "nullable")]
     pub budget: Budget,
@@ -162,6 +172,9 @@ pub struct ReplyToolCall {
     pub name: String,
     /// Arguments object.
     pub args: Box<RawValue>,
+    /// The provider returned malformed native arguments.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub invalid_arguments: bool,
 }
 
 /// `usage`.
@@ -180,16 +193,16 @@ pub struct Cost {
     pub currency: &'static str,
     /// Six-place decimal string.
     pub amount: String,
-    /// `free_local` | subscription | api (omitted on errors).
+    /// `free_local` | subscription | api (omitted on errors except a settled partial stream).
     #[serde(skip_serializing_if = "str::is_empty")]
     pub class: String,
     /// Provider-reported charge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub charged: Option<f64>,
-    /// `amount` as a number (ok replies only).
+    /// `amount` as a number (ok replies and settled partial streams).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub est_usd: Option<f64>,
-    /// What the caller's wallet is charged (ok replies only).
+    /// What the caller's wallet is charged (ok replies and settled partial streams).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub charged_usd: Option<f64>,
     /// True when settlement exceeded the pre-flight reservation (additive).
@@ -198,7 +211,7 @@ pub struct Cost {
 }
 
 impl Cost {
-    /// The $0 block every error carries.
+    /// The $0 block every error without a settled partial stream carries.
     pub fn zero() -> Self {
         Self {
             currency: "USD",
@@ -209,6 +222,12 @@ impl Cost {
             charged_usd: None,
             over_reservation: false,
         }
+    }
+
+    /// A positive, finite charge reported by the provider.
+    pub fn reported_charge(&self) -> Option<f64> {
+        self.charged
+            .filter(|charge| charge.is_finite() && *charge > 0.0)
     }
 
     /// The cost rule: `est_usd` is amount as a number; `charged_usd` is the provider's reported charge when
@@ -233,11 +252,6 @@ impl Cost {
     }
 }
 
-/// List-price amount from token usage and per-category rates (six decimal places).
-pub fn amount(rates: ResolvedRates, bill: TokenBill) -> String {
-    amount_string(rates, bill)
-}
-
 /// Build cost from usage, reservation, and optional provider charge.
 pub fn price_call(
     rates: ResolvedRates,
@@ -246,7 +260,7 @@ pub fn price_call(
     charged: Option<f64>,
     reservation_usd: Option<f64>,
 ) -> Cost {
-    let amount = amount(rates, bill);
+    let amount = amount_string(rates, bill);
     let est = settle_usd(rates, bill);
     let settlement = charged
         .filter(|c| c.is_finite() && *c >= 0.0)
@@ -380,7 +394,7 @@ impl Chunk {
         }
     }
 
-    /// The terminal error chunk: index 0, $0, never recoverable.
+    /// The terminal error chunk: index 0, $0 unless replaced after partial settlement, never recoverable.
     pub fn error(family: &'static str, request_id: &str, error: WireError) -> Self {
         Self {
             schema_version: family,
@@ -434,9 +448,9 @@ mod tests {
             output_tokens: 34,
             ..TokenBill::default()
         };
-        assert_eq!(amount(rates, bill), "0.012340");
+        assert_eq!(amount_string(rates, bill), "0.012340");
         assert_eq!(
-            amount(
+            amount_string(
                 rates,
                 TokenBill {
                     input_tokens: 1,
@@ -446,7 +460,7 @@ mod tests {
             "0.000010"
         );
         assert_eq!(
-            amount(
+            amount_string(
                 ResolvedRates {
                     input_per_1k: 0.0,
                     output_per_1k: 0.0,

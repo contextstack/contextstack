@@ -2,8 +2,7 @@
 //!
 //! - A **node** holds a node token (`csn_…`), issued once by `director-rs node register`.
 //! - The **local credential** (`csl_…`) is created when the data directory is first opened and kept in
-//!   `<data>/local-credential` (0600). Clients on this machine read it; holding it makes a client the
-//!   owner (pairing, revoking).
+//!   `<data>/local-credential` (0600). Local and paired clients act for the Director owner.
 //! - A **device** (`csd_…`) pairs once: the owner issues a one-time code on a trusted machine, and the
 //!   device exchanges it at `POST /api/v1/pair`. Without a live code that endpoint creates nothing.
 //!
@@ -25,7 +24,7 @@ const PAIRING_MAX_FAILURES: i64 = 5;
 pub enum Kind {
     /// This machine's own credential: the owner.
     Local,
-    /// A paired device: reads and writes work; not pairing or revoking.
+    /// A paired device acting for the Director owner.
     Device,
     /// A hosted lead bound to one conversation and its estate node.
     Lead,
@@ -44,6 +43,12 @@ pub struct Client {
     pub intent_id: Option<String>,
     /// The estate node a lead can submit and inspect work on.
     pub node: Option<String>,
+}
+
+impl Client {
+    pub fn is_owner(&self) -> bool {
+        matches!(self.kind, Kind::Local | Kind::Device)
+    }
 }
 
 /// The file local clients read their credential from.
@@ -143,6 +148,7 @@ pub fn mint_lead(
     name: &str,
     conversation_id: &str,
     intent_id: Option<&str>,
+    actor: &str,
 ) -> Result<serde_json::Value, String> {
     if !util::plain_name(name, 100) {
         return Err("the lead name must match [A-Za-z0-9][A-Za-z0-9._-]{0,99}".into());
@@ -174,9 +180,9 @@ pub fn mint_lead(
     let token = util::secret("cslead_")?;
     let id = format!("cred_{}", util::ulid()?.to_lowercase());
     db.execute(
-        "INSERT INTO credentials (id, kind, name, token_hash, created_at, conversation_id, intent_id, node)
-         VALUES (?1, 'lead', ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, name, sha256_hex(token.as_bytes()), now_utc(), conversation_id, intent_id, node],
+        "INSERT INTO credentials (id, kind, name, token_hash, created_at, conversation_id, intent_id, node, created_by)
+         VALUES (?1, 'lead', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, name, sha256_hex(token.as_bytes()), now_utc(), conversation_id, intent_id, node, actor],
     ).map_err(|e| e.to_string())?;
     Ok(
         serde_json::json!({"credential_id": id, "kind": "lead", "name": name, "token": token,
@@ -245,25 +251,38 @@ pub fn revoke_node(store: &Store, name: &str) -> Result<(), String> {
 }
 
 /// Revoke a client credential. Revoking the local one issues a fresh local credential at once.
-pub fn revoke_credential(store: &Store, id: &str) -> Result<(), String> {
-    let changed = store
-        .db()
-        .execute(
-            "UPDATE credentials SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
-            params![now_utc(), id],
+pub fn revoke_credential(store: &Store, id: &str, actor: &str) -> Result<(), String> {
+    let kind = {
+        let mut db = store.db();
+        let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
+        let now = now_utc();
+        let kind: String = tx.query_row(
+            "UPDATE credentials SET revoked_at = ?1, revoked_by = ?3 WHERE id = ?2 AND revoked_at IS NULL
+             RETURNING kind",
+            params![now, id, actor],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no live credential {id}"))?;
+        // The running Director also publishes changes written by the host CLI.
+        tx.execute(
+            "INSERT INTO changes (kind, record_id, at) VALUES ('credential_revoked', ?1, ?2)",
+            params![id, now],
         )
         .map_err(|e| e.to_string())?;
-    if changed == 0 {
-        return Err(format!("no live credential {id}"));
+        tx.commit().map_err(|e| e.to_string())?;
+        kind
+    };
+    if kind == "local" {
+        ensure_local_credential(store)?;
     }
-    ensure_local_credential(store)
+    Ok(())
 }
 
 /// Every client credential, for the owner: no hashes.
-pub fn credentials(store: &Store) -> Result<Vec<serde_json::Value>, String> {
+pub fn credentials(store: &Store) -> Result<serde_json::Value, String> {
     let db = store.db();
     let mut stmt = db
-        .prepare("SELECT id, kind, name, created_at, last_used_at, revoked_at, conversation_id, intent_id, node FROM credentials ORDER BY rowid")
+        .prepare("SELECT id, kind, name, created_at, last_used_at, revoked_at, conversation_id, intent_id, node, created_by, revoked_by FROM credentials ORDER BY rowid")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -275,14 +294,35 @@ pub fn credentials(store: &Store) -> Result<Vec<serde_json::Value>, String> {
                 "conversation_id": r.get::<_, Option<String>>(6)?,
                 "intent_id": r.get::<_, Option<String>>(7)?,
                 "node": r.get::<_, Option<String>>(8)?,
+                "created_by": r.get::<_, Option<String>>(9)?,
+                "revoked_by": r.get::<_, Option<String>>(10)?,
             }))
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    let credentials = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    let mut stmt = db
+        .prepare("SELECT name, issued_by, created_at, expires_at, used_at, credential_id FROM pairings ORDER BY rowid")
+        .map_err(|e| e.to_string())?;
+    let pairings = stmt
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "name": r.get::<_, String>(0)?,
+                "issued_by": r.get::<_, Option<String>>(1)?,
+                "issued_at": r.get::<_, String>(2)?,
+                "expires_at": r.get::<_, String>(3)?,
+                "used_at": r.get::<_, Option<String>>(4)?,
+                "credential_id": r.get::<_, Option<String>>(5)?,
+            }))
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"credentials": credentials, "pairings": pairings}))
 }
 
 /// Issue a one-time pairing code for a device the owner names. Returns `(code, expires_at)`.
-pub fn issue_pairing(store: &Store, name: &str) -> Result<(String, String), String> {
+pub fn issue_pairing(store: &Store, name: &str, actor: &str) -> Result<(String, String), String> {
     if !util::plain_name(name, 100) {
         return Err("the device name must match [A-Za-z0-9][A-Za-z0-9._-]{0,99}".into());
     }
@@ -290,12 +330,13 @@ pub fn issue_pairing(store: &Store, name: &str) -> Result<(String, String), Stri
     let expires = util::utc_in(PAIRING_TTL_SECONDS);
     let db = store.db();
     db.execute(
-        "INSERT INTO pairings (code_hash, name, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO pairings (code_hash, name, created_at, expires_at, issued_by) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             sha256_hex(util::canonical_code(&code).as_bytes()),
             name,
             now_utc(),
-            expires
+            expires,
+            actor,
         ],
     )
     .and_then(|_| db.execute("DELETE FROM meta WHERE key = 'pairing_failures'", []))
@@ -414,11 +455,26 @@ mod tests {
                 params![id, node],
             )?;
         }
-        assert!(mint_lead(&store, "lead", "missing", None).is_err());
-        assert!(mint_lead(&store, "lead", "conv_test", Some("missing")).is_err());
-        assert!(mint_lead(&store, "lead", "conv_test", Some("intent_other")).is_err());
-        assert!(mint_lead(&store, "bad name", "conv_test", None).is_err());
-        let minted = mint_lead(&store, "lead", "conv_test", Some("intent_here"))?;
+        assert!(mint_lead(&store, "lead", "missing", None, "cred_test").is_err());
+        assert!(mint_lead(&store, "lead", "conv_test", Some("missing"), "cred_test").is_err());
+        assert!(
+            mint_lead(
+                &store,
+                "lead",
+                "conv_test",
+                Some("intent_other"),
+                "cred_test"
+            )
+            .is_err()
+        );
+        assert!(mint_lead(&store, "bad name", "conv_test", None, "cred_test").is_err());
+        let minted = mint_lead(
+            &store,
+            "lead",
+            "conv_test",
+            Some("intent_here"),
+            "cred_test",
+        )?;
         let token = minted["token"].as_str().ok_or("token")?;
         assert!(token.starts_with("cslead_"));
         let hash: String = store.db().query_row(
@@ -434,9 +490,9 @@ mod tests {
         assert_eq!(lead.conversation_id.as_deref(), Some("conv_test"));
         assert_eq!(lead.intent_id.as_deref(), Some("intent_here"));
         assert_eq!(lead.node.as_deref(), Some("estate"));
-        revoke_credential(&store, &lead.id)?;
+        revoke_credential(&store, &lead.id, "cred_test")?;
         assert!(client(&store, token)?.is_none());
-        let unscoped = mint_lead(&store, "lead2", "conv_test", None)?;
+        let unscoped = mint_lead(&store, "lead2", "conv_test", None, "cred_test")?;
         let unscoped = client(&store, unscoped["token"].as_str().ok_or("token")?)?
             .ok_or("unscoped lead authenticated")?;
         assert_eq!(unscoped.intent_id, None);
@@ -524,16 +580,16 @@ mod tests {
             exchange_pairing(&store, "AAAAA-AAAAA")?.is_none(),
             "no code, nothing"
         );
-        let (code, _) = issue_pairing(&store, "phone")?;
+        let (code, _) = issue_pairing(&store, "phone", "cred_test")?;
         let (id, name, token) = exchange_pairing(&store, &code.to_lowercase())?.ok_or("paired")?;
         assert_eq!(name, "phone");
         assert!(token.starts_with("csd_"));
         assert!(exchange_pairing(&store, &code)?.is_none(), "used once");
         assert_eq!(client(&store, &token)?.map(|c| c.kind), Some(Kind::Device));
-        revoke_credential(&store, &id)?;
+        revoke_credential(&store, &id, "cred_test")?;
         assert!(client(&store, &token)?.is_none(), "revoked");
 
-        let (code, _) = issue_pairing(&store, "laptop")?;
+        let (code, _) = issue_pairing(&store, "laptop", "cred_test")?;
         for _ in 0..PAIRING_MAX_FAILURES {
             assert!(exchange_pairing(&store, "ZZZZZ-ZZZZZ")?.is_none());
         }
@@ -559,7 +615,7 @@ mod tests {
         );
         let c = client(&store, &first)?.ok_or("live")?;
         assert_eq!(c.kind, Kind::Local);
-        revoke_credential(&store, &c.id)?;
+        revoke_credential(&store, &c.id, "cred_test")?;
         assert!(client(&store, &first)?.is_none());
         let second = std::fs::read_to_string(&path)?.trim().to_string();
         assert_ne!(first, second);

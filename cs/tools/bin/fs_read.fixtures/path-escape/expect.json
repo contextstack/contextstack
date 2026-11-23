@@ -1,8 +1,8 @@
 {
   "exit": 1,
-  "stdout": "path escapes workspace: ../x\n",
+  "stdout": "path escapes workspace: ../x. Use a path relative to the workspace.\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"path\": \"../x\"}, \"name\": \"fs_read\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"path\": \"../x\"}, \"name\": \"fs_read\"}\n"
   },
   "untouched": true
 }

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# Private implementation of the gateway-owned Lab work order.
-# Run a CLI in a cloned workspace against goal.md, then check → harvest.
+# Private implementation of the gateway-owned CLI work order.
+# Run a CLI against the frozen goal and return its execution receipt.
 # Dest merge is parked (operator_close).
 from _yaml import load as load_yaml
-from _estate_io import append_jsonl, state_dir
-import atexit, hashlib, json, os, re, shutil, subprocess, sys, time, signal, threading
+from _estate_io import state_dir
+import atexit, hashlib, json, os, re, shutil, subprocess, sys, time, signal, threading, tempfile
 from pathlib import Path
 
 
@@ -12,32 +12,28 @@ from _estate_io import run_op as estate_run_op
 import _lanes
 from functools import partial
 
-from _agent_stream import CursorAvailability, Events, Mapper, append as append_event, dialect, run_streaming, signals as stream_signals
+from _agent_stream import CursorAvailability, CursorEditRefusals, Events, Mapper, append as append_event, dialect, run_streaming, signals as stream_signals
 from _provider_limits import detect_limit, enrich_allowance, limit_signal, record_limit
 from _cli_native import stage_copies, finish_copies, stage_claude_login, snapshot_login_files, stage as stage_native, terminal_stop, unstage as unstage_native, verify_login_files
 from _est import parse_usage
 import _run_record
 from _job_reason import persist_output, redact
 from _stuck import Monitor as StuckMonitor, parse_budget_stuck, write_report as write_stuck_report
-from _roots import task_label, transcript_id
+from _roots import NAMES as ROOT_ENV, task_label, transcript_id
 from _frozen_inputs import stage_frozen_inputs
 from _grant import covers_path, cover
 from _muse import Cancelled, run_process
 from _setup_workspace import materialize
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
-LEDGER = state_dir(LAB) / "ledger.jsonl"
+CODE_ROOT = HERE.parent.parent
 TEMPLATES = HERE / "executor-templates.json"
 HOME = Path.home()
-PATH_FALLBACK = os.pathsep.join(str(p) for p in (
-    HOME / ".local/bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin"),
-) if p.is_dir())
 KEEP_ENV = {
     "PATH", "HOME", "USER", "LOGNAME", "TERM", "LANG", "LC_ALL", "LC_CTYPE",
     "TMPDIR", "TMP", "TEMP", "SHELL", "HOMEBREW_PREFIX", "HOMEBREW_CELLAR",
-    "LAB_SCHEDULE_DATE", "LAB_SCHEDULE_SLOT", "LAB_SCHEDULE_TIMEZONE",
-    "LAB_JOB_ID", "LAB_TRIAL", "LAB_VIDEO_MUTATION",
+    "CS_SCHEDULE_DATE", "CS_SCHEDULE_SLOT", "CS_SCHEDULE_TIMEZONE",
+    "CS_JOB_ID", "CS_TRIAL", "CS_VIDEO_MUTATION",
 }
 CRED_ENV = re.compile(
     r"(API[_-]?KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|^AWS_|SSH_AUTH_SOCK)",
@@ -97,8 +93,8 @@ def names_executor(spec, name):
 
 def allowlist_env(extra_drop, tmpdir, workspace=None):
     drop = {str(k) for k in (extra_drop or [])}
-    from _toolchains import discover_path_dirs, toolchain_lane_env
-    path = os.pathsep.join((*discover_path_dirs(), os.environ.get("PATH", ""), PATH_FALLBACK))
+    from _toolchains import lane_path, toolchain_lane_env
+    path = lane_path(os.environ.get("PATH", ""))
     out = {"GIT_TERMINAL_PROMPT": "0", "PATH": path, "TMPDIR": str(tmpdir), "TMP": str(tmpdir), "TEMP": str(tmpdir)}
     out.update(toolchain_lane_env(tmpdir, workspace))
     for k, v in os.environ.items():
@@ -108,6 +104,14 @@ def allowlist_env(extra_drop, tmpdir, workspace=None):
             continue
         out[k] = v
     return out
+
+
+def trusted_op_env(env):
+    return dict(env, **{key: os.environ[key] for key in ROOT_ENV if key in os.environ})
+
+
+def research_prompt(repo_view, goal):
+    return f"Research the question using the read-only repository snapshot at {repo_view}. Do not commit.\n\n{goal}"
 
 
 def require_executor_sandbox():
@@ -125,11 +129,11 @@ def sandbox_cmd(binary, args, ws, tmpdir, profile_path, protected=None, read_lin
     # Render against the host environment, as the Python renderer did: the child env strips
     # SSH_AUTH_SOCK, and the host's real agent socket must still get its explicit deny.
     env = os.environ if env is None else env
-    policy = LAB / "policy/sandbox.json" if policy is None else policy
+    policy = CODE_ROOT / "policy/sandbox.json" if policy is None else policy
     request = native_sandbox_request(binary, ws, tmpdir, HOME, protected=protected,
                                      read_links=read_links, login=login_writes,
                                      read_roots=read_roots, home_reads=home_reads, env=env, caller=caller)
-    profile_path.write_bytes(render_native_sandbox(LAB, policy, request))
+    profile_path.write_bytes(render_native_sandbox(CODE_ROOT, policy, request))
     return ["sandbox-exec", "-f", str(profile_path), binary, *args]
 
 
@@ -146,10 +150,10 @@ def claude_auth_refresh_cmd(binary, args):
     ]
 
 
-def changed_paths(ws, base, lane=None):
+def changed_paths(ws, base, lane=None, *, env=None):
     lane_ctx = {"main": lane["main"], "lane": lane["lane"]} if lane else None
     if lane_ctx:
-        return _lanes.workspace_changed_paths(ws, base, lane_ctx=lane_ctx, env=child_env)
+        return _lanes.workspace_changed_paths(ws, base, lane_ctx=lane_ctx, env=env)
     names = []
     for args in (
         ("diff", "--name-only", "%s..HEAD" % base),
@@ -157,7 +161,7 @@ def changed_paths(ws, base, lane=None):
         ("diff", "--name-only"),
         ("ls-files", "--others", "--exclude-standard"),
     ):
-        done = _lanes.workspace_git(ws, *args, lane_ctx=None, env=child_env)
+        done = _lanes.workspace_git(ws, *args, lane_ctx=None, env=env)
         if done.returncode != 0:
             fail("git %s: %s" % (args[0], (done.stderr or done.stdout or "").strip()))
         names.extend((done.stdout or "").splitlines())
@@ -198,28 +202,31 @@ def changed_state(ws, base, paths=None):
     return state
 
 
-def under_grant(path, prefixes):
-    return covers_path(path, prefixes)
-
-
-def append_ledger(row):
-    LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    append_jsonl(LEDGER, row, sort_keys=False, compact=False,
-                 sync=False, encoding='utf-8')
-
 
 def main(argv=None) -> int:
-    global child_env
+    trace_started = _run_record.trace_clock()
     argv = sys.argv[1:] if argv is None else list(argv)
-    GATEWAY_OWNED = argv == ["--gateway-owned"]
-    if GATEWAY_OWNED:
-        a = json.loads(sys.stdin.readline())
-        def owner_lifetime():
-            sys.stdin.read()
-            os.killpg(os.getpgrp(), signal.SIGTERM)
-        threading.Thread(target=owner_lifetime, daemon=True).start()
-    else:
-        a = json.load(sys.stdin)
+    if argv != ["--gateway-owned", "--execution-only"]:
+        fail("expected gateway-owned execution")
+    receipt_path = os.environ.pop("CS_CLI_RECEIPT_PATH", None)
+    reserved_id = os.environ.pop("CS_RUN_ID", None)
+    execution_id = os.environ.pop("CS_EXECUTION_ID", None)
+    if not (receipt_path and execution_id and reserved_id
+            and re.fullmatch(r"[0-9][A-Za-z0-9._-]{0,127}", reserved_id)):
+        fail("invalid CLI receipt binding")
+    receipt_channel = open(receipt_path, "w", encoding="utf-8")
+    # Keep only the private, non-inheritable descriptor while running the agent.
+    os.unlink(receipt_path)
+    atexit.register(receipt_channel.close)
+    a = json.loads(sys.stdin.readline())
+    approval_token = a.pop("_cs_action_binding", None)
+    lane_binding = a.pop("_cs_lane_binding", None)
+
+    def owner_lifetime():
+        sys.stdin.read()
+        os.killpg(os.getpgrp(), signal.SIGTERM)
+
+    threading.Thread(target=owner_lifetime, daemon=True).start()
     name = str(a.get("executor") or "").strip()
     templates = json.loads(TEMPLATES.read_text())
     tmpl = templates.get(name)
@@ -228,7 +235,7 @@ def main(argv=None) -> int:
     require_executor_sandbox()
     task = Path(str(a.get("task") or ""))
     if not task.is_absolute():
-        task = LAB / task
+        task = CODE_ROOT / task
     if not (task / "goal.md").is_file() or not (task / "check").is_file():
         fail("task needs goal.md and check")
     dest = str(a.get("dest") or "").strip()
@@ -263,7 +270,7 @@ def main(argv=None) -> int:
     if binary.startswith("~/"):  # grok's install lives at ~/.grok/bin/grok, off a launchd PATH
         binary = str(HOME / binary[2:])
     spec_rel = str(a.get("spec") or "")
-    spec_path = (LAB / spec_rel) if spec_rel else None
+    spec_path = (CODE_ROOT / spec_rel) if spec_rel else None
     if spec_rel:
         if not spec_path or not spec_path.is_file():
             fail("spec not found: %s" % spec_rel)
@@ -290,7 +297,7 @@ def main(argv=None) -> int:
     hosted_turn = str(spec.get("id") or "") == "hosted-lead"
     if hosted_turn:
         from _lead_host import authorize_hosted_turn
-        reason = authorize_hosted_turn(a, task, spec, LAB)
+        reason = authorize_hosted_turn(a, task, spec, CODE_ROOT)
         if reason:
             fail("hosted_turn_refused: " + reason)
 
@@ -298,7 +305,7 @@ def main(argv=None) -> int:
         stuck_config = parse_budget_stuck(spec.get("budget") if isinstance(spec, dict) else None)
     except ValueError as error:
         fail(str(error))
-    trial = int(a.get("trial") or 1)
+    trial = int(a["trial"]) if a.get("trial") not in (None, "") else 1
     if trial_limit is not None and trial > trial_limit:
         fail("trial %d exceeds spec trials %d" % (trial, trial_limit))
     timeout = int(a.get("timeout_s") or 300)
@@ -340,7 +347,7 @@ def main(argv=None) -> int:
     from _harness_usage import resolve_harness_cost
     from _job_memory import job_memory_cap_bytes
 
-    cap_bytes = job_memory_cap_bytes(spec=spec if spec_rel else None, limits=job_budget, config_root=LAB)
+    cap_bytes = job_memory_cap_bytes(spec=spec if spec_rel else None, limits=job_budget, config_root=CODE_ROOT)
     memory_cap_mb = cap_bytes // (1024 * 1024) if cap_bytes else None
 
     cost_class, unmetered = resolve_harness_cost(tmpl, tmpl.get("args"))
@@ -371,8 +378,18 @@ def main(argv=None) -> int:
     auth_verified = auth == "none"
     # A repo lane (_lanes): the spec names `repo:` and `lane:`, and the agent works in that lane's worktree beside the
     # repo's main checkout instead of a fresh workspace. Refused here, before any run effect, when it cannot be.
-    lane = None
-    if spec.get("repo") is not None or spec.get("lane") is not None:
+    lane = repo_config = repo_view = None
+    repo_denies = []
+    if spec.get("repo_read_only") is True:
+        if not spec.get("repo") or spec.get("lane"):
+            fail("a read-only repo spec requires repo: and omits lane:")
+        if sys.platform != "darwin":
+            fail("read-only repo workspaces require the macOS executor sandbox")
+        try:
+            repo_config = _lanes.repo_config(str(spec["repo"]))
+        except _lanes.LaneError as error:
+            fail("repo: %s" % error)
+    elif spec.get("repo") is not None or spec.get("lane") is not None:
         if not (spec.get("repo") and spec.get("lane")):
             fail("a lane spec names both repo: and lane:")
         if name == "muse-code":
@@ -380,40 +397,47 @@ def main(argv=None) -> int:
         if (task / "setup").exists() or a.get("inputs"):
             fail("a lane task has no setup/ or inputs: the agent works in the lane's worktree")
         try:
-            lane = _lanes.ensure_lane(_lanes.repo_config(str(spec["repo"])), str(spec["lane"]))
+            cfg = _lanes.repo_config(str(spec["repo"]))
+            name_of_lane = str(spec["lane"])
+            _lanes.check_lane(cfg, name_of_lane)
+            lease = _lanes.lane_execution(cfg["path"], name_of_lane, lane_binding)
+            lease.__enter__()
+            atexit.register(lease.__exit__, None, None, None)
+            lane = _lanes.ensure_lane(cfg, name_of_lane)
         except _lanes.LaneError as error:
             fail("lane: %s" % error)
-    # UTC, as the runner names its runs: node-listen finds a running job's run by this prefix against the job's UTC start,
-    # so a local stamp west of UTC hid the run until it ended (2026-11-11).
-    # Two runs of one task in the same second would share a run dir, so wait for the next second rather than change
-    # the id's shape (2026-11-11).
-    while True:
-        run_id = "%s-%s-%s-t%d" % (
-            time.strftime("%Y%m%d-%H%M%S", time.gmtime()), name.lower().replace("_", "-"),
-            task.name, trial,
-        )
-        run_dir = state_dir(LAB) / "runs" / run_id
-        if not run_dir.exists():
-            break
-        time.sleep(0.2)
+    run_id = reserved_id
+    run_dir = state_dir(CODE_ROOT) / "runs" / run_id
+    if run_dir.is_symlink() or not run_dir.is_dir() or os.environ.get("CS_TRIAL") != str(trial):
+        fail("CLI run reservation missing or mismatched")
+    approval_prefix = None
+    approval_job = os.environ.get("CS_JOB_ID")
+    cli_name = Path(binary).name
+    if approval_token is not None and cli_name in ("codex", "cursor-agent", "claude") and not hosted_turn and not repo_config:
+        import _lane_mcp
+        if _lane_mcp.consume_binding(run_dir, approval_job, approval_token):
+            approval_prefix = _lane_mcp.action_prefix()
+    approval_bridge = None
     ws = run_dir / "workspace"
     if lane:
         ws = Path(lane["path"])
-    elif os.environ.get("LAB_WORKSPACES_ROOT"):  # a separate workspaces root: where finalize-run and the runner look
+    elif os.environ.get("CS_WORKSPACES_ROOT"):  # a separate workspaces root: where finalize-run and the runner look
         from _roots import workspace_dir
         ws = workspace_dir(run_dir)
     cli_tmp = run_dir / "tmp"
     run_dir.mkdir(parents=True, exist_ok=True)
     cli_tmp.mkdir(parents=True)
+    trace_task = "tasks/turn" if hosted_turn else str(a["task"])
+    trace = _run_record.ObservedTrace(run_dir, CODE_ROOT, trace_task, trial, trace_started, execution_id)
     child_env = allowlist_env(tmpl.get("env_drop") or [], cli_tmp, ws)
-    run_op = partial(estate_run_op, env=child_env)
+    run_op = partial(estate_run_op, env=trusted_op_env(child_env))
     from _estate_io import link_target  # a ../../../ledger/... setup link resolves through the state root
-    setup = link_target(LAB, task / "setup")
+    setup = link_target(CODE_ROOT, task / "setup")
     if lane:
         pass
     elif setup.is_dir():
         try:
-            materialize(setup, ws, task=task, lab=LAB, env=child_env)
+            materialize(setup, ws, task=task, code_root=CODE_ROOT, env=child_env)
         except (OSError, ValueError) as error:
             fail("copy setup: " + str(error))
     else:
@@ -428,7 +452,7 @@ def main(argv=None) -> int:
             if done.returncode != 0:
                 fail("git %s: %s" % (args[0], (done.stderr or done.stdout or "").strip()))
         subprocess.run(
-            ["git", "-C", str(ws), *_lanes.LANE_GIT_HARDEN, "-c", "user.name=lab", "-c", "user.email=lab@local",
+            ["git", "-C", str(ws), *_lanes.LANE_GIT_HARDEN, "-c", "user.name=ContextStack", "-c", "user.email=cs@local",
              "commit", "--allow-empty", "-q", "-m", "executor base"],
             capture_output=True, env=child_env,
         )
@@ -444,12 +468,35 @@ def main(argv=None) -> int:
         fail("workspace has no HEAD to pin as grant base")
     (run_dir / "base.sha").write_text(base + "\n", encoding="utf-8")
 
+    if repo_config:
+        def cancel_setup(_signum, _frame):
+            raise SystemExit(128 + signal.SIGTERM)
+
+        signal.signal(signal.SIGTERM, cancel_setup)
+        snapshot = Path(tempfile.mkdtemp(prefix="read-only-", dir=run_dir))
+        repo_view = snapshot / "repo"
+
+        def discard_unfinished_snapshot():
+            if not (run_dir / "execution-receipt.json").is_file():
+                shutil.rmtree(snapshot, ignore_errors=True)
+
+        atexit.register(discard_unfinished_snapshot)
+        try:
+            repo_denies = _lanes.prepare_repo_view(repo_config, repo_view)
+        except (OSError, subprocess.CalledProcessError, _lanes.LaneError) as error:
+            fail("repo: %s" % error)
+
+    def send_receipt(receipt):
+        json.dump(receipt, receipt_channel, allow_nan=False)
+        receipt_channel.close()
+        raise SystemExit(0)
+
     if name == "muse-code" or tmpl.get("profile") == "cli-profiles.json":
         from _muse_adapter import run
         run({**globals(), **locals()})
         raise SystemExit(0)
 
-    stim, stim_err = run_op(LAB, "capture-stimulus", {
+    stim, stim_err = run_op(CODE_ROOT, "capture-stimulus", {
         "run_dir": str(run_dir), "run_id": run_id, "task": str(task),
         "spec": spec_rel, "spec_sha": spec_sha(spec_path) if spec_path else "",
         "trial": trial, "adapter": "executor", "workspace": str(ws),
@@ -460,11 +507,16 @@ def main(argv=None) -> int:
         fail("capture-stimulus: " + stim_err)
     stim_dir = run_dir / "stimulus"
     # The CLI is prompted from the frozen goal, never the live task.
-    goal = (stim_dir / "goal.md").read_text(encoding="utf-8").strip()
+    from _muse_adapter import goal_with_context
+    goal = goal_with_context(stim_dir)
     prompt = (
         "Implement the task in the current working directory. "
         "Do not leave this directory. Do not commit unless asked.\n\n" + goal
     )
+    if repo_view:
+        prompt = research_prompt(repo_view, goal)
+    if approval_prefix:
+        prompt = _lane_mcp.DISCOVERY + "\n\n" + prompt
     turns = str(budget_turns(spec, job_budget))
     args = []
     for part in tmpl.get("args") or []:
@@ -479,9 +531,10 @@ def main(argv=None) -> int:
         "spec": spec_rel, "spec_sha": spec_sha(spec_path) if spec_path else "",
         "task_sha": stim.get("task_sha", ""), "env_sha": stim.get("env_sha", ""),
         "stimulus_sha": stim.get("stimulus_sha", ""),
-        "model": name, "task": task_label(task, LAB),
+        "model": name, "task": task_label(task, CODE_ROOT),
         "trial": trial,
         "cost_usd": cost_usd, "cost_class": cost_class, "auth": auth,
+        "est_usd": 0, "est_basis": "not_invoked",
         "auth_verified": auth_verified,
         "turns": 0, "tool_calls": 0,
         "transcript": transcript_id(run_id),
@@ -523,6 +576,7 @@ def main(argv=None) -> int:
             refresh_caller = {"deny_write_roots": [str(ws.resolve()), str(cli_tmp.resolve())],
                               "run_protection": {"run_root": str(run_dir.resolve()),
                               "workspace": str(refresh_root), "tmpdir": str(refresh_root),
+                                                 "action_capabilities": True,
                               "refresh_write_paths": [str(refresh_root)]}}
             return sandbox_cmd(command[0], command[1:], refresh_root, refresh_root,
                                run_dir / "sandbox-login-refresh.sb", read_roots=(refresh_root,),
@@ -534,50 +588,24 @@ def main(argv=None) -> int:
             # Notify and pause only when the job reported a sign-in failure the trusted refresh did not fix.
             # A failed maintenance refresh after a successful job, or a quota error, is not a dead login.
             if expired and login_refresh_status not in ("written_back", "unchanged"):
-                notice(state_dir(LAB), name, Path(binary).name, home=HOME)
+                notice(state_dir(CODE_ROOT), name, Path(binary).name, home=HOME)
 
 
-    def emit(verdict, stop, extra=None, ok=None):
-        # Finalization still runs after a cancel; a later TERM is ignored here (children keep the default), as in runner.rs.
-        signal.signal(signal.SIGTERM, lambda *_: None)
+    def cleanup():
+        if approval_bridge is not None:
+            atexit.unregister(approval_bridge.close)
+            approval_bridge.close()
         finalize_login_copies()
         unstage_native(native_links)
         if budget_broker is not None:
-            row['tool_calls'] = budget_broker.admission.count
-        row["verdict"] = verdict
-        row["stop"] = stop
-        row.update(extra or {})
-        append_ledger(row)
-        # The runner's terminal record, then finalize-run: it finds this row by transcript and appends none.
-        _run_record.check_json(run_dir, row.get("stimulus_sha"), check_window, verdict=verdict)
-        _run_record.terminal(run_dir, ws, row, run_id, str(spec.get("id") or "") or spec_rel, str(a.get("task") or ""),
-                             started, check_window)
-        finalized = _run_record.finalize(LAB, run_dir, {k: v for k, v in os.environ.items() if not CRED_ENV.search(k)})
-        out = {
-            "ok": verdict == "pass" if ok is None else ok,
-            "run_id": run_id, "verdict": verdict, "stop": stop,
-            "model": name, "cost_usd": cost_usd, "cost_class": cost_class,
-            "est_usd": row.get("est_usd", 0), "est_basis": row.get("est_basis", ""),
-            "auth": auth, "auth_verified": auth_verified,
-            "transcript": row["transcript"],
-            "cli_invoked": row.get("cli_invoked", False),
-        }
-        if row.get("preflight_reason"):
-            out["preflight_reason"] = row["preflight_reason"]
-        if "cli_exit" in row:
-            out["cli_exit"] = row["cli_exit"]
-        if row.get("branch"):
-            out["branch"] = row["branch"]
-        if row.get("lane"):
-            out["lane"] = row["lane"]
-        out["finalize"] = finalized.get("state") or "pending"
-        print(json.dumps(out))
-        sys.stdout.flush()
-        if out["finalize"] != "finalized":
-            sys.exit(3)  # finalization pending, as the runner exits: tick retries finalize-run before it reads the row
-        sys.exit(0 if verdict == "pass" else 1)
+            row["tool_calls"] = budget_broker.admission.count
 
+    def emit(verdict, stop, extra=None):
+        complete("terminal", stop, verdict=verdict, extra=extra)
 
+    import _machine_finish as finish
+
+    spec_id = str(spec.get("id") or "") or spec_rel
     started = time.time()
     if limits is not None:
         budget_broker = Broker(limits['tool_calls'])
@@ -593,7 +621,13 @@ def main(argv=None) -> int:
 
     from _estate_io import native_caller
     sandbox_caller, sandbox_read_roots = native_caller(tmpl, HOME, run_dir, ws, cli_tmp, lane)
-    sandbox_policy = LAB / "policy/sandbox.json"
+    sandbox_caller["run_protection"]["action_capabilities"] = True
+    if repo_view:
+        sandbox_caller["run_protection"].pop("workspace")
+        denied = [*sandbox_caller["deny_write_roots"], *repo_denies, str(ws.resolve())]
+        sandbox_caller["deny_write_roots"] = denied
+        sandbox_read_roots = (*sandbox_read_roots, repo_view)
+    sandbox_policy = CODE_ROOT / "policy/sandbox.json"
 
 
     def record_process_evidence(stage, rows):
@@ -601,18 +635,28 @@ def main(argv=None) -> int:
             append_event(run_dir / "process-evidence.jsonl", dict(evidence, stage=stage))
 
 
-    def run_check_sandboxed():
-        check_sb = run_dir / "check-sandbox.sb"
-        try:
-            check_cmd = sandbox_cmd(str(stim_dir / "check"), [], ws, cli_tmp, check_sb,
-                                    budget_controls if budget_broker else None,
-                                    read_roots=(stim_dir, *sandbox_read_roots),
-                                    policy=sandbox_policy, caller=sandbox_caller)
-            return run_process(check_cmd, str(ws), child_env, check_window, memory_cap_mb=memory_cap_mb,
-                               on_evidence=lambda rows: record_process_evidence("check", rows))
-        finally:
-            check_sb.unlink(missing_ok=True)
+    protected = budget_controls if budget_broker else None
 
+    def complete(mode, stop, verdict=None, extra=None):
+        signal.signal(signal.SIGTERM, lambda *_: None)
+        (cli_tmp / "claude-home/Library/Keychains").unlink(missing_ok=True)
+        cleanup()
+        receipt = finish.execution_receipt(
+            run_dir, ws, row, spec_id, str(a.get("task") or ""), task.name, started,
+            check_window, mode, stop, verdict, extra, trace, lane, bool(repo_view), grant_paths,
+            sandbox_policy, sandbox_caller, sandbox_read_roots, protected, tmpl.get("env_drop") or [],
+            memory_cap_mb, child_env, execution_id=execution_id,
+        )
+        send_receipt(receipt)
+
+    def hosted_finish():
+        complete("hosted", "done")
+
+    def cancel_staged(_signum, _frame):
+        row["seconds"] = time.time() - started
+        emit("fail", "cancelled", extra={"note": "execution cancelled"})
+
+    signal.signal(signal.SIGTERM, cancel_staged)
 
     if hosted_turn:
         from _lead_host import run_hosted_lead_turn
@@ -658,26 +702,7 @@ def main(argv=None) -> int:
             row["est_usd"], row["est_basis"] = 0, "not_invoked"
             persist_output(run_dir / "cli.log", probe_log)
             persist_output(run_dir / "transcript.md", probe_log)
-            try:
-                chk = run_check_sandboxed()
-            except (subprocess.TimeoutExpired, Cancelled) as error:
-                row['seconds'] = time.time() - started
-                _run_record.check_json(run_dir, stim.get("stimulus_sha"), check_window, -1,
-                                       str(error.stdout or "") + str(error.stderr or ""))
-                emit('fail', 'preflight_check_timeout' if isinstance(error, subprocess.TimeoutExpired) else 'cancelled')
-            _run_record.check_json(run_dir, stim.get("stimulus_sha"), check_window, chk.returncode,
-                                   (chk.stdout or "") + (chk.stderr or ""))
-            if chk.returncode != 0:
-                row["note"] = redact((chk.stderr or chk.stdout or "preflight check failed").strip())
-                emit("fail", "preflight_check")
-            if grant_paths:
-                bad = [rel for rel in changed_paths(ws, base, lane)
-                       if not under_grant(rel, grant_paths)]
-                if bad:
-                    emit("fail", "grant_paths", extra={
-                        "note": "path not in grant.paths: " + ", ".join(bad)})
-            emit("pass", "preflight_skip")
-            raise SystemExit(0)
+            complete("semantic", "preflight_skip")
         if probe.returncode != 0 or probe_value["run"] is not True:
             row["seconds"] = time.time() - started
             row["note"] = "preflight refused execution"
@@ -717,6 +742,10 @@ def main(argv=None) -> int:
         fail("stage %s runtime: %s" % (name, error))
     native_links.extend(made)
     cli_env.update(native_env)
+    if approval_prefix:
+        approval_bridge = _lane_mcp.start(ws, cli_tmp, run_dir, name, approval_job, approval_prefix)
+        atexit.register(approval_bridge.close)
+        args = _lane_mcp.stage(cli_name, args, cli_env, approval_bridge.config)
     cmd = sandbox_cmd(binary, args, ws, cli_tmp, run_dir / "sandbox.sb", budget_controls if budget_broker else None,
                       read_links=native_links, login_writes=tmpl, read_roots=sandbox_read_roots,
                       policy=sandbox_policy, caller=sandbox_caller)
@@ -734,7 +763,10 @@ def main(argv=None) -> int:
         nonlocal cost_usd
         codex_home = cli_env.get("CODEX_HOME") or os.environ.get("CODEX_HOME") or str(HOME / ".codex")
         sessions = Path(codex_home) / "sessions" if Path(binary).name == "codex" else None
-        row.update(parse_usage(log, prompt, cost_per_1k, codex_sessions=sessions, since=started))
+        usage = parse_usage(log, prompt, cost_per_1k, codex_sessions=sessions, since=started)
+        row.update(usage)
+        trace.report_usage({"claude": "claude_code", "agy": "antigravity"}.get(Path(binary).name, Path(binary).name)
+                           + "_native", usage)
         from _harness_usage import settle_cost
         cost_usd = settle_cost(row, cost_usd, unmetered, cost_class)
 
@@ -744,6 +776,7 @@ def main(argv=None) -> int:
     # voids the partial text, to messages.jsonl.
     stream_kind = dialect(binary)
     events = Events(run_dir) if stream_kind else None
+    edit_refusals = CursorEditRefusals() if Path(binary).name == "cursor-agent" else None
     turn = 0
     stuck_monitor = None
     if events is not None and stuck_config.get("enabled", True):
@@ -751,7 +784,7 @@ def main(argv=None) -> int:
 
 
     def close_turn(mapper, error=None):
-        events.write(turn, discard=error is not None)
+        events.write(turn, discard=error is not None, at=_run_record.utc_now(), timestamp_source="producer")
         event = {"event": "turn", "turn": turn, "text": redact(mapper.reply())} if error is None else \
             {"event": "error", "turn": turn, "error": redact(str(error))}
         append_event(run_dir / "messages.jsonl", event)
@@ -762,22 +795,26 @@ def main(argv=None) -> int:
         run_env = cli_env if env is None else env
         def process_evidence(rows):
             record_process_evidence(stage, rows)
+        task_call = stage.startswith("task")
         mapper = None
         availability = CursorAvailability() if Path(binary).name == "cursor-agent" else None
-        if events is not None and stage.startswith("task"):
+        if events is not None and task_call:
             turn, mapper = turn + 1, Mapper(stream_kind)
 
-            def on_line(raw):
-                if GATEWAY_OWNED:
-                    sys.stdout.buffer.write(raw if raw.endswith(b"\n") else raw + b"\n")
-                    sys.stdout.flush()
+            def on_line(raw, at, timestamp_source):
+                sys.stdout.buffer.write(raw if raw.endswith(b"\n") else raw + b"\n")
+                sys.stdout.flush()
                 delta = mapper.text(raw)
                 if delta:
-                    events.write(turn, delta)
+                    events.write(turn, delta, at=at, timestamp_source=timestamp_source)
                 if availability is not None:
                     unavailable = availability.feed(raw, progress=bool(delta))
                     if unavailable:
                         return unavailable
+                if edit_refusals is not None:
+                    refused = edit_refusals.feed(raw)
+                    if refused:
+                        return refused
                 hit = limit_signal(stream_kind, raw)
                 if hit:
                     return hit
@@ -792,9 +829,14 @@ def main(argv=None) -> int:
                     limit = min(limit, timeout - (time.time() - started))
                     if limit <= 0:
                         raise subprocess.TimeoutExpired(command, timeout)
-                if mapper is None:
+                if not task_call:
                     return run_process(command, str(working), run_env, limit, memory_cap_mb=memory_cap_mb, on_evidence=process_evidence)
-                done = run_streaming(command, str(working), run_env, limit, on_line, on_idle=availability.poll if availability else None, memory_cap_mb=memory_cap_mb, on_evidence=process_evidence)
+                done = run_streaming(command, str(working), run_env, limit,
+                                     on_line if mapper is not None else lambda *_: None,
+                                     on_idle=availability.poll if availability and mapper is not None else None,
+                                     memory_cap_mb=memory_cap_mb, on_evidence=process_evidence, trace=trace)
+                if mapper is None:
+                    return done
                 forced = getattr(done, "forced_meta", None)
                 if forced:
                     close_turn(mapper, str(forced.get("reason") or forced.get("stop") or ("%s exited %s" % (stage, done.returncode))))
@@ -901,7 +943,7 @@ def main(argv=None) -> int:
     if forced_meta and str(forced_meta.get("stop") or "") == "provider_limit":
         pl = forced_meta.get("provider_limit") if isinstance(forced_meta.get("provider_limit"), dict) else {}
         try:
-            record_limit(state_dir(LAB), name, dict(pl, template=name))
+            record_limit(state_dir(CODE_ROOT), name, dict(pl, template=name))
         except OSError:
             pass
     if forced_meta and str(forced_meta.get("stop", "")).startswith("stuck:") and stuck_monitor is not None and not (run_dir / "stuck.md").is_file():
@@ -923,6 +965,8 @@ def main(argv=None) -> int:
             row["reason"] = str(forced_meta.get("reason"))
         if isinstance(forced_meta.get("stuck"), dict):
             row["stuck"] = forced_meta["stuck"]
+        if native_stop == "provider_edit_refused":
+            row["refused_paths"] = forced_meta["refused_paths"]
         if native_stop == "provider_limit":
             pl = forced_meta.get("provider_limit") if isinstance(forced_meta.get("provider_limit"), dict) else {}
             if pl:
@@ -954,7 +998,7 @@ def main(argv=None) -> int:
             row["allowance"] = enrich_allowance(row.get("allowance"), limit_hit)
             row["reason"] = limit_hit["message"]
             try:
-                record_limit(state_dir(LAB), name, limit_hit)
+                record_limit(state_dir(CODE_ROOT), name, limit_hit)
             except OSError:
                 pass
             if native_stop != "done" or row.get("allowance", {}).get("rejected"):
@@ -966,71 +1010,11 @@ def main(argv=None) -> int:
         # Only CLIs whose login file is known: a re-login (file change) can then lift the pause.
         from _provider_limits import notice
         if login_refresh_status not in ("written_back", "unchanged"):
-            notice(state_dir(LAB), name, Path(binary).name, home=HOME)
+            notice(state_dir(CODE_ROOT), name, Path(binary).name, home=HOME)
     elif native_stop == "done" and login_refresh_status in (None, "written_back", "unchanged"):
         from _provider_limits import clear_pause
-        clear_pause(state_dir(LAB), name)
-    check_timed_out = False
-    try:
-        chk = run_check_sandboxed()
-    except (subprocess.TimeoutExpired, Cancelled) as error:
-        check_timed_out = isinstance(error, subprocess.TimeoutExpired)
-        chk = subprocess.CompletedProcess([], 124, timeout_output(error.stdout), timeout_output(error.stderr))
-        if native_stop == 'done':
-            native_stop = 'check_timeout' if check_timed_out else 'cancelled'
-    _run_record.check_json(run_dir, stim.get("stimulus_sha"), check_window, -1 if chk.returncode == 124 and not chk.args
-                           else chk.returncode, (chk.stdout or "") + (chk.stderr or ""))
-
-    (cli_tmp / "claude-home/Library/Keychains").unlink(missing_ok=True)
-    finalize_login_copies()
-    unstage_native(native_links)
-    # Publish before harvest can commit the workspace and flatten the diff. The transcript's footer goes on first, so
-    # the hash publish-evidence records stays true once finalize-run runs (it appends no footer to a footed transcript).
-    publish_verdict = "pass" if chk.returncode == 0 and native_stop == "done" else "fail"
-    _run_record.footer(run_dir, native_stop, publish_verdict, row)
-    published, publish_err = run_op(LAB, "publish-evidence", {
-        "run_dir": str(run_dir), "adapter": "executor", "workspace": str(ws),
-        "verdict": publish_verdict,
-        "stop": native_stop,
-        "check_output": redact((chk.stdout or "") + (chk.stderr or ""))[:8192],
-        "check_exit": chk.returncode, "check_skipped": False,
-        **({"archive": "changed_files"} if lane else {}),  # a lane is a whole repo: archive what changed, not the walk
-        **({"lane_git": {"main": lane["main"], "lane": lane["lane"]}} if lane else {}),
-    })
-    if publish_err:
-        emit("fail", "publish_evidence", extra={"note": "publish-evidence: " + publish_err})
-    row["evidence_sha"] = (published or {}).get("evidence_sha", "")
-    row["capture_state"] = (published or {}).get("capture_state", "")
-    if native_stop != "done":
-        emit("fail", native_stop)
-    elif chk.returncode != 0:
-        emit("fail", "check")
-    elif (published or {}).get("capture_state") != "complete":
-        emit("fail", "evidence_incomplete",
-             extra={"note": "; ".join((published or {}).get("incomplete_reasons") or [])})
-
-    if grant_paths:
-        bad = [rel for rel in changed_paths(ws, base, lane) if not under_grant(rel, grant_paths)]
-        if bad:
-            emit("fail", "grant_paths", extra={"note": "path not in grant.paths: " + ", ".join(bad)})
-
-    if lane:  # the lane branch keeps the work; the repo's gate runs when it lands (_lanes.land)
-        try:
-            lane["commit"] = _lanes.commit_lane(ws, "lane %s: %s (%s)" % (lane["lane"], task.name, run_id),
-                                                  main=lane["main"], lane=lane["lane"])
-        except _lanes.LaneError as error:
-            emit("fail", "harvest", extra={"note": str(error)})
-        row["lane"]["commit"] = lane["commit"]
-        row["branch"] = lane["branch"]
-        emit("pass", "done")
-    harvested, err = run_op(LAB, "harvest", {
-        "workspace": str(ws), "slug": re.sub(r"[^a-z0-9-]", "", task.name.lower()) or "task",
-        "run_id": run_id,
-    })
-    if err:
-        emit("fail", "harvest", extra={"note": "harvest: " + err})
-    row["branch"] = harvested.get("branch")
-    emit("pass", "done")
+        clear_pause(state_dir(CODE_ROOT), name)
+    complete("task", native_stop)
 
 
 if __name__ == "__main__":

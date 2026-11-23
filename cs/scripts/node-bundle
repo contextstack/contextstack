@@ -36,7 +36,7 @@ a release of the persistent ~/.contextstack layout (scripts/node-install). Stdli
                          `git archive HEAD | tar -x -C X`, then X/cs/scripts/node-bundle build --commit <sha>, which
                          carries the commit's files only and is never -d; npm ci restores the defuddle tree), versions, URLs, sha256 of the uv tarball,
                          the Python archive and every file under release/, the manifest tools, "binaries" and the
-                         lab commit. "target" and "release" are the lines scripts/node-install reads.
+                         code commit. "target" and "release" are the lines scripts/node-install reads.
       Refuses when a tool or helper imports anything outside the standard library.
   node-bundle deps
       That scan alone, no network: the manifest tools, the helpers they reach and any non-stdlib import by
@@ -68,7 +68,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[1]
+CODE_ROOT = Path(__file__).resolve().parents[1]
 TRIPLE = {"linux-aarch64": "aarch64-unknown-linux-gnu", "linux-x86_64": "x86_64-unknown-linux-gnu",
           "macos-aarch64": "aarch64-apple-darwin", "macos-x86_64": "x86_64-apple-darwin"}
 UV_RELEASES = "https://github.com/astral-sh/uv/releases/download"
@@ -135,13 +135,13 @@ def host_target():
 
 
 def manifest_tools():
-    return json.loads((LAB / "tools/manifest.json").read_text(encoding="utf-8"))["tools"]
+    return json.loads((CODE_ROOT / "tools/manifest.json").read_text(encoding="utf-8"))["tools"]
 
 
 def python_closure(tools):
     """Tools plus every local module they import, transitively; external imports by importer."""
-    stdlib, dirs = set(sys.stdlib_module_names), [LAB / "tools/bin", LAB / "ops/bin"]
-    files, external, queue = {}, {}, [(t["name"], LAB / "tools/bin" / t["name"]) for t in tools if t["runtime"] == "python3"]
+    stdlib, dirs = set(sys.stdlib_module_names), [CODE_ROOT / "tools/bin", CODE_ROOT / "ops/bin"]
+    files, external, queue = {}, {}, [(t["name"], CODE_ROOT / "tools/bin" / t["name"]) for t in tools if t["runtime"] == "python3"]
     while queue:
         name, path = queue.pop()
         if name in files:
@@ -166,33 +166,36 @@ def git_run(argv, **kw):
     """git about this checkout only: without the caller's GIT_* (a commit hook sets GIT_DIR and GIT_INDEX_FILE,
     which pointed an export's git calls back at the real repository and its staged index)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # Keep the lane's explicit opt-out of reading the owner's global configuration.
+    if os.environ.get("GIT_CONFIG_GLOBAL") == os.devnull:
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
     return subprocess.run(argv, env=env, **kw)
 
 
 def in_git():
     """True in a git work tree; False in an export (`git archive HEAD | tar -x`), which has no .git."""
-    return git_run(["git", "-C", str(LAB), "rev-parse", "--is-inside-work-tree"], capture_output=True,
+    return git_run(["git", "-C", str(CODE_ROOT), "rev-parse", "--is-inside-work-tree"], capture_output=True,
                           text=True).stdout.strip() == "true"
 
 
 def release_files():
-    """Code-root paths (relative to lab/) a release carries, outside EXCLUDE, plus REQUIRES_TREES. In a work tree:
+    """Code-root paths (relative to cs/) a release carries, outside EXCLUDE, plus REQUIRES_TREES. In a work tree:
     tracked files only (plus REQUIRES_TREES). In an export: every file it holds (the commit's, nothing else)."""
     if in_git():
-        out = git_run(["git", "-C", str(LAB), "ls-files", "-z", "--cached"],
+        out = git_run(["git", "-C", str(CODE_ROOT), "ls-files", "-z", "--cached"],
                              capture_output=True, check=True).stdout
         found = out.decode("utf-8").split("\0")
     else:
-        found = [str(p.relative_to(LAB)) for p in LAB.rglob("*") if p.is_file()]
+        found = [str(p.relative_to(CODE_ROOT)) for p in CODE_ROOT.rglob("*") if p.is_file()]
     rels = {r for r in found if r and r not in EXCLUDE_FILES and not r.startswith(EXCLUDE) and not r.startswith(REQUIRES_TREES)}
     for tree in REQUIRES_TREES:
-        rels.update(str(p.relative_to(LAB)) for p in (LAB / tree).rglob("*") if p.is_file())
-    return sorted(r for r in rels if "__pycache__" not in r and (LAB / r).is_file())
+        rels.update(str(p.relative_to(CODE_ROOT)) for p in (CODE_ROOT / tree).rglob("*") if p.is_file())
+    return sorted(r for r in rels if "__pycache__" not in r and (CODE_ROOT / r).is_file())
 
 
 def bundle_tree_porcelain(extra_paths=()):
     """Porcelain lines for changes under paths that feed the bundle (repo root), outside ledger/, specs/, tasks/."""
-    repo, code = LAB.parent, LAB.name
+    repo, code = CODE_ROOT.parent, CODE_ROOT.name
     paths = [code, "modelgateway", "harness", "sandbox", "tools", "gateway", "Cargo.lock", "Cargo.toml", *extra_paths]
     out = git_run(["git", "-C", str(repo), "status", "--porcelain", "--", *paths,
                           ":!%s/ledger" % code, ":!%s/specs" % code, ":!%s/tasks" % code],
@@ -211,7 +214,7 @@ def refuse_dirty_tree(allow_dirty, extra_paths=()):
 
 def requires_trees():
     """An export has no gitignored trees: install tools/defuddle/node_modules from its lockfile (npm ci)."""
-    nm = LAB / "tools/defuddle/node_modules"
+    nm = CODE_ROOT / "tools/defuddle/node_modules"
     if not nm.is_dir():
         subprocess.run(["npm", "ci", "--silent", "--no-audit", "--no-fund"], cwd=str(nm.parent), check=True)
 
@@ -230,7 +233,7 @@ def client_web_files(src):
 def build_client_web(dest, composer_auth=None):
     """dest/ = client-web ready to serve: committed files, vendor (no dev), built assets, package manifests.
     Returns bundle.json's "client_web" entry."""
-    src = LAB.parent / CLIENT_WEB_SRC
+    src = CODE_ROOT.parent / CLIENT_WEB_SRC
     for rel in client_web_files(src):
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src / rel, dest / rel, follow_symlinks=False)
@@ -265,7 +268,7 @@ def build_binaries(target, dest, optional=()):
     `optional` (OPTIONAL_BINARIES) is built too (build refuses one for another target before writing)."""
     if target != host_target():
         return {}
-    repo = LAB.parent
+    repo = CODE_ROOT.parent
     subprocess.run(cargo_argv(optional), cwd=str(repo), check=True)
     dest.mkdir(parents=True, exist_ok=True)
     built = {}
@@ -288,8 +291,8 @@ def stage(out, target, bins):
     for rel in release_files():
         dst = rel_root / KIT / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(LAB / rel, dst, follow_symlinks=False)
-    models = LAB.parent / "gateway/models.json"
+        shutil.copy2(CODE_ROOT / rel, dst, follow_symlinks=False)
+    models = CODE_ROOT.parent / "gateway/models.json"
     (rel_root / "gateway").mkdir(parents=True, exist_ok=True)
     shutil.copy2(models, rel_root / "gateway/models.json")
     binaries = []
@@ -342,12 +345,12 @@ def stage(out, target, bins):
 def release_id(files, commit=None, extra_paths=()):
     """<YYYYMMDD>-<short sha>, plus -d<hash of the file hashes> when the shipped tree differs from the commit.
     From an export, `commit` (--commit) names it and the tree is the commit's by construction: never -d."""
-    repo = LAB.parent
+    repo = CODE_ROOT.parent
     if commit:
         return "%s-%s" % (datetime.now(timezone.utc).strftime("%Y%m%d"), commit[:9]), False
     short = git_run(["git", "-C", str(repo), "rev-parse", "--short=9", "HEAD"], capture_output=True,
                            text=True, check=True).stdout.strip()
-    code = LAB.name  # the checkout's code root (cs since the cs/ rename)
+    code = CODE_ROOT.name  # the checkout's code root (cs since the cs/ rename)
     paths = [code, "modelgateway", "harness", "sandbox", "tools", "gateway", "Cargo.lock", "Cargo.toml", *extra_paths]
     dirty = git_run(["git", "-C", str(repo), "status", "--porcelain", "--", *paths, ":!%s/ledger" % code,
                             ":!%s/specs" % code, ":!%s/tasks" % code], capture_output=True, text=True, check=True).stdout.strip()
@@ -435,7 +438,7 @@ def _assemble(a, out, target, uv, uvver, version):
     files, binaries = stage(out, target, bins)
     rid, dirty = release_id(files, a.commit, [OPTIONAL_BINARIES[n][0] for n in optional] + ([CLIENT_WEB_SRC] if client_web else []))
     report = {"created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "target": target, "release": a.release_version or rid,
-              "lab_commit": a.commit or git_run(["git", "-C", str(LAB), "rev-parse", "HEAD"], capture_output=True,
+              "code_commit": a.commit or git_run(["git", "-C", str(CODE_ROOT), "rev-parse", "HEAD"], capture_output=True,
                                                       text=True).stdout.strip(),
               "dirty": dirty, "python": {"version": version}, "uv": {"version": uvver}, "tools": [], "files": files,
               "binaries": binaries, "client_web": client_web}
@@ -495,7 +498,7 @@ def build(a):
         sys.exit("node-bundle: --director-rs is built only for this host's target (%s), not %s" % (host_target(), target))
     extra = ([OPTIONAL_BINARIES["director-rs"][0]] if a.director_rs else []) + ([CLIENT_WEB_SRC] if a.client_web else [])
     refuse_dirty_tree(getattr(a, "allow_dirty", False), extra)
-    version = (LAB / ".python-version").read_text(encoding="utf-8").strip()
+    version = (CODE_ROOT / ".python-version").read_text(encoding="utf-8").strip()
     tools = manifest_tools()
     _, external = python_closure(tools)
     if external:
@@ -525,23 +528,23 @@ def write_meta(out, report):
 def deps(a):
     tools = manifest_tools()
     helpers, external = python_closure(tools)
-    print(json.dumps({"python_version": (LAB / ".python-version").read_text(encoding="utf-8").strip(),
+    print(json.dumps({"python_version": (CODE_ROOT / ".python-version").read_text(encoding="utf-8").strip(),
                       "tools": [t["name"] for t in tools], "runtimes": sorted({t["runtime"] for t in tools}),
-                      "python_files": [str(p.relative_to(LAB)) for p in helpers], "external_imports": external}, indent=2))
+                      "python_files": [str(p.relative_to(CODE_ROOT)) for p in helpers], "external_imports": external}, indent=2))
     return 1 if external else 0
 
 
 def probe(req, prefix):
     """Where a manifest 'requires' entry is satisfied on this host, or None (same lookup as the tool)."""
-    estate = Path(os.environ.get("LAB_ESTATE_RUNTIME") or prefix / ".estate/runtime")  # browser_fetch.estate_runtime
+    estate = Path(os.environ.get("CS_ESTATE_RUNTIME") or prefix / ".estate/runtime")  # browser_fetch.estate_runtime
     if req.startswith("tools/"):
         p = kit_root(prefix) / req.split()[0]
         return str(p) if p.is_file() else None
-    if req.startswith("target/"):  # a runtime exe tool's bin, relative to the release holding lab/
+    if req.startswith("target/"):  # a runtime exe tool's bin, relative to the release holding cs/
         p = prefix / req
         return str(p) if p.is_file() and os.access(p, os.X_OK) else None
     if req.startswith("gstack browse"):
-        cands = [os.environ.get("LAB_BROWSE"), estate / "browse", Path.home() / ".claude/skills/gstack/browse/dist/browse"]
+        cands = [os.environ.get("CS_BROWSE"), estate / "browse", Path.home() / ".claude/skills/gstack/browse/dist/browse"]
         return next((str(c) for c in cands if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
     if req.startswith("Playwright"):
         cache = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or estate / "ms-playwright"
@@ -585,10 +588,10 @@ def verify(a):
     for t in meta["tools"]:
         runtime = sys.executable if t["runtime"] == "python3" else shutil.which(t["runtime"])
         need = t["runtime"]
-        if t["runtime"] == "exe":  # the descriptor's bin, under the release (the repo holding lab/) unless absolute
-            sys.path.insert(0, str(LAB / "ops/bin"))
+        if t["runtime"] == "exe":  # the descriptor's bin, under the release (the repo holding cs/) unless absolute
+            sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
             import _sandbox_policy  # tool_argv; imported here so capture-stimulus can load this file anywhere
-            need = _sandbox_policy.tool_argv(LAB, t["name"])[0]
+            need = _sandbox_policy.tool_argv(CODE_ROOT, t["name"])[0]
             runtime = need if Path(need).is_file() and os.access(need, os.X_OK) else None
         found = {req: probe(req, prefix) for req in t["requires"]}
         found = {("%s (%s)" % (k, unbundled[k]) if k in unbundled else k): v for k, v in found.items()}
@@ -606,7 +609,7 @@ def verify(a):
         if not ok:
             missing.setdefault("php >= 8.3", []).append("client-web")
     out = {"bundle": str(bundle), "prefix": str(prefix), "target": meta["target"], "release": meta.get("release"),
-           "lab_commit": meta.get("lab_commit"),
+           "code_commit": meta.get("code_commit"),
            "python": {"path": str(py), "version": platform.python_version(), "want": want, "build": meta["python"].get("build")},
            "uv": meta["uv"]["version"], "files_checked": len(meta["files"]), "errors": bad, "tools": tools,
            "missing_host_runtimes": missing, "ok": not bad and not missing}

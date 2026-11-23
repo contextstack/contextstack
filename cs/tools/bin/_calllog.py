@@ -3,14 +3,14 @@
 import json
 import os
 
-LOG = ".lab-calls.jsonl"
+LOG = ".cs-calls.jsonl"
 
 
 def destination():
     """Permit a direct batch parent to isolate composed child-call evidence."""
-    candidate = os.environ.get("LAB_BATCH_CHILD_CALLLOG", "")
-    parent = os.environ.get("LAB_BATCH_PARENT_PID", "")
-    if candidate == ".lab-batch-child-calls.jsonl" and parent == str(os.getppid()):
+    candidate = os.environ.get("CS_BATCH_CHILD_CALLLOG", "")
+    parent = os.environ.get("CS_BATCH_PARENT_PID", "")
+    if candidate == ".cs-batch-child-calls.jsonl" and parent == str(os.getppid()):
         return candidate
     return LOG
 

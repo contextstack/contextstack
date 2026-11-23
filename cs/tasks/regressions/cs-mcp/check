@@ -101,7 +101,7 @@ def finish_stuck(node, job_id, run_id, reason="stuck:repeat"):
     assert (a.json or {}).get("status") == "acked", a
 
 
-def finish(node, job_id, run_id, state="done", reason=None):
+def finish(node, job_id, run_id, state="done", reason=None, stop=None):
     """The node reports the run (check pass, a diff, a transcript) and the job's end, as spool-send would.
     For an error end with no run, pass run_id=None and state='error' with a reason."""
     if run_id:
@@ -121,6 +121,8 @@ def finish(node, job_id, run_id, state="done", reason=None):
     if reason:
         body["reason"] = reason
         body["stop"] = "error: no_row: " + reason
+    if stop:
+        body["stop"] = stop
     row = json.dumps(body)
     term = {"envelope_version": 1, "event_id": "job_terminal:" + job_id, "job_id": job_id, "files": [],
             "envelope_sha256": wire.sha(b""), "row_sha256": wire.sha(row)}
@@ -330,7 +332,7 @@ def scenario(server, node, target, token, tmp):
     server.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     names = {t["name"] for t in server.rpc("tools/list")["result"]["tools"]}
     want = {"start_task", "list_agents", "list_tasks", "task_status", "task_output", "wait_tasks", "cancel_task", "decide", "usage",
-            "machines", "list_repos", "land_task", "needs_you", "clear_needs_you", "retry_task", "find_task"}
+            "machines", "list_repos", "land_task", "needs_you", "clear_needs_you", "retry_task", "find_task", "decision_log", "record_decision", "backlog", "backlog_update"}
     expect(names == want, "tools/list names the tools", names)
 
     # 1b. the shipped profiles (cs/agents), and a budget over the gateway's hour refused before any upload.
@@ -515,6 +517,22 @@ def scenario(server, node, target, token, tmp):
     # 10. retry_task: keeps model, allow_fallback for profile chain, previous-attempt goal, refuse pass and third attempt.
     retry_task_scenario(target, node, token, tmp)
 
+    research, err = server.tool("start_task", title="Study the repo", goal="Read the README.",
+                                agent="researcher", repo="contextstack")
+    expect(not err and research.get("job_id") and research.get("workspace") == {"repo": "contextstack", "read_only": True}
+           and "lane_renamed" not in research, "a researcher can start with a repo and no lane", research)
+    if not err:
+        spec = owner("jobs/%s/files/spec.yaml" % research["job_id"]).body.decode()
+        response = owner("jobs/" + research["job_id"]).json
+        job = response.get("job", response)
+        expect("\nrepo: contextstack\n" in spec and "\nrepo_read_only: true\n" in spec and "\nlane:" not in spec
+               and "branch" not in job["meta"], "the researcher bundle selects a read-only repo without a branch", [job, spec])
+        node.accept(research["job_id"])
+        finish(node, research["job_id"], None, state="error", reason="fixture failure")
+        retry, err = server.tool("retry_task", job_id=research["job_id"])
+        expect(not err and retry.get("workspace") == research["workspace"],
+               "retry preserves the read-only repo workspace", retry)
+
 
 # ---- sub-agent types (cs/agents; CS_AGENTS_DIR) -----------------------------------------------------------------
 TESTER = """---
@@ -644,10 +662,20 @@ def retry_task_scenario(target, node, token, tmp):
         finish_stuck(node, s2_id, "run-plain", reason="provider_limit")
         r2, err = plain.tool("retry_task", job_id=s2_id)
         expect(not err and r2.get("model") == "cursor-sol", "retry_task keeps the prior model by default", r2)
+        refused, err = plain.tool("start_task", title="Edit refused", goal="Goal.\n", agent="coder",
+                                   repo="contextstack", lane="edit-refused")
+        expect(not err and refused.get("model") == "cursor-sol", "edit refusal starts on cursor-sol", refused)
+        refused_id = refused["job_id"]
+        node.accept(refused_id)
+        finish(node, refused_id, None, state="error", reason="Cursor's edit tools repeatedly refused writes.",
+               stop="provider_edit_refused")
+        retried, err = plain.tool("retry_task", job_id=refused_id)
+        expect(not err and retried.get("model_fallback") == {"from": "cursor-sol", "to": "codex"},
+               "retry_task automatically switches after Cursor edit refusals", retried)
     finally:
         plain.close()
     server = Server(target.url, target.data / "local-credential", node.name,
-                    env={"CS_AGENTS_DIR": agents_dir, "LAB_STATE_ROOT": str(state_root)})
+                    env={"CS_AGENTS_DIR": agents_dir, "CS_STATE_ROOT": str(state_root)})
     owner = lambda path: wire.request(target.url, "GET", "/api/v1/client/" + path, token=token)
     try:
         server.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})

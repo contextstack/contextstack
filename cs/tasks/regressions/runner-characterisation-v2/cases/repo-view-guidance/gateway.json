@@ -1,0 +1,15 @@
+[
+ {"ok":{"tool_calls":[
+  {"id":"shell","name":"exec","args":{"cmd":["ls","docs","2>/dev/null"]}},
+  {"id":"string","name":"exec","args":{"cmd":"test -d docs"}},
+  {"id":"missing","name":"fs_read","args":{"path":"docs/facts.txt"}},
+  {"id":"files","name":"repo_search","args":{"mode":"files","query":"facts","path":"docs"}},
+  {"id":"text","name":"repo_search","args":{"mode":"text","query":"snapshot fact"}},
+  {"id":"parent","name":"repo_search","args":{"mode":"files","query":"facts","path":"../"}},
+  {"id":"absolute","name":"repo_search","args":{"mode":"text","query":"fact","path":"/"}},
+  {"id":"symlink","name":"repo_search","args":{"mode":"files","query":"facts","path":"outside"}}
+ ]}},
+ {"ok":{"tool_calls":[{"id":"workspace","name":"fs_read","args":{"path":"."}}]}},
+ {"ok":{"tool_calls":[{"id":"recheck","name":"repo_search","args":{"mode":"text","query":"snapshot fact","path":"docs"}}]}},
+ {"ok":{"tool_calls":[{"id":"deliverable","name":"fs_write","args":{"path":"answer.md","content":"snapshot fact\n"}}]}}
+]

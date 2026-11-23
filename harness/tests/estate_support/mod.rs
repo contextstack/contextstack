@@ -35,14 +35,15 @@ const OP_HELPERS: &[&str] = &[
     "_sandbox_policy.py",
     "_runner.py",
     "_errors.py",
+    "_api_run.py",
 ];
 
-fn lab() -> PathBuf {
+fn cs() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../cs")
 }
 
 fn fixture_dir() -> PathBuf {
-    lab().join("tasks/regressions/runner-characterisation-v2/fixture")
+    cs().join("tasks/regressions/runner-characterisation-v2/fixture")
 }
 
 fn copy_exec(from: &Path, to: &Path) -> Result<(), String> {
@@ -62,16 +63,16 @@ fn copy_exec(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// A minimal runnable estate under a temporary directory.
-pub struct Lab {
+pub struct ContextStack {
     pub _guard: TempDir,
     pub root: PathBuf,
 }
 
-impl Lab {
+impl ContextStack {
     pub fn build() -> Result<Self, String> {
         let guard = TempDir::new().map_err(|e| e.to_string())?;
         let root = guard.path().to_path_buf();
-        let src = lab();
+        let src = cs();
         let here = fixture_dir();
         for sub in [
             "ledger",
@@ -98,6 +99,10 @@ impl Lab {
         copy_exec(
             &here.join("fx_tool.json"),
             &root.join("tools/bin/fx_tool.json"),
+        )?;
+        copy_exec(
+            &cs().join("ops/bin/machine-finish"),
+            &root.join("ops/bin/machine-finish"),
         )?;
         for name in REAL_OPS {
             let real = src.join("ops/bin").join(name);
@@ -238,8 +243,16 @@ pub async fn mock_gateway_observed(
             }
             let request = String::from_utf8_lossy(&buf);
             let (body, content_type) = if request.starts_with("GET ") {
+                let streaming = queue
+                    .lock()
+                    .ok()
+                    .and_then(|q| q.front().cloned())
+                    .is_some_and(|body| body.trim_start().starts_with("data:"));
                 (
-                    serde_json::json!({"models": []}).to_string(),
+                    serde_json::json!({
+                        "models": [{"name": "fixture", "streaming": streaming}]
+                    })
+                    .to_string(),
                     "application/json",
                 )
             } else {
@@ -247,7 +260,12 @@ pub async fn mock_gateway_observed(
                     r#"{"status":"error","error":{"class":"fatal","code":"unexpected","message":"no scripted reply"}}"#
                         .into()
                 });
-                (body, "application/json")
+                let content_type = if body.trim_start().starts_with("data:") {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                (body, content_type)
             };
             if body == "__hang__" {
                 if let Some(received) = &received {
@@ -277,15 +295,15 @@ pub async fn mock_gateway_for_test(
 }
 
 pub async fn drive(
-    lab: &Lab,
+    cs: &ContextStack,
     spec: &Spec,
     bodies: Vec<String>,
 ) -> Result<runner::ResultRow, String> {
-    drive_observed(lab, spec, bodies, None).await
+    drive_observed(cs, spec, bodies, None).await
 }
 
 pub async fn drive_observed(
-    lab: &Lab,
+    cs: &ContextStack,
     spec: &Spec,
     bodies: Vec<String>,
     received: Option<Arc<tokio::sync::Notify>>,
@@ -296,24 +314,24 @@ pub async fn drive_observed(
         ("PATH".to_string(), path),
         (
             "HOME".to_string(),
-            lab.root.join("home").to_string_lossy().into_owned(),
+            cs.root.join("home").to_string_lossy().into_owned(),
         ),
         (
             "TMPDIR".to_string(),
-            lab.root.join("tmp").to_string_lossy().into_owned(),
+            cs.root.join("tmp").to_string_lossy().into_owned(),
         ),
         ("LANG".to_string(), "en_US.UTF-8".to_string()),
         (
-            "LAB_STATE_ROOT".to_string(),
-            lab.root.join("ledger").to_string_lossy().into_owned(),
+            "CS_STATE_ROOT".to_string(),
+            cs.root.join("ledger").to_string_lossy().into_owned(),
         ),
         (
-            "LAB_CODE_ROOT".to_string(),
-            lab.root.to_string_lossy().into_owned(),
+            "CS_CODE_ROOT".to_string(),
+            cs.root.to_string_lossy().into_owned(),
         ),
         (
-            "LAB_CONFIG_ROOT".to_string(),
-            lab.root.to_string_lossy().into_owned(),
+            "CS_CONFIG_ROOT".to_string(),
+            cs.root.to_string_lossy().into_owned(),
         ),
     ];
     if !harness.is_empty() {
@@ -321,10 +339,42 @@ pub async fn drive_observed(
         env.push(("CS_RUNNER_BIN".to_string(), harness));
     }
     let _env = cs_harness::process::ScopedEnv::set(env);
-    let (endpoint, server) = mock_gateway_observed(bodies, received).await?;
-    let gateway = Gateway::new(endpoint, spec.model.clone(), spec.id.clone())?;
-    let row = runner::run(spec, "tasks/fx", 1, &lab.root, &gateway, Control::default()).await;
-    server.abort();
+    let (endpoint, server) = if bodies.is_empty() {
+        ("http://127.0.0.1:1/v1/agent/model.call".into(), None)
+    } else {
+        let (endpoint, server) = mock_gateway_observed(bodies, received).await?;
+        (endpoint, Some(server))
+    };
+    let gateway = Gateway::new(endpoint, spec.model.clone())?;
+    let mut row = runner::run(spec, "tasks/fx", 1, &cs.root, &gateway, Control::default()).await;
+    if let Some((dir, lock)) = row.execution.take() {
+        drop(lock);
+        let receipt = fs::read(dir.join("execution-receipt.json")).map_err(|e| e.to_string())?;
+        let receipt: Value = serde_json::from_slice(&receipt).map_err(|e| e.to_string())?;
+        let request = serde_json::json!({"run_dir": dir, "receipt": receipt, "foreground": true});
+        let output = cs_harness::process::command(
+            &cs.root.join("ops/bin/machine-finish"),
+            &[],
+            &cs.root,
+            request.to_string().as_bytes(),
+            &[],
+            None,
+            None,
+            cs_harness::process::Capture::Stdout,
+        )
+        .await?;
+        let finished: Value = serde_json::from_slice(&output.bytes).map_err(|e| e.to_string())?;
+        row.pending = finished["state"] != "finalized";
+        if let Some(verdict) = finished["verdict"].as_str() {
+            verdict.clone_into(&mut row.verdict);
+        }
+        if let Some(stop) = finished["stop"].as_str() {
+            stop.clone_into(&mut row.stop);
+        }
+    }
+    if let Some(server) = server {
+        server.abort();
+    }
     Ok(row)
 }
 
@@ -345,11 +395,11 @@ pub async fn finish(
     yaml: &str,
     bodies: Vec<String>,
 ) -> Result<(runner::ResultRow, Value, Option<String>), String> {
-    let lab = Lab::build()?;
-    let spec = lab.write_spec(yaml)?;
-    let row = drive(&lab, &spec, bodies).await?;
-    let terminal = lab.terminal()?;
-    let runs = lab.root.join("ledger/runs");
+    let cs = ContextStack::build()?;
+    let spec = cs.write_spec(yaml)?;
+    let row = drive(&cs, &spec, bodies).await?;
+    let terminal = cs.terminal()?;
+    let runs = cs.root.join("ledger/runs");
     let entry = fs::read_dir(&runs)
         .map_err(|e| e.to_string())?
         .next()

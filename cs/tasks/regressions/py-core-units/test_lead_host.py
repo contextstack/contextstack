@@ -2,6 +2,8 @@
 import io
 import json
 import os
+import socket
+import subprocess
 import sys
 import threading
 import unittest
@@ -367,6 +369,18 @@ class HostTests(unittest.TestCase):
         self.assertTrue(dead.stopped)
         self.assertEqual(self.host._turn_depth, 0)
 
+    def test_turn_message_reads_each_bundles_decision_log(self):
+        self.write('tasks/turn/goal.md', ' goal\n')
+        self.write('conversation/context.md', ' transcript\n')
+        self.write('conversation/decision-log.md', '# Decision log\nFirst revision\n')
+        self.assertEqual(m.turn_message(self.ws, first_turn=True),
+                         'transcript\n\n# Decision log\nFirst revision\n\ngoal')
+        self.write('conversation/decision-log.md', '# Decision log\nSecond revision\n')
+        self.assertEqual(m.turn_message(self.ws, first_turn=False),
+                         '# Decision log\nSecond revision\n\n goal\n')
+        (self.ws / 'conversation/decision-log.md').unlink()
+        self.assertEqual(m.turn_message(self.ws, first_turn=False), ' goal\n')
+
     def test_turn_message_includes_context_only_on_first_turn_and_bundle_prefers_session_file(self):
         self.write('tasks/turn/goal.md', ' goal\n')
         self.assertEqual(m.turn_message(self.ws, first_turn=True), 'goal')
@@ -512,6 +526,19 @@ class HostTests(unittest.TestCase):
         self.assertEqual(payload, {'op': 'ping'})
         self.assertEqual(json.loads(conn.sendall.call_args.args[0]), {'op': 'ping', 'token': 'fixture-token'})
 
+    def test_socket_request_relays_each_event_before_returning_the_reply(self):
+        conn = Mock()
+        conn.__enter__ = Mock(return_value=conn)
+        conn.__exit__ = Mock(return_value=False)
+        conn.recv.side_effect = [b'{"cli_event":{"type":"system"}}\n{"cli_ev',
+                                 b'ent":{"type":"result"}}\n{"reply":"answer"}\n']
+        events = []
+        with patch.object(m.socket, 'socket', return_value=conn), \
+             patch.object(m, 'read_socket_token', return_value='fixture-token'):
+            response = m.socket_request(self.root / 'socket', {'op': 'turn'}, on_event=events.append)
+        self.assertEqual(events, [{'type': 'system'}, {'type': 'result'}])
+        self.assertEqual(response, {'reply': 'answer'})
+
     def test_socket_request_closed_without_reply_reports_host_log_location(self):
         conn = Mock()
         conn.__enter__ = Mock(return_value=conn)
@@ -534,7 +561,7 @@ class HostTests(unittest.TestCase):
         env = spawn.call_args.kwargs['env']
         self.assertEqual(env['LEAD_HOST_PARENT_PID'], '456')
         self.assertEqual(env['LEAD_HOST_IDLE_EXIT_S'], '12')
-        self.assertEqual(env['LAB_STATE_ROOT'], str(self.state))
+        self.assertEqual(env['CS_STATE_ROOT'], str(self.state))
         self.assertTrue(spawn.call_args.kwargs['start_new_session'])
         self.assertEqual(spawn.call_args.args[0][-2:], ['--cli', 'fake'])
         with patch.object(m, 'socket_file', return_value=sock), \
@@ -694,23 +721,112 @@ class HostTests(unittest.TestCase):
 
     def test_hosted_executor_persists_redacted_reply_checks_and_publishes_evidence(self):
         import _run_record
-        run = self.root / 'run'
-        run.mkdir()
-        values = {'ws': self.ws, 'task': self.ws / 'tasks/turn', 'run_dir': run, 'emit': Mock(),
-                  'started': 0, 'check_window': {}, 'child_env': {}, 'LAB': self.root,
-                  'run_op': Mock(return_value=({'evidence_sha': 'sha', 'capture_state': 'complete'}, '')),
-                  'a': {'conversation_id': 'conversation'}, 'row': {'stimulus_sha': 'stim'},
-                  'run_check_sandboxed': Mock(return_value=Mock(returncode=0, stdout='check ok', stderr=''))}
+        code_root = HERE.parents[2]
+        run = self.state / 'runs/run'
+        run.mkdir(parents=True)
+        trace = _run_record.ObservedTrace(run, code_root, 'tasks/turn', 1, _run_record.trace_clock())
+        row = {'stimulus_sha': 'stim', 'transcript': 'ledger/runs/run'}
+        env = dict(os.environ, CS_CODE_ROOT=str(code_root), CS_CONFIG_ROOT=str(self.config),
+                   CS_STATE_ROOT=str(self.state))
+
+        def emit(verdict, stop):
+            # Mirror executor.emit: the executor already owns the ledger row.
+            row.update(verdict=verdict, stop=stop)
+            self.write('ledger.jsonl', json.dumps(row) + '\n', self.state)
+            _run_record.terminal(run, self.ws, row, run.name, 'hosted-lead', 'tasks/turn',
+                                 values['started'], values['check_window'], trace=trace)
+            finalized = _run_record.finalize(code_root, run, env)
+            self.assertEqual(finalized.get('state'), 'finalized', finalized)
+            self.assertFalse(finalized['row_appended'])
+            raise SystemExit(0)
+
+        def turn(*args, trace, cost_per_1k, **kwargs):
+            self.assertEqual(cost_per_1k, 0)
+            trace.event(b'{"type":"result"}')
+            return 'answer sk-ant-private'
+
+        def publish(*args):
+            self.write('evidence/manifest.json', {'evidence_sha': 'sha', 'capture_state': 'complete'}, run)
+            self.write('ready_for_inspection', '', run)
+            return {'evidence_sha': 'sha', 'capture_state': 'complete'}, ''
+
+        from _machine_finish import hosted, record_check
+
+        execute_check = Mock(return_value=Mock(returncode=0, stdout='check ok', stderr=''))
+        publish_evidence = Mock(side_effect=publish)
+        emit_result = Mock(side_effect=emit)
+
+        def hosted_finish():
+            hosted(run, self.ws, row, lambda: record_check(run, row, 60, execute_check, hosted=True),
+                   emit_result, publish_evidence, code_root)
+
+        values = {'ws': self.ws, 'task': self.ws / 'tasks/turn', 'run_dir': run, 'emit': emit_result,
+                  'trace': trace, 'started': m.time.time(), 'check_window': 60, 'CODE_ROOT': code_root,
+                  'a': {'conversation_id': 'conversation'}, 'row': row, 'hosted_finish': hosted_finish}
         with patch.object(m, 'roots', return_value={'config': self.config, 'state': self.state}), \
-             patch.object(m, 'client_turn', return_value='answer sk-ant-private'), \
-             patch.object(_run_record, 'check_json') as check, patch.object(_run_record, 'footer') as footer:
+             patch.object(m, 'client_turn', side_effect=turn), self.assertRaises(SystemExit) as exited:
             m.run_hosted_lead_turn(values)
+        self.assertEqual(exited.exception.code, 0)
         self.assertEqual((run / 'lead-reply.txt').read_text(), 'answer <redacted>\n')
         for name in ('cli.log', 'transcript.md', 'messages.jsonl'):
             self.assertNotIn('sk-ant-private', (run / name).read_text())
         self.assertEqual(values['row']['turns'], 1)
+        self.assertEqual((values['row']['est_usd'], values['row']['est_basis']), (0, 'unreported'))
         self.assertEqual(values['row']['evidence_sha'], 'sha')
-        check.assert_called_once()
-        footer.assert_called_once()
-        values['run_op'].assert_called_once()
-        values['emit'].assert_called_once_with('pass', 'done')
+        execute_check.assert_called_once()
+        publish_evidence.assert_called_once()
+        emit_result.assert_called_once_with('pass', 'done')
+        directory_map = self.write('trace-directories.json', {'run_directories': {run.name: str(run)}}, self.root)
+        checked = subprocess.run([sys.executable, str(code_root.parent / 'tracing/check-trace'),
+                                  str(trace.path), str(directory_map)],
+                                 env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, (checked.stdout, checked.stderr))
+        self.assertEqual(json.loads(checked.stdout), {'result': 'complete', 'findings': [], 'missing': []})
+        spans = {span['kind']: span for span in map(json.loads, trace.path.read_text().splitlines())}
+        self.assertEqual(spans['finalization']['attributes']['evidence_id'], 'sha')
+
+    def test_gateway_cancel_waits_for_hosted_turn_stop(self):
+        connection = Mock()
+        connection.__enter__ = Mock(return_value=connection)
+        connection.__exit__ = Mock(return_value=False)
+        connection.recv.side_effect = [
+            socket.timeout(), b'{"error":"turn cancelled","exit_status":143,"outcome":"cancelled"}\n',
+        ]
+        with patch.object(m.socket, "socket", return_value=connection), \
+             patch.object(m, "read_socket_token", return_value="fixture"):
+            result = m.socket_request(self.root / "socket", {"op": "turn"}, timeout=1,
+                                      cancelled=Mock(side_effect=[False, True]))
+        self.assertEqual(result["outcome"], "cancelled")
+        connection.shutdown.assert_called_once_with(socket.SHUT_WR)
+        self.assertEqual(connection.recv.call_count, 2)
+
+        self.host._token = "fixture"
+        connection = Mock()
+        connection.recv.return_value = b'{"op":"turn","token":"fixture","cancel_on_eof":true}\n'
+
+        def cancel_turn(*args, cancelled, **kwargs):
+            self.assertTrue(cancelled())
+            raise m.TurnCancelled("turn cancelled")
+
+        with patch.object(m, "_peer_uid", return_value=os.getuid()), \
+             patch.object(m.select, "select", return_value=([connection], [], [])), \
+             patch.object(self.host, "handle_turn", side_effect=cancel_turn):
+            m._serve_conn(connection, self.host)
+        self.assertEqual(json.loads(connection.sendall.call_args.args[0])["outcome"], "cancelled")
+
+    def test_failed_hosted_turn_records_only_the_failure(self):
+        import _run_record
+        trace = _run_record.ObservedTrace(self.ws, self.root, 'tasks/turn', 1, _run_record.trace_clock())
+        values = {'ws': self.ws, 'task': self.ws / 'tasks/turn', 'run_dir': self.ws, 'emit': Mock(),
+                  'trace': trace, 'started': 0, 'check_window': 60, 'child_env': {}, 'CODE_ROOT': self.root,
+                  'hosted_finish': Mock(), 'a': {'conversation_id': 'conversation'}}
+        error = m.HostedTurnError('turn timed out', 124, 'timeout')
+        with patch.object(m, 'roots', return_value={'config': self.config, 'state': self.state}), \
+             patch.object(m, 'client_turn', side_effect=error), patch.object(trace, 'exited', wraps=trace.exited) as exited:
+            m.run_hosted_lead_turn(values)
+        exited.assert_called_once()
+        self.assertEqual((trace.status, trace.process_outcome), (124, 'timeout'))
+        self.assertEqual((values['row']['est_usd'], values['row']['est_basis']), (0, 'unreported'))
+        self.assertIsNotNone(trace.finalization_start)
+        values['emit'].assert_called_once_with('fail', 'lead_host', extra={'note': 'turn timed out'})
+        values['hosted_finish'].assert_not_called()

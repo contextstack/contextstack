@@ -17,9 +17,9 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
-REPO = LAB.parent
-SCRIPTS = LAB / 'scripts'
+CODE_ROOT = Path(__file__).resolve().parents[3]
+REPO = CODE_ROOT.parent
+SCRIPTS = CODE_ROOT / 'scripts'
 WORKFLOW = REPO / '.github/workflows/release-bundles.yml'
 RUNNERS = {
     'macos-latest': 'macos-aarch64',
@@ -199,7 +199,7 @@ def load_workflow(path):
     parsed = Yaml(path.read_text()).parse()
     binary = os.environ.get('CS_TOOLS_BIN') or str(REPO / 'target/release/cs-tools')
     if os.path.isfile(binary) and os.access(binary, os.X_OK):
-        sys.path.insert(0, str(LAB / 'ops/bin'))
+        sys.path.insert(0, str(CODE_ROOT / 'ops/bin'))
         from _yaml import load
         other = load(path)
         check(other == parsed, 'stdlib YAML reader disagrees with yaml-json')
@@ -244,7 +244,7 @@ def bundle(root, target, version, commit, marker):
     path = root / target / marker
     path.mkdir(parents=True)
     (path / 'bundle.json').write_text(json.dumps({
-        'target': target, 'release': version, 'lab_commit': commit}))
+        'target': target, 'release': version, 'code_commit': commit}))
     (path / 'marker').write_text(marker)
     return path
 

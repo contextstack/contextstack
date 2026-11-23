@@ -9,7 +9,7 @@ use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\LiveUpdates;
 use App\Client\ModelCatalog;
 use App\Client\TurnFailure;
-use App\Livewire\DirectorPage;
+use App\Livewire\ApprovalsPage;
 use App\Livewire\Forms\BudgetForm;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Locked;
@@ -23,7 +23,7 @@ use Livewire\Attributes\Title;
  * Replies appear as they are written: the stream is filtered to this conversation (`GET events?conversation=`), its
  * run_events are tagged with the turn or summary, and when the turn ends its `reply` replaces the partial text.
  */
-new #[Layout('layouts::client')] #[Title('Conversation')] class extends DirectorPage
+new #[Layout('layouts::client')] #[Title('Conversation')] class extends ApprovalsPage
 {
     public BudgetForm $budget;
 
@@ -247,6 +247,10 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Director
     protected function afterChanges(): void
     {
         $this->trim();
+        $approvalId = $this->attentionApprovalId();
+        if ($approvalId !== null && ($this->approvals[$approvalId]['status'] ?? null) !== 'needs_owner') {
+            $this->loadApproval($approvalId);
+        }
         foreach ([...$this->turns(), ...$this->summaries()] as $item) {
             $jobId = $item['job_id'] ?? null;
             if (! is_string($jobId) || $this->finished($item)) {
@@ -565,6 +569,19 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Director
     public function clearBudget(): void
     {
         $this->takeConversation($this->attempt(fn () => $this->budget->clear($this->director(), 'conversations/'.rawurlencode($this->conversationId).'/budget')));
+    }
+
+    /**
+     * The action approval the conversation's attention links, when an agent's request waits on the owner
+     * (CLIENT-API.md "Action approvals"): it is answered with Approve or Deny, not a reply.
+     */
+    public function attentionApprovalId(): ?string
+    {
+        $attention = $this->conversation()['attention'] ?? null;
+
+        return is_array($attention) && ($attention['source_kind'] ?? null) === 'action_approval' && is_string($attention['action_approval_id'] ?? null)
+            ? $attention['action_approval_id']
+            : null;
     }
 
     public function dismissAttention(): void
@@ -980,7 +997,10 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Director
                             @endforeach
                         @endforeach
 
-                        @if ($attention !== null)
+                        @php($attentionApproval = $this->attentionApprovalId() !== null ? ($this->approvals[$this->attentionApprovalId()] ?? null) : null)
+                        @if (is_array($attentionApproval))
+                            <x-client.action-approval :approval="$attentionApproval" />
+                        @elseif ($attention !== null)
                             <article class="space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/[.06] px-4 py-3" data-test="attention-message">
                                 <div class="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
                                     <flux:icon.bell variant="micro" class="text-amber-500" />

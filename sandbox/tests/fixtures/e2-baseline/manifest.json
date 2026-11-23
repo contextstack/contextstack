@@ -58,16 +58,16 @@
     "_executor.py:main:sandbox_cmd",
     "_executor.py:main:sandbox_cmd",
     "_executor.py:refresh_sandbox:sandbox_cmd",
-    "_executor.py:run_check_sandboxed:sandbox_cmd",
     "_executor.py:sandbox_cmd:sandbox-exec",
     "_lead_host.py:build:sandbox_cmd",
     "_lead_host.py:make_session:sandbox_builder",
+    "_machine_finish.py:profiled_check:check_command",
+    "_machine_finish.py:sandboxed_check:sandbox_cmd",
     "_muse.py:sandbox_command:sandbox-exec",
     "_muse.py:sandbox_command:sandbox-exec",
     "_muse_adapter.py:check_command:sandbox_command",
     "_muse_adapter.py:execute:sandbox_command",
-    "_muse_adapter.py:probe:sandbox_command",
-    "_muse_adapter.py:run:check_command"
+    "_muse_adapter.py:probe:sandbox_command"
   ],
   "cases": [
     {

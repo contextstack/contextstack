@@ -90,7 +90,7 @@ a directory other users can read or write.
 | `objects/ab/<sha256>` | the content-addressed object store: bundle files and run evidence, named by their sha256, written once |
 | `local-credential` | the local client token (0600) |
 
-It starts empty. Nothing is read from or written to the Laravel app's database or the lab ledger. Only SHA-256
+It starts empty. Nothing is read from or written to the Laravel app's database or the cs ledger. Only SHA-256
 hashes of tokens and pairing codes are stored. The installation ID (`inst_<ulid>`) is created on first start and
 never changes.
 
@@ -233,7 +233,7 @@ throwaway certificate when `openssl` and `curl` are present) and a hand-made job
 
 ## Not built yet
 
-A node client that speaks protocol 2 (the node tooling in `lab/`, moving to `cs/`, speaks protocol 1, so
+A node client that speaks protocol 2 (the node tooling in `cs/`, moving to `cs/`, speaks protocol 1, so
 cancels to it stay requested), a library of specs and tasks to choose from, event replay, Teams and accounts, CORS for browser clients, garbage collection of uploaded objects that no
 intent used, a limit on how many live events a run may keep, a conversation's reply from the coding-agent path
 (its runs carry no `messages.jsonl` turn events yet), changing a conversation's spec, a summary job whose own

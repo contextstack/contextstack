@@ -29,11 +29,13 @@ hook accepts rules-tier commits. land() merges the lane into main, runs the gate
 or a conflict main is reset to where it was. It never pushes.
 """
 import fcntl
+from contextlib import contextmanager
 from contextvars import ContextVar
 import fnmatch
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -543,6 +545,40 @@ def refuse_tracked_secrets(cfg, _ref="HEAD"):
                     "in config/repos.json for this repo." % "; ".join(bits))
 
 
+def archive_main(cfg, destination):
+    """Export the configured branch without consulting or changing its checkout."""
+    main = cfg["path"]
+    ref = "refs/heads/" + cfg["branch"]
+    commit = out(main, "rev-parse", "--verify", ref + "^{commit}")
+    refuse_tracked_secrets(cfg)
+    # Give archive its own attributes and object access. Export settings in the
+    # source tree must not omit files or substitute their committed contents.
+    staging = destination.parent
+    bare = staging / "archive.git"
+    object_format = out(main, "rev-parse", "--show-object-format")
+    env = git_environment()
+    subprocess.run(["git", "init", "-q", "--bare", "--template=", "--object-format=" + object_format, str(bare)],
+                   env=env, check=True, stdin=subprocess.DEVNULL)
+    (bare / "info").mkdir(exist_ok=True)
+    (bare / "info/attributes").write_text("* -export-ignore -export-subst\n")
+    objects = out(main, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    (bare / "objects/info/alternates").write_text(objects + "\n")
+    archive = staging / "repo.tar"
+    subprocess.run(["git", "-C", str(bare), "archive", "--format=tar", "--output=" + str(archive), commit],
+                   env=env, check=True, stdin=subprocess.DEVNULL)
+    shutil.rmtree(bare)
+    destination.mkdir()
+    subprocess.run(["tar", "-xf", str(archive), "-C", str(destination)], check=True)
+    archive.unlink()
+
+
+
+def prepare_repo_view(cfg, destination):
+    archive_main(cfg, destination)
+    main = cfg["path"]
+    return [str(path) for path in (destination.resolve(), Path(main).resolve(), git_common_dir(main))]
+
+
 def clone_lane_dependencies(main, lane):
     """Seed ignored dependencies as independent files, never links back into main."""
     for name in ("vendor", "node_modules", "public/build"):
@@ -560,6 +596,67 @@ def clone_lane_dependencies(main, lane):
             if target.exists():
                 shutil.rmtree(target)
         shutil.copytree(source, target)
+
+
+def lane_admin(main, lane):
+    # Git removes its worktree metadata when a lane lands. Keep leases in
+    # stable host-owned metadata, outside the sandbox's lane write grants.
+    if not isinstance(lane, str) or not LANE.fullmatch(lane) or ".." in lane:
+        raise LaneError("invalid lane %r" % lane)
+    return git_common_dir(main) / "cs-lanes" / lane
+
+
+@contextmanager
+def _lane_flock(path, lane):
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise LaneError("lane %s is busy" % lane) from error
+        yield lock
+
+
+@contextmanager
+def lane_lock(cfg, lane):
+    check_lane(cfg, lane)
+    with lane_owner(cfg["path"], lane) as binding:
+        yield binding
+
+
+@contextmanager
+def lane_owner(main, lane):
+    admin = lane_admin(main, lane)
+    admin.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _lane_flock(admin / "owner.lock", lane) as owner:
+        binding = secrets.token_hex(32)
+        # A gateway executor can outlive its launcher briefly. Keep its
+        # separate lock authoritative until it exits.
+        with _lane_flock(admin / "execution.lock", lane):
+            owner.seek(0)
+            owner.truncate()
+            owner.write(binding)
+            owner.flush()
+        try:
+            yield binding
+        finally:
+            owner.truncate(0)
+            owner.flush()
+
+
+@contextmanager
+def lane_execution(main, lane, binding):
+    admin = lane_admin(main, lane)
+    with _lane_flock(admin / "execution.lock", lane):
+        # A valid binding is written by the machine launcher, never by the
+        # gateway caller. Check under the execution lock against owner turnover.
+        with (admin / "owner.lock").open() as owner:
+            if binding and owner.read() == binding:
+                try:
+                    fcntl.flock(owner, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    yield
+                    return
+        raise LaneError("lane %s has no matching machine reservation" % lane)
 
 
 def ensure_lane(cfg, lane):
@@ -628,7 +725,7 @@ def commit_lane(lane_dir, message, *, main, lane):
     """Commit everything in the worktree on its lane branch, without hooks: the gate runs when the lane lands.
     Returns the new commit, or None when there was nothing to commit."""
     main, lane_path = Path(main).resolve(), Path(lane_dir).resolve()
-    if lane_git(main, lane, lane_path, "add", "-A", "--", ".", ":(exclude).lab-*", ":(exclude).lab-*/**").returncode != 0:
+    if lane_git(main, lane, lane_path, "add", "-A", "--", ".", ":(exclude).cs-*", ":(exclude).cs-*/**").returncode != 0:
         raise LaneError("git add failed in %s" % lane_path)
     if lane_git(main, lane, lane_path, "diff", "--cached", "--quiet").returncode == 0:
         return None
@@ -688,10 +785,17 @@ def land(name, lane, message=None, *, allow_agent_config=False):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return refused("another landing is running in %s" % main)
-        os.ftruncate(fd, 0)
-        os.write(fd, ("%d\n" % os.getpid()).encode())
         try:
-            return _land(cfg, lane, message, result, refused, allow_agent_config)
+            with lane_lock(cfg, lane):
+                previous = os.read(fd, 128).strip()
+                dead_lock = bool(previous) and _land_lock_holder(main) is None
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, ("%d\n" % os.getpid()).encode())
+                try:
+                    return _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock)
+                finally:
+                    os.ftruncate(fd, 0)
         except LaneError as error:
             return refused(str(error))
     except OSError as error:
@@ -708,10 +812,14 @@ def _land_lock_holder(main):
         return None
     try:
         pid = int(lock_path.read_text(encoding="utf-8").strip().split()[0])
+        if pid <= 0:
+            return None
     except (OSError, ValueError, IndexError):
         return None
     try:
         os.kill(pid, 0)
+        return pid
+    except PermissionError:
         return pid
     except (OSError, ValueError, TypeError):
         return None
@@ -726,39 +834,25 @@ def _lane_branch_heads(main):
 
 
 def _squash_merge_tree(main, branch):
-    base = out(main, "merge-base", "HEAD", branch)
-    done = git(main, "merge-tree", "--write-tree", base, "HEAD", branch)
+    done = git(main, "merge-tree", "--write-tree", "HEAD", branch)
     if done.returncode != 0:
         return None
     line = (done.stdout or "").strip().splitlines()
     return line[0].strip() if line else None
 
 
-def _recover_leftover_squash(main):
-    if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+def _recover_leftover_squash(main, dead_lock=False):
+    if not dead_lock or git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
         return False
-    holder = _land_lock_holder(main)
-    if holder is not None and holder != os.getpid():
+    if any(git(main, *args).returncode != expected for args, expected in (
+        (("diff", "--cached", "--quiet"), 1), (("diff", "--quiet"), 0),
+    )):
         return False
-    if git(main, "diff", "--cached", "--quiet").returncode == 0:
-        return False
-    lock_path = git_common_dir(main) / "cs-land.lock"
-    dead_lock = lock_path.is_file() and (holder is None or holder == os.getpid())
-    staged_only = git(main, "diff", "--quiet").returncode == 0
     index_tree = out(main, "write-tree")
-    heads = _lane_branch_heads(main)
-    matched = any(_squash_merge_tree(main, branch) == index_tree for branch in heads)
-    if matched or dead_lock or (staged_only and heads):
-        git(main, "reset", "-q", "--hard", "HEAD")
-        git(main, "clean", "-fd")
-        if dead_lock:
-            lock_path.unlink(missing_ok=True)
-        return True
+    if any(_squash_merge_tree(main, branch) == index_tree for branch in _lane_branch_heads(main)):
+        # The index and tracked working tree are the squash. Preserve untracked files.
+        return git(main, "read-tree", "-m", "-u", "HEAD").returncode == 0
     return False
-
-
-def _leftover_squash_recovery(main):
-    return "git -C %s reset --hard HEAD" % main
 
 
 def red_marker(message):
@@ -766,21 +860,18 @@ def red_marker(message):
     return message.lstrip().lower().startswith("check-red:")
 
 
-def _land(cfg, lane, message, result, refused, allow_agent_config):
+def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
+    from _process_group import stop_group
+
     main, branch = cfg["path"], result["branch"]
     if message is not None and red_marker(message):
         return refused("a landing message may not start with check-red: (landing refuses on red)")
     current = git(main, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
     if current != cfg["branch"]:
         return refused("%s is on %s, not %s" % (main, current or "a detached HEAD", cfg["branch"]))
-    if _recover_leftover_squash(main):
-        pass
+    _recover_leftover_squash(main, dead_lock)
     dirty = out(main, "status", "--porcelain")
     if dirty:
-        if git(main, "diff", "--cached", "--quiet").returncode != 0:
-            return refused("main has uncommitted changes (leftover landing squash?): run %s"
-                           % _leftover_squash_recovery(main) + "; "
-                           + "; ".join(dirty.splitlines()[:10]))
         return refused("main has uncommitted changes: " + "; ".join(dirty.splitlines()[:10]))
     if git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
         return refused("main has a merge in progress")
@@ -824,11 +915,15 @@ def _land(cfg, lane, message, result, refused, allow_agent_config):
     gate_proc = None
     old_handlers = {}
 
+    class GateInterrupted(Exception):
+        pass
+
     def _on_land_signal(_signum, _frame):
         nonlocal interrupted
-        interrupted = True
-        if gate_proc is not None and gate_proc.poll() is None:
-            gate_proc.kill()
+        if not interrupted:
+            interrupted = True
+            if gate_proc is not None:
+                raise GateInterrupted
 
     try:
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -846,6 +941,8 @@ def _land(cfg, lane, message, result, refused, allow_agent_config):
             restore()
             return refused("nothing to land: main already has the lane's changes")
 
+        if interrupted:
+            return refused("land interrupted")
         hooks_cover = bool(cfg["hooks_path"]) and any(f.startswith(tuple(cfg["hook_gated"])) for f in files)
         result["gate"] = {"hooks": cfg["hooks_path"] or "repo default", "command": None}
         if cfg["gate"] and not hooks_cover:
@@ -853,19 +950,21 @@ def _land(cfg, lane, message, result, refused, allow_agent_config):
             try:
                 gate_proc = subprocess.Popen(["/bin/sh", "-c", cfg["gate"]], cwd=str(main), stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, text=True,
-                                             env=_LAND_GIT.get().environment(), stdin=subprocess.DEVNULL)
+                                             env=_LAND_GIT.get().environment(), stdin=subprocess.DEVNULL, start_new_session=True)
                 try:
+                    if interrupted:
+                        raise GateInterrupted
                     gate_out, _ = gate_proc.communicate(timeout=int(cfg["gate_timeout_s"]))
-                except subprocess.TimeoutExpired as error:
-                    gate_proc.kill()
-                    gate_out = (error.stdout or "") + (gate_proc.communicate()[0] or "")
+                except subprocess.TimeoutExpired:
+                    stop_group(gate_proc)
+                    gate_out, _ = gate_proc.communicate()
                     gate_rc = 124
                 else:
                     gate_rc = gate_proc.returncode
-                    gate_out = gate_out or ""
-                if interrupted:
-                    restore()
-                    return refused("land interrupted")
+                gate_proc = None
+                gate_out = gate_out or ""
+            except GateInterrupted:
+                return refused("land interrupted")
             except OSError as error:
                 gate_rc, gate_out = 1, str(error)
             if gate_rc != 0:
@@ -893,10 +992,14 @@ def _land(cfg, lane, message, result, refused, allow_agent_config):
     finally:
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
-        if gate_proc is not None and gate_proc.poll() is None:
-            gate_proc.kill()
-        if not committed:
-            restore()
+        try:
+            if gate_proc is not None:
+                stop_group(gate_proc)
+                gate_proc.wait()
+                gate_proc.stdout.close()
+        finally:
+            if not committed:
+                restore()
 
     result.update(ok=True, status="landed", commit=after, removed={"worktree": None, "branch": None})
     if registered:

@@ -1,8 +1,8 @@
 {
   "exit": 1,
-  "stdout": "bad args: need cmd:[...]\n",
+  "stdout": "Exec requires a nonempty shell string or argv list of strings. Pass {\"cmd\":[\"ls\",\"docs\"]} for argv or {\"cmd\":\"cd docs && ls | head\"} for shell syntax.\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {}, \"name\": \"exec\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {}, \"name\": \"exec\"}\n"
   },
   "untouched": true
 }

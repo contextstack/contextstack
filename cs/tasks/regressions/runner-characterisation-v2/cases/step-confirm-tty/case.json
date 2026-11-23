@@ -1,5 +1,5 @@
 {
  "env": {
-  "LAB_STEP_TTY": "keys.txt"
+  "CS_STEP_TTY": "keys.txt"
  }
 }

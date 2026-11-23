@@ -26,37 +26,37 @@ with tempfile.TemporaryDirectory(prefix="cli-pins-") as raw:
     root = Path(raw)
     config = root / "config"
     config.mkdir()
-    lab_root = root / "lab"
-    lab = lab_root / "ops/bin"
-    lab.mkdir(parents=True)
-    shutil.copy2(SOURCE / "INVARIANTS.md", lab_root / "INVARIANTS.md")
+    code_root = root / "code_root"
+    code_root = code_root / "ops/bin"
+    code_root.mkdir(parents=True)
+    shutil.copy2(SOURCE / "INVARIANTS.md", code_root / "INVARIANTS.md")
     for path in (SOURCE / "ops/bin").glob("_*.py"):
-        shutil.copy2(path, lab / path.name)
+        shutil.copy2(path, code_root / path.name)
     for name in ("cli-profiles.json",):
-        shutil.copy2(SOURCE / "ops/bin" / name, lab / name)
+        shutil.copy2(SOURCE / "ops/bin" / name, code_root / name)
     from native_runtime import stage_native_runtime
-    stage_native_runtime(lab)  # Muse/adapter profiles render through cs-sandbox with the estate's policy
+    stage_native_runtime(code_root)  # Muse/adapter profiles render through cs-sandbox with the estate's policy
     home = root / "home"
     home.mkdir()
     binary = root / "fake-opencode"
     fake_cli(binary)
 
-    profiles = json.loads((lab / "cli-profiles.json").read_text())
+    profiles = json.loads((code_root / "cli-profiles.json").read_text())
     profiles["opencode"]["binary"] = str(binary)
     profiles["opencode"].pop("sha256", None)
     profiles["opencode"].pop("version", None)
-    (lab / "cli-profiles.json").write_text(json.dumps(profiles))
+    (code_root / "cli-profiles.json").write_text(json.dumps(profiles))
 
-    env = {**hermetic_env(), "HOME": str(home), "LAB_CONFIG_ROOT": str(config), "LAB_CODE_ROOT": str(lab_root)}
+    env = {**hermetic_env(), "HOME": str(home), "CS_CONFIG_ROOT": str(config), "CS_CODE_ROOT": str(code_root)}
     os.environ.update(env)
-    sys.path.insert(0, str(lab))
+    sys.path.insert(0, str(code_root))
     from _cli_pins import changed_message, ensure_pin, load_pins, resolve_binary
 
     digest_v1 = hashlib.sha256(binary.read_bytes()).hexdigest()
     ensure_pin("opencode", binary, "fixture-v1", env=env)
     pin_path = config / "cli-pins.json"
     assert pin_path.is_file() and pin_path.stat().st_mode & 0o777 == 0o600
-    assert not list((root / "lab").rglob("cli-pins.json")), "pins must not live under the code root"
+    assert not list((root / "code_root").rglob("cli-pins.json")), "pins must not live under the code root"
     assert load_pins(env)["opencode"]["sha256"] == digest_v1
 
     ensure_pin("opencode", binary, "fixture-v1", env=env)  # unchanged: pass
@@ -84,10 +84,10 @@ with tempfile.TemporaryDirectory(prefix="cli-pins-") as raw:
 
     ws = root / "workspace"
     ws.mkdir()
-    (ws / ".lab-tmp").mkdir()
+    (ws / ".cs-tmp").mkdir()
     with patch.object(_muse, "run_process", return_value=Probe()), patch.object(_muse, "require_resources"), patch.object(_cli_adapter, "stage_git", return_value={}):
         out = _cli_adapter.prepare({
-            "name": "opencode", "ws": ws, "HOME": home, "HERE": lab, "timeout": 15,
+            "name": "opencode", "ws": ws, "HOME": home, "HERE": code_root, "timeout": 15,
             "cost_class": "free_local", "auth": "none", "on_probe": lambda: None,
             "allowlist_env": lambda *_: {"PATH": "/usr/bin:/bin"},
             "sandbox_extra": (),

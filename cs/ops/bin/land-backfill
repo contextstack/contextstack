@@ -84,7 +84,7 @@ def main(argv=None):
     except LaneError as error:
         die(str(error))
     landings = git_main_log(cfg["path"])
-    root = Path(os.environ.get("LAB_STATE_ROOT") or Path.home() / ".contextstack")
+    root = Path(os.environ.get("CS_STATE_ROOT") or Path.home() / ".contextstack")
     session, err = recorder_session(root)
     if err:
         die(err)

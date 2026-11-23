@@ -5,7 +5,7 @@
     "properties": {
       "task": {
         "type": "string",
-        "description": "Task dir, absolute or lab-relative."
+        "description": "Task dir, absolute or code-root-relative."
       },
       "dest": {
         "type": "string",

@@ -4,23 +4,19 @@
 Run by scripts/node-install under a release's own interpreter; a person types `node-install <command>`.
 
   ROOT = $HOME/.contextstack
-    releases/<id>/        one release: cs/ (code root; releases before Director.Plan step 0b have a real lab/
-                          instead, which this script still activates; a release built since carries no lab link, so
-                          an earlier release's node-install or node-release cannot switch to it), bin/ (cs-harness, cs-sandbox, cs-tools, cs-gateway;
-                          cs-go and the Go csgateway only in releases built before 2026-11-10), gateway/models.json, python/,
-                          <kit>/.venv; never changed once .complete. Every path into a release is derived from the
-                          release being activated (kit()), so a switch or rollback across the rename writes valid plists
+    releases/<id>/        one release: cs/ (code root), bin/ (cs-harness, cs-sandbox, cs-tools, cs-gateway),
+                          gateway/models.json, python/, cs/.venv; release files stay fixed once .complete.
     current -> releases/<id>   switched atomically (a temp symlink renamed over it); previous releases kept
-    config/               LAB_CONFIG_ROOT: ESTATE, policy/spool.json and policy/env.json (the two policy files ops
+    config/               CS_CONFIG_ROOT: ESTATE, policy/spool.json and policy/env.json (the two policy files ops
                           read from the config root; seeded from the release when absent, never overwritten),
                           gateway/providers.d (CSGATEWAY_PROVIDERS_DIR; seeded once from gateway/providers.d when
                           that exists), node.env (optional, 0600, sourced by the node tick: where the director
                           token goes), install.json (this installer's record), replaced-agents/ (adopted plists)
-    state/  workspaces/   LAB_STATE_ROOT, LAB_WORKSPACES_ROOT; may already hold data (a director host's ledger):
+    state/  workspaces/   CS_STATE_ROOT, CS_WORKSPACES_ROOT; may already hold data (a director host's ledger):
                           the installer creates what is missing and never writes, moves or re-modes what exists
     logs/                 the agents' stdout and stderr
     gateway/              the gateway's own runtime dir (csgateway.sock, discovery-health.json: its defaults) and
-                          models.json, derived from current's at each activation with lab_executor pointed into
+                          models.json, derived from current's at each activation with cli_executor pointed into
                           current (the shipped catalog names the dev checkout's absolute path), minus the deployments
                           of overlay-only providers (OVERLAY_PROVIDERS) this host's providers.d does not define
   macOS: ~/Library/LaunchAgents/com.contextstack.{csgateway-socket,node,node-listen,director-rs,client-web}.plist
@@ -34,8 +30,8 @@ Run by scripts/node-install under a release's own interpreter; a person types `n
   Plists/units name absolute paths into ROOT/current and set an explicit PATH; they never use the PATH links. An
   agent at one of these paths that is not ours (it does not run from ROOT/current) refuses the command before anything is
   written, unless --adopt LABEL: then it is copied to config/replaced-agents/ and replaced.
-  PATH links: csgateway, node-install, cs, each a symlink to ROOT/current/...; a `lab` link an earlier release
-  made is removed (it is ours, and the name is retired); in ~/.local/bin when that is on the user's login-shell PATH, else
+  PATH links: csgateway, node-install, cs, each a symlink to ROOT/current/...; in ~/.local/bin when that
+  is on the user's login-shell PATH, else
   /opt/homebrew/bin. A path that is not already our symlink refuses the whole command before anything is
   written (--skip-link NAME).
 
@@ -68,9 +64,12 @@ Run by scripts/node-install under a release's own interpreter; a person types `n
                             state/client-web/ and ROOT/credentials are never removed
 Before a restart, active jobs from state/dispatch.jsonl drain first: wait up to 30 min by default or
 --wait SECONDS; --no-wait refuses with exit 2 and a JSON reason; --force restarts anyway.
+An exclusive installer lock covers activation and drain. A target with a local Director database
+must report its supported schema. An automatic rollback restores a matching pre-trial snapshot.
 Env NODE_INSTALL_USER_PATH replaces the login-shell PATH probe (tests).
 """
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import re
@@ -86,16 +85,17 @@ if _SCRIPTS not in sys.path:
 
 from _node_layout import (  # noqa: E402
     DEFAULTS, DIRECTOR_ENV, DrainRefused, INSTALLATION, KEPT_STATE, LARAVEL_KEYS, LINKS, RECORD, RELEASES, RETIRED_LINKS,
-    check_config, client_web_php, complete, current_id, derive_models, director_rs_listen, director_url,
-    setup_path, remove_path, drain_before_restart, kit, load_record, migrate_churn_dirs, ours, pick_link_dir, plan_links, private_listen,
+    check_config, check_director_schema, client_web_php, complete, current_id, derive_models, director_db_schema,
+    director_rs_listen, director_supported_schema, director_url, install_lock,
+    setup_path, remove_path, restart_window, kit, load_record, migrate_churn_dirs, ours, pick_link_dir, plan_links, private_listen,
     DIRECTOR_DB, prune_bundles, read_node_token, restore_director_db, seed_client_web, seed_config, snapshot_director_db,
     switch_current, write_atomic, write_node_token,
 )
 from _node_services import (  # noqa: E402
-    ALL_LABELS, CLIENT_WEB, CLIENT_WEB_ENV, CLIENT_WEB_LABEL, CLIENT_WEB_STATE, CONFIG, CREDENTIALS, CURRENT,
+    ALL_LABELS, BACKUP_LABEL, CLIENT_WEB, CLIENT_WEB_ENV, CLIENT_WEB_LABEL, CLIENT_WEB_STATE, CONFIG, CREDENTIALS, CURRENT,
     DIRECTOR_RS_DATA, DIRECTOR_RS_LABEL, DIRECTOR_RS_LISTEN, GATEWAY_BIN, GATEWAY_LABEL, HOME, LARAVEL_LABELS,
     LINGER_NOTE, LISTEN_LABEL, NODE_LABEL, ROOT, RUNNER_BIN, SYSTEM_PATH, Refused, agent_path, agent_specs, agent_suffix,
-    host_platform, launchctl, load_agent, need_systemctl, our_agent, plan_agents, reload_units, render_agent,
+    backup_timer, backup_timer_path, host_platform, launchctl, load_agent, need_systemctl, our_agent, plan_agents, reload_units, render_agent,
     release_bin, unload_agent,
 )
 
@@ -112,28 +112,87 @@ def is_node():
 
 
 
-def rollback_failed_activation(before, failed_rid, rec, opts, load, reason):
-    """Undo a partial activation: director database, current symlink, and services."""
-    if not before or before == failed_rid:
-        raise Refused(reason)
-    serve_rs = bool(rec.get("serve_director_rs"))
-    restored = False
-    if load and serve_rs:
-        unload_agent(DIRECTOR_RS_LABEL)
-        restored = restore_director_db(failed_rid)
-    activate(before, {"force": True, "retain": True, "smoke": False, "rolling_back": True,
-                      "wait": opts.get("wait"), "no_wait": opts.get("no_wait")}, load)
+class SmokeFailed(Refused):
+    pass
+
+
+def save_record(rec):
+    write_atomic(RECORD, (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+
+
+def rollback_target(rec, current):
+    failed = rec.get("failed_releases", [])
+    return next((h for h in reversed(rec.get("history", []))
+                 if h != current and h not in failed and complete(h)), None)
+
+
+def rollback_failed_activation(before, rid, original, trial, load, snapshot, error, *, restart_held=False):
+    """Restore the previous release and record a failed trial."""
+    record = {"history": [], "failed_releases": [], "previous": None, **original}
+    if isinstance(error, SmokeFailed):
+        failed = sorted(set(record.get("failed_releases", [])) | {rid})
+        record.update(failed_releases=failed, history=[h for h in record.get("history", []) if h not in failed])
+        if record.get("previous") in failed:
+            record["previous"] = rollback_target(record, before)
+    if not before:
+        if DIRECTOR_DB.is_file():
+            save_record({**trial, "failed_releases": record["failed_releases"]})
+            raise Refused(f"{error}; automatic rollback refused: no previous release; current is {rid}") from error
+        CURRENT.unlink(missing_ok=True)
+        save_record(record)
+        raise Refused(str(error)) from error
+    if before == rid:
+        save_record(record)
+        raise Refused(str(error)) from error
+    with nullcontext() if restart_held else restart_window(load, {"force": True}):
+        director_stopped = False
+        try:
+            if not complete(before):
+                raise Refused(f"previous release {before} is no longer complete")
+            if before in record.get("failed_releases", []):
+                raise Refused(f"release {before} previously failed smoke")
+            if current_id() != rid:
+                raise Refused("current changed since the trial started")
+            if snapshot is None:
+                check_director_schema(before)
+            else:
+                supported = director_supported_schema(before)
+                saved = director_db_schema(snapshot)
+                if supported is not None and saved != supported:
+                    raise Refused(f"snapshot schema {saved} does not match release {before}'s Director schema {supported}")
+                unload_agent(DIRECTOR_RS_LABEL, require_stopped=True)
+                director_stopped = True
+                restore_director_db(snapshot)
+            activate(before, {"force": True, "retain": True, "smoke": False}, load,
+                     rollback_record=record, restart_held=True)
+        except Exception as rollback_error:
+            if current_id() == rid:
+                if director_stopped:
+                    load_agent(DIRECTOR_RS_LABEL, agent_path(DIRECTOR_RS_LABEL), False, True)
+                save_record({**trial, **{key: record.get(key) for key in ("failed_releases", "history", "previous")}})
+            raise Refused(f"{error}; automatic rollback refused: {rollback_error}; "
+                          f"current is {current_id()}") from rollback_error
     raise Refused("%s; old release %s is back (failed release %s retained%s)"
-                  % (reason, before, failed_rid, "; director database restored" if restored else ""))
+                  % (error, before, rid, "; director database restored" if snapshot else "")) from error
 
 
 
-def activate(rid, opts, load=True):
+def recheck_current(expected, rid):
+    before = current_id()
+    if before != expected:
+        raise Refused(f"current changed while preparing or waiting to activate {rid} "
+                      f"(from {expected} to {before}); rerun the install")
+    return before
+
+
+def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
     if not complete(rid):
         raise Refused("release %s is not installed (no %s)" % (rid, RELEASES / rid / ".complete"))
+    expected_before = current_id()
     from _node_rename import migrate_config
     migrate_config(CONFIG)
-    rec = {**DEFAULTS, **load_record()}
+    original = load_record() if rollback_record is None else rollback_record
+    rec = {**DEFAULTS, **original}
     rec.update({k: v for k, v in opts.items() if v not in (None, [])
                 and k not in ("adopt", "director_token_from", "from_bundle", "wait", "no_wait", "force", "yes", "smoke", "retain")})
     if rec["gateway"] not in GATEWAY_BIN or rec["runner"] not in ("go", "rust"):
@@ -193,105 +252,123 @@ def activate(rid, opts, load=True):
     adopted = plan_agents([s.label for s in specs], opts.get("adopt") or [])
     if load and host_platform() == "linux":
         need_systemctl()
-    drain = drain_before_restart(load, opts)
-    rec["link_dir"] = str(link_dir)
-    seed_config(rid, rec)
-    if serve_rs and not DIRECTOR_RS_DATA.exists():
-        DIRECTOR_RS_DATA.mkdir(mode=0o700)
-        DIRECTOR_RS_DATA.chmod(0o700)
-    env_seeded = seed_client_web(rid, rec) if serve_cw else None
-    token_changed = write_node_token(rec["token_env"], token) if token else None
-    before = current_id()
-    switch_current(rid)
-    models_changed = derive_models(rid)
-    history = [h for h in rec.get("history", []) if h != rid] + [rid]
-    retired = [link_dir / n for n in RETIRED_LINKS if ours(link_dir / n)]
-    for path in retired:
-        path.unlink()
-    for name, (path, target) in links.items():
-        if not (path.is_symlink() and os.readlink(path) == target):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(".%s.tmp.%d" % (name, os.getpid()))
-            os.symlink(target, tmp)
-            os.replace(tmp, path)
-    wanted = {s.label: s for s in agent_specs(rec, code, node=is_node(), serve_rs=serve_rs, serve_cw=serve_cw)}
-    for label in (NODE_LABEL, LISTEN_LABEL):
-        path = agent_path(label)
-        if label not in wanted and our_agent(path):
-            if load:
-                unload_agent(label)
-            path.unlink()
-    report = {}
-    for label in adopted:
-        keep_dir = CONFIG / "replaced-agents"
-        keep_dir.mkdir(mode=0o700, exist_ok=True)
-        src = agent_path(label)
-        shutil.copy2(src, keep_dir / ("%s%s.%s" % (label, agent_suffix(), time.strftime("%Y%m%d-%H%M%S"))))
-    linux = host_platform() == "linux"
-    switched = before is not None and before != rid
-    if load and serve_rs and switched and DIRECTOR_DB.is_file():
-        path = agent_path(DIRECTOR_RS_LABEL)
-        if our_agent(path):
-            unload_agent(DIRECTOR_RS_LABEL)
-        snapshot_director_db(rid)
-    for label, svc in wanted.items():
-        path = agent_path(label)
-        changed = write_atomic(path, render_agent(svc))
-        restart = (switched or models_changed) if label == GATEWAY_LABEL else \
-            switched and label in (DIRECTOR_RS_LABEL, LISTEN_LABEL, CLIENT_WEB_LABEL)
-        report[label] = {"path": str(path), "changed": changed, "restart": restart}
-    if not load:
-        for label in report:
-            report[label]["launchd"] = "not loaded (--no-load)"
-    else:
-        try:
-            if linux:
-                reload_units()
-            for label, info in report.items():
-                info["launchd"] = load_agent(label, Path(info["path"]), info["changed"], info["restart"])
-        except Refused as error:
-            if opts.get("rolling_back"):
-                raise
-            rollback_failed_activation(before, rid, rec, opts, load, str(error))
-    for info in report.values():
-        info.pop("restart", None)
-    # Trial only what can be trialled: services not loaded (--no-load) cannot be, nor a release without cs smoke.
-    if opts.get("smoke") and load and (RELEASES / rid / code / "scripts/cs_smoke.py").is_file():
-        # Publish configuration for the trial, but retain every release until it passes.
-        rec["history"] = history
-        rec["previous"] = before if before != rid else rec.get("previous")
-        write_atomic(RECORD, (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode(), 0o600)
-        try:
-            smoke = subprocess.run([sys.executable, "-I", str(RELEASES / rid / code / "scripts/cs"),
-                                    "smoke", "--json"], capture_output=True, text=True, timeout=300)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            smoke = subprocess.CompletedProcess([], 1, "", str(error))
-        try:
-            result = json.loads(smoke.stdout)
-            if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
-                raise ValueError("invalid smoke report")
-        except ValueError:
-            result = {"ok": False, "checks": [{"name": "smoke", "ok": False,
-                       "reason": (smoke.stderr or smoke.stdout)[-500:]}]}
-        if smoke.returncode or not result.get("ok"):
-            failed = "; ".join("%s: %s" % (c["name"], c.get("reason", "failed"))
-                               for c in result.get("checks", []) if not c.get("ok")) or "smoke exited %s" % smoke.returncode
-            if before and before != rid:
-                rollback_failed_activation(before, rid, rec, opts, load,
-                                            "smoke failed: %s (failed release %s retained)" % (failed, rid))
-            raise Refused("smoke failed: %s; no previous release to restore" % failed)
-    keep = max(1, int(rec["keep"]))
-    pruned = [] if opts.get("retain") else [h for h in history[:-keep] if h not in (rid, before)]
-    for h in pruned:
-        shutil.rmtree(RELEASES / h, ignore_errors=True)
-    rec["history"] = [h for h in history if h not in pruned]
-    rec["previous"] = before if before != rid else rec.get("previous")
-    write_atomic(RECORD, (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode(), 0o600)
-    bundle_dir = migrate_churn_dirs()
-    pruned_bundles = prune_bundles(opts.get("from_bundle"), bundle_dir)
-    verify = RELEASES / rid / "verify.json"
-    v = json.loads(verify.read_text(encoding="utf-8")) if verify.is_file() else {}
-    setup_path(link_dir, opts.get("yes", False))
+    activated = False
+    snapshot = None
+    try:
+        with (nullcontext() if restart_held else restart_window(load, opts)) as drain:
+            director_stopped = False
+            try:
+                recheck_current(expected_before, rid)
+                check_director_schema(rid)
+                rec["link_dir"] = str(link_dir)
+                seed_config(rid, rec)
+                if serve_rs and not DIRECTOR_RS_DATA.exists():
+                    DIRECTOR_RS_DATA.mkdir(mode=0o700)
+                    DIRECTOR_RS_DATA.chmod(0o700)
+                env_seeded = seed_client_web(rid, rec) if serve_cw else None
+                token_changed = write_node_token(rec["token_env"], token) if token else None
+                switched = rollback_record is not None or (expected_before is not None and expected_before != rid)
+                if load and serve_rs and expected_before != rid and rollback_record is None and DIRECTOR_DB.is_file():
+                    if our_agent(agent_path(DIRECTOR_RS_LABEL)):
+                        unload_agent(DIRECTOR_RS_LABEL, require_stopped=True)
+                        director_stopped = True
+                    check_director_schema(rid)
+                    snapshot = snapshot_director_db(rid)
+                before = recheck_current(expected_before, rid)
+                switch_current(rid)
+                activated = True
+                models_changed = derive_models(rid)
+                retired = [link_dir / n for n in RETIRED_LINKS if ours(link_dir / n)]
+                for path in retired:
+                    path.unlink()
+                for name, (path, target) in links.items():
+                    if not (path.is_symlink() and os.readlink(path) == target):
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = path.with_name(".%s.tmp.%d" % (name, os.getpid()))
+                        os.symlink(target, tmp)
+                        os.replace(tmp, path)
+                wanted = {s.label: s for s in agent_specs(rec, code, node=is_node(), serve_rs=serve_rs, serve_cw=serve_cw)}
+                for label in (NODE_LABEL, LISTEN_LABEL):
+                    path = agent_path(label)
+                    if label not in wanted and our_agent(path):
+                        if load:
+                            unload_agent(label)
+                        path.unlink()
+                report = {}
+                for label in adopted:
+                    keep_dir = CONFIG / "replaced-agents"
+                    keep_dir.mkdir(mode=0o700, exist_ok=True)
+                    src = agent_path(label)
+                    shutil.copy2(src, keep_dir / ("%s%s.%s" % (label, agent_suffix(), time.strftime("%Y%m%d-%H%M%S"))))
+                linux = host_platform() == "linux"
+                for label, svc in wanted.items():
+                    path = agent_path(label)
+                    changed = write_atomic(path, render_agent(svc))
+                    restart = (switched or models_changed) if label == GATEWAY_LABEL else \
+                        switched and label in (DIRECTOR_RS_LABEL, LISTEN_LABEL, CLIENT_WEB_LABEL)
+                    report[label] = {"path": str(path), "changed": changed, "restart": restart}
+                if not load:
+                    for label in report:
+                        report[label]["launchd"] = "not loaded (--no-load)"
+                else:
+                    if linux:
+                        reload_units()
+                    for label, info in report.items():
+                        info["launchd"] = load_agent(label, Path(info["path"]), info["changed"], info["restart"])
+            except Exception as error:
+                if not activated:
+                    if director_stopped:
+                        load_agent(DIRECTOR_RS_LABEL, agent_path(DIRECTOR_RS_LABEL), False, True)
+                    raise
+                if rollback_record is not None:
+                    raise
+                activated = False
+                rollback_failed_activation(before, rid, original, rec, load, snapshot, error, restart_held=True)
+        for info in report.values():
+            info.pop("restart", None)
+        # Trial only what can be trialled: services not loaded (--no-load) cannot be, nor a release without cs smoke.
+        if opts.get("smoke") and load and (RELEASES / rid / code / "scripts/cs_smoke.py").is_file():
+            # Publish configuration for the trial, but retain every release until it passes.
+            save_record(rec)
+            try:
+                smoke = subprocess.run([sys.executable, "-I", str(RELEASES / rid / code / "scripts/cs"),
+                                        "smoke", "--json"], capture_output=True, text=True, timeout=300)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                smoke = subprocess.CompletedProcess([], 1, "", str(error))
+            try:
+                result = json.loads(smoke.stdout)
+                if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
+                    raise ValueError("invalid smoke report")
+            except ValueError:
+                result = {"ok": False, "checks": [{"name": "smoke", "ok": False,
+                           "reason": (smoke.stderr or smoke.stdout)[-500:]}]}
+            if smoke.returncode or not result.get("ok"):
+                failed = "; ".join("%s: %s" % (c["name"], c.get("reason", "failed"))
+                                   for c in result.get("checks", []) if not c.get("ok")) or "smoke exited %s" % smoke.returncode
+                raise SmokeFailed("smoke failed: %s" % failed)
+            rec["failed_releases"] = [h for h in rec.get("failed_releases", []) if h != rid]
+        failed = rec.get("failed_releases", [])
+        history = [h for h in rec.get("history", []) if h != rid and h not in failed]
+        if before and before != rid and before not in failed and before not in history:
+            history.append(before)
+        if rid not in failed:
+            history.append(rid)
+        keep = max(1, int(rec["keep"]))
+        pruned = [] if opts.get("retain") else [h for h in history[:-keep] if h not in (rid, before)]
+        rec["history"] = [h for h in history if h not in pruned]
+        rec["previous"] = rollback_target(rec, rid)
+        bundle_dir = migrate_churn_dirs()
+        verify = RELEASES / rid / "verify.json"
+        v = json.loads(verify.read_text(encoding="utf-8")) if verify.is_file() else {}
+        setup_path(link_dir, opts.get("yes", False))
+        save_record(rec)
+        for h in pruned:
+            shutil.rmtree(RELEASES / h, ignore_errors=True)
+        pruned_bundles = prune_bundles(opts.get("from_bundle"), bundle_dir)
+    except Exception as error:
+        if not activated or rollback_record is not None:
+            raise
+        rollback_failed_activation(before, rid, original, rec, load, snapshot, error)
     out = {"ok": True, "release": rid, "previous": before, "root": str(ROOT), "node": is_node(), "kit": code,
            "runner": rec["runner"], "gateway": rec["gateway"], "credentials": rec["credentials"],
            "drain": drain,
@@ -330,13 +407,19 @@ def uninstall(purge, load=True, purge_secrets=False):
     linux = host_platform() == "linux"
     if load and linux:
         need_systemctl()
-    for label in (LISTEN_LABEL, NODE_LABEL, GATEWAY_LABEL) + LARAVEL_LABELS + (DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL):
+    labels = (BACKUP_LABEL, LISTEN_LABEL, NODE_LABEL, GATEWAY_LABEL) + LARAVEL_LABELS + (DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL)
+    for label in labels:
         path = agent_path(label)
         if our_agent(path):
             if load:
                 unload_agent(label)
             path.unlink()
             removed.append(str(path))
+    if linux:
+        timer = backup_timer_path()
+        if timer.is_file() and timer.read_bytes() == backup_timer():
+            timer.unlink()
+            removed.append(str(timer))
     if load and linux and removed:
         reload_units()
     remove_path()
@@ -425,44 +508,50 @@ def main():
     u.add_argument("--purge-secrets", action="store_true", help="with --purge: also delete config/director/director.env")
     u.add_argument("--no-load", action="store_true")
     args = ap.parse_args()
+    lock = nullcontext() if args.cmd == "status" else install_lock("node-release " + args.cmd)
     try:
-        if args.cmd == "activate":
-            if args.serve_director is not None:
-                raise Refused("--serve-director (the Laravel director) was retired on 2026-11-11; "
-                              "the Rust Director is --serve-director-rs")
-            opts = {"estate": args.estate, "adopt": args.adopt, "node": args.node, "director": args.director,
-                    "token_env": args.token_env, "installation": args.installation, "runner": args.runner, "credentials": args.credentials,
-                    "gateway": args.gateway, "link_dir": args.link_dir, "skip_links": args.skip_link, "keep": args.keep,
-                    "from_bundle": args.from_bundle, "yes": args.yes,
-                    "serve_director_rs": args.serve_director_rs, "director_rs_listen": args.director_rs_listen,
-                    "director_token_from": args.director_token_from,
-                    "serve_client_web": args.serve_client_web, "client_web_php": args.php,
-                    "wait": args.wait, "no_wait": args.no_wait, "force": args.force, "smoke": not args.no_smoke}
-            out = activate(args.release, opts, not args.no_load)
-        elif args.cmd == "switch":
-            out = activate(args.release, {"wait": args.wait, "no_wait": args.no_wait, "force": args.force}, not args.no_load)
-        elif args.cmd == "select":
-            if not complete(current_id() or ""):
-                raise Refused("no current release to select on")
-            out = activate(current_id(), {"gateway": args.gateway, "runner": args.runner,
-                                          "credentials": args.credentials, "wait": args.wait,
-                                          "no_wait": args.no_wait, "force": args.force}, not args.no_load)
-        elif args.cmd == "rollback":
-            rec, cur = load_record(), current_id()
-            back = next((h for h in reversed(rec.get("history", [])) if h != cur and complete(h)), None)
-            if not back:
-                raise Refused("no earlier complete release to roll back to")
-            out = activate(back, {"wait": args.wait, "no_wait": args.no_wait, "force": args.force}, not args.no_load)
-        elif args.cmd == "status":
-            out = status()
-        else:
-            out = uninstall(args.purge, not args.no_load, args.purge_secrets)
+        with lock:
+            return run_command(args)
     except DrainRefused as error:
         print(json.dumps({"ok": False, "reason": error.reason}))
         return 2
     except Refused as error:
         print(json.dumps({"ok": False, "refused": str(error)}))
         return 1
+
+
+def run_command(args):
+    if args.cmd == "activate":
+        if args.serve_director is not None:
+            raise Refused("--serve-director (the Laravel director) was retired on 2026-11-11; "
+                          "the Rust Director is --serve-director-rs")
+        opts = {"estate": args.estate, "adopt": args.adopt, "node": args.node, "director": args.director,
+                "token_env": args.token_env, "installation": args.installation, "runner": args.runner, "credentials": args.credentials,
+                "gateway": args.gateway, "link_dir": args.link_dir, "skip_links": args.skip_link, "keep": args.keep,
+                "from_bundle": args.from_bundle, "yes": args.yes,
+                "serve_director_rs": args.serve_director_rs, "director_rs_listen": args.director_rs_listen,
+                "director_token_from": args.director_token_from,
+                "serve_client_web": args.serve_client_web, "client_web_php": args.php,
+                "wait": args.wait, "no_wait": args.no_wait, "force": args.force, "smoke": not args.no_smoke}
+        out = activate(args.release, opts, not args.no_load)
+    elif args.cmd == "switch":
+        out = activate(args.release, {"wait": args.wait, "no_wait": args.no_wait, "force": args.force}, not args.no_load)
+    elif args.cmd == "select":
+        if not complete(current_id() or ""):
+            raise Refused("no current release to select on")
+        out = activate(current_id(), {"gateway": args.gateway, "runner": args.runner,
+                                      "credentials": args.credentials, "wait": args.wait,
+                                      "no_wait": args.no_wait, "force": args.force}, not args.no_load)
+    elif args.cmd == "rollback":
+        rec, cur = load_record(), current_id()
+        back = rollback_target(rec, cur)
+        if not back:
+            raise Refused("no earlier complete release to roll back to")
+        out = activate(back, {"wait": args.wait, "no_wait": args.no_wait, "force": args.force}, not args.no_load)
+    elif args.cmd == "status":
+        out = status()
+    else:
+        out = uninstall(args.purge, not args.no_load, args.purge_secrets)
     # Pipes retain the historical JSON contract, including the plists map.
     if args.cmd == "activate" and sys.stdout.isatty() and not (args.json or args.verbose):
         services = (["Director"] if out.get("director_rs") else []) + ["gateway"]

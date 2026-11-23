@@ -31,6 +31,11 @@ impl Lines {
         }
     }
 
+    #[cfg(test)]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     /// The next `data:` payload (`\r` and the one optional space after the colon removed); other lines
     /// (event names, comments, blanks) are skipped. `Ok(None)` at EOF.
     pub async fn data(&mut self) -> Result<Option<Vec<u8>>, CallError> {
@@ -58,7 +63,7 @@ impl Lines {
             }
             let chunk = match tokio::time::timeout_at(self.deadline, self.resp.chunk()).await {
                 Err(_) => {
-                    return Err(CallError::transport_local("context deadline exceeded"));
+                    return Err(CallError::deadline("context deadline exceeded"));
                 }
                 Ok(Ok(chunk)) => chunk,
                 // A peer that closes TLS without close_notify has ended the body: the same EOF.

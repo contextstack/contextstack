@@ -106,14 +106,14 @@ with scratch_dir(prefix='proc-env-isolation-') as raw:
             pass
         else:
             raise AssertionError('Director client fell back to token in process environment')
-    import _node_control as control
-    for settings, expected in ((values, 'Bearer decoy-gateway'), ({}, None)):
-        with patch.object(control, 'node_env', return_value=settings), \
-                patch.object(control.urllib.request, 'urlopen', return_value=io.BytesIO(b'{"cancelled": true}')) as send, \
-                patch.dict(os.environ, {'CSGATEWAY_AUTH_TOKEN': 'decoy-legacy-env'}):
-            assert control.gateway_cancel('fixture-job') == 'gateway cancelled'
-            request = send.call_args.args[0]
-            assert request.get_header('Authorization') == expected, 'gateway token did not come exclusively from loader'
+    import _api_run
+    for settings, expected in ((values, "decoy-gateway"), ({}, "")):
+        with patch("_node_env.node_env", return_value=settings), \
+                patch.object(_api_run, "execute_harness", return_value=(1, "", None)) as launch, \
+                patch.dict(os.environ, {"CSGATEWAY_AUTH_TOKEN": "decoy-legacy-env"}):
+            assert _api_run.launch_cli(root, "/unused", "{}") == 1
+            assert "CSGATEWAY_AUTH_TOKEN" not in launch.call_args.kwargs["env"]
+            assert json.loads(launch.call_args.kwargs["order"])["token"] == expected
     for valid in ("A=plain\nA='last value'\n", 'A="hash # inside" # outside\n',
                   "_NAME=escaped\\ space\n", "A=$HOME\nB=`literal`\n"):
         fixture.write_text(valid)
@@ -170,10 +170,10 @@ finally:
 '''
     for op in ('tick', 'node-listen'):
         source = standin if host_probe else standin.replace(
-            'values = node_env()', 'values = node_env(Path(os.environ["LAB_CONFIG_ROOT"]) / "settings.txt")')
+            'values = node_env()', 'values = node_env(Path(os.environ["CS_CONFIG_ROOT"]) / "settings.txt")')
         (opdir / op).write_text(source)
-    roots_env = {'HOME': str(home), 'LAB_CONFIG_ROOT': str(config),
-                 'LAB_STATE_ROOT': str(root / 'state'), 'LAB_WORKSPACES_ROOT': str(ws)}
+    roots_env = {'HOME': str(home), 'CS_CONFIG_ROOT': str(config),
+                 'CS_STATE_ROOT': str(root / 'state'), 'CS_WORKSPACES_ROOT': str(ws)}
     with patch.object(services, 'CONFIG', config), patch.object(services, 'CURRENT', current), \
             patch.object(services, 'ROOTS_ENV', roots_env):
         rec = {'runner': 'rust', 'gateway': 'rust', 'credentials': 'off',

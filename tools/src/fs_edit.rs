@@ -23,8 +23,8 @@ struct Edit {
 pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
     let (path_value, edits) = prepare(a)?;
     let p = py::fspath(path_value)?;
-    if jail::lexically_escapes(p) || jail::resolves_outside(Path::new(p)) {
-        return Err(Failure::exit(format!("path escapes workspace: {p}")));
+    if jail::lexically_escapes(p, None) || jail::resolves_outside(Path::new(p)) {
+        return Err(workspace_escape(p));
     }
     let path = Path::new(p);
     let meta = match fs::symlink_metadata(path) {
@@ -36,12 +36,12 @@ pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
     };
     if meta.file_type().is_symlink() {
         if jail::link_leaves_workspace(path) {
-            return Err(Failure::exit(format!("path escapes workspace: {p}")));
+            return Err(workspace_escape(p));
         }
     } else if !meta.is_file() {
         return Err(Failure::exit(format!("not a file: {p}")));
     }
-    let file = jail::open_for_read(path).map_err(|e| py::os_error(&e, p))?;
+    let file = jail::open_for_read(path).map_err(|e| open_error(&e, p))?;
     let expected = file.metadata().map_err(|e| py::os_error(&e, p))?;
     let mut bytes = Vec::new();
     file.take((MAX_FILE_BYTES + 1) as u64)
@@ -72,7 +72,7 @@ pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
             "edited output exceeds fs_edit 10 MB size cap",
         ));
     }
-    let mut out = jail::open_for_write(path).map_err(|e| py::os_error(&e, p))?;
+    let mut out = jail::open_for_write(path).map_err(|e| open_error(&e, p))?;
     let opened = out.metadata().map_err(|e| py::os_error(&e, p))?;
     if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
         return Err(Failure::exit("file changed before write; retry fs_edit"));
@@ -95,6 +95,36 @@ pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
         diff.push_str("diff truncated\n");
     }
     Ok(diff.into_bytes())
+}
+
+fn open_error(error: &std::io::Error, path: &str) -> Failure {
+    if error.kind() == std::io::ErrorKind::PermissionDenied
+        && error.to_string() == jail::WORKSPACE_OPEN_DENIED
+    {
+        return workspace_escape(path);
+    }
+    py::os_error(error, path)
+}
+
+fn workspace_escape(path: &str) -> Failure {
+    let mut error = format!("path escapes workspace: {path}");
+    if jail::repo_view().is_some_and(|root| {
+        Path::new(path).starts_with(&root)
+            || fs::canonicalize(path).is_ok_and(|target| target.starts_with(&root))
+    }) {
+        error.push_str(". The repository view is read-only. Write deliverables in your workspace with a relative path, e.g. answer.md.");
+    }
+    if let Ok(workspace) = std::env::current_dir() {
+        let basename = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("answer.md");
+        error = format!(
+            "{error}\nYour workspace is {}; write there or use a relative path such as {basename}.",
+            workspace.display()
+        );
+    }
+    Failure::exit(error)
 }
 
 fn is_single(v: &Value) -> bool {

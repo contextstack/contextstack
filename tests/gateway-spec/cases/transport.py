@@ -23,7 +23,7 @@ def sock_dir(t, mode=0o700):
 
 def cfg(t):
     return t.run.config(deployments=[{"id": "cli-spec", "provider": "cli", "models": ["fake-cli"], "max_concurrent": 1, "max_queued": 0, "max_wait_ms": 0}],
-                        lab_executor=True)
+                        cli_executor=True)
 
 
 @case("transport", gw=None)
@@ -80,14 +80,14 @@ def refusal_waits_for_late_body(t):
 
 
 @case("transport", gw=None)
-def socket_lab_execute_refused(t):
-    """Loopback-origin routes refuse over the socket (no peer IP): lab-execute is 403; over TCP it runs."""
+def socket_cli_run_refused(t):
+    """Loopback-origin routes refuse over the socket (no peer IP): cli.run is 403; over TCP it runs."""
     path = os.path.join(sock_dir(t), "gw.sock")
-    gw = t.gateway("socket-lab", cfg(t), socket_path=path)
+    gw = t.gateway("socket-code_root", cfg(t), socket_path=path)
     body = {"work_order": {"executor": "fake-cli", "timeout_s": 5, "fake": {"stdout": "ran"}}}
-    r = gw.post("/v1/ai/lab-execute", body, via_socket=True)
-    eq((r.status, r.text), (403, "Lab execution is local only\n"), "over the socket")
-    eq(gw.post("/v1/ai/lab-execute", body).json["stdout"], "ran", "over TCP")
+    r = gw.post("/v1/agent/cli.run", body, via_socket=True)
+    eq((r.status, r.text), (403, "CLI execution is local only\n"), "over the socket")
+    eq(gw.post("/v1/agent/cli.run", body).json["stdout"], "ran", "over TCP")
 
 
 @case("transport", gw=None)

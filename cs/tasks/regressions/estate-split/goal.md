@@ -17,8 +17,8 @@ change cannot weaken it silently. A fleet node is a host whose `policy/spool.jso
 - A job may carry a grant (`grants/<id>.yaml`, hashed into the bundle): the node enforces it before
   queueing (active, unexpired, estate = the node's ESTATE); a refused grant runs nothing and the job closes
   at once (`grant:...`, `node_config`), reported like any terminal row. The run freezes the carried copy.
-- `schedule-tick` fires a schedule naming `node` through `LAB_DIRECTOR_DISPATCH` (never `enqueue`) and reads
-  the slot's state from `LAB_DIRECTOR_ESTATE_ROOT/dispatch.jsonl`; its grant must name that node as estate.
+- `schedule-tick` fires a schedule naming `node` through `CS_DIRECTOR_DISPATCH` (never `enqueue`) and reads
+  the slot's state from `CS_DIRECTOR_ESTATE_ROOT/dispatch.jsonl`; its grant must name that node as estate.
 
 Run: `tasks/regressions/estate-split/check` (`CS_RUNNER_BIN` picks the runner; default the Rust `../target/release/cs-harness`).
 `_fake_director.py` stands in for the Director (`api/v1/nodes/me`); the Rust Director's own side of the

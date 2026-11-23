@@ -35,7 +35,7 @@ def _run(argv, timeout=1.0):
 def _pids_in_group(pgid):
     out = _run(["pgrep", "-g", str(pgid)])
     pids = [int(part) for part in (out or "").split() if part.strip().isdigit()]
-    return pids or [int(pgid)]
+    return pids
 
 
 def _darwin_pid_rss_kb(pid):
@@ -104,9 +104,21 @@ def process_group_rss_kb(pgid):
     return sum(_pid_rss_kb(pid) for pid in _pids_in_group(pgid))
 
 
-def terminate_process_group(pgid, grace_s=_GRACE_S):
-    """Legacy group helper: snapshot identities, never signal a whole reused group."""
-    members = {pid: _pid_identity(pid) for pid in _pids_in_group(pgid)}
+def terminate_process_group(pgid, leader_identity, grace_s=_GRACE_S):
+    """Snapshot a group while its original leader still anchors it."""
+    if leader_identity is None or _pid_identity(pgid) != leader_identity:
+        return
+    members = {}
+    for pid in _pids_in_group(pgid):
+        birth = _pid_identity(pid)
+        try:
+            in_group = os.getpgid(pid) == pgid
+        except ProcessLookupError:
+            continue
+        if in_group and birth is not None and _pid_identity(pid) == birth:
+            members[pid] = birth
+    if _pid_identity(pgid) != leader_identity:
+        return
     for pid, birth in members.items():
         _signal_pid(pid, birth, signal.SIGTERM)
     deadline = time.monotonic() + grace_s
@@ -266,7 +278,7 @@ def job_memory_cap_bytes(spec=None, limits=None, config_root=None):
     mb = _memory_mb_from_budget(spec, limits)
     if mb is not None:
         return mb * 1024 * 1024
-    config_root = Path(config_root or os.environ.get("LAB_CONFIG_ROOT") or HERE.parent.parent)
+    config_root = Path(config_root or os.environ.get("CS_CONFIG_ROOT") or HERE.parent.parent)
     policy = load_resources_policy(config_root)
     frac = policy.get("job_memory_fraction")
     try:
@@ -288,6 +300,7 @@ class MemoryMonitor:
         self.cap_kb = int(cap_mb) * 1024
         self.pgid = pgid
         self.processes = processes
+        self.leader_identity = _pid_identity(pgid) if processes is None and pgid else None
         self.peak_kb = 0
         self.exceeded = False
         self._stop = threading.Event()
@@ -307,7 +320,10 @@ class MemoryMonitor:
                 self.peak_kb = rss
             if rss > self.cap_kb:
                 self.exceeded = True
-                self.processes.kill() if self.processes else terminate_process_group(self.pgid)
+                if self.processes:
+                    self.processes.kill()
+                else:
+                    terminate_process_group(self.pgid, self.leader_identity)
                 return
 
     def close(self):

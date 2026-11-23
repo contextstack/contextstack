@@ -30,6 +30,7 @@ pub fn reply(provider: &str, call: &Call) -> Reply {
                 r.tool_calls.push(ReplyToolCall {
                     id: "mock-call-1".into(),
                     name: tool.name.clone(),
+                    invalid_arguments: false,
                     args,
                 });
             }
@@ -105,6 +106,7 @@ mod tests {
                     schema: None,
                 })
                 .collect(),
+            tool_choice: None,
             max_tokens: 0,
             request_id: String::new(),
         }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """finalize-crash-loses-row: observed reproduction (Plan.CS.v2.1 §4).
 
-Kills the Go runner with SIGKILL at a KNOWN boundary inside finalization:
+Kills the machine launcher with SIGKILL at a KNOWN boundary inside finalization:
 after the frozen check has run and transcript.md (rendered by finalize-run
 from the runner's messages.jsonl, then footered) is on disk, inside the
 `publish-evidence` op, before the ledger row. The boundary is
@@ -21,13 +21,13 @@ check.json and the rendered transcript.md, and the row is recoverable.
 Three parts, each printed:
   observation  what was on disk, what was in the ledger, the exit status
   detection    tick's execution_row/ledger_size logic (ops/bin/tick) against
-               the temp ledger; and what a manual `lab run` tells its caller
+               the temp ledger; and what a manual `run-api` tells its caller
                (nothing but -9)
   recovery     ops/bin/finalize-run on the run dir yields the row with the
                original verdict and the evidence record, exactly once; the
                kill op forwards to the real publish-evidence on later calls.
 
-Builds its own temp estate; never touches lab/ledger. The binary under
+Builds its own temp estate; never touches cs/ledger. The binary under
 test is $CS_RUNNER_BIN; absent, the default Rust runner.
 Wired into scripts/check as finalize-run's acceptance.
 """
@@ -42,17 +42,16 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-CHAR = LAB / "tasks/regressions/runner-characterisation-v2"  # the fake gateway that speaks the current wire
+CODE_ROOT = HERE.parents[2]
+CHAR = CODE_ROOT / "tasks/regressions/runner-characterisation-v2"  # the fake gateway that speaks the current wire
 sys.path.insert(0, str(CHAR))
 from _fake_gateway import FakeGateway  # noqa: E402
-sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation"))
 from _harness import install_exe  # noqa: E402 runtime exe tools
 
 REAL_TOOLS = ("fs_read", "fs_write", "exec", "_calllog.py")
-REAL_OPS = ("setup-workspace", "capture-stimulus", "finalize-run")
+REAL_OPS = ("setup-workspace", "capture-stimulus", "finalize-run", "run-api", "machine-finish")
 OP_HELPERS = ("_estate_io.py", "_roots.py", "_lifecycle_evidence.py", "_harvest_git.py", "_setup_workspace.py",
-              "_corpus_contract.py", "_workspace_setup.py", "_env_policy.py", "_errors.py")
+              "_workspace_setup.py", "_env_policy.py", "_errors.py")
 SPEC_REL = "specs/fx.yaml"
 SPEC_ID = "fx-finalize-crash"
 TASK_REL = "tasks/create-file"
@@ -132,9 +131,9 @@ def copy_exec(src, dst):
 
 def runner_binary(scratch):
     """$CS_RUNNER_BIN if set, else the default Rust runner (_runner.built_runner)."""
-    sys.path.insert(0, str(LAB / "ops/bin"))
+    sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
     from _runner import built_runner
-    return built_runner(LAB).resolve()
+    return built_runner(CODE_ROOT).resolve()
 
 
 def build_estate(root):
@@ -144,25 +143,25 @@ def build_estate(root):
         (estate / d).mkdir(parents=True)
     (estate / "INVARIANTS.md").write_text("# fixture estate\n", encoding="utf-8")
     (estate / "ESTATE").write_text("dev\n", encoding="utf-8")
-    shutil.copy2(LAB / "prompts/coder-min.md", estate / "prompts/coder-min.md")
+    shutil.copy2(CODE_ROOT / "prompts/coder-min.md", estate / "prompts/coder-min.md")
     for name in REAL_TOOLS:
-        if not (LAB / "tools/bin" / name).is_file() and (LAB / "tools/bin" / (name + ".json")).is_file():
-            install_exe(LAB / "tools/bin" / (name + ".json"), LAB, estate)
+        if not (CODE_ROOT / "tools/bin" / name).is_file() and (CODE_ROOT / "tools/bin" / (name + ".json")).is_file():
+            install_exe(CODE_ROOT / "tools/bin" / (name + ".json"), CODE_ROOT, estate)
             continue
-        copy_exec(LAB / "tools/bin" / name, estate / "tools/bin" / name)
-        if (LAB / "tools/bin" / (name + ".json")).is_file():
-            shutil.copy2(LAB / "tools/bin" / (name + ".json"), estate / "tools/bin" / (name + ".json"))
+        copy_exec(CODE_ROOT / "tools/bin" / name, estate / "tools/bin" / name)
+        if (CODE_ROOT / "tools/bin" / (name + ".json")).is_file():
+            shutil.copy2(CODE_ROOT / "tools/bin" / (name + ".json"), estate / "tools/bin" / (name + ".json"))
     for name in REAL_OPS:
-        copy_exec(LAB / "ops/bin" / name, estate / "ops/bin" / name)
-    for name in OP_HELPERS:
-        shutil.copy2(LAB / "ops/bin" / name, estate / "ops/bin" / name)
-        shutil.copy2(LAB / "ops/bin" / name, estate / "ops/real-bin" / name)
+        copy_exec(CODE_ROOT / "ops/bin" / name, estate / "ops/bin" / name)
+    for name in (*OP_HELPERS, "_api_run.py", "_runner.py"):
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, estate / "ops/bin" / name)
+        shutil.copy2(CODE_ROOT / "ops/bin" / name, estate / "ops/real-bin" / name)
     # The real publisher, reached by the kill op only after it has fired.
-    copy_exec(LAB / "ops/bin/publish-evidence", estate / "ops/real-bin/publish-evidence")
+    copy_exec(CODE_ROOT / "ops/bin/publish-evidence", estate / "ops/real-bin/publish-evidence")
     kill = estate / "ops/bin/publish-evidence"
     kill.write_text(KILL_OP, encoding="utf-8")
     kill.chmod(0o755)
-    shutil.copytree(LAB / TASK_REL, estate / TASK_REL)
+    shutil.copytree(CODE_ROOT / TASK_REL, estate / TASK_REL)
     (estate / TASK_REL / "check").chmod(0o755)
     (estate / SPEC_REL).write_text(SPEC, encoding="utf-8")
     with open(estate / "ledger/ledger.jsonl", "w", encoding="utf-8") as f:
@@ -177,7 +176,7 @@ def child_env(estate, endpoint):
             "CSGATEWAY_ENDPOINT": endpoint}
 
 
-# --- tick's detection, replicated faithfully from lab/ops/bin/tick -------------
+# --- tick's detection, replicated faithfully from code_root/ops/bin/tick -------------
 # ledger_size: tick:39-43. execution_row: tick:46-57 (spec_key: tick:35-36).
 # tick:290 takes `before = ledger_size()`, runs the trial, then tick:303-305:
 #     row = execution_row(rel, sid, before)
@@ -236,15 +235,16 @@ def main():
     try:
         binary = runner_binary(scratch)
         estate = build_estate(scratch)
-        if estate.resolve() == LAB or LAB in estate.resolve().parents:
-            raise SystemExit("check: refusing live lab root")
+        if estate.resolve() == CODE_ROOT or CODE_ROOT in estate.resolve().parents:
+            raise SystemExit("check: refusing live code_root root")
         ledger = estate / "ledger/ledger.jsonl"
         gateway = FakeGateway(GATEWAY, estate)
         env = child_env(estate, gateway.endpoint)
 
         # --- 1. run and observe -------------------------------------------------
         before = ledger_size(ledger)
-        child = subprocess.Popen([str(binary), "run", SPEC_REL], cwd=str(estate), env=env,
+        child = subprocess.Popen([str(estate / "ops/bin/run-api"), SPEC_REL], cwd=str(estate),
+                                 env=dict(env, CS_RUNNER_BIN=str(binary)),
                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (estate / "fixture/runner.pid").write_text("%d\n" % child.pid, encoding="utf-8")
         out, err = child.communicate(timeout=120)
@@ -291,7 +291,7 @@ def main():
         print("observation " + json.dumps(observation, sort_keys=True, ensure_ascii=False))
         print()
         print("--- observation")
-        rep.expect(proc.returncode == -signal.SIGKILL, "runner terminated by SIGKILL",
+        rep.expect(proc.returncode == -signal.SIGKILL, "machine launcher terminated by SIGKILL",
                    "returncode=%s" % proc.returncode)
         rep.expect(run_dir is not None, "exactly one run dir", str(entries))
         rep.expect(observation["publish_evidence_invoked"], "publish-evidence was invoked (boundary reached)")
@@ -326,7 +326,7 @@ def main():
         # The per-cell line is printed after Run returns, which never happens; the
         # banner and TOTAL lines left the runner for ops/bin/run-spec.
         rep.expect(proc.stdout == "" and proc.stderr.strip() == "",
-                   "manual `lab run` reports nothing: no cell line, no stderr, "
+                   "manual `run-api` reports nothing: no cell line, no stderr, "
                    "only exit status %d" % proc.returncode,
                    "stdout=%r stderr=%r" % (proc.stdout, proc.stderr))
         run_name = run_dir.name if run_dir else ""

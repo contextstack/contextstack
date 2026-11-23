@@ -1,7 +1,6 @@
 # cs
 
-The node tooling of the ContextStack experimentation lab (moved out of
-`../lab/` by Director.Plan step 0b). Specs, tasks, and the ledger are
+The ContextStack node tooling. Specs, tasks, and the ledger are
 the estate; the runner (`../harness/`, Rust) is a disposable loop. Behavior
 changes by spec, never by service. See INVARIANTS.md (one page).
 
@@ -18,7 +17,7 @@ verdicts.
 - `tools/bin/` — the tool surface: executable + `<name>.json` pairs.
 - `hooks/bin/` — post_turn executables; spec-declared, deny-by-default.
 - `ops/bin/` — operator harvest/merge/setup-refresh/enqueue/tick; never palette.
-- the ledger — append-only rows and run evidence, under the state root (`LAB_STATE_ROOT`, ~/.contextstack/state).
+- the ledger — append-only rows and run evidence, under the state root (`CS_STATE_ROOT`, ~/.contextstack/state).
 - `PINNED.md` — pin, routing, recent changelog (older: ledger/CHANGELOG.md).
 - `scripts/check` — the constitution as a linter (also git hooks).
   The monorepo's `scripts/git-hooks` chain to `scripts/hooks` here.
@@ -52,10 +51,10 @@ defaults to `auto`: authenticated hosts use short-lived headed installed
 Google Chrome, while public pages use headless Playwright Chromium. The
 authenticated partitions import only the matching cookie domain from the
 regular profile; they never control the regular profile itself. Set
-`LAB_BROWSER_ENGINE=chrome` to use installed Chrome for public pages too,
-`LAB_BROWSER_VISIBILITY=headless` for an authenticated comparison run, or
-`LAB_BROWSER_VISIBILITY=headed` for a visible public diagnostic.
-`LAB_BROWSER_KEEP_OPEN=1` is an operator-only debugging override; normal
+`CS_BROWSER_ENGINE=chrome` to use installed Chrome for public pages too,
+`CS_BROWSER_VISIBILITY=headless` for an authenticated comparison run, or
+`CS_BROWSER_VISIBILITY=headed` for a visible public diagnostic.
+`CS_BROWSER_KEEP_OPEN=1` is an operator-only debugging override; normal
 scheduled runs must leave it unset.
 
 Try a thought (everything runs through a spec so it lands in the
@@ -71,5 +70,5 @@ ledger; there are deliberately no unledgered runs):
 Add a task by hand: `mkdir tasks/<name>` with `goal.md` (stimulus
 only — no comments), `setup/` (start state), an executable `check`
 (cwd = workspace, exit 0 = pass), and optional `notes.md`/`solution/`
-(lab-facing, never mounted). `scripts/check` lints all of this and
+(operator-facing, never mounted). `scripts/check` lints all of this and
 runs as the pre-commit hook.

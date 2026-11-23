@@ -17,6 +17,25 @@ def messages_calls(t):
     return [r for r in t.anthropic.requests.items if r["path"] == "/v1/messages"]
 
 
+@case("anthropic", gw=None, needs=NEEDS)
+def anthropic_tls_ca_file(t):
+    """The local TLS intercept is trusted only when its generated CA is configured."""
+    store = t.run.credential_store("tls-ca", anthropic="sk-ant-spec-FAKE")
+    env = {"CSGATEWAY_CREDENTIALS": str(store)}
+    empty_bundle = t.run.tmp / "empty-ca.pem"
+    empty_bundle.touch()
+    without_ca = t.gateway("without-ca", env=dict(env, SSL_CERT_FILE=str(empty_bundle)))
+    b = without_ca.call(model_call("claude-spec")).json
+    eq(b["status"], "error", "untrusted CA")
+    eq(messages_calls(t), [], "untrusted server received no HTTP request")
+
+    with_ca = t.gateway("with-ca", env=dict(env, SSL_CERT_FILE=str(t.run.tls.ca)))
+    b = with_ca.call(model_call("claude-spec")).json
+    eq(b["status"], "ok", "trusted CA")
+    eq(len(messages_calls(t)), 1, "trusted server received the HTTP request")
+    no_egress(t)
+
+
 @case("anthropic", gw="cloud", needs=NEEDS)
 def anthropic_request_bytes(t):
     """Headers (x-api-key from the store, anthropic-version) and body: model, max_tokens, top-level system, tools with encoded names and input_schema."""
@@ -31,6 +50,18 @@ def anthropic_request_bytes(t):
                                {"name": "okf-x", "input_schema": {"type": "object"}}]}, "body")
     eq([s["host"] for s in t.proxy.seen.items if s["host"] == "api.anthropic.com"] != [], True, "reached via the intercepted host")
     no_egress(t)
+
+
+@case("anthropic", gw="cloud", needs=NEEDS)
+def anthropic_tool_choice(t):
+    """Named selection uses the same name encoding as declarations. Required becomes any."""
+    tools = [{"name": "fs_write"}, {"name": "fs_edit"}]
+    named = {"type": "function", "function": {"name": "fs_write"}}
+    for choice, expected in ((named, {"type": "tool", "name": "fs_uwrite"}),
+                             ("required", {"type": "any"})):
+        b = t.gw.call(model_call("claude-spec", tool_schema=tools, tool_choice=choice)).json
+        eq(b["status"], "ok", "status")
+        eq(messages_calls(t)[-1]["json"]["tool_choice"], expected, "upstream tool_choice")
 
 
 @case("anthropic", gw="cloud", needs=NEEDS)
@@ -143,12 +174,14 @@ def anthropic_stream_stop_reason(t):
 
 @case("anthropic", gw="cloud", needs=NEEDS)
 def anthropic_stream_eof_without_stop(t):
-    """WIRE clause 4: deltas then EOF without message_stop ends in an error chunk (runtime_fault transport_failed, $0), never ok."""
+    """WIRE clause 4: deltas then EOF without message_stop ends in an error chunk carrying the settled partial charge, never ok."""
     got = stream(t, upstreams.anthropic_stream(["par", "tial"], terminal=False))
     eq([f["kind"] for f in got], ["delta", "delta", "error"], "kinds")
-    sub(got[-1], {"index": 0, "cost": {"currency": "USD", "amount": "0.000000"},
+    sub(got[-1], {"index": 0, "cost": {"currency": "USD", "amount": "0.000180", "class": "api",
+                                      "est_usd": 0.00018},
                   "error": {"class": "runtime_fault", "code": "gateway.transport_failed",
                             "message": "anthropic stream ended without message_stop: unexpected EOF"}}, "terminal error (index restarts at 0)")
+    eq(round(got[-1]["cost"]["charged_usd"], 6), 0.00018, "settled partial charge")
 
 
 @case("anthropic", gw="cloud", needs=NEEDS)
@@ -157,16 +190,20 @@ def anthropic_stream_error_event(t):
     frames = upstreams.anthropic_stream(["a"], terminal=False) + [upstreams.sse("error", {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})]
     got = stream(t, frames)
     eq([f["kind"] for f in got], ["delta", "error"], "kinds")
-    sub(got[-1], {"error": {"class": "runtime_fault", "code": "gateway.upstream_error", "message": "Overloaded"}, "cost": {"amount": "0.000000"}}, "error chunk")
+    sub(got[-1], {"error": {"class": "runtime_fault", "code": "gateway.upstream_error", "message": "Overloaded"},
+                  "cost": {"currency": "USD", "amount": "0.000180", "class": "api",
+                           "est_usd": 0.00018}}, "error chunk")
+    eq(round(got[-1]["cost"]["charged_usd"], 6), 0.00018, "settled partial charge")
 
 
 @case("anthropic", gw="cloud", needs=NEEDS)
 def anthropic_stream_upstream_status(t):
-    """A non-2xx before streaming: one error chunk with the status class (529 retryable provider_transient)."""
+    """A non-2xx before output: one $0 error chunk with the status class (529 retryable provider_transient)."""
     t.anthropic.messages = {"json": {"error": {"message": "overloaded"}}, "status": 529}
     got = t.gw.call(model_call("claude-spec", stream=True)).sse()
     eq(len(got), 1, "frames")
-    sub(got[0], {"kind": "error", "error": {"class": "retryable_gateway", "code": "gateway.provider_transient"}}, "error chunk")
+    sub(got[0], {"kind": "error", "cost": {"currency": "USD", "amount": "0.000000"},
+                 "error": {"class": "retryable_gateway", "code": "gateway.provider_transient"}}, "error chunk")
 
 
 @case("anthropic", gw="cloud", needs=NEEDS)
@@ -240,8 +277,10 @@ def anthropic_stream_equivalence(t):
 
 @case("anthropic", gw="cloud", needs=NEEDS)
 def anthropic_stream_tool_args_not_json(t):
-    """Streamed tool input that joins to non-JSON fails the call (G1 3): after the text delta, one error chunk runtime_fault gateway.provider_failed, $0, no partial tool calls."""
+    """Streamed tool input that joins to non-JSON fails after output with a charged runtime_fault gateway.provider_failed and no partial tool calls."""
     got = stream(t, tool_frames([("toolu_1", "fs_dread", ['{"path": '])]), tool_schema=[{"name": "fs.read"}])
     eq([f["kind"] for f in got], ["delta", "error"], "kinds")
-    sub(got[-1], {"index": 0, "cost": {"currency": "USD", "amount": "0.000000"},
+    sub(got[-1], {"index": 0, "cost": {"currency": "USD", "amount": "0.000300", "class": "api",
+                                      "est_usd": 0.0003},
                   "error": {"class": "runtime_fault", "code": "gateway.provider_failed", "recoverable": False}}, "error chunk")
+    eq(round(got[-1]["cost"]["charged_usd"], 6), 0.0003, "settled partial charge")

@@ -9,7 +9,7 @@ call its own tmp directory outside the workspace. Authority sits here, as for th
 and the env resolution and hands the runner CS_TOOL_PREFIX; the runner only prepends its words to every
 tool argv (run.go Tool.Run).
 
-Decision rule, tool_prefix_value(lab, env) -> value to set, or None to set nothing:
+Decision rule, tool_prefix_value(code_root, env) -> value to set, or None to set nothing:
   1. a policy file that is present is validated first; malformed is SandboxPolicyError (a config void);
   2. CS_TOOL_PREFIX already set: returned unchanged (an operator or a fixture chose it);
   3. no policy file: None (unconfined, nothing to enforce);
@@ -18,9 +18,9 @@ Decision rule, tool_prefix_value(lab, env) -> value to set, or None to set nothi
   5. policy present, no wrapper: SandboxPolicyError (tick voids the cell, run-spec exits 2), unless
      CS_SANDBOX_DEV_UNCONFINED=1: None and one stderr line saying tools run unconfined.
 Wrapper binary: $CS_SANDBOX_BIN, else <repo>/target/release/cs-sandbox, else <repo>/target/debug/
-cs-sandbox, where <repo> is the directory holding the lab checkout; else none.
+cs-sandbox, where <repo> is the directory holding the code root; else none.
 
-tool_argv(lab, name): what both runners exec after the prefix words: a descriptor naming "bin"
+tool_argv(code_root, name): what the runner executes after the prefix words: a descriptor naming "bin"
 (runtime exe) is [bin, *args], bin relative to <repo> unless absolute; any other tool is [tools/bin/<name>].
 cs-sandbox finds an exe tool's descriptor by that bin and args (sandbox/src/policy.rs descriptor_for).
 
@@ -34,8 +34,8 @@ died before terminal.json). A cell dir whose newest entry is ORPHAN_AGE_S old is
 entry is a readable report (*.json, a dict with a cwd) and no pending run (terminal.json, no finalized.json) has that
 cwd as its workspace. A pending claim, a torn or foreign file, or an OSError keeps it. Counts candidates only.
 
-browser_state_value(lab, env): LAB_BROWSER_STATE for the runner when the host policy lists it in write_env:
-the value passed through when set, else $HOME/.contextstack/lab/browser-state (the state root); None when the
+browser_state_value(code_root, env): CS_BROWSER_STATE for the runner when the host policy lists it in write_env:
+the value passed through when set, else $HOME/.contextstack/state/browser-state (the state root); None when the
 policy is absent or does not list it, so an estate without that grant sees no new variable.
 """
 import json
@@ -47,7 +47,7 @@ import sys
 import time
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parent.parent.parent
+CODE_ROOT = Path(__file__).resolve().parent.parent.parent
 POLICY = "policy/sandbox.json"
 NETS = ("none", "gateway", "all")
 KEYS = ("version", "runtime_read", "allow_net")
@@ -58,7 +58,7 @@ ROOTED = ("/", "$CODE_ROOT", "$REPO_ROOT", "$HOME")
 READ_ROOTED = ROOTED + ("$TOOL_PYTHON",)  # read lists only: the venv interpreter's install (cs-sandbox policy.rs tool_python)
 OSES = ("macos", "linux")
 VAR = re.compile(r"[A-Z_][A-Z0-9_]*")
-BROWSER_STATE = ".contextstack/lab/browser-state"  # under $HOME
+BROWSER_STATE = ".contextstack/state/browser-state"  # under $HOME
 ORPHAN_AGE_S = 24 * 3600  # every wrapped call writes a report, so a live cell's dir is never this old in practice
 UNBUILT = "sandbox: wrapper not built; tools run unconfined (development mode)"
 DEV_UNCONFINED = "CS_SANDBOX_DEV_UNCONFINED"
@@ -72,10 +72,10 @@ def _strings(value):
     return isinstance(value, list) and all(isinstance(v, str) and v for v in value)
 
 
-def load_policy(lab=LAB):
+def load_policy(code_root=CODE_ROOT):
     """The validated policy dict; None when the file is absent; SandboxPolicyError when malformed."""
     try:
-        raw = (Path(lab) / POLICY).read_text(encoding="utf-8")
+        raw = (Path(code_root) / POLICY).read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     try:
@@ -116,13 +116,13 @@ def _paths(where, rr):
                          % (where, ", ".join(OSES), rr))
 
 
-def wrapper_path(lab=LAB, env=None):
+def wrapper_path(code_root=CODE_ROOT, env=None):
     """The cs-sandbox binary as a Path, or None when none is built."""
     env = os.environ if env is None else env
     if env.get("CS_SANDBOX_BIN"):
         given = Path(env["CS_SANDBOX_BIN"])
         return given if given.is_file() else None
-    repo = Path(lab).resolve().parent
+    repo = Path(code_root).resolve().parent
     for build in ("release", "debug"):
         for name in ("cs-sandbox",):
             candidate = repo / "target" / build / name
@@ -131,12 +131,12 @@ def wrapper_path(lab=LAB, env=None):
     return None
 
 
-def tool_prefix(lab=LAB, env=None):
-    """[wrapper, --policy, <lab>/policy/sandbox.json, --]; static per spec (cell_prefix adds the per-cell report dir)."""
-    wrapper = wrapper_path(lab, env)
+def tool_prefix(code_root=CODE_ROOT, env=None):
+    """[wrapper, --policy, <code-root>/policy/sandbox.json, --]; static per spec (cell_prefix adds the per-cell report dir)."""
+    wrapper = wrapper_path(code_root, env)
     if wrapper is None:
         return []
-    words = [str(wrapper), "--policy", str(Path(lab).resolve() / POLICY), "--"]
+    words = [str(wrapper), "--policy", str(Path(code_root).resolve() / POLICY), "--"]
     for word in words:
         if word != "".join(word.split()):
             raise SandboxPolicyError("%r: a prefix path may not contain whitespace (the runner splits on it)" % word)
@@ -148,15 +148,15 @@ def prefix_value(words):
     return shlex.join(words)
 
 
-def tool_prefix_value(lab=LAB, env=None, stderr=None):
+def tool_prefix_value(code_root=CODE_ROOT, env=None, stderr=None):
     """The decision rule in the module docstring."""
     env = os.environ if env is None else env
-    policy = load_policy(lab)
+    policy = load_policy(code_root)
     if "CS_TOOL_PREFIX" in env:
         return env["CS_TOOL_PREFIX"]
     if policy is None:
         return None
-    words = tool_prefix(lab, env)
+    words = tool_prefix(code_root, env)
     if words:
         return prefix_value(words)
     if env.get(DEV_UNCONFINED) == "1":
@@ -178,25 +178,25 @@ def cell_prefix(value, env, reports):
     return prefix_value(words)
 
 
-def tool_argv(lab, name):
+def tool_argv(code_root, name):
     """[exec path, *args] for tool `name`, as the runners build it after the prefix (module docstring)."""
-    lab = Path(lab)
-    desc = lab / "tools/bin" / (name + ".json")
+    code_root = Path(code_root)
+    desc = code_root / "tools/bin" / (name + ".json")
     d = json.loads(desc.read_text(encoding="utf-8")) if desc.is_file() else {}
     d = d if isinstance(d, dict) else {}
     if not d.get("bin"):
-        return [str(lab / "tools/bin" / name)] + [str(a) for a in d.get("args") or []]
-    return [str(lab.resolve().parent / d["bin"])] + [str(a) for a in d.get("args") or []]
+        return [str(code_root / "tools/bin" / name)] + [str(a) for a in d.get("args") or []]
+    return [str(code_root.resolve().parent / d["bin"])] + [str(a) for a in d.get("args") or []]
 
 
-def browser_state_value(lab=LAB, env=None):
-    """LAB_BROWSER_STATE for the runner's children, or None to set nothing (module docstring)."""
+def browser_state_value(code_root=CODE_ROOT, env=None):
+    """CS_BROWSER_STATE for the runner's children, or None to set nothing (module docstring)."""
     env = os.environ if env is None else env
-    policy = load_policy(lab)
-    if policy is None or "LAB_BROWSER_STATE" not in policy.get("write_env", {}):
+    policy = load_policy(code_root)
+    if policy is None or "CS_BROWSER_STATE" not in policy.get("write_env", {}):
         return None
-    if env.get("LAB_BROWSER_STATE"):
-        return env["LAB_BROWSER_STATE"]
+    if env.get("CS_BROWSER_STATE"):
+        return env["CS_BROWSER_STATE"]
     return str(Path(env.get("HOME") or Path.home()) / BROWSER_STATE)
 
 

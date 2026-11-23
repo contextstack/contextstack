@@ -2,7 +2,7 @@
 Director. node-listen (protocol 2) runs in the background, never starting tick or schedule-tick ("dispatch": false).
 
 The client is a directory holding the two ops and their helper modules (today cs/ops/bin). Each case gets its
-own roots (LAB_CONFIG_ROOT, LAB_STATE_ROOT, LAB_WORKSPACES_ROOT) under the suite's temp dir, a fixture token in
+own roots (CS_CONFIG_ROOT, CS_STATE_ROOT, CS_WORKSPACES_ROOT) under the suite's temp dir, a fixture token in
 a 0600 node.env file, a temp HOME and nothing else from the caller's environment.
 """
 import json
@@ -45,8 +45,8 @@ class NodeRig:
 
     def env(self, **more):
         return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.tmp / "home"),
-                "LAB_CONFIG_ROOT": str(self.tmp / "config"), "LAB_STATE_ROOT": str(self.state),
-                "LAB_WORKSPACES_ROOT": str(self.tmp / "workspaces"), **more}
+                "CS_CONFIG_ROOT": str(self.tmp / "config"), "CS_STATE_ROOT": str(self.state),
+                "CS_WORKSPACES_ROOT": str(self.tmp / "workspaces"), **more}
 
     def op(self, name, payload=None):
         r = subprocess.run([sys.executable, str(self.client / name)], input=json.dumps(payload or {}), text=True,
@@ -88,7 +88,7 @@ class NodeRig:
         self.listen_log = open(self.tmp / "listen.log", "ab")
         self.listener = subprocess.Popen([sys.executable, str(client / "node-listen")], stdin=subprocess.PIPE,
                                          stdout=self.listen_log, stderr=subprocess.STDOUT, cwd=str(self.tmp),
-                                         env=self.env(LAB_CANCEL_GRACE_S="5", **env))
+                                         env=self.env(CS_CANCEL_GRACE_S="5", **env))
         self.listener.stdin.write(json.dumps({"seconds": seconds, "dispatch": dispatch}).encode())
         self.listener.stdin.close()
         return self.listener

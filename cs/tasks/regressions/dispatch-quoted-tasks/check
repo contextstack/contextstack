@@ -10,17 +10,17 @@ from hermetic_env import hermetic_env
 _fixture_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_fixture_env)
-lab=Path(__file__).resolve().parents[3];sys.path.insert(0,str(lab/'ops/bin'))
-loader=importlib.machinery.SourceFileLoader('quoted_tick',str(lab/'ops/bin/tick'))
+code_root=Path(__file__).resolve().parents[3];sys.path.insert(0,str(code_root/'ops/bin'))
+loader=importlib.machinery.SourceFileLoader('quoted_tick',str(code_root/'ops/bin/tick'))
 spec=importlib.util.spec_from_loader(loader.name,loader);tick=importlib.util.module_from_spec(spec);loader.exec_module(tick)
 with scratch_dir() as raw:
- root=Path(raw);(root/'specs').mkdir();tick.LAB=root;tick.TEMPLATES={'fake-cli':{}}
+ root=Path(raw);(root/'specs').mkdir();tick.CODE_ROOT=root;tick.TEMPLATES={'fake-cli':{}}
  calls=[];holds=[];tick.child_env=lambda *a,**k:{};tick.ledger_size=lambda:0
  tick.hold_schedule=lambda name,reason:holds.append((name,reason))
  def invoke(argv,**kw):
   if argv[0].endswith('/executor'):task=json.loads(kw['input'])['task']
   else:
-   assert argv[0]==str(root.parent/'target/release/cs-harness') and (root/argv[-1]).is_file() and '-trial' in argv  # one cell per call
+   assert argv[0]==str(tick.HERE/'run-api') and (root/argv[-1]).is_file() and '-trial' in argv  # one cell per call
    task=argv[argv.index('-task')+1]
   calls.append(task);return types.SimpleNamespace(returncode=0)
  teed=tick.run_teed

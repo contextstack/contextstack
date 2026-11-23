@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Exercise capability discovery with the installed release layout and fake agents."""
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OPS = HERE.parents[2] / "ops/bin"
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from hermetic_env import hermetic_env
+from scratch import scratch_dir
+
+
+def executable(path, script):
+    path.write_text(script)
+    path.chmod(0o755)
+
+
+def main():
+    with scratch_dir(prefix="node-agents-") as raw:
+        home = Path(raw)
+        root = home / ".contextstack"
+        release = root / "releases/fixture"
+        ops = release / "cs/ops/bin"
+        ops.mkdir(parents=True)
+        for name in ("_vitals.py", "_agent_discovery.py", "_runner.py", "_provider_limits.py",
+                     "_estate_io.py", "_est.py", "_node_env.py", "executor-templates.json"):
+            shutil.copy2(OPS / name, ops / name)
+        current = root / "current"
+        current.symlink_to("releases/fixture", target_is_directory=True)
+        config = root / "config"
+        config.mkdir()
+        bins = home / "agent-bin"
+        bins.mkdir()
+
+        env = hermetic_env()
+        env.pop("CS_RUNNER_BIN", None)
+        env.pop("CS_AGENT_PATH", None)
+        env.update(HOME=str(home), PATH=str(bins), PYTHONDONTWRITEBYTECODE="1",
+                   CSGATEWAY_ENDPOINT="http://127.0.0.1:1")
+
+        def check(assertions, setup=None):
+            setup = setup or (
+                "import sys; sys.path.insert(0, sys.argv[1]); "
+                "from _vitals import agent_capabilities; caps = agent_capabilities(sys.argv[2])"
+            )
+            subprocess.run(
+                [sys.executable, "-c", setup + "\n" + assertions, str(current / "cs/ops/bin"), str(config)],
+                env=env, check=True, timeout=45,
+            )
+
+        check("assert caps['agent_capabilities']['templates'] == [], caps")
+        print("ok   no installed agents reports an empty template list")
+
+        check("""
+from pathlib import Path
+from threading import Event
+from time import monotonic, sleep
+import _agent_discovery
+from _vitals import status_extras
+
+started, finish = Event(), Event()
+calls = []
+
+def discover():
+    calls.append(1)
+    started.set()
+    assert finish.wait(5)
+    return []
+
+_agent_discovery.discover_node_agents = discover
+config = Path(sys.argv[2])
+
+def status():
+    return status_extras(config.parent / "state", config, cache_ttl=5)
+
+try:
+    assert "agent_capabilities" not in status()
+    assert started.wait(5)
+    assert "agent_capabilities" not in status()
+finally:
+    finish.set()
+
+deadline = monotonic() + 5
+body = status()
+while "agent_capabilities" not in body and monotonic() < deadline:
+    sleep(0.01)
+    body = status()
+assert body["agent_capabilities"]["templates"] == [], body
+assert status()["agent_capabilities"]["templates"] == []
+assert calls == [1], calls
+""", "import sys; sys.path.insert(0, sys.argv[1])")
+        print("ok   status stays responsive during discovery and reuses the completed result")
+
+        executable(bins / "codex", '#!/bin/sh\ncase "$*" in\n"login status") echo "Logged in using ChatGPT";;\n'
+                   '"--version") echo "codex fixture";;\n*) exit 2;;\nesac\n')
+        executable(bins / "claude", '#!/bin/sh\ncase "$*" in\n"auth status --json") '
+                   'echo \'{"loggedIn":true}\';;\n"--version") echo "claude fixture";;\n*) exit 2;;\nesac\n')
+        executable(bins / "cursor-agent", '#!/bin/sh\necho "Not logged in"\nexit 1\n')
+        check("templates = caps['agent_capabilities']['templates']\n"
+              "assert {'codex', 'claude-code-sonnet'} <= set(templates), caps\n"
+              "assert not any(name.startswith('cursor') for name in templates), caps")
+        print("ok   reports signed-in templates without agents.json")
+
+        binary = release / "bin/cs-harness"
+        binary.parent.mkdir()
+        executable(home / "harness-artifact", "#!/bin/sh\nexit 0\n")
+        os.link(home / "harness-artifact", binary)
+        check("assert caps['agent_capabilities']['harness'] is True, caps")
+        print("ok   installed harness is found through current")
+
+        executable(bins / "codex", "#!" + str(home / "missing-interpreter") + "\n")
+        check("assert 'agent_capabilities' not in caps, caps")
+        print("ok   a discovery error leaves capabilities unknown")
+
+        assert not (config / "agents.json").exists()
+
+
+if __name__ == "__main__":
+    main()

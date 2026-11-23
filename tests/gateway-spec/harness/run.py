@@ -103,9 +103,9 @@ class Run:
             env["CSGATEWAY_DISCOVERY_DISABLED"] = ",".join(disabled)
         return env
 
-    def config(self, deployments=None, lab_executor=False, models=None, extra_models=(), **top):
+    def config(self, deployments=None, cli_executor=False, models=None, extra_models=(), **top):
         """The suite's models.json. Model names are the routing fixtures every
-        area shares; deployments and the lab executor are opt-in because any
+        area shares; deployments and the CLI executor are opt-in because any
         deployment turns admission on for every provider."""
         c = {
             "models": models if models is not None else [
@@ -126,8 +126,8 @@ class Run:
                             "agy": str(self.tmp / "absent" / "agy"), "python3": python_exe()},
             "deployments": deployments or [],
         }
-        if lab_executor:
-            c["lab_executor"] = str(self.fake_cli)
+        if cli_executor:
+            c["cli_executor"] = str(self.fake_cli)
         c.update(top)
         return c
 
@@ -147,14 +147,14 @@ class Run:
         "admit": lambda r: r.gateway("admit", r.config(
             deployments=[r.vllm_deployment(max_concurrent=1, max_queued=1, max_wait_ms=5000),
                          {"id": "cli-spec", "provider": "cli", "models": ["fake-cli"], "max_concurrent": 1, "max_queued": 0, "max_wait_ms": 0}],
-            lab_executor=True, estate="spec")),
+            cli_executor=True, estate="spec")),
         # Coding-agent work orders (live output, cancel): the fake executor stands in for each agent CLI.
         "agents": lambda r: r.gateway("agents", r.config(
             deployments=[{"id": "cli-agents", "provider": "cli",
                           "models": ["claude-code", "codex", "gemini-cli", *CURSOR_CLIS, "antigravity",
                                      "antigravity-hydrogen", "fake-cli"],
                           "max_concurrent": 4, "max_queued": 0, "max_wait_ms": 0}],
-            lab_executor=True, extra_models=AGENT_CLIS), auth_token="spec-token"),
+            cli_executor=True, extra_models=AGENT_CLIS), auth_token="spec-token"),
         "cloud": lambda r: r.gateway("cloud", env={"CSGATEWAY_CREDENTIALS": str(r.credential_store("cloud", anthropic="sk-ant-spec-FAKE", openai="sk-spec-FAKE"))}),
     }
 

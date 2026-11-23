@@ -9,13 +9,13 @@ use crate::inventory::{FREE_LOCAL, Inventory};
 use crate::log;
 use crate::pricing::{ResolvedRates, TokenBill, settle_usd};
 use crate::protocol::{Call, Event, MeteredUsage, Tool, history};
-use crate::spend::Reservation;
+use crate::trace::{Exchange, Stamp};
 use crate::wire::{self, Chunk, Cost, ReplyMessage, Request, Response as Envelope, Usage};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, StreamBody};
+use http_body_util::{BodyExt, LengthLimitError, Limited, StreamBody};
 use hyper::Response;
-use hyper::body::Frame;
+use hyper::body::{Frame, Incoming};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +44,9 @@ fn token_bill(input: i64, output: i64, cache_read: i64, cache_write: i64) -> Tok
 }
 
 /// A body that never decoded: `bad_request` under the v2 family.
-pub fn undecodable(err: &str) -> Response<Body> {
+async fn undecodable(trace: &mut Exchange, err: &str) -> Response<Body> {
+    trace.finish("refused_before_provider_contact", Some("bad_request"));
+    trace.flush().await;
     json(
         200,
         &Envelope::error(
@@ -77,7 +79,15 @@ fn sse_headers(r: &mut Response<Body>) {
 }
 
 /// Refuse in the request's shape: an SSE error chunk for a stream, else an envelope.
-fn refuse(stream: bool, schema: &'static str, request_id: &str, e: WireError) -> Response<Body> {
+async fn refuse(
+    trace: &mut Exchange,
+    stream: bool,
+    schema: &'static str,
+    request_id: &str,
+    e: WireError,
+) -> Response<Body> {
+    trace.finish("refused_before_provider_contact", Some(e.code));
+    trace.flush().await;
     if stream {
         return sse(Chunk::error(wire::chunk_family(schema), request_id, e).frame());
     }
@@ -178,6 +188,7 @@ fn invocation(gw: &Gateway, req: &Request, t: &Target) -> Result<Call, WireError
         system: system.join("\n\n"),
         messages,
         tools,
+        tool_choice: req.tool_choice.clone(),
         max_tokens: req.budget.max_output_tokens,
         request_id: req.request_id.clone(),
     })
@@ -189,6 +200,7 @@ fn accept(
     path: &str,
     caller: &str,
     req: &Request,
+    trace: &Exchange,
 ) -> Result<&'static str, WireError> {
     let Some(schema) = wire::accepted_schema(&req.schema_version) else {
         let msg = format!(
@@ -208,9 +220,9 @@ fn accept(
     if let Ok(mut w) = gw.wire.lock() {
         w.record(schema, caller);
     }
-    crate::log::row(&serde_json::json!({
-        "event": "wire_request", "schema_version": schema, "caller": caller, "path": path, "request_id": req.request_id,
-    }));
+    crate::log::row(&trace.attributes(serde_json::json!({
+        "event": "wire_request", "schema_version": schema, "caller": caller, "path": path,
+    })));
     Ok(schema)
 }
 
@@ -235,79 +247,167 @@ fn agent_debug_row(messages: &serde_json::Value, body: &[u8]) -> serde_json::Val
     })
 }
 
-/// Handle one call.
-pub async fn handle(gw: &Arc<Gateway>, path: &str, caller: &str, body: &Bytes) -> Response<Body> {
+/// Receive the request body under the model-call size limit, including it in exchange time.
+pub async fn receive(gw: &Gateway, path: &str, caller: &str, body: Incoming) -> Response<Body> {
+    const MODEL_CALL_MAX: usize = 32 * 1024 * 1024;
+    let start = Stamp::now();
+    match Limited::new(body, MODEL_CALL_MAX).collect().await {
+        Ok(body) => handle(gw, path, caller, &body.to_bytes(), start).await,
+        Err(error) => {
+            let mut trace = Exchange::new(gw.settings.home.as_deref(), start, &Request::default());
+            if error.downcast_ref::<LengthLimitError>().is_some() {
+                trace.finish("refused_before_provider_contact", Some("payload_too_large"));
+                trace.flush().await;
+                super::error(413, "model call over 32 MiB", "payload_too_large")
+            } else {
+                undecodable(&mut trace, &error.to_string()).await
+            }
+        }
+    }
+}
+
+async fn handle(
+    gw: &Gateway,
+    path: &str,
+    caller: &str,
+    body: &Bytes,
+    start: Stamp,
+) -> Response<Body> {
     let req: Request = match crate::protocol::openai::first_value(body) {
         Ok(r) => r,
-        Err(e) => return undecodable(&e),
+        Err(e) => {
+            return undecodable(
+                &mut Exchange::new(gw.settings.home.as_deref(), start, &Request::default()),
+                &e,
+            )
+            .await;
+        }
     };
-    let schema = match accept(gw, path, caller, &req) {
+    let mut trace = Exchange::new(gw.settings.home.as_deref(), start, &req);
+    let schema = match accept(gw, path, caller, &req, &trace) {
         Ok(s) => s,
-        Err(e) => return json(200, &Envelope::error(wire::REQUEST_V2, &req.request_id, e)),
+        Err(e) => return refuse(&mut trace, false, wire::REQUEST_V2, &req.request_id, e).await,
     };
+    handle_request(gw, body, req, schema, trace).await
+}
+
+async fn handle_request(
+    gw: &Gateway,
+    body: &Bytes,
+    req: Request,
+    schema: &'static str,
+    mut trace: Exchange,
+) -> Response<Body> {
     if req.messages.is_empty() {
         let e = WireError::fatal(
             "gateway.empty_messages",
             "messages array must contain at least one entry",
         );
-        return refuse(req.stream, schema, &req.request_id, e);
+        return refuse(&mut trace, req.stream, schema, &req.request_id, e).await;
     }
     let snap = gw.bind(&req.request_id);
     let target = match resolve(&snap.inventory(), &req.capability.model_tier_hint) {
         Ok(t) => t,
-        Err(e) => return refuse(req.stream, schema, &req.request_id, e),
+        Err(e) => return refuse(&mut trace, req.stream, schema, &req.request_id, e).await,
     };
+    trace.billing(&target.class);
     if gw.settings.env.get("CSGATEWAY_AGENT_DEBUG", "") == "1" {
         let raw: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
-        crate::log::row(&agent_debug_row(&raw["messages"], body));
+        crate::log::row(&trace.attributes(agent_debug_row(&raw["messages"], body)));
     }
     let call = match invocation(gw, &req, &target) {
         Ok(c) => c,
-        Err(e) => return refuse(req.stream, schema, &req.request_id, e),
+        Err(e) => return refuse(&mut trace, req.stream, schema, &req.request_id, e).await,
     };
-    // The source's budget decides before any connection (crate::spend); other classes are never counted.
+    // Pay-as-you-go calls reserve before connecting. Other routes can report a charge afterward.
     let hold = if target.class == "api" {
         let est = crate::spend::estimate(target.rates, body.len(), req.budget.max_output_tokens);
-        match gw.spend.admit(&target.provider, &req.budget.max_usd, est) {
+        match gw
+            .spend
+            .admit_async(&target.provider, &req.budget.max_usd, est)
+            .await
+        {
             Ok(h) => Some(h),
-            Err(d) => return refuse(req.stream, schema, &req.request_id, WireError::budget(d)),
+            Err(d) => {
+                return refuse(
+                    &mut trace,
+                    req.stream,
+                    schema,
+                    &req.request_id,
+                    WireError::budget(d),
+                )
+                .await;
+            }
         }
     } else {
         None
     };
+    trace.wallet(Arc::clone(&gw.spend), hold);
     let timeout = u64::try_from(req.budget.timeout_ms)
         .ok()
         .filter(|ms| *ms > 0)
         .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
     let deadline = tokio::time::Instant::now() + timeout;
-    if req.stream {
-        let family = wire::chunk_family(schema);
-        let est_input = i64::try_from(body.len().div_ceil(4)).unwrap_or(i64::MAX);
-        return match stream_with_retry(gw, &snap, &target.provider, &call, deadline).await {
-            Ok(s) => stream_response(
-                s,
-                family,
+    match with_retry(gw, &snap, &target, &call, deadline, req.stream, &mut trace).await {
+        Ok(UpstreamReply::Stream(stream)) => stream_response(StreamState {
+            stream: Some(stream),
+            family: wire::chunk_family(schema),
+            request_id: req.request_id,
+            target,
+            revision: snap.revision.clone(),
+            est_input_tokens: i64::try_from(body.len().div_ceil(4)).unwrap_or(i64::MAX),
+            index: 0,
+            streamed_bytes: 0,
+            trace,
+        }),
+        Ok(UpstreamReply::Unary(reply)) => {
+            if !reply.text.is_empty() || !reply.tool_calls.is_empty() {
+                trace.output();
+            }
+            trace.end_attempt("success");
+            let response = ok(
+                schema,
                 req.request_id,
-                target,
-                snap.revision.clone(),
-                hold,
-                est_input,
-            ),
-            Err(e) => sse(Chunk::error(family, &req.request_id, e.to_wire()).frame()),
-        };
+                &target,
+                &snap.revision,
+                reply,
+                &mut trace,
+            );
+            trace.finish("completed", None);
+            trace.flush().await;
+            response
+        }
+        Err(error) => upstream_error(&mut trace, &req, schema, error, deadline).await,
     }
-    match invoke_with_retry(
-        gw,
-        &snap,
-        &target.provider,
-        &call,
-        deadline,
-        &req.request_id,
-    )
-    .await
-    {
-        Ok(reply) => ok(schema, req.request_id, &target, &snap.revision, reply, hold),
-        Err(e) => json(200, &Envelope::error(schema, &req.request_id, e.to_wire())),
+}
+
+async fn upstream_error(
+    trace: &mut Exchange,
+    req: &Request,
+    schema: &'static str,
+    error: CallError,
+    deadline: Instant,
+) -> Response<Body> {
+    let (outcome, refusal) = trace.failure(&error, Instant::now() >= deadline);
+    if error.is_connection_lost() {
+        trace.connection_lost();
+    }
+    let cost = trace.settle_abort(outcome);
+    trace.finish(outcome, refusal);
+    trace.flush().await;
+    let error = error.to_wire();
+    if req.stream {
+        let mut chunk = Chunk::error(wire::chunk_family(schema), &req.request_id, error);
+        if let Some(cost) = cost {
+            chunk.cost = Some(cost);
+        }
+        sse(chunk.frame())
+    } else {
+        let mut response = Envelope::error(schema, &req.request_id, error);
+        if let Some(cost) = cost {
+            response.cost = cost;
+        }
+        json(200, &response)
     }
 }
 
@@ -320,79 +420,73 @@ fn retry_backoff_ms(attempt: u32, retry_after_ms: Option<i64>) -> u64 {
     base + jitter
 }
 
-async fn sleep_for_retry(deadline: Instant, wait_ms: u64) {
-    if wait_ms == 0 {
-        return;
-    }
-    let left = deadline.saturating_duration_since(Instant::now());
-    let wait = Duration::from_millis(wait_ms).min(left);
-    if !wait.is_zero() {
-        tokio::time::sleep(wait).await;
-    }
+enum UpstreamReply {
+    Unary(crate::protocol::Reply),
+    Stream(Box<OpenStream>),
 }
 
-async fn invoke_with_retry(
-    gw: &Arc<Gateway>,
+async fn with_retry(
+    gw: &Gateway,
     snap: &crate::gateway::Snapshot,
-    provider: &str,
+    target: &Target,
     call: &Call,
     deadline: Instant,
-    request_id: &str,
-) -> Result<crate::protocol::Reply, CallError> {
-    let mut attempt = 0u32;
+    stream: bool,
+    trace: &mut Exchange,
+) -> Result<UpstreamReply, CallError> {
+    let provider = &target.provider;
+    let mut attempt = 0;
     loop {
-        match gw.invoke(snap, provider, call, deadline).await {
-            Ok(reply) => return Ok(reply),
-            Err(e) if e.gateway_retryable() && attempt < MAX_UPSTREAM_RETRIES => {
+        let result = if stream {
+            gw.stream(snap, provider, call, deadline, trace)
+                .await
+                .map(|stream| UpstreamReply::Stream(Box::new(stream)))
+        } else {
+            gw.invoke(snap, provider, call, deadline, trace)
+                .await
+                .map(UpstreamReply::Unary)
+        };
+        match result {
+            Err(e) if e.is_connection_lost() && target.class != FREE_LOCAL => {
+                return Err(e.without_transport_retry());
+            }
+            Err(e) if e.gateway_retryable() => {
                 let wait_ms = retry_backoff_ms(attempt, e.retry_after_ms());
-                crate::log::row(&serde_json::json!({
+                if e.is_connection_lost() {
+                    trace.connection_lost();
+                    // Let the terminal error handler finish the last attempt.
+                    if attempt == MAX_UPSTREAM_RETRIES
+                        || Duration::from_millis(wait_ms)
+                            >= deadline.saturating_duration_since(Instant::now())
+                    {
+                        return Err(e);
+                    }
+                }
+                trace.end_attempt("retryable_failure");
+                if attempt == MAX_UPSTREAM_RETRIES || Instant::now() >= deadline {
+                    return Err(e);
+                }
+                crate::log::row(&trace.attributes(serde_json::json!({
                     "event": "gateway_upstream_retry",
-                    "request_id": request_id,
                     "provider": provider,
                     "attempt": attempt + 1,
                     "wait_ms": wait_ms,
+                    "stream": stream,
                     "code": e.to_wire().code,
-                }));
+                })));
                 attempt += 1;
-                sleep_for_retry(deadline, wait_ms).await;
+                let wait = Duration::from_millis(wait_ms)
+                    .min(deadline.saturating_duration_since(Instant::now()));
+                if !wait.is_zero() {
+                    trace.begin_backoff();
+                    tokio::time::sleep(wait).await;
+                    trace.end_backoff("completed");
+                }
                 if Instant::now() >= deadline {
                     return Err(e);
                 }
             }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-async fn stream_with_retry(
-    gw: &Arc<Gateway>,
-    snap: &crate::gateway::Snapshot,
-    provider: &str,
-    call: &Call,
-    deadline: Instant,
-) -> Result<OpenStream, CallError> {
-    let mut attempt = 0u32;
-    loop {
-        match gw.stream(snap, provider, call, deadline).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) if e.gateway_retryable() && attempt < MAX_UPSTREAM_RETRIES => {
-                let wait_ms = retry_backoff_ms(attempt, e.retry_after_ms());
-                crate::log::row(&serde_json::json!({
-                    "event": "gateway_upstream_retry",
-                    "request_id": call.request_id,
-                    "provider": provider,
-                    "attempt": attempt + 1,
-                    "wait_ms": wait_ms,
-                    "stream": true,
-                    "code": e.to_wire().code,
-                }));
-                attempt += 1;
-                sleep_for_retry(deadline, wait_ms).await;
-                if Instant::now() >= deadline {
-                    return Err(e);
-                }
-            }
-            Err(e) => return Err(e),
+            other => return other,
         }
     }
 }
@@ -420,7 +514,7 @@ fn ok(
     target: &Target,
     revision: &str,
     reply: crate::protocol::Reply,
-    hold: Option<Reservation>,
+    trace: &mut Exchange,
 ) -> Response<Body> {
     let bill = token_bill(
         reply.input_tokens,
@@ -433,7 +527,7 @@ fn ok(
         bill,
         &target.class,
         reply.charged,
-        hold.as_ref().map(Reservation::reservation_usd),
+        trace.reservation(),
     );
     log::line(&usage_line(
         (&reply.provider, reply.input_tokens, reply.output_tokens),
@@ -443,7 +537,7 @@ fn ok(
         revision,
         false,
     ));
-    settle(hold, &cost);
+    trace.settle(&target.provider, Some(bill), &cost, false, false);
     let stop = if reply.stop_reason.is_empty() {
         "end_turn".to_string()
     } else {
@@ -474,28 +568,24 @@ fn ok(
     )
 }
 
-/// Count an ok api call's `charged_usd` into today's spend; an unsettled hold is released on drop.
-fn settle(hold: Option<Reservation>, cost: &Cost) {
-    if let (Some(h), Some(charged)) = (hold, cost.charged_usd) {
-        h.settle(charged, cost.over_reservation);
-    }
-}
-
-struct PartialStreamBill {
-    hold: Reservation,
-    target: Target,
+struct PartialStreamBill<'a> {
+    target: &'a Target,
     meter: MeteredUsage,
     streamed_bytes: usize,
     est_input_tokens: i64,
-    provider: String,
-    request_id: String,
-    revision: String,
+    provider: &'a str,
+    request_id: &'a str,
+    revision: &'a str,
 }
 
 /// After streamed output, a faulted stream still owes priced tokens (list-price settlement capped by the
 /// admission estimate; a provider-reported charge above the hold is recorded in full with `over_reservation`).
-fn settle_partial_stream(bill: PartialStreamBill) {
-    let reservation = bill.hold.held_estimate();
+fn settle_partial_stream(
+    bill: &PartialStreamBill<'_>,
+    trace: &mut Exchange,
+    estimated: Option<f64>,
+) -> Cost {
+    let reservation = trace.reservation();
     let mut input = bill.meter.input_tokens;
     let mut output = bill.meter.output_tokens;
     if output == 0 && bill.streamed_bytes > 0 {
@@ -503,21 +593,27 @@ fn settle_partial_stream(bill: PartialStreamBill) {
             .unwrap_or(i64::MAX)
             .max(1);
     }
-    if input == 0 && bill.est_input_tokens > 0 {
+    if input == 0 && bill.meter.cache_read_tokens == 0 && bill.meter.cache_write_tokens == 0 {
         input = bill.est_input_tokens;
     }
-    let token_bill = token_bill(input, output, 0, 0);
-    let provider_charge = bill.meter.charged.filter(|c| c.is_finite() && *c >= 0.0);
+    let token_bill = token_bill(
+        input,
+        output,
+        bill.meter.cache_read_tokens,
+        bill.meter.cache_write_tokens,
+    );
+    let provider_charge = bill.meter.charged.filter(|c| c.is_finite() && *c > 0.0);
     let mut cost = wire::price_call(
         bill.target.rates,
         token_bill,
         &bill.target.class,
         provider_charge,
-        Some(reservation),
+        reservation,
     );
     let list = settle_usd(bill.target.rates, token_bill);
-    let wallet = match provider_charge {
-        Some(c) if c > 0.0 => c,
+    let wallet = match (provider_charge, estimated) {
+        (Some(c), _) if c > 0.0 => c,
+        (_, Some(reserve)) => reserve,
         _ => {
             let mut w = if list > 0.0 {
                 list
@@ -526,30 +622,33 @@ fn settle_partial_stream(bill: PartialStreamBill) {
             } else {
                 0.0
             };
-            w = w.min(reservation);
+            w = w.min(reservation.unwrap_or_default());
             w
         }
     };
-    if wallet <= 0.0 {
-        return;
-    }
-    let over = wallet > reservation + 1e-9;
+    let over = reservation.is_some_and(|held| wallet > held + 1e-9);
     cost.charged_usd = Some(wallet);
     cost.over_reservation = over;
     log::line(&usage_line(
-        (&bill.provider, input, output),
-        &bill.target,
+        (bill.provider, input, output),
+        bill.target,
         &cost.amount,
-        &bill.request_id,
-        &bill.revision,
+        bill.request_id,
+        bill.revision,
         true,
     ));
-    bill.hold.settle(wallet, over);
+    trace.settle(
+        &bill.target.provider,
+        Some(token_bill),
+        &cost,
+        true,
+        estimated.is_some(),
+    );
+    cost
 }
 
 struct StreamState {
-    stream: Option<OpenStream>,
-    hold: Option<Reservation>,
+    stream: Option<Box<OpenStream>>,
     family: &'static str,
     request_id: String,
     target: Target,
@@ -557,49 +656,71 @@ struct StreamState {
     est_input_tokens: i64,
     index: i64,
     streamed_bytes: usize,
-    client_saw_output: bool,
+    trace: Exchange,
 }
 
 impl StreamState {
-    fn maybe_settle_partial(&mut self, provider: &str) {
-        if !self.client_saw_output || self.target.class != "api" {
-            return;
+    fn maybe_settle_partial(&mut self, provider: &str, outcome: &str) -> Option<Cost> {
+        let meter = self.stream.as_ref()?.metered_usage();
+        let reported = meter
+            .charged
+            .is_some_and(|charge| charge.is_finite() && charge > 0.0);
+        let reservation = self.trace.aborted_reservation(outcome);
+        if !(reported || self.trace.saw_output() && self.trace.reservation().is_some()) {
+            return self.trace.settle_abort(outcome);
         }
-        let Some(stream) = self.stream.as_ref() else {
-            return;
-        };
-        let meter = stream.metered_usage();
-        let Some(hold) = self.hold.take() else {
-            return;
-        };
-        settle_partial_stream(PartialStreamBill {
-            hold,
-            target: self.target.clone(),
-            meter,
-            streamed_bytes: self.streamed_bytes,
-            est_input_tokens: self.est_input_tokens,
-            provider: provider.to_string(),
-            request_id: self.request_id.clone(),
-            revision: self.revision.clone(),
-        });
+        Some(settle_partial_stream(
+            &PartialStreamBill {
+                target: &self.target,
+                meter,
+                streamed_bytes: self.streamed_bytes,
+                est_input_tokens: self.est_input_tokens,
+                provider,
+                request_id: &self.request_id,
+                revision: &self.revision,
+            },
+            &mut self.trace,
+            reservation,
+        ))
+    }
+
+    async fn error_chunk(
+        &mut self,
+        provider: &str,
+        error: WireError,
+        outcome: &'static str,
+    ) -> Chunk {
+        let cost = self.maybe_settle_partial(provider, outcome);
+        self.trace.end_attempt(outcome);
+        let mut chunk = Chunk::error(self.family, &self.request_id, error);
+        if let Some(cost) = cost {
+            chunk.cost = Some(cost);
+        }
+        self.stream = None;
+        self.trace.finish(outcome, None);
+        self.trace.flush().await;
+        chunk
     }
 
     /// The next SSE frame; the upstream stream (and its permit) is dropped at the terminal chunk.
     async fn frame(&mut self) -> Option<String> {
         let stream = self.stream.as_mut()?;
-        let terminal = |s: &mut Self, chunk: Chunk| {
-            s.stream = None;
-            Some(chunk.frame())
-        };
         match stream.next().await {
             Ok(Some(Event::Delta(text))) => {
-                self.client_saw_output = !text.is_empty();
+                if !text.is_empty() {
+                    self.trace.output();
+                }
                 self.streamed_bytes += text.len();
                 let c = Chunk::delta(self.family, &self.request_id, self.index, text);
                 self.index += 1;
                 Some(c.frame())
             }
             Ok(Some(Event::Stop(stop))) => {
+                if !stop.tool_calls.is_empty() {
+                    self.trace.output();
+                }
+                self.stream = None;
+                self.trace.end_attempt("success");
                 let bill = token_bill(
                     stop.input_tokens,
                     stop.output_tokens,
@@ -611,7 +732,7 @@ impl StreamState {
                     bill,
                     &self.target.class,
                     stop.charged,
-                    self.hold.as_ref().map(Reservation::reservation_usd),
+                    self.trace.reservation(),
                 );
                 log::line(&usage_line(
                     (&stop.provider, stop.input_tokens, stop.output_tokens),
@@ -621,7 +742,8 @@ impl StreamState {
                     &self.revision,
                     false,
                 ));
-                settle(self.hold.take(), &cost);
+                self.trace
+                    .settle(&self.target.provider, Some(bill), &cost, false, false);
                 let mut c = Chunk::delta(self.family, &self.request_id, self.index, String::new());
                 c.kind = "stop";
                 c.stop_reason = stop.reason;
@@ -633,35 +755,47 @@ impl StreamState {
                     output_tokens: stop.output_tokens,
                 });
                 c.cost = Some(cost);
-                terminal(self, c)
+                self.trace.finish("completed", None);
+                self.trace.flush().await;
+                Some(c.frame())
             }
             Ok(Some(Event::UpstreamError(msg))) => {
                 let provider = self.target.provider.clone();
-                self.maybe_settle_partial(&provider);
                 let msg = if msg.is_empty() {
                     "upstream stream error".to_string()
                 } else {
                     msg
                 };
                 let e = WireError::runtime("gateway.upstream_error", &msg);
-                let c = Chunk::error(self.family, &self.request_id, e);
-                terminal(self, c)
+                Some(
+                    self.error_chunk(&provider, e, "upstream_error")
+                        .await
+                        .frame(),
+                )
             }
             Ok(None) => {
                 let provider = self.target.provider.clone();
-                self.maybe_settle_partial(&provider);
                 let e = WireError::runtime(
                     "gateway.transport_failed",
                     "upstream stream ended without a stop event",
                 );
-                let c = Chunk::error(self.family, &self.request_id, e);
-                terminal(self, c)
+                Some(self.error_chunk(&provider, e, "stream_fault").await.frame())
             }
             Err(e) => {
+                if e.is_connection_lost() {
+                    self.trace.connection_lost();
+                }
                 let provider = self.target.provider.clone();
-                self.maybe_settle_partial(&provider);
-                let c = Chunk::error(self.family, &self.request_id, CallError::to_wire(&e));
-                terminal(self, c)
+                let outcome = if e.is_deadline() {
+                    "deadline"
+                } else {
+                    "stream_fault"
+                };
+                Some(
+                    self.error_chunk(&provider, e.to_wire(), outcome)
+                        .await
+                        .frame(),
+                )
             }
         }
     }
@@ -669,35 +803,16 @@ impl StreamState {
 
 impl Drop for StreamState {
     fn drop(&mut self) {
-        if self.hold.is_none() {
-            return;
+        if self.stream.is_some() {
+            let provider = self.target.provider.clone();
+            let _ = self.maybe_settle_partial(&provider, "client_disconnect");
+            self.stream = None;
+            self.trace.finish("client_disconnect", None);
         }
-        let provider = self.target.provider.clone();
-        self.maybe_settle_partial(&provider);
     }
 }
 
-fn stream_response(
-    stream: OpenStream,
-    family: &'static str,
-    request_id: String,
-    target: Target,
-    revision: String,
-    hold: Option<Reservation>,
-    est_input_tokens: i64,
-) -> Response<Body> {
-    let state = StreamState {
-        stream: Some(stream),
-        hold,
-        family,
-        request_id,
-        target,
-        revision,
-        est_input_tokens,
-        index: 0,
-        streamed_bytes: 0,
-        client_saw_output: false,
-    };
+fn stream_response(state: StreamState) -> Response<Body> {
     let frames = futures_util::stream::unfold(state, |mut s| async move {
         let f = s.frame().await?;
         Some((Ok::<_, Infallible>(Frame::data(Bytes::from(f))), s))
@@ -715,19 +830,75 @@ fn stream_response(
 mod tests {
     use super::*;
     use crate::inventory::{ModelEntry, Observed};
+    use crate::spend::Guard;
+
+    #[tokio::test]
+    async fn settles_each_cost_class_with_and_without_a_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::{Value, json};
+
+        for class in ["api", "subscription", "free_local"] {
+            for reported in [None, Some(0.25)] {
+                let home = tempfile::tempdir()?;
+                let guard = Arc::new(Guard::new(Some(home.path())));
+                assert!(
+                    guard
+                        .replace(br#"{"sources":{"*":{"usd":1,"period":"day"}}}"#)
+                        .is_ok()
+                );
+                let hold = (class == "api")
+                    .then(|| guard.admit("vllm", "", 0.1))
+                    .transpose()?;
+                let request = serde_json::from_value(json!({"run_id": "billing"}))?;
+                let mut trace = Exchange::new(Some(home.path()), Stamp::now(), &request);
+                trace.billing(class);
+                trace.wallet(Arc::clone(&guard), hold);
+                let cost = Cost::priced("0.100000".into(), class, reported, reported.is_some());
+                trace.settle("vllm", Some(token_bill(3, 2, 0, 0)), &cost, false, false);
+                trace.finish("completed", None);
+                trace.flush().await;
+
+                let expected = reported.or((class == "api").then_some(0.1));
+                let budget = guard.report(["vllm".to_owned()]);
+                assert_eq!(
+                    budget["total"]["spent_usd"].as_f64(),
+                    expected.or(Some(0.0))
+                );
+                assert_eq!(budget["total"]["held_usd"], json!(0.0));
+                let rows = std::fs::read_to_string(
+                    home.path()
+                        .join(".contextstack/gateway/traces/billing.jsonl"),
+                )?;
+                let rows = rows
+                    .lines()
+                    .map(serde_json::from_str::<Value>)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let settlement = rows.iter().find(|row| row["kind"] == "settlement");
+                assert_eq!(
+                    settlement.and_then(|row| row["attributes"]["charged_usd"].as_f64()),
+                    expected
+                );
+                assert_eq!(
+                    settlement.and_then(|row| row["attributes"]["basis"].as_str()),
+                    reported.map(|_| "provider_reported"),
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn agent_debug_row_hides_message_text() {
+    fn agent_debug_row_hides_message_text() -> serde_json::Result<()> {
         let secret = "super-secret-prompt-text";
         let body = format!(r#"{{"messages":[{{"role":"user","content":"{secret}"}}]}}"#);
-        let raw: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&body)?;
         let row = agent_debug_row(&raw["messages"], body.as_bytes());
         let line = row.to_string();
         assert!(!line.contains(secret));
         assert!(line.contains("payload_sha256"));
         assert_eq!(row["message_count"], 1);
         assert_eq!(row["roles"], serde_json::json!(["user"]));
+        Ok(())
     }
 
     #[test]

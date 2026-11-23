@@ -385,7 +385,7 @@ pub fn release(store: &Store, db: &Connection) -> Res<usize> {
                     Place::Reserve(m) => m,
                     _ => 0,
                 };
-                offer(store, db, &job_id, &spec, trials, reserved)?;
+                offer_job(store, db, &job_id, &spec, trials, reserved)?;
                 touch_scopes(db, &scope)?;
                 offered += 1;
             }
@@ -395,7 +395,7 @@ pub fn release(store: &Store, db: &Connection) -> Res<usize> {
 }
 
 /// A waiting job is offered: its spec carries the amount reserved (none when its budget was removed meanwhile).
-fn offer(
+pub fn offer_job(
     store: &Store,
     db: &Connection,
     job_id: &str,

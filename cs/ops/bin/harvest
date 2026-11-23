@@ -29,13 +29,13 @@ if git_dir.is_symlink():
     sys.exit("host harvest repository must not be a symlink")
 if not git_dir.exists():
     initialize(ws)
-branch = "lab/%s-%s" % (slug, run_id)
+branch = "cs/%s-%s" % (slug, run_id)
 base = git(ws, "rev-parse", "--verify", "HEAD")
 if base.returncode == 0:
     checked(ws, "update-ref", "refs/heads/" + branch, base.stdout.strip())
 checked(ws, "symbolic-ref", "HEAD", "refs/heads/" + branch)
 checked(ws, "add", "-A", "--", ".", ":(exclude).git", ":(exclude)**/.git",
-        ":(exclude).lab-*", ":(exclude).lab-*/**", ":(exclude)**/.lab-*", ":(exclude)**/.lab-*/**")
-checked(ws, "-c", "user.name=lab", "-c", "user.email=lab@local", "commit",
-        "--no-verify", "--allow-empty", "-m", "lab: %s (%s)" % (slug, run_id))
+        ":(exclude).cs-*", ":(exclude).cs-*/**", ":(exclude)**/.cs-*", ":(exclude)**/.cs-*/**")
+checked(ws, "-c", "user.name=ContextStack", "-c", "user.email=cs@local", "commit",
+        "--no-verify", "--allow-empty", "-m", "cs: %s (%s)" % (slug, run_id))
 print(json.dumps({"ok": True, "branch": branch, "git_dir": str(git_dir)}))

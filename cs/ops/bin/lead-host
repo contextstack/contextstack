@@ -15,7 +15,7 @@ sys.path.insert(0, str(HERE))
 from _lead_host import client_turn, fail, resolve_conversation_id, serve_loop  # noqa: E402
 from _roots import roots  # noqa: E402
 
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 
 
 def main(argv=None) -> int:
@@ -34,7 +34,7 @@ def main(argv=None) -> int:
     turn.add_argument("--no-sandbox", action="store_true")
     turn.add_argument("--timeout", type=float, default=120)
     args = ap.parse_args(argv)
-    r = roots(LAB, os.environ)
+    r = roots(CODE_ROOT, os.environ)
     config_root, state = r["config"], r["state"]
     sandbox = not args.no_sandbox
     if args.cmd == "serve":

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Reject names from the retired experiment in product source."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_lib"))
+from hermetic_env import hermetic_env  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[3]
+SCOPES = (
+    "gateway/src", "director/src", "harness/src", "sandbox/src", "tools/src",
+    "cs/ops", "cs/scripts", "cs/agents", "cs/lead", "cs/policy", "scripts",
+)
+NAME = re.compile(r"(?<![^\W_])lab(?=[_-]|\b)", re.IGNORECASE)
+
+
+def main():
+    allowed = set()
+    for record in (HERE / "historical.tsv").read_text().splitlines():
+        path, line, reason = record.split("\t")
+        if not reason.strip():
+            raise ValueError(f"Historical exception needs a reason: {path}")
+        allowed.add((path, line))
+    files = subprocess.check_output(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *SCOPES],
+        cwd=ROOT,
+        env={**hermetic_env(), "GIT_CONFIG_GLOBAL": os.devnull},
+    )
+    failed = False
+    for name in sorted(set(filter(None, files.decode().split("\0")))):
+        try:
+            lines = (ROOT / name).read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            continue  # A tracked file deleted in the worktree.
+        except OSError as exc:
+            print(f"{name}: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        for number, line in enumerate(lines, 1):
+            if not NAME.search(line):
+                continue
+            entry = (name, line)
+            if entry in allowed:
+                allowed.remove(entry)
+                continue
+            print(f"{name}:{number}: {line.strip()}", file=sys.stderr)
+            failed = True
+    return int(failed)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,2 +1,6 @@
 #!/usr/bin/env python3
-exec(compile(open("CHECK.py", encoding="utf-8").read(), "CHECK.py", "exec"))
+import runpy
+from pathlib import Path
+
+fixture = Path(__file__).resolve().parent
+runpy.run_path(str(fixture / "setup/CHECK.py"), run_name="__main__")

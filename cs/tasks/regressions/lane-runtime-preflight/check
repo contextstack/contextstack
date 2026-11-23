@@ -10,8 +10,8 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = Path(__file__).resolve().parents[3]
-PREFLIGHT = LAB / "ops/bin/setup-preflight"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+PREFLIGHT = CODE_ROOT / "ops/bin/setup-preflight"
 
 
 def git(cwd, *args):
@@ -34,13 +34,13 @@ with scratch_dir(prefix="lane-runtime-preflight-") as raw:
     (prepared / "CORPUS.md").write_text("fixture\n")
     git(prepared, "add", "CORPUS.md")
     git(prepared, "commit", "-qm", "base")
-    git(prepared, "update-ref", "refs/lab/base", "HEAD")
+    git(prepared, "update-ref", "refs/cs/base", "HEAD")
     head = git(prepared, "rev-parse", "HEAD").stdout.strip()
     (task / "setup").symlink_to(prepared)
     cache = root / "ms-playwright"
     cache.mkdir()
     browse = root / "missing-browse"
-    env = {**hermetic_env(), "PLAYWRIGHT_BROWSERS_PATH": str(cache), "LAB_BROWSE": str(browse),
+    env = {**hermetic_env(), "PLAYWRIGHT_BROWSERS_PATH": str(cache), "CS_BROWSE": str(browse),
            "PATH": "/usr/bin:/bin"}
     result = subprocess.run(
         [str(PREFLIGHT)],

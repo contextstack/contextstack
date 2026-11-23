@@ -104,7 +104,11 @@ pub(super) fn toolchain_rules(request: &ExecutorRequest) -> Result<Vec<String>, 
         return Ok(rules);
     };
     let home = crate::sbpl::resolve(&request.home)?;
-    for root in &toolchains.read_roots {
+    for root in toolchains
+        .read_roots
+        .iter()
+        .chain(&toolchains.uv_cache_roots)
+    {
         rules.push(rule(
             "deny",
             "file-write*",

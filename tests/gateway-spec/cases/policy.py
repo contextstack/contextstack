@@ -150,6 +150,21 @@ def cross_host_redirect_refused(t):
         del t.vllm.routes[("POST", "/v1/moved")]
 
 
+@case("policy")
+def paid_post_follows_same_host_redirect(t):
+    """Tracking the paid POST body preserves safe redirects and the final settlement."""
+    t.vllm.chat["fake-paid"] = {"redirect": "/v1/moved", "status": 307}
+    t.vllm.routes[("POST", "/v1/moved")] = {"json": upstreams.chat_completion(text="moved", cost=0.0042)}
+    try:
+        b = t.gw.call(model_call("fake-paid")).json
+        sub(b, {"status": "ok", "message": {"content": "moved"}, "cost": {"charged_usd": 0.0042}}, "paid redirect")
+        original, redirected = [call["raw"] for call in t.vllm.requests.items
+                                if call["method"] == "POST"]
+        eq(original, redirected, "same POST body after redirect")
+    finally:
+        del t.vllm.routes[("POST", "/v1/moved")]
+
+
 def offline(t, gw, state):
     sub(catalog(gw)["policy"], {"state": state}, "policy state")
     eq(gw.call(model_call("local-coder")).json["status"], "ok", state + ": loopback serves")

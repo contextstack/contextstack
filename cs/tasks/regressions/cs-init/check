@@ -27,7 +27,7 @@ sys.path.insert(0, str(HERE.parent / "_lib"))
 from scratch import scratch_dir
 from hermetic_env import hermetic_env
 
-LAB = _bundle.LAB
+CODE_ROOT = _bundle.CODE_ROOT
 RID = "20990101-csinit000"
 REAL = {"cs-harness": "cs-harness", "cs-sandbox": "cs-sandbox", "cs-tools": "cs-tools", "cs-gateway": "cs-gateway",
         "cs-director": "cs-director"}
@@ -103,7 +103,7 @@ def start(path):
     env = {k: str(v).replace("127.0.0.1:9200", "127.0.0.1:" + port) for k, v in d["EnvironmentVariables"].items()}
     if env.get("CSGATEWAY_PORT") == "9200":
         env["CSGATEWAY_PORT"] = port
-    env.update(HOME=os.environ["HOME"], CSGATEWAY_LAB_ENDPOINT="http://127.0.0.1:%%s/v1/ai/lab-execute" %% port)
+    env.update(HOME=os.environ["HOME"], CSGATEWAY_CLI_ENDPOINT="http://127.0.0.1:%%s/v1/agent/cli.run" %% port)
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "NO_PROXY", "no_proxy"):
         if k in os.environ:
             env[k] = os.environ[k]
@@ -387,7 +387,7 @@ def _on_sigterm(signum, _frame):
 
 
 def test_agent_probes():
-    spec = importlib.util.spec_from_file_location("cs_init_fixture", LAB / "scripts/cs_init.py")
+    spec = importlib.util.spec_from_file_location("cs_init_fixture", CODE_ROOT / "scripts/cs_init.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     with scratch_dir(prefix="cs-init-agents-") as raw:
@@ -443,7 +443,7 @@ def test_agent_probes():
 
 
 def test_failed_first_job_ending():
-    sys.path.insert(0, str(LAB / "scripts"))
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
     import cs_init
     init = cs_init.Init.__new__(cs_init.Init)
     init.args = SimpleNamespace(no_first_job=False, first_job=False, no_open=True, yes=True, timeout=1)
@@ -465,7 +465,7 @@ def test_failed_first_job_ending():
 
 
 def test_machine_name_refusal():
-    sys.path.insert(0, str(LAB / "scripts"))
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
     import cs_init
     with scratch_dir(prefix="cs-init-name-") as raw:
         root = Path(raw)
@@ -492,7 +492,7 @@ def test_machine_name_refusal():
 
 
 def test_login_and_fallback():
-    spec = importlib.util.spec_from_file_location("cs_init_login", LAB / "scripts/cs_init.py")
+    spec = importlib.util.spec_from_file_location("cs_init_login", CODE_ROOT / "scripts/cs_init.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     with scratch_dir(prefix="cs-init-login-") as raw:
@@ -567,13 +567,14 @@ def test_activation_output():
     import io
     import contextlib
     import importlib.machinery
-    loader = importlib.machinery.SourceFileLoader("node_release_progress", str(LAB / "scripts/node-release"))
+    loader = importlib.machinery.SourceFileLoader("node_release_progress", str(CODE_ROOT / "scripts/node-release"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     release = importlib.util.module_from_spec(spec)
     loader.exec_module(release)
     record = {"ok": True, "plists": {"fixture": {"launchd": "loaded"}}, "director_rs": {}, "node": True}
     record["director_rs"] = {"url": "http://fixture"}
     release.activate = lambda *a: record
+    release.install_lock = lambda command: contextlib.nullcontext()
     class Output(io.StringIO):
         def isatty(self):
             return self.tty
@@ -596,7 +597,7 @@ def test_activation_output():
 
 
 def test_progress_retry():
-    spec = importlib.util.spec_from_file_location("cs_init_progress", LAB / "scripts/cs_init.py")
+    spec = importlib.util.spec_from_file_location("cs_init_progress", CODE_ROOT / "scripts/cs_init.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     init = module.Init.__new__(module.Init)
@@ -641,7 +642,7 @@ def test_progress_retry():
 
 
 def test_api_keys():
-    spec = importlib.util.spec_from_file_location("cs_init_keys", LAB / "scripts/cs_init.py")
+    spec = importlib.util.spec_from_file_location("cs_init_keys", CODE_ROOT / "scripts/cs_init.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     init = module.Init.__new__(module.Init)
@@ -704,7 +705,7 @@ def test_api_keys():
 
 def test_browser_handoff():
     from unittest.mock import patch
-    sys.path.insert(0, str(LAB / "scripts"))
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
     import cs_init
     import cs_ui
     with scratch_dir(prefix="cs-init-test-") as tmp:
@@ -789,7 +790,7 @@ def test_browser_handoff():
 
 def test_quiet_details():
     from unittest.mock import patch
-    sys.path.insert(0, str(LAB / "scripts"))
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
     import cs_init
     import cs_ui
     init = cs_init.Init.__new__(cs_init.Init)
@@ -828,7 +829,7 @@ def test_quiet_details():
         init.listen = "127.0.0.1:8780"
         init.cs.CURRENT = Path(tmp) / "current"
         init.cs.CURRENT.symlink_to("release")
-        init.cs.KIT = LAB
+        init.cs.KIT = CODE_ROOT
         init.cs.read_body = json.loads
         init.run = lambda *args: SimpleNamespace(returncode=0, stdout=json.dumps(
             {"ok": True, "plists": {"fixture-service": {"launchd": "loaded"}}}))
@@ -850,7 +851,7 @@ def test_quiet_details():
 def test_welcome_completion():
     from unittest.mock import patch
     import io
-    sys.path.insert(0, str(LAB / "scripts"))
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
     import cs_init
     with scratch_dir(prefix="cs-welcome-test-") as tmp:
         data = Path(tmp)
@@ -931,9 +932,8 @@ def test_toolchains():
         env = hermetic_env()
         env.update(HOME=str(home), SHELL=str(shell), CS_SERVICE_PATH="/usr/bin:/bin")
         (home / ".contextstack/current/code/.venv/bin").mkdir(parents=True, exist_ok=True)
-        sys.path.insert(0, str(LAB / "scripts"))
-        import cs_init
-        lookup = ";".join("command -v %s" % name for name in cs_init.TOOLCHAIN_BINARIES)
+        sys.path.insert(0, str(CODE_ROOT / "ops/bin"))
+        from _toolchains import LOGIN_LOOKUP
         program = (
             "def _write_atomic(path, data, mode):\n from pathlib import Path\n path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)\n path.write_bytes(data); path.chmod(mode)\n"
             "import sys; from pathlib import Path; from types import SimpleNamespace; "
@@ -946,11 +946,11 @@ def test_toolchains():
             "lines = []; init.say = lines.append; "
             "init.detail = (lambda line: lines.append(line)) if ('--verbose' in sys.argv) else (lambda line: None); "
             "init.step_toolchains(); print('\\n'.join(lines))"
-        ) % (str(LAB / "scripts"),)
+        ) % (str(CODE_ROOT / "scripts"),)
 
         def detect(paths, verbose=False):
-            shell.write_text("#!%s\nimport sys\nassert sys.argv[1:] == ['-lic', %r]\nprint(%r, end='')"
-                             % (sys.executable, lookup, "".join(str(p) + "\n" for p in paths)))
+            shell.write_text("#!%s\nimport sys\nassert sys.argv[1:] == ['-lc', %r]\nprint(%r, end='')"
+                             % (sys.executable, LOGIN_LOOKUP, "".join(str(p) + "\n" for p in paths)))
             shell.chmod(0o755)
             result = subprocess.run([sys.executable, "-c", program, *(["--verbose"] if verbose else [])],
                                     env=env, capture_output=True, text=True, timeout=15)
@@ -997,7 +997,7 @@ def main():
     test_quiet_details()
     test_browser_handoff()
     test_welcome_completion()
-    target = LAB.parent / "target/release"
+    target = CODE_ROOT.parent / "target/release"
     missing = [f for f in REAL.values() if not os.access(target / f, os.X_OK)]
     if missing:
         print("SKIP cs-init: not built: %s (cargo build --release -p cs-harness -p cs-sandbox -p cs-tools -p cs-gateway "
@@ -1031,13 +1031,16 @@ def main():
         _bundle.bundle(tmp / "bundle", uv, RID, {name: target / f for name, f in REAL.items()})
         _bundle.seed_python(home, RID, managed)
         port, gw_port = free_port(), free_port()
+        shell = shims / "fixture-shell"
+        shell.write_text("#!%s\n" % sys.executable)
+        shell.chmod(0o755)
         env = _bundle.dead_network_env(
-            home, PATH="%s:/usr/bin:/bin:/usr/sbin:/sbin" % shims, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home,
+            home, SHELL=str(shell), PATH="%s:/usr/bin:/bin:/usr/sbin:/sbin" % shims, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home,
             NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost", LAUNCHD_EMU=str(emu), EMU_GW_PORT=str(gw_port),
             CS_AGENT_PATH="%s/.local/bin:/usr/bin:/bin" % home, CS_PLATFORM="macos")
-        env.pop("LAB_STATE_ROOT", None)
+        env.pop("CS_STATE_ROOT", None)
         env.pop("CSGATEWAY_ENDPOINT", None)
-        r = subprocess.run(["sh", str(LAB / "scripts/node-install"), "install", str(tmp / "bundle")], env=env, cwd="/",
+        r = subprocess.run(["sh", str(CODE_ROOT / "scripts/node-install"), "install", str(tmp / "bundle")], env=env, cwd="/",
                            capture_output=True, text=True)
         expect(r.returncode == 0, "node-install install BUNDLE (no options): %s" % (r.stderr[-400:] if r.returncode else "ok"))
         root, cs = home / ".contextstack", home / ".local/bin/cs"

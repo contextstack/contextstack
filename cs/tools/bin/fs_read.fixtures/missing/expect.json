@@ -1,8 +1,8 @@
 {
   "exit": 1,
-  "stdout": "not a file: nope.txt\n",
+  "stdout": "not a file: nope.txt (path does not exist). Use a path relative to the workspace.\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"path\": \"nope.txt\"}, \"name\": \"fs_read\"}\n"
+    ".cs-calls.jsonl": "{\"args\": {\"path\": \"nope.txt\"}, \"name\": \"fs_read\"}\n"
   },
   "untouched": true
 }

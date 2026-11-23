@@ -4,7 +4,8 @@ __pycache__/
 .DS_Store
 
 # Lane and run scratch
-.lab-tmp/
+.cs-tmp/
+.cs-out/
 .task-tmp/
 .tmp-*/
 
@@ -25,3 +26,6 @@ __pycache__/
 
 # Lane agents sometimes leave check logs at the repo root: never commit them
 /*.log
+
+# tool call logs written by test runs
+**/.cs-calls.jsonl

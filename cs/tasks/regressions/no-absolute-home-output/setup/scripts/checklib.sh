@@ -78,13 +78,13 @@ fi
 # while modified, staged, and generated files are scanned.
 if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ]; then
   task_setup=
-  if [ -n "${LAB_CHECK:-}" ]; then
-    task_setup=$(dirname "$LAB_CHECK")/setup
+  if [ -n "${CS_CHECK:-}" ]; then
+    task_setup=$(dirname "$CS_CHECK")/setup
   fi
   home_hits=$(
     find . -type f \
       ! -path './.git/*' ! -path '*/vendor/*' ! -path '*/node_modules/*' \
-      ! -path '*/.lab-tmp/*' ! -name '.lab-*' -print 2>/dev/null \
+      ! -path '*/.cs-tmp/*' ! -name '.cs-*' -print 2>/dev/null \
     | while IFS= read -r candidate; do
         relative=${candidate#./}
         if [ -n "$task_setup" ] && [ -f "$task_setup/$relative" ] \
@@ -107,7 +107,7 @@ fi
 # Escaped-entity class: literal \u003c in product files (dest-unsafe);
 # &#039; as a test needle (cousin).
 if grep -R --include='*.php' --include='*.blade.php' --include='*.js' --include='*.vue' \
-     --exclude-dir=vendor --exclude-dir=node_modules --exclude-dir=.lab-tmp --exclude-dir=.git \
+     --exclude-dir=vendor --exclude-dir=node_modules --exclude-dir=.cs-tmp --exclude-dir=.git \
      -F '\u003c' . 2>/dev/null | grep -q .; then
   echo "check: literal \\\\u003c is banned — write real HTML tags"
   exit 1

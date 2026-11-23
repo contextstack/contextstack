@@ -24,8 +24,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "node-install-layout"))
 import _bundle  # noqa: E402
 
-LAB = _bundle.LAB
-sys.path.insert(0, str(LAB / "scripts"))
+CODE_ROOT = _bundle.CODE_ROOT
+sys.path.insert(0, str(CODE_ROOT / "scripts"))
 from check_timeout import timeout as check_timeout
 A, B = "20990101-aaaaaaaaa", "20990102-bbbbbbbbb"
 TOKEN = "tok-SECRETnode-7f3a9c"              # config/node.env
@@ -73,6 +73,7 @@ sys.stdout.write("\n000"); sys.exit(7)
     "ssh": r'''
 sys.exit(int(open(os.path.join(S, "ssh_rc")).read()) if os.path.exists(os.path.join(S, "ssh_rc")) else 255)
 ''',
+    "fixture-shell": "sys.exit(0)",
     "fdesetup": r'''
 f = os.path.join(S, "fdesetup.txt")
 sys.stdout.write(open(f).read() if os.path.exists(f) else "FileVault is On.\n")
@@ -91,6 +92,7 @@ def write_shims(shim):
 
 def cs(home, shim, *args, platform=None, timeout=120):
     env = _bundle.dead_network_env(home, PATH="%s:%s" % (shim / "bin", os.environ.get("PATH", "/usr/bin:/bin")))
+    env["SHELL"] = str(shim / "bin/fixture-shell")
     env.pop("CS_PLATFORM", None)
     if platform:
         env["CS_PLATFORM"] = platform
@@ -182,7 +184,7 @@ def part_install(tmp, uv, managed):
     _bundle.seed_python(home, B, managed)
     env = _bundle.dead_network_env(home, NODE_INSTALL_USER_PATH="%s/.local/bin:/usr/bin:/bin" % home)
     for bundle, extra in (("bundle-a", ["--node", "test-node", "--director", "http://127.0.0.1:9"]), ("bundle-b", [])):
-        r = subprocess.run(["sh", str(LAB / "scripts/node-install"), "install", str(tmp / bundle), *extra, "--no-load"],
+        r = subprocess.run(["sh", str(CODE_ROOT / "scripts/node-install"), "install", str(tmp / bundle), *extra, "--no-load"],
                            capture_output=True, text=True, env=env, cwd="/")
         if r.returncode != 0:
             return fail("node-install install %s: %s %s" % (bundle, r.stdout[-600:], r.stderr[-600:]))
@@ -346,7 +348,7 @@ def part_install(tmp, uv, managed):
     node_plist.write_bytes(plistlib.dumps(p))
     (root / "state").chmod(0o755)
     (root / "workspaces").rmdir()
-    link = home / ".local/bin/cs"  # the runner's PATH command (cs-go / cs-harness); `lab` is retired
+    link = home / ".local/bin/cs"  # the runner's PATH command (cs-go / cs-harness); `code_root` is retired
     link.unlink()
     os.symlink(str(root / "releases/20990000-gone/bin/cs-go"), link)
     r, f = doctor(home, shim)
@@ -365,7 +367,7 @@ def part_install(tmp, uv, managed):
     node_plist = home / "Library/LaunchAgents" / (NODE + ".plist")
     original = node_plist.read_bytes()
     data = plistlib.loads(original)
-    data.setdefault("EnvironmentVariables", {})["LAB_STATE_ROOT"] = str(state)
+    data.setdefault("EnvironmentVariables", {})["CS_STATE_ROOT"] = str(state)
     node_plist.write_bytes(plistlib.dumps(data))
     def row(model, stop, age=60, **extra):
         return dict(ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age)),
@@ -543,7 +545,7 @@ def part_ui(home, root, shim):
     plist_path = home / "Library/LaunchAgents" / "com.contextstack.director-rs.plist"
     try:
         kit_scripts = root / "current/cs/scripts"
-        src = LAB / "scripts/cs_ui.py"
+        src = CODE_ROOT / "scripts/cs_ui.py"
         if src.is_file() and kit_scripts.is_dir() and not (kit_scripts / "cs_ui.py").is_file():
             shutil.copy2(src, kit_scripts / "cs_ui.py")
         r = cs(home, shim, "ui", "--print")
@@ -626,7 +628,7 @@ def part_ui(home, root, shim):
                 p.unlink()
 
 
-CS_SCRIPT = LAB / "scripts/cs"
+CS_SCRIPT = CODE_ROOT / "scripts/cs"
 
 
 def part_init_agent():
@@ -642,7 +644,7 @@ def part_init_agent():
         loader.exec_module(mod)
         return mod
 
-    init = load("cs_init_check", LAB / "scripts/cs_init.py")
+    init = load("cs_init_check", CODE_ROOT / "scripts/cs_init.py")
     cs_mod = load("cs_check_mod", CS_SCRIPT)
     cs_mod.node_env = lambda: {}
     cs_mod.client_web_env = lambda: {}
@@ -704,7 +706,37 @@ def part_init_agent():
         expect(run("--agent", n)[0] == 0 and seen[-1] == n, "init --agent %s is accepted" % n)
 
 
+def part_device():
+    with scratch_dir(prefix="cs-device-") as tmp:
+        home = Path(tmp)
+        root = home / ".contextstack"
+        release = root / "releases/fixture"
+        (release / "bin").mkdir(parents=True)
+        (root / "current").symlink_to("releases/fixture")
+        binary = release / "bin/cs-director"
+        binary.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        binary.chmod(0o755)
+
+        custom = home / "custom director data"
+        agents = home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "com.contextstack.director-rs.plist").write_bytes(plistlib.dumps({
+            "ProgramArguments": [str(binary), "serve", "--data-dir", str(custom)],
+        }))
+
+        cases = [(("list",), ["credential", "list"]),
+                 (("pair", "tablet"), ["pair", "tablet"]),
+                 (("revoke", "cred_fixture"), ["credential", "revoke", "cred_fixture"])]
+        for args, command in cases:
+            result = cs(home, home, "device", *args)
+            expect(result.returncode == 0 and json.loads(result.stdout) == command + ["--data-dir", str(custom)],
+                   "cs device %s delegates to the installed Director with its data directory" % args[0])
+        result = cs(home, home, "device", "pair")
+        expect(result.returncode == 2, "cs device pair requires a name")
+
+
 def main():
+    part_device()
     part_init_agent()
     uv, managed = _bundle.host_python()
     if uv is None:
@@ -712,14 +744,14 @@ def main():
         return 1 if problems else 0
     real = Path.home()
     watched = [real / ".local/bin", real / "Library/LaunchAgents"]
-    before = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    before = [_bundle.directory_snapshot(w) for w in watched]
     agents = _bundle.real_agents()
     tmp = Path(tempfile.mkdtemp(prefix="cs-cli-", suffix=".noindex"))
     try:
         part_install(tmp, uv, managed)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    after = [sorted(os.listdir(w)) if w.is_dir() else None for w in watched]
+    after = [_bundle.directory_snapshot(w) for w in watched]
     expect(before == after, "the real ~/.local/bin and ~/Library/LaunchAgents are unchanged")
     leak = _bundle.launchd_untouched(agents)
     expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")

@@ -18,15 +18,15 @@ import _lead_host as lead
 def check():
     with tempfile.TemporaryDirectory(dir=ROOT / 'target', prefix='native-switch-') as raw:
         root = Path(raw)
-        lab = root / 'cs'
-        lab.mkdir()
+        code_root = root / 'cs'
+        code_root.mkdir()
         binary = root / 'bin/cs-sandbox'
         binary.parent.mkdir()
         binary.write_bytes(b'fixture')
-        assert io.native_sandbox_binary(lab, env={}) == binary
-        assert io.native_sandbox_binary(lab, env={'CS_SANDBOX_BIN': '/missing'}) == Path('/missing')
+        assert io.native_sandbox_binary(code_root, env={}) == binary
+        assert io.native_sandbox_binary(code_root, env={'CS_SANDBOX_BIN': '/missing'}) == Path('/missing')
         binary.unlink()
-        assert io.native_sandbox_binary(lab, env={}) == root / 'target/release/cs-sandbox'
+        assert io.native_sandbox_binary(code_root, env={}) == root / 'target/release/cs-sandbox'
         import _toolchains
         with patch.object(_toolchains, 'discover', return_value=()), \
                 patch.object(_toolchains, 'discover_sandbox_links', return_value=()), \
@@ -101,9 +101,9 @@ def check():
         # Every switched caller sends the host inputs and unresolved symlink paths.
         captured = []
         labs = []
-        def capture(lab, policy, body):
+        def capture(code_root, policy, body):
             captured.append(dict(body))
-            labs.append(lab)
+            labs.append(code_root)
             return b'(version 1)\n'
         original_is_file = Path.is_file
         def fixture_is_file(path):
@@ -131,7 +131,7 @@ def check():
             spec.loader.exec_module(frozen)
             frozen.sandbox_command([str(link)], ws, home)
         assert len(captured) == 5
-        assert all(lab == io.sandbox_runtime_lab() for lab in labs), 'frozen Muse located a different runtime'
+        assert all(code_root == io.sandbox_runtime_code_root() for code_root in labs), 'frozen Muse located a different runtime'
         for body in captured:
             assert body['executable'] == str(link)
             assert body['lookup_path'] == [str(link.parent)]

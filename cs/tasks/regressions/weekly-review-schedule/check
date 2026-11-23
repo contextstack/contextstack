@@ -5,7 +5,7 @@ A delivery that keeps failing is held after repeated_failure's threshold (defaul
 forever. A success on the dispatch shelf resets that streak.
 
 Fake clock via schedule-tick's `now`. Temp state root only. Run with
-`env -u LAB_STATE_ROOT -u CSGATEWAY_ENDPOINT`.
+`env -u CS_STATE_ROOT -u CSGATEWAY_ENDPOINT`.
 """
 import json
 import os

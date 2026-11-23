@@ -11,10 +11,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
-# refusing live lab root as a write target: planted files stay in
+CODE_ROOT = Path(__file__).resolve().parents[3]
+# refusing live code_root root as a write target: planted files stay in
 # TemporaryDirectory. The live-tree scan only reads git ls-files / porcelain.
-CLASSIFY = LAB / "scripts/estate_classify.py"
+CLASSIFY = CODE_ROOT / "scripts/estate_classify.py"
 assert CLASSIFY.is_file()
 
 spec = importlib.util.spec_from_file_location("estate_classify", CLASSIFY)
@@ -47,8 +47,8 @@ PLANTED = (
     ("tasks/regressions/example/notes.md", "rules"),
     (".gitignore", "rules"),
     ("INVARIANTS.md", "rules"),
-    ("internal/lab/example.go", "rules"),
-    ("cmd/lab/example.go", "rules"),
+    ("internal/code_root/example.go", "rules"),
+    ("cmd/code_root/example.go", "rules"),
 )
 
 with scratch_dir(prefix="estate-classify-") as raw:
@@ -61,9 +61,6 @@ with scratch_dir(prefix="estate-classify-") as raw:
         assert got == expected, f"{rel}: want {expected}, got {got}"
         assert got in ("facts", "rules"), f"{rel} third bucket: {got}"
         assert mod.is_rules(rel) == (expected == "rules"), rel
-        if hasattr(mod, "skip_auto"):
-            skipped = rel.endswith(".go") or rel.startswith(("internal/", "cmd/"))
-            assert bool(mod.skip_auto(rel)) == skipped, rel
 
 # Receipt provenance is exact and estate-scoped, including archived local cells.
 with scratch_dir(prefix="estate-receipts-") as raw:
@@ -150,10 +147,10 @@ with scratch_dir(prefix="estate-session-archives-") as raw:
     assert "specs/archive/" + names[3] not in mod.receipted_paths(root), "archive symlink was accepted"
 
 # Live tree: tracked + porcelain (git status never lists ignored files).
-tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=LAB).split(b"\0")
+tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=CODE_ROOT).split(b"\0")
 tracked = [p.decode("utf-8", errors="surrogateescape") for p in tracked if p]
 porcelain = subprocess.check_output(
-    ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=LAB,
+    ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=CODE_ROOT,
 )
 found = []
 tokens = porcelain.split(b"\0")

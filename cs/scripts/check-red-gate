@@ -26,8 +26,8 @@ _spec.loader.exec_module(_mod)
 is_rules = _mod.is_rules
 
 def root():
-    # lab may be its own repo or a subfolder of one; git runs from here and
-    # --relative keeps paths lab-relative and drops paths outside lab.
+    # the code root may be its own repo or a subfolder of one; git runs from here and
+    # --relative keeps paths code-root-relative and drops paths outside the code root.
     return _HERE.parent
 
 
@@ -73,16 +73,16 @@ def names_family(message, family):
     return needle[:24] in text or needle in text
 
 
-def append_event(lab, row):
+def append_event(code_root, row):
     sys.path.insert(0, str(_HERE.parent / "ops/bin"))
     from _estate_io import state_dir
-    path = Path(os.environ.get("LAB_ESTATE_ALERTS") or state_dir(lab) / "estate-commit.jsonl")
-    if not os.environ.get("LAB_ESTATE_ALERTS") and not os.environ.get("LAB_STATE_ROOT") and not path.parent.is_dir():  # never recreate <lab>/ledger
-        raise SystemExit("check-red-gate: no state root: lab/ledger has left this checkout and LAB_STATE_ROOT is not set. Record check-red rows where the estate lives: LAB_CONFIG_ROOT=$HOME/.contextstack/config LAB_STATE_ROOT=$HOME/.contextstack/state")
+    path = Path(os.environ.get("CS_ESTATE_ALERTS") or state_dir(code_root) / "check-red.jsonl")
+    if not os.environ.get("CS_ESTATE_ALERTS") and not os.environ.get("CS_STATE_ROOT") and not path.parent.is_dir():  # never recreate <code-root>/ledger
+        raise SystemExit("check-red-gate: no state root: cs/ledger has left this checkout and CS_STATE_ROOT is not set. Record check-red rows where the estate lives: CS_CONFIG_ROOT=$HOME/.contextstack/config CS_STATE_ROOT=$HOME/.contextstack/state")
     path.parent.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(_HERE.parent / "ops/bin"))
     from _estate_io import estate_dir
-    if (estate_dir(lab) / "ESTATE").exists() or (lab / "ledger/estate-cutover.json").exists():
+    if (estate_dir(code_root) / "ESTATE").exists() or (code_root / "ledger/estate-cutover.json").exists():
         from _estate_io import estate_row
         row = estate_row(path, row)
     with path.open("a", encoding="utf-8") as dest:

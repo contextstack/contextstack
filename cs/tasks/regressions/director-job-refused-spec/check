@@ -17,12 +17,12 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parents[2]
-sys.path.insert(0, str(LAB / "tasks/regressions/estate-split"))
-sys.path.insert(0, str(LAB / "tasks/regressions/runner-characterisation-v2"))
+CODE_ROOT = HERE.parents[2]
+sys.path.insert(0, str(CODE_ROOT / "tasks/regressions/estate-split"))
+sys.path.insert(0, str(CODE_ROOT / "tasks/regressions/runner-characterisation-v2"))
 from _fake_director import FakeDirector  # noqa: E402
 from _fake_gateway import FakeGateway  # noqa: E402
-sys.path.append(str(LAB / "ops/bin"))
+sys.path.append(str(CODE_ROOT / "ops/bin"))
 from _runner import built_runner  # noqa: E402
 
 FAILED = []
@@ -57,16 +57,15 @@ def main():
         node, state = scratch / "node", scratch / "state"
         for d in ("ops/bin", "policy", "tools/bin", "hooks/bin", "scripts", "home", "tmp"):
             (node / d).mkdir(parents=True, exist_ok=True)
-        for p in (LAB / "ops/bin").iterdir():
+        for p in (CODE_ROOT / "ops/bin").iterdir():
             if p.is_file():
                 shutil.copy2(p, node / "ops/bin" / p.name)
-        # Admission probes the local model through the real gateway; this case is about a refused spec, not the
-        # DGX, so the probe is stubbed ready (a fake HOME and a scrubbed environment can never reach the gateway).
+        # The Director offer must reach the runner even if the local readiness probe fails.
         stub = node / "ops/bin/local-model-ready"
-        stub.write_text('#!/bin/sh\necho \'{"ok": true, "stub": true}\'\n', encoding="utf-8")
+        stub.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         stub.chmod(0o755)
         for rel in ("INVARIANTS.md", "policy/env.json", "scripts/checklib.sh"):
-            shutil.copy2(LAB / rel, node / rel)
+            shutil.copy2(CODE_ROOT / rel, node / rel)
         (node / "ESTATE").write_text("node-fx\n", encoding="utf-8")
         state.mkdir()
         director = FakeDirector(scratch / "director", TOKEN)
@@ -77,9 +76,9 @@ def main():
         (node / "node.env").write_text("export CS_FX_TOKEN=%s\n" % TOKEN)
         (node / "node.env").chmod(0o600)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(node / "home"), "TMPDIR": str(node / "tmp"),
-               "LANG": os.environ.get("LANG", "en_US.UTF-8"), "LAB_STATE_ROOT": str(state), "LAB_CONFIG_ROOT": str(node),
+               "LANG": os.environ.get("LANG", "en_US.UTF-8"), "CS_STATE_ROOT": str(state), "CS_CONFIG_ROOT": str(node),
                "CSGATEWAY_ENDPOINT": gateway.endpoint, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
-               "CS_RUNNER_BIN": str(built_runner(LAB))}
+               "CS_RUNNER_BIN": str(built_runner(CODE_ROOT))}
 
         def tick():
             r = subprocess.run([sys.executable, str(node / "ops/bin/tick")], input="{}", text=True, capture_output=True,

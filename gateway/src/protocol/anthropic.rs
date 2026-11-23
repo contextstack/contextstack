@@ -9,17 +9,13 @@
 
 use super::history::{anthropic_images, validate_tool_history};
 use super::sse::Lines;
-use super::{Call, Event, Http, Reply, Stop, error_body, request_id_header, transport};
+use super::{Call, Event, Http, Reply, Stop, error_body, request_id_header};
 use crate::errors::CallError;
 use crate::wire::{ReplyToolCall, nullable};
 use serde::Deserialize;
 use serde_json::{Map, Value, json, value::RawValue};
 use std::collections::HashMap;
-use std::time::Duration;
 use tokio::time::Instant;
-
-/// Go's client timeout for this adapter: the whole exchange, body included.
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One Anthropic endpoint.
 pub struct Anthropic<'a> {
@@ -96,7 +92,12 @@ struct Block {
 }
 
 impl Anthropic<'_> {
-    fn marshal(&self, call: &Call, stream: bool) -> Result<Wire, CallError> {
+    fn marshal(
+        &self,
+        call: &Call,
+        stream: bool,
+        trace: &mut crate::trace::Exchange,
+    ) -> Result<Wire, CallError> {
         let model = call.model_or(self.default_model);
         let max_tokens = call.max_tokens_or_default();
         let messages = encode(call).map_err(CallError::transport_local)?;
@@ -130,6 +131,18 @@ impl Anthropic<'_> {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
+        if let Some(choice) = &call.tool_choice {
+            match (choice.as_str(), choice["type"].as_str()) {
+                (Some("required"), _) => body["tool_choice"] = json!({"type": "any"}),
+                (Some("auto"), _) => body["tool_choice"] = json!({"type": "auto"}),
+                (Some("none"), _) => body["tool_choice"] = json!({"type": "none"}),
+                (_, Some("function")) if let Some(name) = choice["function"]["name"].as_str() => {
+                    let name = encode_name(name).map_err(CallError::transport_local)?;
+                    body["tool_choice"] = json!({"type": "tool", "name": name});
+                }
+                _ => trace.drop_tool_choice(),
+            }
+        }
         let raw = serde_json::to_vec(&body)
             .map_err(|e| CallError::transport_local(format!("anthropic: marshal request: {e}")))?;
         Ok(Wire { raw, inverse })
@@ -142,6 +155,7 @@ impl Anthropic<'_> {
         call: &Call,
         raw: Vec<u8>,
         stream: bool,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<reqwest::Response, CallError> {
         let url = format!("{}/v1/messages", self.base.trim_end_matches('/'));
         let mut req = http
@@ -149,19 +163,20 @@ impl Anthropic<'_> {
             .post(&url)
             .header("Content-Type", "application/json")
             .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .body(raw);
+            .header("anthropic-version", "2023-06-01");
         if stream {
             req = req.header("Accept", "text/event-stream");
         }
         if let Some(id) = request_id_header(&call.request_id) {
             req = req.header("X-Request-Id", id);
         }
-        let resp = req.send().await.map_err(|e| transport("Post", &url, &e))?;
+        let resp = http.model_post(req, &url, raw, trace).await?;
         let status = resp.status().as_u16();
+        trace.headers(status);
         if status >= 300 {
             let retry_after_ms = crate::errors::parse_retry_after(resp.headers());
             let text = error_body(resp, 4096).await;
+            trace.upstream_error_body(&text);
             return Err(CallError::upstream_http(
                 status,
                 "anthropic",
@@ -172,11 +187,6 @@ impl Anthropic<'_> {
         Ok(resp)
     }
 
-    /// The effective deadline: the request's, capped by the adapter's client timeout.
-    fn cap(deadline: Instant) -> Instant {
-        deadline.min(Instant::now() + CLIENT_TIMEOUT)
-    }
-
     /// One unary call.
     pub async fn invoke(
         &self,
@@ -184,12 +194,14 @@ impl Anthropic<'_> {
         key: &str,
         call: &Call,
         deadline: Instant,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<Reply, CallError> {
-        let wire = self.marshal(call, false)?;
+        let wire = self.marshal(call, false, trace)?;
+        trace.begin_attempt("anthropic", &wire.raw, false);
         let url = format!("{}/v1/messages", self.base.trim_end_matches('/'));
         let start = std::time::Instant::now();
-        super::until(Self::cap(deadline), "Post", &url, async {
-            let resp = self.post(http, key, call, wire.raw, false).await?;
+        super::until(deadline, "Post", &url, async {
+            let resp = self.post(http, key, call, wire.raw, false, trace).await?;
             let latency_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
             let bytes = super::success_body(resp, "Post", &url).await?;
             let out: Out =
@@ -206,6 +218,7 @@ impl Anthropic<'_> {
                         tool_calls.push(ReplyToolCall {
                             id: b.id,
                             name,
+                            invalid_arguments: false,
                             args,
                         });
                     }
@@ -235,15 +248,16 @@ impl Anthropic<'_> {
         key: &str,
         call: &Call,
         deadline: Instant,
+        trace: &mut crate::trace::Exchange,
     ) -> Result<Stream, CallError> {
-        let wire = self.marshal(call, true)?;
+        let wire = self.marshal(call, true, trace)?;
+        trace.begin_attempt("anthropic", &wire.raw, true);
         let url = format!("{}/v1/messages", self.base.trim_end_matches('/'));
-        let deadline = Self::cap(deadline);
         let resp = super::until(
             deadline,
             "Post",
             &url,
-            self.post(http, key, call, wire.raw, true),
+            self.post(http, key, call, wire.raw, true, trace),
         )
         .await?;
         Ok(Stream {
@@ -331,6 +345,8 @@ impl Stream {
         super::MeteredUsage {
             input_tokens: self.input,
             output_tokens: self.output,
+            cache_read_tokens: self.cache_read,
+            cache_write_tokens: self.cache_write,
             charged: None,
         }
     }
@@ -415,6 +431,7 @@ impl Stream {
             tool_calls.push(ReplyToolCall {
                 id: t.id,
                 name,
+                invalid_arguments: false,
                 args,
             });
         }
@@ -498,6 +515,65 @@ fn encode(call: &Call) -> Result<Vec<Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stream_uses_the_full_call_deadline_and_meters_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await?;
+            let events = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{",
+                "\"input_tokens\":5,\"cache_read_input_tokens\":11,\"cache_creation_input_tokens\":23}}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            );
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{events}",
+                events.len()
+            );
+            socket.write_all(reply.as_bytes()).await
+        });
+        let http = Http::new()?;
+        let mut trace = crate::trace::Exchange::new(
+            None,
+            crate::trace::Stamp::now(),
+            &crate::wire::Request::default(),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(180);
+        let endpoint = Anthropic {
+            base: &base,
+            default_model: "test",
+        };
+        let call = Call {
+            model: String::new(),
+            system: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: 32,
+            request_id: String::new(),
+        };
+        let mut stream = endpoint
+            .stream(&http, "fake", &call, deadline, &mut trace)
+            .await?;
+        server.await??;
+        assert_eq!(stream.lines.deadline(), deadline);
+        assert!(matches!(stream.next().await?, Some(Event::Delta(_))));
+        let meter = stream.metered_usage();
+        assert_eq!(
+            (
+                meter.input_tokens,
+                meter.cache_read_tokens,
+                meter.cache_write_tokens
+            ),
+            (5, 11, 23)
+        );
+        Ok(())
+    }
 
     #[test]
     fn tool_names_are_injective_and_refuse_odd_runes() {

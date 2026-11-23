@@ -267,7 +267,8 @@ class Listener:
             extras = status_extras(self.state, self.config, cache_ttl=VITALS_CACHE_S)
             limits = status_limits(self.state)  # usage-limited templates, so clients can show out-of-quota models
             body = {"active": active, "node_version": "cs node-listen", **extras, **limits, "repos": repo_inventory()}
-            seen = digest([seen, body["repos"], [(r.get("template"), r.get("resets_at")) for r in limits.get("provider_limits", [])]])
+            seen = digest([seen, body["repos"], body.get("agent_capabilities"),
+                           [(r.get("template"), r.get("resets_at")) for r in limits.get("provider_limits", [])]])
             held_seen = (extras.get("held") or {}).get("reason")
             if seen != sent_status or held_seen != getattr(self, "_held_seen", None) \
                     or (active and now() - status_at >= STATUS_S) \

@@ -10,9 +10,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-LAB = Path(__file__).resolve().parents[3]
-CHECKLIB = LAB / "scripts/checklib.sh"
-RERUN = LAB / "hooks/bin/rerun-check"
+CODE_ROOT = Path(__file__).resolve().parents[3]
+CHECKLIB = CODE_ROOT / "scripts/checklib.sh"
+RERUN = CODE_ROOT / "hooks/bin/rerun-check"
 WRAPPER = '#!/bin/sh\n. "$CHECKLIB_PATH"\necho check: ok\n'
 
 
@@ -42,7 +42,7 @@ def run_check(ws, env, wrapper):
     direct = subprocess.run([str(wrapper)], cwd=str(ws), capture_output=True, text=True, env=env)
     rerun = subprocess.run(
         [str(RERUN)], cwd=str(ws), capture_output=True, text=True,
-        env={**env, "LAB_CHECK": str(wrapper)},
+        env={**env, "CS_CHECK": str(wrapper)},
     )
     return direct, rerun
 
@@ -77,7 +77,7 @@ with scratch_dir(prefix="checklib-cell-authored-scope-") as raw:
     root = Path(raw)
     home = root / "home"
     home.mkdir()
-    env = {k: v for k, v in os.environ.items() if k != "LAB_CHECK"}
+    env = {k: v for k, v in os.environ.items() if k != "CS_CHECK"}
     env.update(
         CHECKLIB_PATH=str(CHECKLIB),
         HOME=str(home),
@@ -146,7 +146,7 @@ with scratch_dir(prefix="checklib-cell-authored-scope-") as raw:
     check = root / "task/check"
     check.write_text(WRAPPER, encoding="utf-8")
     check.chmod(0o755)
-    bare_env = {**env, "LAB_CHECK": str(check)}
+    bare_env = {**env, "CS_CHECK": str(check)}
     inherited_bare = subprocess.run(
         [str(check)], cwd=str(bare), capture_output=True, text=True, env=bare_env)
     assert inherited_bare.returncode == 0, inherited_bare.stdout + inherited_bare.stderr

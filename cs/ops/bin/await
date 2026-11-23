@@ -10,7 +10,7 @@ from pathlib import Path
 from _roots import roots
 
 HERE = Path(__file__).resolve().parent
-LAB = HERE.parent.parent
+CODE_ROOT = HERE.parent.parent
 STATE = roots()["state"]
 # the dispatch shelf tick drains: under the state root (default <code>/ledger, as before)
 Q = STATE / "dispatch.jsonl"
@@ -31,7 +31,7 @@ def close_dead(jid, spec):
             "id": jid, "spec": spec or "",
             "state": "error", "note": "running pid dead",
         }),
-        capture_output=True, text=True, cwd=str(LAB),
+        capture_output=True, text=True, cwd=str(CODE_ROOT),
     )
     if r.returncode != 0:
         sys.exit("await: close: " + (r.stderr or r.stdout or "close failed").strip())

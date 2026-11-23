@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CS = HERE.parents[2]
+ROOT = CS.parent
+sys.path[:0] = [str(HERE.parent / "_lib"), str(CS / "ops/bin"), str(CS / "scripts")]
+from check_timeout import timeout
+from hermetic_env import hermetic_env
+from cli_execution import command as fixture_command
+from native_runtime import stage_native_runtime
+from receipt_schema import matches_schema
+from scratch import scratch_dir
+from _node_events import send
+
+STAMP = "2026-11-19T12:00:02.123400Z"
+TEXT = "content held in the run directory"
+
+
+class Director:
+    protocol = 2
+
+    def __init__(self):
+        self.events = []
+
+    def call(self, method, path, body):
+        assert method == "POST" and path.endswith("/events") and body["job_id"] == "job-observed"
+        self.events.extend(body["events"])
+        return {"confirmed": self.events[-1]["seq"]}
+
+
+def write_executable(path, script):
+    path.write_text(script)
+    path.chmod(0o755)
+
+
+def run_case(root, reports_usage, provisional=False):
+    code_root, home = root / "code", root / "home"
+    state = code_root / "ledger"
+    ops = code_root / "ops/bin"
+    task = code_root / "tasks/fixture"
+    fixture_bin = root / "bin"
+    for directory in (ops, task, state, home, fixture_bin):
+        directory.mkdir(parents=True)
+    for source in (CS / "ops/bin").glob("_*.py"):
+        shutil.copy2(source, ops / source.name)
+    for name in ("capture-stimulus", "publish-evidence", "harvest", "finalize-run", "machine-finish"):
+        shutil.copy2(CS / "ops/bin" / name, ops / name)
+    stage_native_runtime(ops)
+
+    result = {"type": "result", "subtype": "success", "result": TEXT}
+    if reports_usage:
+        result["usage"] = {"input_tokens": 5, "output_tokens": 12}
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "timestamp": STAMP, "message": {"content": [{"type": "text", "text": TEXT}]}},
+        result,
+    ]
+    binary = root / "claude"
+    binary.write_text("#!/usr/bin/env python3\n" + "".join(
+        "print(%r, flush=True)\n" % json.dumps(event) for event in events))
+    binary.chmod(0o755)
+    (ops / "executor-templates.json").write_text(json.dumps({"stub": {
+        "binary": str(binary), "args": ["--print", "--output-format", "stream-json", "{{prompt}}"],
+        "cost_class": "subscription", "cost_usd": 0, "auth": "subscription",
+    }}))
+    (home / ".gitconfig").write_text("[user]\nname = Fixture\nemail = fixture@example.test\n")
+    (code_root / "ESTATE").write_text("fixture\n")
+    (task / "goal.md").write_text("Do nothing.\n")
+    (task / "check").write_text("#!/bin/sh\nexit 0\n")
+    (task / "check").chmod(0o755)
+    (state / "dispatch.jsonl").write_text(json.dumps({
+        "id": "job-observed", "director_job": "job-observed", "state": "running",
+    }) + "\n")
+
+    env = {key: value for key, value in hermetic_env().items()
+           if not key.startswith(("CS_", "GIT_", "CSGATEWAY_", "CODEX_", "CLAUDE_", "FINALIZE_RUN_"))}
+    # Keep repository discovery and owner Git configuration inside the fixture.
+    git = shutil.which("git")
+    write_executable(fixture_bin / "git", f'''#!/bin/sh
+if [ "$1" = config ] && [ "$2" = --global ]; then
+    shift 2
+    GIT_DIR="$HOME/.fixture-git" exec "{git}" config --file "$HOME/.gitconfig" "$@"
+fi
+GIT_CEILING_DIRECTORIES="{root}" exec "{git}" "$@"
+''')
+    # The regression exercises the real executor and process reader. The launcher only
+    # needs to start our trusted stub and frozen check, including under nested Seatbelt.
+    if sys.platform == "darwin":
+        write_executable(fixture_bin / "sandbox-exec", '#!/bin/sh\n[ "$1" = -f ] || exit 2\nshift 2\nexec "$@"\n')
+    env["PATH"] = str(fixture_bin) + ":" + env["PATH"]
+    env["CS_EXECUTOR_ALLOW_UNSANDBOXED"] = "1"
+    env.update(HOME=str(home), CS_JOB_ID="job-observed",
+               CS_TOOLS_BIN=str(ROOT / "target/release/cs-tools"))
+    order = {"executor": "stub", "task": "tasks/fixture", "trial": 2, "timeout_s": 30}
+    command = [sys.executable, str(ops / "_executor.py")]
+    binding = {}
+    if reports_usage:
+        # Exercise the trusted child channel with a real executor. The read end
+        # remains open in the simulated gateway after the executor unlinks it.
+        run_id = "20261120-120000.000000000-stub-fixture-t2"
+        binding = {"execution_id": "cli-" + run_id}
+        (state / "runs" / run_id).mkdir(parents=True)
+        channel = root / "receipt-channel"
+        read_fd, write_fd = os.pipe()
+        with channel.open("w+") as private, os.fdopen(read_fd, "r") as work, os.fdopen(write_fd, "w") as owner:
+            owner.write(json.dumps(order) + "\n")
+            owner.flush()
+            done = subprocess.run([*command, "--gateway-owned", "--execution-only"], cwd=code_root, env={
+                **env, "CS_TRIAL": "2", "CS_RUN_ID": run_id, "CS_EXECUTION_ID": binding["execution_id"],
+                "CS_CLI_RECEIPT_PATH": str(channel),
+            }, stdin=work, text=True, capture_output=True, start_new_session=True, timeout=timeout(60))
+            assert done.returncode == 0, (done.stdout, done.stderr)
+            native = json.load(private)
+        assert not channel.exists()
+        assert native["run_id"] == run_id and native["execution_id"] == binding["execution_id"]
+        matches_schema(json.loads((CS / "ops/execution-receipt.schema.json").read_text()), native)
+        assert native["native"] == {"stop": "done", "exit": 0}
+        assert [json.loads(line) for line in done.stdout.splitlines()] == events
+        run = state / "runs" / run_id
+        assert native == json.loads((run / "execution-receipt.json").read_text())
+        assert not (run / "terminal.json").exists()
+        # The harness closes its transport span before the receipt is handed to machine-finish.
+        trace = run / "trace.jsonl"
+        observed = trace.read_bytes()
+        assert observed
+        sample = json.loads(observed.splitlines()[0])
+        span = {**sample, "kind": "run" if provisional else "cli_work_order", "name": "cli_work_order",
+                "span_id": "harness-cli", "parent_id": None if provisional else "run", "outcome": "child_exit",
+                "attributes": {"machine": "harness" if provisional else "fixture", **binding}}
+        with trace.open("a") as records:
+            records.write(json.dumps(span) + "\n")
+        done = subprocess.run([str(ops / "machine-finish")], cwd=code_root, env=env,
+                              input=json.dumps({"run_dir": str(run), "receipt": native}),
+                              text=True, capture_output=True, timeout=timeout(60))
+        assert done.returncode == 0, (done.stdout, done.stderr)
+        assert native["usage"]["input_tokens"] == 5 and native["usage"]["output_tokens"] == 12
+    else:
+        done = subprocess.run(fixture_command(*command), cwd=code_root, env=env,
+                              input=json.dumps(order), text=True, capture_output=True, timeout=timeout(60))
+        assert done.returncode == 0, (done.stdout, done.stderr)
+
+    receipt = json.loads(done.stdout.splitlines()[-1])
+    assert receipt["finalize"] == "finalized"
+    if reports_usage:
+        assert receipt["run_id"] == run_id
+    run = state / "runs" / receipt["run_id"]
+    trace = run / "trace.jsonl"
+    directory_map = root / "directories.json"
+    directory_map.write_text(json.dumps({"run_directories": {run.name: str(run)}}))
+    checked = subprocess.run([str(ROOT / "tracing/check-trace"), str(trace), str(directory_map)],
+                             env=env, capture_output=True, text=True, timeout=timeout(10))
+    assert checked.returncode == 0, (checked.stdout, checked.stderr)
+    assert json.loads(checked.stdout) == {"result": "complete", "findings": [], "missing": []}
+
+    raw = trace.read_bytes()
+    envelope_path = state / "outbox" / (run.name + ".json")
+    envelope_bytes = envelope_path.read_bytes()
+    # Replay finalization after the trace and outbox were written.
+    (run / "finalized.json").unlink()
+    rerun = subprocess.run([str(ops / "finalize-run")], cwd=code_root, env=env,
+                           input=json.dumps({"run_dir": str(run)}), text=True,
+                           capture_output=True, timeout=timeout(10))
+    assert rerun.returncode == 0, (rerun.stdout, rerun.stderr)
+    assert trace.read_bytes() == raw
+    assert envelope_path.read_bytes() == envelope_bytes
+    assert TEXT.encode() not in raw
+    spans = [json.loads(line) for line in raw.splitlines()]
+    if reports_usage:
+        assert raw.startswith(observed)
+        transport, = [record for record in spans if record["span_id"] == "harness-cli"]
+        assert transport == {**span, "kind": "cli_work_order", "parent_id": "run",
+                             "attributes": {"machine": "fixture", **binding}}
+    binding = {"execution_id": "cli-" + run.name}
+    root_span = next(span for span in spans if span["kind"] == "run")
+    assert root_span["outcome"] == "finalized"
+    assert root_span["attributes"] == {
+        "machine": "fixture", "coverage": "observed", "run_id": run.name,
+        "job_id": "job-observed", "task": "tasks/fixture", "trial": 2, **binding,
+    }
+    process = next(span for span in spans if span["kind"] == "cli_process")
+    assert process["duration_ms"] > 0
+    assert process["attributes"] == {
+        "machine": "fixture", "exit_status": 0, "received_events": 3, "usage_reported": reports_usage,
+    }
+    observed = [span for span in spans if span["kind"] == "cli_event"]
+    assert [span["attributes"]["timestamp_source"] for span in observed] == [
+        "adapter_receive", "producer", "adapter_receive",
+    ]
+    assert observed[1]["start"] == observed[1]["end"] == STAMP
+    cli_events = (run / "cli-events.jsonl").read_bytes()
+    assert cli_events.endswith(b"\n")
+    lines = cli_events[:-1].split(b"\n")
+    assert [json.loads(line) for line in lines] == [
+        {"event": "cli_event", "output": json.dumps(event)} for event in events
+    ]
+    assert [span["attributes"]["content"]["output"] for span in observed] == [
+        {"file": "cli-events.jsonl", "line": number, "sha256": hashlib.sha256(line).hexdigest()}
+        for number, line in enumerate(lines, 1)
+    ]
+    envelope = json.loads(envelope_bytes)
+    hashes = {entry["path"]: entry["sha256"] for entry in envelope["files"]}
+    assert hashes["cli-events.jsonl"] == hashlib.sha256(cli_events).hexdigest()
+    assert hashes["trace.jsonl"] == hashlib.sha256(raw).hexdigest()
+    usage = [span["attributes"] for span in spans if span["kind"] == "cli_usage"]
+    assert usage == ([{"machine": "fixture", "source": "claude_code_native",
+                       "input_tokens": 5, "output_tokens": 12}] if reports_usage else [])
+    final = next(span["attributes"] for span in spans if span["kind"] == "finalization")
+    assert final["verdict"] == "pass" and final["evidence_id"]
+
+    director = Director()
+    assert send(director, state, run)
+    assert director.events[0]["at"] == STAMP and director.events[0]["timestamp_source"] == "producer"
+    assert "received_at" not in director.events[0]
+
+    # A legacy producer left no timestamp on disk. The adapter marks its own receive time.
+    legacy_run = root / "legacy"
+    legacy_run.mkdir()
+    (legacy_run / "events.jsonl").write_text('{"seq":1,"kind":"runner.event","payload":{}}\n')
+    legacy_director = Director()
+    assert send(legacy_director, state, legacy_run, "job-observed") is False
+    fallback, = legacy_director.events
+    assert fallback["at"].endswith("Z") and "." in fallback["at"]
+    assert fallback["timestamp_source"] == "adapter_receive" and "timestamp_source" not in fallback["payload"]
+
+
+with scratch_dir(prefix="trace-observed-") as scratch:
+    for reports_usage in (True, False):
+        run_case(Path(scratch) / str(reports_usage), reports_usage)
+    run_case(Path(scratch) / "provisional", reports_usage=True, provisional=True)
+print("check: observed traces with and without CLI usage are complete, and live timestamps keep their provenance")

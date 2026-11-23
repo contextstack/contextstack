@@ -9,7 +9,7 @@ that applies, counting estimates held by calls in flight. A refusal is fatal_ses
 gateway.policy_denied at $0 with error.budget.reason off | exhausted | ceiling | invalid. Spend
 is kept per source per day and month in ~/.contextstack/gateway/spend.json and survives a
 restart. GET /v1/budgets reports each source's state. free_local and subscription calls are
-never counted or refused."""
+admitted without a reservation and only counted when a provider reports a positive charge."""
 import concurrent.futures
 import os
 import datetime
@@ -227,13 +227,16 @@ def budgets_report(t):
 
 
 @case("spend", gw=None)
-def local_models_not_counted(t):
-    """With no budget at all, free_local (vLLM, Ollama, even with a provider-reported charge) and subscription calls dispatch and are never counted."""
+def local_and_subscription_skip_admission(t):
+    """With no budget, local and subscription calls dispatch and only reported charges count."""
     gw = t.gateway("spend-local", limits=None)
     t.vllm.chat["vllm-big"] = {"json": upstreams.chat_completion(usage=(100, 100), cost=0.25)}
     for name in ("local-coder", "vllm-big", "ollama-small", "fake-sub", ""):
         sub(gw.call(model_call(name)).json, {"status": "ok"}, name or "empty hint")
-    eq(spend(gw), None, "nothing counted")
+    eq(spent(gw), (0.25, 0.25), "only the reported charge counted")
+    gw.limits_path.parent.mkdir(parents=True, exist_ok=True)
+    gw.limits_path.write_text(json.dumps(limits(0.25)))
+    denied(gw.call(model_call("fake-paid")).json, "reported charge exhausted the source", "exhausted")
 
 
 @case("spend", gw=None)

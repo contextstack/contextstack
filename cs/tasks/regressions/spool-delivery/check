@@ -9,7 +9,7 @@
   malformed  a receiver that is not null or {kind: dir, path}: exit 2
   floor      tick below min_free_bytes admits nothing (a yield row, class spool_full, no running row),
              space back = tick admits again
-Isolated estates only; lab/ledger is never written.
+Isolated estates only; cs/ledger is never written.
 """
 import json
 import shutil
@@ -57,7 +57,7 @@ def outbox(root):
 def main():
     scratch = Path(tempfile.mkdtemp(prefix="spool-delivery-", suffix=".noindex"))
     try:
-        root = te.build(scratch / "lab")
+        root = te.build(scratch / "code_root")
         run = finalized_run(root, "fx-a")
         entry = run.name + ".json"
         envelope = json.loads((root / "ledger/outbox" / entry).read_text())

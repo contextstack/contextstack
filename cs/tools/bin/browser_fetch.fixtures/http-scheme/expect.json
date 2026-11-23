@@ -2,7 +2,7 @@
   "exit": 1,
   "stdout": "browser_fetch: only https URLs are allowed\n",
   "files": {
-    ".lab-calls.jsonl": "{\"args\": {\"url\": \"http://93.184.216.34/\"}, \"name\": \"browser_fetch\"}\n",
+    ".cs-calls.jsonl": "{\"args\": {\"url\": \"http://93.184.216.34/\"}, \"name\": \"browser_fetch\"}\n",
     "_evidence/manifest.jsonl": null
   },
   "untouched": true

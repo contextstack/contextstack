@@ -6,7 +6,7 @@
   "run_dirs_distinct": true,
   "runs": [],
   "stderr": [
-    "lab: no gateway endpoint: set CSGATEWAY_ENDPOINT"
+    "cs: no gateway endpoint: set CSGATEWAY_ENDPOINT"
   ],
   "stdout": []
 }

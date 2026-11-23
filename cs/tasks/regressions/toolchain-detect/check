@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Exercise the init step and doctor's read-only findings with a fake login shell."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+CS = HERE.parents[2]
+sys.path[:0] = [str(HERE.parent / "_lib"), str(CS / "ops/bin"), str(CS / "scripts")]
+from hermetic_env import hermetic_env
+import _toolchains
+from cs_init import Init
+
+
+def executable(path, contents):
+    path.write_text(f"#!{sys.executable}\n{contents}")
+    path.chmod(0o755)
+
+
+def main():
+    with TemporaryDirectory(prefix="toolchain-detect-") as tmp:
+        home = Path(tmp).resolve()
+        config = home / ".contextstack/config"
+        destination = config / "toolchains.json"
+        config.mkdir(parents=True)
+        tools = home / "tools with spaces"
+        tools.mkdir()
+        aliases = home / "aliases"
+        aliases.symlink_to(tools, target_is_directory=True)
+        for name in ("php", "node", "rustc"):
+            executable(tools / name, "pass\n")
+        shell = home / "login-shell"
+        found = [str(aliases / name) for name in ("php", "node", "rustc")]
+        successful_lookup = (
+            "import sys\n"
+            "assert sys.argv[1] == '-lc'\n"
+            "assert all(f'command -v {name}' in sys.argv[2] for name in "
+            "('php', 'composer', 'node', 'npm', 'uv', 'cargo', 'rustc', 'python3', 'go'))\n"
+            "assert sys.stdin.read() == ''\n"
+            f"print({chr(10).join(found)!r})\n"
+        )
+        executable(shell, successful_lookup)
+
+        env = hermetic_env()
+        env.update(HOME=str(home), SHELL=str(shell), CS_SERVICE_PATH=str(home / "empty"))
+        lines = []
+        init = Init.__new__(Init)
+        init.config = config
+        init.nr = SimpleNamespace(write_atomic=lambda path, data, mode: path.write_bytes(data))
+        init.say = lines.append
+        expected = [{"name": name, "bin": str(tools)} for name in ("php", "node", "rustc")]
+        release = home / "release"
+        release.mkdir()
+        (release / "cs").symlink_to(CS, target_is_directory=True)
+        (home / ".contextstack/current").symlink_to(release, target_is_directory=True)
+        env["CS_PLATFORM"] = "linux"
+        doctor = subprocess.run([sys.executable, str(CS / "scripts/cs"), "doctor", "--json"],
+                                env=env, capture_output=True, text=True, timeout=10)
+        findings = [f for f in json.loads(doctor.stdout) if f["check"].startswith("toolchain ")]
+        assert [f["check"] for f in findings] == ["toolchain php", "toolchain node", "toolchain rustc"], findings
+        assert all(f["info"] and str(tools) in f["detail"] for f in findings), findings
+        with patch.dict(os.environ, env, clear=True):
+            assert not destination.exists()
+            init.step_toolchains()
+            assert json.loads(destination.read_text()) == expected
+            assert lines == [f"{entry['name']}: {tools}" for entry in expected], lines
+
+            manual = {"name": "php", "bin": str(home / "manual"), "extra": "keep"}
+            destination.write_text(json.dumps([manual]))
+            lines.clear()
+            init.step_toolchains()
+            assert json.loads(destination.read_text()) == [manual] + expected[1:]
+            assert lines == [f"node: {tools}", f"rustc: {tools}"], lines
+
+            before = destination.read_bytes()
+            file_stat = destination.stat()
+            lines.clear()
+            init.step_toolchains()
+            assert lines == [] and destination.read_bytes() == before
+            assert destination.stat().st_mtime_ns == file_stat.st_mtime_ns
+            assert _toolchains.doctor_login_findings(destination, init.service_path()) == []
+
+            for body, detail in (("raise SystemExit(9)\n", "exit 9"),
+                                 ("import time\ntime.sleep(30)\n", "timed out")):
+                executable(shell, successful_lookup + body)
+                lines.clear()
+                with patch.object(_toolchains, "LOGIN_TIMEOUT", 1):
+                    init.step_toolchains()
+                    findings = _toolchains.doctor_login_findings(destination, init.service_path())
+                assert len(lines) == 1 and detail in lines[0], lines
+                assert len(findings) == 1 and findings[0]["warn"] and detail in findings[0]["detail"], findings
+                assert destination.read_bytes() == before
+    print("toolchain-detect passed")
+
+
+if __name__ == "__main__":
+    main()
