@@ -348,6 +348,7 @@ fn dispatch_body(call: &Call) -> Result<(String, Map<String, Value>), No> {
 struct IntentInsert<'a> {
     intent_id: &'a str,
     plan: &'a Plan,
+    planner: Option<&'a Plan>,
     want: &'a Value,
     client: &'a Client,
     project: Option<&'a str>,
@@ -366,6 +367,7 @@ fn insert_intent_record(
     let IntentInsert {
         intent_id,
         plan,
+        planner,
         want,
         client,
         project,
@@ -388,7 +390,11 @@ fn insert_intent_record(
                 origin.kind, origin.conversation_id, origin.turn_id],
     )
     .map_err(|e| e.to_string())?;
-    plan.insert(store, &tx, Some(intent_id))?;
+    if let Some(planner) = planner {
+        crate::planning::insert(store, &tx, intent_id, planner, plan)?;
+    } else {
+        plan.insert(store, &tx, Some(intent_id))?;
+    }
     touch(&tx, Record::Intent, intent_id).map_err(|e| e.to_string())?;
     remember(&tx, key, sha, Record::Intent, intent_id, client).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -425,7 +431,55 @@ fn submit_conversation(
     .map_err(|e| e.to_string())
 }
 
-/// `POST intents`: record the intent and the one job it names, offered to its node.
+fn submitted_job(
+    state: &State,
+    db: &Connection,
+    want: &Value,
+    files: Vec<jobs::BundleFile>,
+) -> Result<Plan, No> {
+    let s = |f: &str| want[f].as_str().unwrap_or_default();
+    let mut plan = Plan::new(
+        db,
+        s("node"),
+        s("spec"),
+        s("task"),
+        u32::try_from(want["trials"].as_u64().unwrap_or(1)).unwrap_or(1),
+        want["grant"].as_str(),
+        want["meta"].as_object().cloned().unwrap_or_default(),
+        files,
+    )
+    .map_err(|e| No::invalid(&e))?
+    .under(crate::reservations::JobScope {
+        project: want["project_id"].as_str().map(String::from),
+        conversation: None,
+    });
+    if want["source"].get("from_job").is_some() || plan.spec_names_task(&state.store) {
+        plan.fill_missing_check(&state.store)
+            .map_err(|e| No::internal(&e))?;
+    }
+    Ok(plan)
+}
+
+fn stamp_and_check(
+    state: &State,
+    db: &Connection,
+    plan: &mut Plan,
+    intent: &str,
+    previous: Option<&str>,
+    node: &str,
+) -> Result<(), No> {
+    plan.stamp(&state.store, intent, previous)
+        .map_err(|error| match error {
+            crate::stamp::Refused::Mismatch(message) => {
+                No(422, "invalid_request", message, json!({"field": "intent"}))
+            }
+            crate::stamp::Refused::Invalid(message) => No::invalid(&message),
+        })?;
+    plan.refuse_if_node_lacks_capability(&state.store, db, node)
+        .map_err(|e| No::invalid(&e))
+}
+
+/// `POST intents`: record the intent and offer its first job.
 pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
     let (key, mut m) = match dispatch_body(call) {
         Ok(pair) => pair,
@@ -455,31 +509,15 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
         Err(r) => return r.reply(),
     };
     let s = |f: &str| want[f].as_str().unwrap_or_default().to_string();
+    let node = s("node");
     let project = want["project_id"].as_str();
     if let Err(r) = project_exists(&db, project) {
         return r.reply();
     }
-    let mut plan = match Plan::new(
-        &db,
-        &s("node"),
-        &s("spec"),
-        &s("task"),
-        u32::try_from(want["trials"].as_u64().unwrap_or(1)).unwrap_or(1),
-        want["grant"].as_str(),
-        want["meta"].as_object().cloned().unwrap_or_default(),
-        files,
-    ) {
-        Ok(p) => p.under(crate::reservations::JobScope {
-            project: project.map(String::from),
-            conversation: None,
-        }),
-        Err(e) => return invalid(&e),
+    let mut plan = match submitted_job(state, &db, &want, files) {
+        Ok(plan) => plan,
+        Err(no) => return no.reply(),
     };
-    if (want["source"].get("from_job").is_some() || plan.spec_names_task(&state.store))
-        && let Err(e) = plan.fill_missing_check(&state.store)
-    {
-        return internal(&e);
-    }
     // Provenance is Director-owned, never supplied through request metadata. It survives
     // credential rotation and bundle reuse through arbitrarily many descendant intents.
     let lead_conversation = (client.kind == crate::access::Kind::Lead)
@@ -498,22 +536,28 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
             Ok(o) => o,
             Err(no) => return no.reply(),
         };
-    match plan.stamp(&state.store, &intent_id, stamped_before.as_deref()) {
-        Ok(()) => {}
-        Err(crate::stamp::Refused::Mismatch(m)) => {
-            return refusal(422, "invalid_request", &m, json!({"field": "intent"}));
-        }
-        Err(crate::stamp::Refused::Invalid(m)) => return invalid(&m),
-    }
-    if let Err(e) = plan.refuse_if_node_lacks_capability(&state.store, &db, &s("node")) {
-        return invalid(&e);
-    }
+    let planner = stamp_and_check(
+        state,
+        &db,
+        &mut plan,
+        &intent_id,
+        stamped_before.as_deref(),
+        &node,
+    )
+    .and_then(|()| {
+        crate::planning::prepare_if_requested(state, &db, &want, &m, &intent_id, &mut plan)
+    });
+    let planner = match planner {
+        Ok(planner) => planner,
+        Err(no) => return no.reply(),
+    };
     match insert_intent_record(
         &mut db,
         &state.store,
         &IntentInsert {
             intent_id: &intent_id,
             plan: &plan,
+            planner: planner.as_ref(),
             want: &want,
             client,
             project,
@@ -554,6 +598,14 @@ pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> 
         Ok(None) => return not_found("intent"),
         Err(e) => return internal(&e),
     };
+    match db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM planning_jobs p JOIN jobs j ON j.job_id = p.job_id WHERE j.intent_id = ?1)",
+        [intent_id], |r| r.get::<_, bool>(0),
+    ) {
+        Ok(true) => return refusal(409, "planning_pending", "the coding job follows its planning job automatically", Value::Null),
+        Ok(false) => {}
+        Err(error) => return internal(&error),
+    }
     // Intents have no lifecycle column; an explicit terminal marker lives in their metadata.
     if matches!(
         intent["meta"]["state"].as_str(),

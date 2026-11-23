@@ -68,7 +68,7 @@ sys.exit(_executor.main())
     fake = bins / "fixture-cli"
     cli_script = "#!/bin/sh\nprintf candidate > candidate.txt\ntouch -t 202601021200 candidate.txt\nprintf 'fixture reply\\n'\n"
     (ops / "executor-templates.json").write_text(json.dumps({"fixture": {
-        "binary": str(fake), "args": [], "env_drop": [], "auth": "none",
+        "binary": str(fake), "args": ["{{prompt}}"], "env_drop": [], "auth": "none",
         "cost_class": "free_local", "cost_usd": 0,
     }}))
 
@@ -93,9 +93,16 @@ sys.exit(_executor.main())
         ("hosted", 0, "done"),
     )
     if sys.platform == "darwin":
-        cases += (("read-only", 0, "done"),)
+        cases += (("read-only", 0, "done"), ("planning", 0, "done"))
     for case, expected, expected_stop in cases:
         agent = "#!/bin/sh\nprintf 'research reply\n'\n" if case == "read-only" else cli_script
+        if case == "planning":
+            agent = """#!/bin/sh
+case "$1" in
+    *"$TMPDIR/plan.md"*) printf '# Plan\nUpdate two files.\n' > "$TMPDIR/plan.md";;
+    *) exit 2;;
+esac
+"""
         executable(fake, agent + ("exit 7\n" if case == "native" else ""))
         task = code / "tasks" / ("turn" if case == "hosted" else case)
         task.mkdir(parents=True)
@@ -111,8 +118,11 @@ exit %d
         spec = "id: fixture\nmodel: fixture\ntrials: 1\n"
         if case in ("lane", "grant"):
             spec += "repo: demo\nlane: fixture-lane\n"
-        if case == "read-only":
+        if case in ("read-only", "planning"):
             spec += "repo: demo\nrepo_read_only: true\n"
+        if case == "planning":
+            git_run("branch", "lane/planning-fixture", planned_base)
+            spec += "planning_lane: planning-fixture\n"
         if case == "hosted":
             spec = spec.replace("id: fixture", "id: hosted-lead")
             order.update(conversation_id="fixture", turn_id="fixture-turn")
@@ -140,6 +150,9 @@ exit %d
         receipt = load(path / "execution-receipt.json")
         if case == "read-only":
             assert len(list(path.glob("read-only-*/repo"))) == 1
+        if case == "planning":
+            snapshot, = path.glob("read-only-*/repo")
+            assert (snapshot / "candidate.txt").read_text() == "candidate"
         matches_schema(SCHEMA, receipt)
         path = state / "runs" / receipt["run_id"]
         assert not any((path / file).exists() for file in ("check.json", "terminal.json", "evidence"))
@@ -173,7 +186,7 @@ exit %d
         row = load(state / "ledger.jsonl")
         assert load(path / "finalized.json")["verdict"] == row["verdict"]
         assert row["stop"] == expected_stop, (case, row)
-        if case == "read-only":
+        if case in ("read-only", "planning"):
             assert not list(path.glob("read-only-*"))
             assert "branch" not in row
         check = load(path / "check.json")
@@ -184,9 +197,15 @@ exit %d
         assert again.returncode == expected and json.loads(again.stdout) == json.loads(final.stdout), (case, again.stdout, again.stderr)
         assert len((state / "ledger.jsonl").read_text().splitlines()) == 1
         assert len(list((state / "outbox").glob("*.json"))) == 1
+        if case == "planning":
+            envelope, = (state / "outbox").glob("*.json")
+            assert "plan.md" in [file["path"] for file in load(envelope)["files"]]
+            assert (path / "plan.md").read_text() == "# Plan\nUpdate two files.\n"
         if case in ("lane", "grant"):
             head = git_run("rev-parse", "lane/fixture-lane")
             assert head == (row["lane"]["commit"] if case == "lane" else base)
+            if case == "lane":
+                planned_base = head
             assert evidence["candidate_archive"]["scope"] == "changed_files"
         shutil.rmtree(state)
         state.mkdir()

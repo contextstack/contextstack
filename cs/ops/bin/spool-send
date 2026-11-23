@@ -181,6 +181,9 @@ def send_director(entry, runs, client):
     envelope = json.loads(entry.read_text(encoding="utf-8"))
     line = row_line_for(envelope, envelope.pop("row_line", None))
     run = runs / str(envelope.get("run_id") or "")
+    if str(envelope.get("event_id", "")).startswith("job_terminal:") and envelope.get("run_id") \
+            and (entry.parent / (run.name + ".json")).is_file():
+        raise ValueError("waiting for the run envelope to be acknowledged")
     if str(envelope.get("event_id", "")).startswith("run_finalized:") and not envelope.get("job_id"):
         job = director_job(runs.parent, run)
         if job:  # additive (§9): the Director links every trial's run to its job, so each charge settles
@@ -248,7 +251,8 @@ def main_director(state, receiver, outbox):
     except ValueError as error:
         emit({"ok": False, "error": str(error)}, 2)
     sent, failed, pruned = 0, [], 0
-    for entry in sorted(outbox.glob("*.json")) if outbox.is_dir() else ():
+    entries = sorted(outbox.glob("*.json"), key=lambda entry: (entry.name.startswith("job_"), entry.name))
+    for entry in entries:
         try:
             envelope, ack = send_director(entry, state["state"] / "runs", client)
             sent += 1

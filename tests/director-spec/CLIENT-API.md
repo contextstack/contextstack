@@ -1226,6 +1226,18 @@ and `retry_task` accept the same selector. Agent profiles can also use it in
 Repo-only read views require a CLI executor.
 
 
+For a repo lane, set `lane.plan_with` to a CLI executor template such as `codex` or
+`claude-code-sonnet`. The Director first offers a read-only researcher job with
+`meta.phase: "planning"`. It prefers the requested node if suitable, then another
+capable node that reports the repo. The job reads a snapshot of the lane tip
+when present, or the repo's configured base. The node can publish a `plan.md`
+run file. After planning, the Director offers the original coding job on the
+requested node with `meta.phase: "coding"`, under the same intent. A usable plan
+is frozen in `tasks/<slug>/context/plan.md` and included in the coding goal. If
+planning is unavailable, fails, times out, or yields no usable plan, the coding
+job still starts and the work trace records the reason.
+
+
 ### Agent profiles
 
 `GET agents` is available to any client credential, including leads. It returns

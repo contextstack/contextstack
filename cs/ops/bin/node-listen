@@ -31,6 +31,7 @@ Each event worth seeing is one JSON line on stdout (the agent's log). Exit 0 on 
 import fcntl
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -266,7 +267,8 @@ class Listener:
             seen = digest([(a["job_id"], a["state"], a["run_id"]) for a in active])
             extras = status_extras(self.state, self.config, cache_ttl=VITALS_CACHE_S)
             limits = status_limits(self.state)  # usage-limited templates, so clients can show out-of-quota models
-            body = {"active": active, "node_version": "cs node-listen", **extras, **limits, "repos": repo_inventory()}
+            body = {"active": active, "node_version": "cs node-listen", **extras, **limits, "repos": repo_inventory(),
+                    "platform": platform.system()}
             seen = digest([seen, body["repos"], body.get("agent_capabilities"),
                            [(r.get("template"), r.get("resets_at")) for r in limits.get("provider_limits", [])]])
             held_seen = (extras.get("held") or {}).get("reason")

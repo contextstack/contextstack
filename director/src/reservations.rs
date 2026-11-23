@@ -26,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// The budgets a job falls under: its project's and its conversation's.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct JobScope {
     /// The project of its intent or conversation.
     pub project: Option<String>,

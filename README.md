@@ -4,12 +4,20 @@ ContextStack runs coding work through AI agents on your own machines. You can us
 
 ## Status
 
-This is an **alpha** release (0.1.0). First-time setup targets **macOS on Apple Silicon**. **Linux** support is next. Read [alpha known issues](docs/release/alpha-known-issues.md) before you install.
+The current release line is **0.2.0**, now in release candidates. First-time setup targets **macOS on Apple Silicon**. **Linux** support is next. Read [known issues](docs/release/alpha-known-issues.md) before you install.
 
 ## Install
 
+Install the latest stable release:
+
 ```sh
 curl -fsSL https://github.com/contextstack/contextstack/releases/latest/download/install.sh | sh
+```
+
+To install release candidates, use the `latest` channel:
+
+```sh
+curl -fsSL https://github.com/contextstack/contextstack/releases/latest/download/install.sh | sh -s -- --channel latest
 ```
 
 Then run `cs init` if the installer did not already. Step-by-step instructions are in [Getting started](docs/release/getting-started.md). For a native window on macOS, see the [desktop app](docs/release/desktop-app.md).
@@ -26,7 +34,7 @@ Then run `cs init` if the installer did not already. Step-by-step instructions a
 | [`cs/`](cs/) | The `cs` command and everything that runs on each machine: the installer, the dispatcher, finishing, landing, policy. |
 | [`clients/web/`](clients/web/) | The Laravel web UI for the Director: pages and rendering through the Client API only. |
 | [`tests/`](tests/) | Black-box contract suites for the gateway and the Director (machine and client sides). |
-| [`docs/`](docs/) | Release documentation, architecture decision records, and development evidence. |
+| [`docs/`](docs/) | Release documentation and architecture decision records. |
 
 Terms such as task, job, run, task lane, and land are defined in [GLOSSARY.md](GLOSSARY.md).
 

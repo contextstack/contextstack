@@ -153,6 +153,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "rustls",
+ "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha2",

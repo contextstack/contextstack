@@ -218,6 +218,9 @@ fn status_body(body: &[u8]) -> Result<Value, String> {
         ("repos".into(), repos_body(&m)?),
         ("node_version".into(), opt_text(&m, "node_version", 200)?),
     ]);
+    if m.contains_key("platform") {
+        out.insert("platform".into(), opt_text(&m, "platform", 40)?);
+    }
     if let Some(v) = m.get("vitals") {
         out.insert("vitals".into(), vitals_body(v)?);
     }

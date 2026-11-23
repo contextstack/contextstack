@@ -29,7 +29,7 @@ pub struct NewJob {
 }
 
 /// One bundle file as listed in `GET jobs`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BundleFile {
     /// Its plain relative path.
     pub path: String,
@@ -239,7 +239,7 @@ fn spec_names_task(spec: &[u8], task: &str) -> bool {
 }
 
 /// A job checked and ready to record: its node exists, its bundle holds its spec, task and grant.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Plan {
     node_id: i64,
     spec: String,
@@ -351,6 +351,38 @@ impl Plan {
             self.digest = bundle_sha(&self.files);
             self.meta.insert("check_added".into(), json!("none"));
         }
+        Ok(())
+    }
+
+    pub fn mark_coding(&mut self) {
+        self.meta.insert("phase".into(), json!("coding"));
+    }
+
+    pub fn freeze_plan(&mut self, store: &Store, markdown: &str) -> Result<(), String> {
+        let goal_path = format!("{}/goal.md", self.task);
+        let goal = self
+            .files
+            .iter_mut()
+            .find(|file| file.path == goal_path)
+            .ok_or("coding bundle has no goal")?;
+        let mut body = store
+            .read_object(&goal.sha256)
+            .ok_or("coding goal object missing")?;
+        // The harness reads the frozen goal. Keep the attachment in the bundle as well.
+        body.extend_from_slice(b"\n\nA plan from a planning model is in context/plan.md (included below). Follow it, verify with the check, and deviate only with reason.\n\n");
+        body.extend_from_slice(markdown.as_bytes());
+        store.put_object(&body)?;
+        goal.sha256 = sha256_hex(&body);
+        goal.bytes = body.len() as u64;
+        store.put_object(markdown.as_bytes())?;
+        self.files.push(BundleFile {
+            path: format!("{}/context/plan.md", self.task),
+            sha256: sha256_hex(markdown.as_bytes()),
+            bytes: markdown.len() as u64,
+            mode: 0o644,
+        });
+        self.files.sort_by(|a, b| a.path.cmp(&b.path));
+        self.meta.insert("plan".into(), json!("frozen"));
         Ok(())
     }
 

@@ -418,6 +418,9 @@ pub async fn serve(state: Arc<State>) -> Result<(), String> {
                         if let Err(error) = crate::action_approvals::expire_reviews(&state.store.db()) {
                             crate::logf!("action approvals: expiring reviews: {error}");
                         }
+                        if let Err(error) = crate::planning::sweep(&state.store) {
+                            crate::logf!("planning jobs: {error}");
+                        }
                         if let Err(error) = crate::heartbeat::tick(&state.store) {
                             crate::logf!("heartbeat: {error}");
                         }

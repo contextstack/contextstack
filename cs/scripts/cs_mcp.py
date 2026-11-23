@@ -220,6 +220,8 @@ def job_brief(job, intent=None, run=None):
     brief = {"job_id": job.get("job_id"), "title": (intent or {}).get("title"), "node": job.get("node"),
              "state": job.get("state"), "lane": (job.get("meta") or {}).get("lane"), "created_at": job.get("created_at"),
              "finished_at": job.get("finished_at")}
+    if (job.get("meta") or {}).get("phase"):
+        brief["phase"] = job["meta"]["phase"]
     if job.get("error"):
         brief["error"] = job["error"]
     if job.get("failure"):
@@ -338,7 +340,7 @@ class Tools:
 
     def _submit_lane(self, title, goal, node, model, check, repo, lane, budget, system, task_type, profile, tags,
                      project_id=None, extra_meta=None, lane_label=None, spec_text=None, task_path=None, submit_key=None,
-                     intent_id=None, repo_view=False, decision_context=None):
+                     intent_id=None, repo_view=False, frozen_context=None):
         validate_model(model)
         name = slug(lane or title)
         task = task_path or "tasks/" + name
@@ -352,8 +354,8 @@ class Tools:
                  "prompts/system.md": ((system or SYSTEM).encode(), 420),
                  task + "/goal.md": (goal.encode(), 420),
                  task + "/check": (as_script(check).encode(), 493)}
-        if decision_context is not None:
-            files[task + "/context/decision-log.md"] = (decision_context, 420)
+        for name, data in (frozen_context or {}).items():
+            files[task + "/context/" + name] = (data, 420)
         meta = {k: str(v) for k, v in (("source", "cs-mcp"), ("lane", lane or name), ("repo", repo), ("agent", model), ("model", model),
                                         ("task_type", task_type)) if v}
         if repo_view:
@@ -411,7 +413,7 @@ class Tools:
         return self.d.post(path, fields, key=key)
 
     def start_task(self, title, goal, node=None, model=None, check=None, repo=None, lane=None, budget=None,
-                   system=None, task_type=None, project_id=None, agent=None, dispatch_id=None, context=None):
+                   system=None, task_type=None, project_id=None, agent=None, dispatch_id=None, context=None, plan_with=None):
         if dispatch_id is not None and (not isinstance(dispatch_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", dispatch_id)):
             raise Refused("dispatch_id must be 1-128 characters of A-Z a-z 0-9 . _ : -")
@@ -442,7 +444,7 @@ class Tools:
         if explicit_model or not profile or model != prior:
             form["model"] = model
         for key, value in (("check", check), ("budget", budget), ("system", system),
-                           ("task_type", task_type), ("context", context)):
+                           ("task_type", task_type), ("context", context), ("plan_with", plan_with)):
             if value is not None:
                 form[key] = value
         intent = {"node": node, "lane": form, "meta": {"source": "cs-mcp"}}
@@ -452,13 +454,17 @@ class Tools:
             intent["dispatch_id"] = dispatch_id
         answer = self.d.post("intents", intent, key=dispatch_id)
         job = (answer.get("jobs") or [{}])[0]
-        meta = job.get("meta") or answer.get("intent", {}).get("meta") or {}
+        planning = (job.get("meta") or {}).get("phase") == "planning"
+        meta = (answer["intent"].get("meta") if planning else job.get("meta")) or {}
         model = meta.get("model") or model
         requested_lane = lane
         lane = meta.get("lane") or lane
         out = {"intent_id": answer["intent"]["intent_id"], "job_id": job.get("job_id"),
                "state": job.get("state"), "node": node, "model": model,
                "task": answer["intent"].get("task") or "tasks/" + name}
+        if planning:
+            out["planning_job_id"] = job.get("job_id")
+            out["planning_node"] = job.get("node")
         if profile:
             out.update(agent=agent, agent_sha256=meta.get("agent_sha256"))
         if repo_view:
@@ -482,12 +488,15 @@ class Tools:
         if job.get("state") not in ENDED:
             raise Refused("job %s is still %s: wait for it to end before retry_task" % (job_id, job.get("state")))
         prior_meta = job.get("meta") or {}
+        if prior_meta.get("phase") == "planning":
+            raise Refused("the Director starts the coding job automatically after planning")
         attempt = int(prior_meta.get("attempt") or 1)
         if prior_meta.get("retry_of") or attempt >= 2:
             raise Refused("job %s is already attempt %d: only one retry job per task lane" % (job_id, attempt))
         if not job.get("intent_id"):
             raise Refused("job %s has no task to retry" % job_id)
-        if len(self.d.get("intents/" + q(job["intent_id"])).get("jobs") or []) >= 2:
+        jobs = self.d.get("intents/" + q(job["intent_id"])).get("jobs") or []
+        if sum((j.get("meta") or {}).get("phase") != "planning" for j in jobs) >= 2:
             raise Refused("job %s already has another job on this task lane: refuse a third attempt" % job_id)
         out = self.task_output(job_id, tail_chars=STUCK_CHARS)
         if self._job_passed(job, out.get("check")):
@@ -549,15 +558,19 @@ class Tools:
                 else:
                     tools = "[fs_read, fs_write, exec]"
             spec = re.sub(r"^tools:.*$", "tools: " + tools, spec, count=1, flags=re.M)
-        decision_context = None
-        if prior_meta.get("context") == "decision_log":
-            decision_context = self._job_file(job_id, task + "/context/decision-log.md")
-            extra["context"] = "decision_log"
+        frozen_context = {}
+        for key, value, filename in (("context", "decision_log", "decision-log.md"),
+                                     ("plan", "frozen", "plan.md")):
+            if prior_meta.get(key) == value:
+                frozen_context[filename] = self._job_file(job_id, task + "/context/" + filename)
+                extra[key] = value
+        if prior_meta.get("phase") == "coding":
+            extra["phase"] = "coding"
         out = self._submit_lane(title or "retry", goal, node, chosen, check, repo, lane, None,
                                 system, task_type, profile, tags, extra_meta=extra,
                                 project_id=intent.get("project_id"), spec_text=spec, task_path=task,
                                 submit_key="retry-lane:" + str(job_id), intent_id=job["intent_id"], repo_view=repo_view,
-                                decision_context=decision_context)
+                                frozen_context=frozen_context)
         out["retry_of"] = job_id
         out["prior_model"] = prior_model
         if from_model and from_model != chosen:
@@ -605,7 +618,10 @@ class Tools:
         out = job_brief(job, intent, run)
         if intent:
             out["intent_id"] = job["intent_id"]
-            out["jobs"] = [job_brief(j, intent, (runs or {}).get(j.get("run_id"))) for j in body.get("jobs", [])]
+            jobs = body.get("jobs", [])
+            if any((j.get("meta") or {}).get("phase") == "planning" for j in jobs):
+                jobs = reversed(jobs)
+            out["jobs"] = [job_brief(j, intent, (runs or {}).get(j.get("run_id"))) for j in jobs]
         if out.get("live_run_id"):
             live = self.d.get("runs/%s/events?after=0" % q(out["live_run_id"]))
             out["live_events"] = live.get("confirmed")
@@ -686,9 +702,22 @@ class Tools:
                         break
                 jobs = {i: j for i, j in jobs.items() if isinstance(j, dict)}  # a missing job is simply not ended
                 ended = [i for i, j in jobs.items() if j.get("state") in ENDED]
+                successors = {}
+                for i in ended:
+                    job = jobs[i]
+                    if (job.get("meta") or {}).get("phase") == "planning" and job.get("intent_id"):
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            task = self.d.get("intents/" + q(job["intent_id"]), timeout=remaining)
+                            coding = next((j for j in task.get("jobs", [])
+                                           if (j.get("meta") or {}).get("phase") == "coding"), None)
+                            if coding:
+                                successors[i] = job_brief(coding)
                 if ended or time.monotonic() >= deadline:
                     out = {"ended": [job_brief(jobs[i]) for i in ended], "timed_out": not ended,
                            "still_running": [i for i in ids if i not in ended]}
+                    if successors:
+                        out["coding_jobs"] = successors
                     if capped and not ended:
                         out["note"] = ("waits are capped at %ds here; you are woken when a task lane's job ends, "
                                        "so end your turn instead of waiting" % self.max_wait)
@@ -878,6 +907,7 @@ TOOLS = [
       "system": S("string", "agent system prompt for the job (default: a short worker prompt)"),
       "task_type": S("string", "bugfix, feature, refactor, test, review, docs, ops or research (a meta tag)"),
       "project_id": S("string", "a Director project to charge and source the decision log from"),
+      "plan_with": S("string", "CLI model for a short read-only plan before the coding job, e.g. codex."),
       "context": S("array", "Optional job context. Pass [\"decision_log\"] with project_id.",
                    items={"type": "string", "enum": ["decision_log"]})}, ["title", "goal"]),
     ("backlog", "List project backlog items or find the highest-priority next item with all blockers clear.",

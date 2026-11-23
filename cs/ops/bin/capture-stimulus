@@ -309,14 +309,14 @@ def main():
         (staging / "goal.md").write_bytes(raw_goal)
         inputs.append({"role": "goal", "path": "goal.md", "source": str(goal_src),
                        "sha256": sha256_bytes(raw_goal), "bytes": len(raw_goal)})
-        context_path = "context/decision-log.md"
-        context_src = task / context_path
-        if context_src.is_file():
-            raw_context = context_src.read_bytes()
-            (staging / "context").mkdir()
-            (staging / context_path).write_bytes(raw_context)
-            inputs.append({"role": "context", "path": context_path, "source": str(context_src),
-                           "sha256": sha256_bytes(raw_context), "bytes": len(raw_context)})
+        for context_path in ("context/decision-log.md", "context/plan.md"):
+            context_src = task / context_path
+            if context_src.is_file():
+                raw_context = context_src.read_bytes()
+                (staging / "context").mkdir(exist_ok=True)
+                (staging / context_path).write_bytes(raw_context)
+                inputs.append({"role": "context", "path": context_path, "source": str(context_src),
+                               "sha256": sha256_bytes(raw_context), "bytes": len(raw_context)})
         if check_src.is_file():
             raw_check = check_src.read_bytes()
             (staging / "check").write_bytes(raw_check)

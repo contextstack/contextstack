@@ -41,6 +41,7 @@ mod lead_node;
 mod live;
 mod models;
 mod node_api;
+mod planning;
 mod records;
 mod repos;
 mod reservations;

@@ -474,6 +474,11 @@ fn settle(
     // (or run) may be settled and its queue moved; then waiting jobs get what was released.
     crate::reservations::after_envelope(tx, kind == Kind::JobTerminal, &subject);
     crate::settle::after_envelope(store, tx, kind == Kind::JobTerminal, &subject);
+    if kind == Kind::JobTerminal {
+        crate::planning::advance(store, tx, &subject, false)?;
+    } else {
+        crate::planning::after_run(store, tx, &subject)?;
+    }
     crate::reservations::release_logged(store, tx, &subject);
     let ack = json!({"event_id": event_id, "envelope_sha256": envelope_sha256,
                      "verified_at": now_utc(), "restored": true});

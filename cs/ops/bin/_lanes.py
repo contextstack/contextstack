@@ -545,10 +545,16 @@ def refuse_tracked_secrets(cfg, _ref="HEAD"):
                     "in config/repos.json for this repo." % "; ".join(bits))
 
 
-def archive_main(cfg, destination):
-    """Export the configured branch without consulting or changing its checkout."""
+def archive_main(cfg, destination, lane=None):
+    """Export the lane tip, or its configured base if the lane does not exist."""
     main = cfg["path"]
     ref = "refs/heads/" + cfg["branch"]
+    if lane is not None:
+        if not isinstance(lane, str) or not LANE.fullmatch(lane) or ".." in lane:
+            raise LaneError("invalid planning lane")
+        lane_ref = "refs/heads/lane/" + lane
+        if lane_ref in out(main, "for-each-ref", "--format=%(refname)", lane_ref).splitlines():
+            ref = lane_ref
     commit = out(main, "rev-parse", "--verify", ref + "^{commit}")
     refuse_tracked_secrets(cfg)
     # Give archive its own attributes and object access. Export settings in the
@@ -573,8 +579,8 @@ def archive_main(cfg, destination):
 
 
 
-def prepare_repo_view(cfg, destination):
-    archive_main(cfg, destination)
+def prepare_repo_view(cfg, destination, lane=None):
+    archive_main(cfg, destination, lane)
     main = cfg["path"]
     return [str(path) for path in (destination.resolve(), Path(main).resolve(), git_common_dir(main))]
 

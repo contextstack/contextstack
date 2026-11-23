@@ -6,6 +6,7 @@ from _yaml import load as load_yaml
 from _estate_io import state_dir
 import atexit, hashlib, json, os, re, shutil, subprocess, sys, time, signal, threading, tempfile
 from pathlib import Path
+import stat
 
 
 from _estate_io import run_op as estate_run_op
@@ -112,6 +113,22 @@ def trusted_op_env(env):
 
 def research_prompt(repo_view, goal):
     return f"Research the question using the read-only repository snapshot at {repo_view}. Do not commit.\n\n{goal}"
+
+
+def collect_plan(source, destination):
+    # The CLI owns its temporary directory. Accept only a bounded regular file.
+    try:
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return
+            plan = stream.read(16 * 1024 + 1)
+    except OSError:
+        return
+    if len(plan) <= 16 * 1024:
+        finish_path = destination.parent / ".plan.md.tmp"
+        finish_path.write_bytes(plan)
+        finish_path.replace(destination)
 
 
 def require_executor_sandbox():
@@ -380,6 +397,7 @@ def main(argv=None) -> int:
     # repo's main checkout instead of a fresh workspace. Refused here, before any run effect, when it cannot be.
     lane = repo_config = repo_view = None
     repo_denies = []
+    planning_lane = None
     if spec.get("repo_read_only") is True:
         if not spec.get("repo") or spec.get("lane"):
             fail("a read-only repo spec requires repo: and omits lane:")
@@ -387,6 +405,7 @@ def main(argv=None) -> int:
             fail("read-only repo workspaces require the macOS executor sandbox")
         try:
             repo_config = _lanes.repo_config(str(spec["repo"]))
+            planning_lane = spec.get("planning_lane")
         except _lanes.LaneError as error:
             fail("repo: %s" % error)
     elif spec.get("repo") is not None or spec.get("lane") is not None:
@@ -482,7 +501,7 @@ def main(argv=None) -> int:
 
         atexit.register(discard_unfinished_snapshot)
         try:
-            repo_denies = _lanes.prepare_repo_view(repo_config, repo_view)
+            repo_denies = _lanes.prepare_repo_view(repo_config, repo_view, planning_lane)
         except (OSError, subprocess.CalledProcessError, _lanes.LaneError) as error:
             fail("repo: %s" % error)
 
@@ -515,6 +534,8 @@ def main(argv=None) -> int:
     )
     if repo_view:
         prompt = research_prompt(repo_view, goal)
+        if planning_lane:
+            prompt = f"Write the plan to {cli_tmp / 'plan.md'}.\n\n{prompt}"
     if approval_prefix:
         prompt = _lane_mcp.DISCOVERY + "\n\n" + prompt
     turns = str(budget_turns(spec, job_budget))
@@ -641,6 +662,8 @@ def main(argv=None) -> int:
         signal.signal(signal.SIGTERM, lambda *_: None)
         (cli_tmp / "claude-home/Library/Keychains").unlink(missing_ok=True)
         cleanup()
+        if planning_lane:
+            collect_plan(cli_tmp / "plan.md", run_dir / "plan.md")
         receipt = finish.execution_receipt(
             run_dir, ws, row, spec_id, str(a.get("task") or ""), task.name, started,
             check_window, mode, stop, verdict, extra, trace, lane, bool(repo_view), grant_paths,

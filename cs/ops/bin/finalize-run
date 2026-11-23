@@ -110,7 +110,7 @@ CRASH_AFTER = os.environ.get("FINALIZE_RUN_CRASH_AFTER", "")
 ENOSPC_BEFORE = os.environ.get("FINALIZE_RUN_ENOSPC_BEFORE", "")
 ROW_VERSION = 2
 ENVELOPE_FILES = ("terminal.json", "messages.jsonl", "events.jsonl", "cli-events.jsonl",
-                  "check.json", "transcript.md", "stuck.md", "trace.jsonl")
+                  "check.json", "transcript.md", "stuck.md", "trace.jsonl", "plan.md")
 ENVELOPE_DIRS = ("stimulus", "evidence", "sandbox")
 
 

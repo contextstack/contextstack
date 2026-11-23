@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS intents (
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
   project_id TEXT, conversation_id TEXT, lead_conversation_id TEXT,
   origin_kind TEXT NOT NULL DEFAULT 'api', origin_conversation_id TEXT, origin_turn_id TEXT);
+CREATE TABLE IF NOT EXISTS planning_jobs (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id), executor TEXT NOT NULL, deadline TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS decisions (
   decision_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id), decision TEXT NOT NULL,
   note TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);

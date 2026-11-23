@@ -15,7 +15,7 @@ fn name(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
-fn model_name(model: &str) -> bool {
+pub(crate) fn model_name(model: &str) -> bool {
     if let Some(gateway) = model.strip_prefix("harness:") {
         gateway.len() <= 100
             && gateway
@@ -59,7 +59,7 @@ fn script(s: &str) -> String {
         )
     }
 }
-fn root() -> Result<PathBuf, No> {
+pub(crate) fn root() -> Result<PathBuf, No> {
     if let Some(p) = std::env::var_os("CS_CODE_ROOT") {
         return Ok(p.into());
     }
