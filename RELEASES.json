@@ -9,6 +9,11 @@
       "tag": "v0.1.1",
       "commit": "a118c8c075f1aedf0899249b32eeea29a840c7bb",
       "channel": "stable"
+    },
+    {
+      "tag": "v0.2.0-rc.1",
+      "commit": "3108ee09c6a689e0807114148aa9aabbc1fc09be",
+      "channel": "latest"
     }
   ]
 }
