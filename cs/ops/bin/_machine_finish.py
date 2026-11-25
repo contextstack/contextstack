@@ -9,7 +9,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
@@ -75,16 +77,38 @@ def record_process_evidence(run_dir, rows):
         append(run_dir / "process-evidence.jsonl", dict(evidence, stage="check"))
 
 
+@contextmanager
+def check_environment(env, scratch):
+    git_env = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        if key in os.environ:
+            git_env[key] = os.environ[key]
+    with tempfile.TemporaryDirectory(prefix="cs-", dir=scratch) as target:
+        canonical = str(Path(target).resolve())
+        if len(os.fsencode(canonical)) < 32:
+            yield dict(env, **git_env, TMPDIR=canonical, TMP=canonical, TEMP=canonical)
+            return
+        # Unix sockets count bytes in the supplied path before resolving symlinks.
+        # The link lives in a private directory and resolves inside the existing grant.
+        with tempfile.TemporaryDirectory(prefix="cs-", dir="/tmp") as short:
+            alias = Path(short) / "t"
+            alias.symlink_to(Path(target).absolute(), target_is_directory=True)
+            yield dict(env, **git_env, TMPDIR=str(alias), TMP=str(alias), TEMP=str(alias))
+
+
 def sandboxed_check(run_dir, ws, child_env, window, memory_cap_mb, policy, caller, read_roots, protected):
     from _executor import sandbox_cmd
 
     profile = run_dir / "check-sandbox.sb"
     stimulus = run_dir / "stimulus"
     try:
-        command = sandbox_cmd(str(stimulus / "check"), [], ws, run_dir / "tmp", profile, protected,
-                              read_roots=(stimulus, *read_roots), policy=policy, caller=caller)
-        return run_process(command, str(ws), child_env, window, memory_cap_mb=memory_cap_mb,
-                           on_evidence=lambda rows: record_process_evidence(run_dir, rows))
+        # A physical directory under /tmp stays short after canonicalization.
+        with check_environment(child_env, "/tmp") as env:
+            command = sandbox_cmd(str(stimulus / "check"), [], ws, run_dir / "tmp", profile, protected,
+                                  read_roots=(stimulus, *read_roots), policy=policy, caller=caller,
+                                  check_scratch=env["TMPDIR"])
+            return run_process(command, str(ws), env, window, memory_cap_mb=memory_cap_mb,
+                               on_evidence=lambda rows: record_process_evidence(run_dir, rows))
     finally:
         profile.unlink(missing_ok=True)
 
@@ -408,10 +432,12 @@ def finish_receipt(code_root, run_dir, receipt):
             from _muse_adapter import check_command
 
             try:
-                command = check_command(run_dir / "stimulus/check", ws, Path.home(),
-                                        sandbox["read_roots"], sandbox["caller"], env["TMPDIR"])
-                done = run_process(command, str(ws), env, timeout, memory_cap_mb=settings["memory_cap_mb"],
-                                   on_evidence=lambda rows: record_process_evidence(run_dir, rows))
+                with check_environment(env, "/tmp") as child_env:
+                    command = check_command(run_dir / "stimulus/check", ws, Path.home(),
+                                            sandbox["read_roots"], sandbox["caller"], env["TMPDIR"],
+                                            check_scratch=child_env["TMPDIR"])
+                    done = run_process(command, str(ws), child_env, timeout, memory_cap_mb=settings["memory_cap_mb"],
+                                       on_evidence=lambda rows: record_process_evidence(run_dir, rows))
             except Cancelled:
                 raise
             except (OSError, RuntimeError) as error:

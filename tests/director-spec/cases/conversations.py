@@ -3,6 +3,7 @@ active turn with a queue behind it; stop and resume; replies as they are written
 thread, with summaries made by ordinary jobs. A protocol-2 stand-in node (harness/node2.py) plays the node and
 returns canned replies in the run's messages.jsonl, as the Rust runner records them."""
 import json
+import time
 
 from harness.client import new_key
 from harness.node2 import delta, stop
@@ -403,6 +404,71 @@ def _(ctx):
     ctx.expect(turn(c, good["turn_id"])["failure"] is None, "successful turn has null failure")
 
 
+@case(C, "conversation", "conversation-turn-waiting-for-node")
+def _(ctx):
+    """A turn whose job its node has not pulled says so: `waiting.reason` is `node_not_pulled` (on the turn, the
+    thread, the conversation and the job) once the job has stayed offered past `--offer-grace`, while the turn stays
+    `running`. When the node pulls (accepts) the job, `waiting` is null again."""
+    c = owner(ctx)
+    ctx.target.restart(["--offer-grace", "1"])
+    try:
+        n = ctx.node2()
+        conv = created(ctx, c, n)
+        t = post(ctx, c, conv, "Are you there?")
+        ctx.expect(t["state"] == "running" and t.get("waiting", "absent") is None,
+                   "a fresh offer is not yet waiting", t)
+        deadline = time.time() + 15
+        late = turn(c, t["turn_id"])
+        while late["waiting"] is None and time.time() < deadline:
+            time.sleep(0.25)
+            late = turn(c, t["turn_id"])
+        w = late["waiting"] or {}
+        ctx.expect(late["state"] == "running" and w.get("reason") == "node_not_pulled" and w.get("node") == n.name
+                   and isinstance(w.get("since"), str), "an unpulled job: node_not_pulled, still running", late)
+        th = thread(c, conv)
+        ctx.expect(th["turns"][0]["waiting"] == w and th["conversation"]["waiting"] == w
+                   and th["conversation"]["state"] == "running", "the thread and the conversation say the same", th)
+        ctx.expect(c.call("GET", "jobs/" + t["job_id"]).json["waiting"] == w, "so does the job")
+        n.accept(t["job_id"])
+        pulled = turn(c, t["turn_id"])
+        ctx.expect(pulled["state"] == "running" and pulled["waiting"] is None, "pulled: waiting is null", pulled)
+        ctx.expect(thread(c, conv)["conversation"]["waiting"] is None, "the conversation too")
+        ctx.expect(c.call("GET", "jobs/" + t["job_id"]).json["waiting"] is None, "and the job")
+    finally:
+        ctx.target.restart()
+
+
+@case(C, "conversation", "conversation-turn-waiting-for-summary-job")
+def _(ctx):
+    """A summarising turn uses its summary job's waiting field until the node pulls the job."""
+    c = owner(ctx)
+    ctx.target.restart(["--offer-grace", "1"])
+    try:
+        n = ctx.node2()
+        conv = created(ctx, c, n, TINY)
+        _, pending = converse_until_summary(ctx, c, n, conv)
+        job = thread(c, conv)["summaries"][-1]["job_id"]
+        deadline = time.monotonic() + 15
+        waiting = c.call("GET", "jobs/" + job).json["waiting"]
+        while waiting is None and time.monotonic() < deadline:
+            time.sleep(0.25)
+            waiting = c.call("GET", "jobs/" + job).json["waiting"]
+        ctx.expect(waiting and waiting["reason"] == "node_not_pulled" and waiting["node"] == n.name,
+                   "the summary job is unpulled", waiting)
+        row = turn(c, pending["turn_id"])
+        ctx.expect(row["state"] == "summarising" and row["job_id"] is None and row["waiting"] == waiting,
+                   "the turn shows its summary job's waiting reason", row)
+        th = thread(c, conv)
+        ctx.expect(th["turns"][-1]["waiting"] == waiting and th["conversation"]["waiting"] == waiting,
+                   "the thread and conversation show the same reason", th)
+        n.accept(job)
+        row = turn(c, pending["turn_id"])
+        ctx.expect(row["state"] == "summarising" and row["waiting"] is None,
+                   "accepting the summary job clears waiting", row)
+    finally:
+        ctx.target.restart()
+
+
 @case(C, "conversations", "conversation-chat-spec-bundle")
 def _(ctx):
     """Explicit chat uses the home node and supplies the desktop's spec and prompt."""
@@ -432,3 +498,53 @@ def _(ctx):
                 422, "invalid_request", "invalid chat request")
     explicit = c.call("POST", "conversations", body={**body, "node": node.name}, key=new_key())
     ctx.expect(explicit.status == 201, "explicit chat node", explicit)
+
+
+@case(C, "conversations", "conversation-chat-cli-model")
+def _(ctx):
+    """A chat turn on a CLI catalog model still gets the chat system prompt and context (not a coding lane)."""
+    c, node = owner(ctx), ctx.node2()
+    ctx.expect(c.call("PUT", "lead-node", body={"node": node.name}).status == 200, "set home")
+    body = {"spec": "chat", "model": "claude-code-sonnet", "title": "CLI chat"}
+    a = c.call("POST", "conversations", body=body, key=new_key("chat-cli"))
+    ctx.expect(a.status == 201, "chat on CLI model created", a)
+    conv = a.json["conversation"]
+    ctx.expect(conv["lead"] is False and conv["model"] == "claude-code-sonnet", "ordinary chat, CLI model", conv)
+    t = post(ctx, c, conv, "test 1")
+    files = job_files(node, t["job_id"])
+    expected = ("id: chat\nmodel: \"claude-code-sonnet\"\nsystem: prompts/system.md\n"
+                "context: [conversation/context.md]\ntools: []\nmcp: []\n"
+                "budget: {turns: 4, tool_calls: 0, usd: 0, seconds: 300}\ntasks: [tasks/turn]\ntrials: 1\n")
+    ctx.expect(files["spec.yaml"] == expected.encode(), "CLI chat spec fields", files)
+    ctx.expect(files["prompts/system.md"].startswith(b"You are a helpful assistant"),
+               "CLI chat keeps the conversation system prompt", files["prompts/system.md"])
+    ctx.expect(files["tasks/turn/goal.md"] == b"test 1", "goal is the person's message, not coding framing")
+    reply(ctx, node, t["job_id"], "got it")
+    ctx.expect(thread(c, conv)["turns"][0]["reply"] == "got it", "CLI chat turn completes")
+
+
+@case(C, "conversations", "conversation-model-harness-pair")
+def conversation_model_harness_pair(ctx):
+    node = ctx.node2()
+    node.status([], agent_capabilities={
+        "templates": ["claude-code-sonnet", "codex"], "harness": True, "harness_models": ["local-coder"],
+    })
+    c = owner(ctx)
+    base = {"node": node.name, "spec": "chat", "title": "Paired chat"}
+    for harness, model, expected in (
+        ("claude-code", "sonnet", "claude-code-sonnet"),
+        ("contextstack", "harness:local-coder", "local-coder"),
+        ("codex", "gpt-6.2-sol", "codex:gpt-6.2-sol"),
+    ):
+        a = c.call("POST", "conversations", body={**base, "harness": harness, "model": model}, key=new_key())
+        ctx.expect(a.status == 201 and a.json["conversation"]["model"] == expected, "pair starts chat", a)
+    a = c.call("POST", "conversations", body={**base, "model": "codex:gpt-6.2-sol"}, key=new_key())
+    ctx.expect(a.status == 201, "exact CLI value works without a separate harness", a)
+    turn = post(ctx, c, a.json["conversation"], "test selected model")
+    files = job_files(node, turn["job_id"])
+    ctx.expect(b'model: "codex:gpt-6.2-sol"\n' in files["spec.yaml"], "selection reaches frozen job", files)
+    a = c.call("POST", "conversations", body={**base, "model": "harness:local-coder"}, key=new_key())
+    ctx.expect(a.status == 201 and a.json["conversation"]["model"] == "local-coder",
+               "catalog value works without a separate harness field", a)
+    a = c.call("POST", "conversations", body={**base, "harness": "pi", "model": "sonnet"}, key=new_key())
+    ctx.expect(a.status == 422 and b"cannot run on harness" in a.body, "mismatched pair refused", a)

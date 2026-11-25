@@ -18,7 +18,7 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from hermetic_env import hermetic_env
 
 CODE_ROOT = Path(__file__).resolve().parents[3]
-OPS = ('_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "capture-stimulus", "capture-stimulus.json", "_grant.py")
+OPS = ('_lifecycle_evidence.py', '_estate_io.py', '_harvest_git.py', '_roots.py', "capture-stimulus", "capture-stimulus.json", "_grant.py")
 FAILURES = []
 
 

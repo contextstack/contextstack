@@ -65,18 +65,28 @@ final class MarkdownHtml
         );
     }
 
+    /**
+     * Whether a link stays on this app. A scheme-relative `//host/path` (browsers read `\\` as `/` here too) names
+     * another host, so it is compared like a full URL rather than taken for a path.
+     */
     public static function isSameOrigin(string $href, ?string $baseUrl = null): bool
     {
         if ($href === '' || str_starts_with($href, '#')) {
             return true;
         }
 
+        $baseUrl ??= url('/');
+        $base = parse_url($baseUrl);
+        $href = str_replace('\\', '/', $href);
+
+        if (str_starts_with($href, '//')) {
+            $href = ($base['scheme'] ?? 'http').':'.$href;
+        }
+
         if (! parse_url($href, PHP_URL_SCHEME)) {
             return true;
         }
 
-        $baseUrl ??= url('/');
-        $base = parse_url($baseUrl);
         $target = parse_url($href);
 
         return ($base['scheme'] ?? null) === ($target['scheme'] ?? null)

@@ -14,7 +14,7 @@ from _node_env import node_env
 NODE_SETTINGS = node_env()
 
 from _runner import running_count
-from _dispatch import spec_value
+from _dispatch import executor_template, spec_value
 from _env_policy import EnvPolicyError, child_env_value, resolve
 from _estate_io import read_jsonl, state_dir, pid_live, append_jsonl, call_op
 from _job_identity import _pid_identity
@@ -90,7 +90,12 @@ def execution_row(rel, sid, after=0):
     lines = [line for line in LEDGER.read_text(encoding="utf-8").splitlines()
              if line.strip()]
     for line in reversed(lines[max(0, int(after)):]):
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except ValueError:  # a cut-off line (a crash mid-append) must not break every later read
+            continue
+        if not isinstance(row, dict):
+            continue
         if (row.get("trial") is not None
                 and row.get("verdict") in {"pass", "fail", "void"}
                 and spec_key(row.get("spec")) in wanted):
@@ -484,7 +489,7 @@ def one_executor_trial(rel, spec_text, task, n, job_id="", external_effects=None
         "trial": n,
         "timeout_s": spec_seconds(spec_text),
     }
-    template = TEMPLATES.get(payload['executor'], {})
+    template = executor_template(TEMPLATES, payload['executor']) or {}
     if spec_value(spec_text, 'budget') and Path(template.get('binary', '')).name == 'claude':
         from _cli_budget import declared  # an inline budget, forwarded; a block one the executor reads itself
         from _yaml import load as load_yaml
@@ -492,9 +497,11 @@ def one_executor_trial(rel, spec_text, task, n, job_id="", external_effects=None
     # Bind authority to this exact queued work order, never a sibling spec run.
     order = next((row for row in read_jsonl(Q, strict=True)
                   if job_id and qid(row) == job_id and row.get("state") == "pending"), {})
-    for key in ("conversation_id", "turn_id"):
+    for key in ("conversation_id", "turn_id", "agent"):
         if order.get(key):
             payload[key] = order[key]
+    if isinstance(order.get("writes"), bool):
+        payload["writes"] = order["writes"]
     if order.get("grant"):
         payload["grant"] = order["grant"]
     env = child_env(job_id, external_effects)
@@ -510,7 +517,7 @@ def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion
     sid = spec_value(text, "id")
     # a director job runs the task materialised beside its frozen spec, never a checkout path
     tasks = [job_task] if job_task else (spec_tasks(text) or [None])
-    use_executor = spec_value(text, "model") in TEMPLATES
+    use_executor = executor_template(TEMPLATES, spec_value(text, "model")) is not None
     final_row = {}
     failure = None
     try:  # the node's roots (_roots), then the spec's env: request against policy/env.json; a refusal is a config void, nothing launches
@@ -565,8 +572,12 @@ def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion
                 # error with the child's reason (no later trial would fare better); main appends the terminal row,
                 # which a Director job spools as its job_terminal.
                 reason = no_row_reason(rc)
+                # A job-process cleanup or tracking failure is the host being busy, not the node's
+                # configuration: the job may be retried (seen live 2026-11: a finished job voided).
+                transient = "job process" in reason
                 return (rc or 1), {"verdict": "void", "stop": "error: no_row: %s" % reason, "spec": sid,
-                                   "trial": n, "error": error_object("node_config", "no_row", "runner", False, reason)}
+                                   "trial": n, "error": error_object("interrupted" if transient else "node_config",
+                                                                     "no_row", "runner", transient, reason)}
             final_row = row
             if completion and row.get("stop") != "finalization_pending":
                 completion(row)
@@ -764,7 +775,7 @@ def main(turn_only=False):
             return
         try:
             job = refresh_job(selected)
-        except RuntimeError as error:
+        except Exception as error:  # any refresh failure closes this one job; the rest of the queue moves on
             jid = qid(selected)
             terminal = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "id": jid, "job": jid, "spec": selected["spec"],
@@ -774,7 +785,7 @@ def main(turn_only=False):
                         "failure_class": "machinery_preflight",
                         "turns": 0, "tool_calls": 0, "seconds": 0,
                         "cost_usd": 0, "est_usd": 0,
-                        "note": str(error)}
+                        "note": str(error) or type(error).__name__}
             for key in JOB_META:
                 if selected.get(key):
                     terminal[key] = selected[key]
@@ -802,11 +813,24 @@ def main(turn_only=False):
         fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         lf.close()
     try:
-        rc, trial_row = run_spec(job["spec"], job.get("schedule_id"),
-                                 str(job.get("id") or job.get("job") or ""),
-                                 job.get("external_effects"),
-                                 None,
-                                 job.get("task") if job.get("director_job") else None)
+        try:
+            rc, trial_row = run_spec(job["spec"], job.get("schedule_id"),
+                                     str(job.get("id") or job.get("job") or ""),
+                                     job.get("external_effects"),
+                                     None,
+                                     job.get("task") if job.get("director_job") else None)
+        except Exception as error:
+            # A crash inside run_spec must still close the job: a running row with a live-looking
+            # pid is never swept, so without a terminal row the job stays running.
+            import traceback
+            detail = "%s: %s" % (type(error).__name__, error)
+            try:
+                append_job_log(job_log_path(STATE, job.get("director_job") or jid),
+                               "dispatch crashed:\n%s" % traceback.format_exc())
+            except Exception:
+                pass
+            rc, trial_row = 1, {"verdict": "void", "stop": "error: dispatch crashed: %s" % detail,
+                                "error": error_object("unclassified", "dispatch_exception", "launcher", False, detail)}
         done = lockf(True)
         try:
             if first_terminal(Q, jid) is None:

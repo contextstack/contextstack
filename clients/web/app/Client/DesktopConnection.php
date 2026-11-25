@@ -9,8 +9,9 @@ use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Exceptions\NotConnected;
 
 /**
- * Whether the desktop app can reach the local Director, using the same credential and HTTP path as the rest of
- * client-web.
+ * Whether the desktop app can reach its Director, using the same credential and HTTP path as the rest of client-web:
+ * a paired device token, else this Mac's local credential (`cs init`). With neither, the app is not set up yet and
+ * the owner pairs it from Settings or runs `cs init`.
  */
 final class DesktopConnection
 {
@@ -23,7 +24,7 @@ final class DesktopConnection
 
     public function status(): DesktopConnectionStatus
     {
-        if (! $this->connections->hasLocalCredential()) {
+        if (! $this->connections->isConnected()) {
             return DesktopConnectionStatus::NotSetUp;
         }
 
@@ -34,7 +35,7 @@ final class DesktopConnection
         } catch (NotConnected) {
             return DesktopConnectionStatus::NotSetUp;
         } catch (DirectorRefused $refused) {
-            // A credential the Director rejects is as good as none: this Mac needs `cs init` again.
+            // A credential the Director rejects is as good as none: this Mac needs pairing or `cs init` again.
             return in_array($refused->status, [401, 403], true)
                 ? DesktopConnectionStatus::NotSetUp
                 : DesktopConnectionStatus::Ready;

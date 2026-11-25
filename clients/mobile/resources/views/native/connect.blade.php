@@ -7,6 +7,10 @@
                 Pair this device with your Director once. In the ContextStack desktop app on the Director's machine, open Devices and choose Get a pairing code, then scan its QR code, or enter the address and code it shows here, within 10 minutes.
             </native:text>
 
+            @if ($pairedWith !== '')
+                <native:text class="text-sm text-theme-destructive">This device is already paired with {{ $pairedWith }}. Pairing again replaces that pairing on this device; revoke the old one in Devices if you no longer need it.</native:text>
+            @endif
+
             <native:outlined-text-input label="Director address" placeholder="http://100.x.y.z:8780"
                 native:model.debounce.300ms="url" keyboard="url" autocapitalize="none" />
 

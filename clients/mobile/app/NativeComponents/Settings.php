@@ -4,6 +4,7 @@ namespace App\NativeComponents;
 
 use App\Client\ConnectionStore;
 use App\Client\Exceptions\NotConnected;
+use App\Client\Exceptions\TokenUnreadable;
 use App\Native\AppLock;
 use App\Native\DirectorScreen;
 use Illuminate\View\View;
@@ -36,6 +37,10 @@ class Settings extends DirectorScreen
             $connection = app(ConnectionStore::class)->resolve();
         } catch (NotConnected) {
             $this->replace('/connect');
+
+            return;
+        } catch (TokenUnreadable $unreadable) {
+            $this->problem = $unreadable->getMessage();
 
             return;
         }

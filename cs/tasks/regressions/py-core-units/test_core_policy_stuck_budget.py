@@ -244,7 +244,7 @@ class StuckBudgetParsingTests(unittest.TestCase):
 
     def test_parse_budget_stuck_merges_positive_overrides(self):
         cfg = _stuck.parse_budget_stuck({"stuck": {"repeat": 5, "idle_turns": 10, "edit_churn": 2}})
-        self.assertEqual(cfg, {"enabled": True, "repeat": 5, "idle_turns": 10, "edit_churn": 2})
+        self.assertEqual(cfg, {"enabled": True, "repeat": 5, "idle_turns": 10, "edit_churn": 2, "writes": True})
 
 
 class StuckMonitorTests(unittest.TestCase):
@@ -295,6 +295,43 @@ class StuckMonitorTests(unittest.TestCase):
         self.assertIsNone(mon.feed([{"kind": "turn"}]))
         stopped = mon.feed([{"kind": "turn"}])
         self.assertEqual(stopped["stop"], "stuck:idle_turns")
+
+    def test_read_only_config_skips_idle_turns_but_still_trips_repeat(self):
+        mon, _state = make_monitor(idle_turns=2, repeat=2, writes=False)
+        self.assertIsNone(mon.feed([{"kind": "turn"}]))
+        self.assertIsNone(mon.feed([{"kind": "turn"}]))
+        self.assertIsNone(mon.feed([{"kind": "turn"}]))
+        self.assertIsNone(mon.stopped)
+        self.assertIsNone(self._failed_check(mon, "ro1"))
+        stopped = self._failed_check(mon, "ro2")
+        self.assertEqual(stopped["stop"], "stuck:repeat")
+
+    def test_writing_job_still_trips_idle_turns(self):
+        mon, _state = make_monitor(idle_turns=2, writes=True)
+        self.assertIsNone(mon.feed([{"kind": "turn"}]))
+        stopped = mon.feed([{"kind": "turn"}])
+        self.assertEqual(stopped["stop"], "stuck:idle_turns")
+
+    def test_resolve_stuck_writes_read_only_signals(self):
+        self.assertFalse(_stuck.resolve_stuck_writes(agent_writes=False))
+        self.assertFalse(_stuck.resolve_stuck_writes(writes=False))
+        self.assertFalse(_stuck.resolve_stuck_writes(repo_read_only=True))
+        self.assertFalse(_stuck.resolve_stuck_writes(read_only_check=True))
+        self.assertFalse(_stuck.resolve_stuck_writes(has_grant=False, agent_named=True))
+        self.assertTrue(_stuck.resolve_stuck_writes(agent_writes=True, has_grant=False, agent_named=True))
+        self.assertTrue(_stuck.resolve_stuck_writes(has_grant=False, agent_named=False))
+        self.assertTrue(_stuck.resolve_stuck_writes(has_grant=True))
+
+    def test_agent_profile_writes_reads_frontmatter(self):
+        with scratch_dir(prefix="stuck-agents-") as raw:
+            root = Path(raw)
+            (root / "researcher.md").write_text(
+                "---\nname: researcher\nwrites: false\nlane: false\n---\nbody\n", encoding="utf-8")
+            (root / "coder.md").write_text(
+                "---\nname: coder\nwrites: true\nlane: true\n---\nbody\n", encoding="utf-8")
+            self.assertFalse(_stuck.agent_profile_writes(root, "researcher"))
+            self.assertTrue(_stuck.agent_profile_writes(root, "coder"))
+            self.assertIsNone(_stuck.agent_profile_writes(root, "missing"))
 
     def test_monitor_feed_ignored_when_disabled_in_config(self):
         mon, _state = make_monitor(repeat=1)

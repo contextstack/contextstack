@@ -385,7 +385,7 @@ fn chat_spec(model: &str) -> String {
     )
 }
 
-fn default_bundle(state: &State, m: &mut Map<String, Value>) -> Result<(), No> {
+fn default_bundle(state: &State, m: &mut Map<String, Value>, paired: bool) -> Result<(), No> {
     if m.get("spec").and_then(Value::as_str) == Some(thread::HOSTED_LEAD_SPEC_ID) {
         return lead_bundle(state, m);
     }
@@ -411,15 +411,9 @@ fn default_bundle(state: &State, m: &mut Map<String, Value>) -> Result<(), No> {
     {
         return Err(No::invalid("model cannot be combined with a custom bundle"));
     }
-    if built_chat {
-        let catalog = crate::models::list(&state.settings.gateway).map_err(|e| match e {
-            crate::gateway::Fault::Unavailable(message) => {
-                No(502, "gateway_unavailable", message, Value::Null)
-            }
-            crate::gateway::Fault::Token(message) => {
-                No(502, "gateway_owner_token", message, Value::Null)
-            }
-        })?;
+    if built_chat && !paired {
+        let catalog =
+            crate::models::list(&state.settings.gateway).map_err(crate::models::catalog_error)?;
         if !catalog["models"]
             .as_array()
             .is_some_and(|rows| rows.iter().any(|row| row["name"].as_str() == Some(model)))
@@ -502,6 +496,46 @@ fn validate_create_targets(db: &Connection, want: &Value, node: &str) -> Result<
     Ok(())
 }
 
+fn create_bundle(
+    state: &State,
+    m: &mut Map<String, Value>,
+    built_lead: bool,
+) -> Result<Option<String>, No> {
+    let built_chat = m.get("spec").and_then(Value::as_str) == Some("chat");
+    if !m.contains_key("harness")
+        && m.get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| model.starts_with("harness:"))
+    {
+        m.insert("harness".into(), json!("contextstack"));
+    }
+    if !m.contains_key("harness")
+        && let Some(model) = m.get("model").and_then(Value::as_str)
+        && model.contains(':')
+        && crate::capabilities::is_cli_template(model)
+        && let Some(harness) = crate::capabilities::templates()
+            [crate::capabilities::base_template(model)]["harness"]["id"]
+            .as_str()
+    {
+        m.insert("harness".into(), json!(harness));
+    }
+    let pair = crate::models::resolve(&state.settings.gateway, m, false)?;
+    if let Some(value) = &pair {
+        let model = value.strip_prefix("harness:").unwrap_or(value);
+        m.remove("harness");
+        m.insert("model".into(), json!(model));
+    }
+    default_bundle(state, m, pair.is_some())?;
+    crate::lead_node::apply_create_node(&state.store.db(), m, built_lead)?;
+    if built_chat && m.get("node").is_none_or(Value::is_null) {
+        let node = crate::lead_node::effective(&state.store.db())
+            .map_err(|e| No::internal(&e))?
+            .ok_or_else(|| No::invalid("register a node before creating a chat"))?;
+        m.insert("node".into(), json!(node));
+    }
+    Ok(pair)
+}
+
 /// `POST conversations`: a conversation on a spec bundle, talking to one node.
 fn create(state: &State, call: &Call, client: &Client) -> Reply {
     let (key, mut m) = match (key(call), body(call)) {
@@ -510,22 +544,10 @@ fn create(state: &State, call: &Call, client: &Client) -> Reply {
     };
     // Only the Director builds a hosted-lead bundle (from the installed release); a client bundle may not claim the id.
     let built_lead = m.get("spec").and_then(Value::as_str) == Some(thread::HOSTED_LEAD_SPEC_ID);
-    let built_chat = m.get("spec").and_then(Value::as_str) == Some("chat");
-    if let Err(e) = default_bundle(state, &mut m) {
-        return e.reply();
-    }
-    if let Err(e) = crate::lead_node::apply_create_node(&state.store.db(), &mut m, built_lead) {
-        return e.reply();
-    }
-    if built_chat && m.get("node").is_none_or(Value::is_null) {
-        match crate::lead_node::effective(&state.store.db()) {
-            Ok(Some(node)) => {
-                m.insert("node".into(), json!(node));
-            }
-            Ok(None) => return No::invalid("register a node before creating a chat").reply(),
-            Err(e) => return No::internal(&e).reply(),
-        }
-    }
+    let pair = match create_bundle(state, &mut m, built_lead) {
+        Ok(pair) => pair,
+        Err(e) => return e.reply(),
+    };
     let want = match normalise(&m) {
         Ok(w) => w,
         Err(r) => return r.reply(),
@@ -561,6 +583,17 @@ fn create(state: &State, call: &Call, client: &Client) -> Reply {
     }
     if let Err(r) = validate_create_targets(&db, &want, &s("node")) {
         return *r;
+    }
+    if let Some(value) = pair.as_deref() {
+        let gateway_model = value.strip_prefix("harness:");
+        if let Err(detail) = crate::capabilities::refuse_dispatch(
+            &db,
+            &s("node"),
+            gateway_model.unwrap_or(value),
+            gateway_model.is_some(),
+        ) {
+            return No::invalid(&detail).reply();
+        }
     }
     let project = match project_of(&db, &want) {
         Ok(p) => p,

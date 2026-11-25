@@ -272,6 +272,33 @@ class ListenerTests(unittest.TestCase):
             self.assertEqual(kick.call_count, int(rc == 0))
         self.assertTrue((self.root / 'node/schedules-reported.json').is_file())
 
+    def test_loop_crash_is_logged_and_the_loop_restarts(self):
+        # B4: an exception in a daemon worker loop used to kill the thread silently.
+        calls = []
+        def loop():
+            calls.append(1)
+            if len(calls) < 3:
+                raise KeyError('transient')
+        with patch.object(self.listener.stop, 'wait', return_value=False):
+            self.listener.guard('work', loop)
+        self.assertEqual(len(calls), 3)
+        self.assertIsNone(self.listener.fatal)
+        self.assertFalse(self.listener.stop.is_set())
+        errors = [c.kwargs for c in self.say.call_args_list if c.kwargs.get('event') == 'error']
+        self.assertEqual([e['what'] for e in errors], ['work_loop', 'work_loop'])
+        self.assertIn('transient', errors[0]['detail'])
+
+    def test_loop_that_cannot_continue_stops_the_listener(self):
+        calls = []
+        def loop():
+            calls.append(1)
+            raise RuntimeError('broken for good')
+        with patch.object(self.listener.stop, 'wait', return_value=False):
+            self.listener.guard('schedules', loop, now=lambda: 0.0)
+        self.assertEqual(len(calls), self.m.LOOP_CRASH_LIMIT)
+        self.assertEqual(self.listener.fatal, 'schedules')
+        self.assertTrue(self.listener.stop.is_set())
+
     def test_main_config_variations(self):
         env = {**hermetic_env(), 'CS_STATE_ROOT': str(self.root)}
         with patch.object(sys, 'stdin', io.StringIO('{}')):
@@ -291,7 +318,11 @@ class ListenerTests(unittest.TestCase):
              patch.object(self.m.signal, 'signal'), patch.object(self.m.threading, 'Thread'), \
              patch.object(self.m.threading, 'Timer') as timer:
             listener.return_value.recover_orphaned_jobs.return_value = ['old']
+            listener.return_value.fatal = None
             self.assertEqual(self.m.main(config_root=self.root, env=env), 0)
             self.assertFalse(listener.call_args.kwargs['dispatch'])
             timer.return_value.start.assert_called_once()
-            listener.return_value.duties_loop.assert_called_once()
+            listener.return_value.guard.assert_called_once_with('duties', listener.return_value.duties_loop)
+            listener.return_value.fatal = 'work'  # a loop that cannot continue: exit non-zero so launchd restarts
+            with patch.object(sys, 'stdin', io.StringIO('{"dispatch": false}')):
+                self.assertEqual(self.m.main(config_root=self.root, env=env), 1)

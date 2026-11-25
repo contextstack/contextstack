@@ -37,6 +37,7 @@ def parse_budget_stuck(budget):
         "repeat": DEFAULT_REPEAT,
         "idle_turns": DEFAULT_IDLE_TURNS,
         "edit_churn": DEFAULT_EDIT_CHURN,
+        "writes": True,
     }
     if not isinstance(budget, dict) or "stuck" not in budget:
         return config
@@ -62,6 +63,52 @@ def parse_budget_stuck(budget):
             raise ValueError("budget.stuck.%s must be a positive integer" % key)
         config[key] = raw
     return config
+
+
+def resolve_stuck_writes(*, writes=None, agent_writes=None, has_grant=True, agent_named=False,
+                         repo_read_only=False, read_only_check=False):
+    """Whether idle_turns applies: writing jobs only.
+
+    Read-only when the agent profile has writes: false, the work order carries writes: false,
+    the spec is a read-only repo view, the task check wraps a read-only agent, or a named agent
+    job has no write grant. Grantless experiment work orders (no agent) keep idle_turns.
+    """
+    if writes is False or agent_writes is False or repo_read_only or read_only_check:
+        return False
+    if writes is True or agent_writes is True:
+        return True
+    if not has_grant and agent_named:
+        return False
+    return True
+
+
+def agent_profile_writes(agents_dir, name):
+    """Frontmatter writes: from cs/agents/<name>.md, or None when unknown/malformed."""
+    if not name or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", str(name)):
+        return None
+    path = Path(agents_dir) / ("%s.md" % name)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end < 0:
+        return None
+    for line in text[3:end].splitlines():
+        if ":" not in line or line[:1].isspace():
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() != "writes":
+            continue
+        raw = value.strip().lower()
+        if raw == "true":
+            return True
+        if raw == "false":
+            return False
+        return None
+    return None
 
 
 def _normalize(text):
@@ -346,6 +393,9 @@ class Monitor:
         self.last_state = current
         self.last_changed = tuple(sorted(current))
         self.turn_edit_activity = self.edit_activity
+        # Read-only jobs never change files by design; idle_turns would always trip.
+        if not self.config.get("writes", True):
+            return None
         if changed:
             self.idle_turns = 0
             return None

@@ -23,6 +23,13 @@ its descendant. Y starts a native harness lane through MCP, edits the worktree
 through the real gateway and harness, then checks the committed branch, the
 machine verdict, reported usage and the merged trace.
 
+In L and O the provider outlasts the run deadline. The harness keeps the
+in-flight call alive during its settlement grace period and receives the
+gateway's deadline response. Both traces must be complete with no findings,
+all sends marked delivered, and the terminal charge equal to the gateway
+settlement. L requires a positive charge. O checks the streaming refusal and
+the zero-charge fallback settlement in reverse exchange order.
+
 The proposal's table expected a spend discrepancy in G and J. The
 `partial-charge-total` fix on 2026-11-19 made the gateway's settled partial
 charge reach the harness run total. Both cases now expect `complete` with no

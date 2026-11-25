@@ -117,7 +117,9 @@ class Run:
                 {"name": "ollama-small", "provider": "ollama", "tier": 2, "capability": "general"},
                 {"name": "gpt-spec", "provider": "openai", "tier": 1, "capability": "coding", "cost_per_1k": 0.015},
                 {"name": "claude-spec", "provider": "anthropic", "tier": 1, "capability": "coding", "cost_per_1k": 0.015},
-                {"name": "claude-code", "provider": "anthropic", "tier": 1, "capability": "coding", "executor": "cli", "cli_binary": "claude"},
+                {"name": "claude-code", "provider": "anthropic", "tier": 1, "capability": "coding", "executor": "cli", "cli_binary": "claude",
+                 "picker": {"provider_label": "Anthropic", "label": "Claude Code, uses its configured model",
+                            "efforts": ["low", "medium", "high"]}},
                 {"name": "mock-echo", "provider": "mock", "tier": 3, "capability": "general"},
             ] + list(extra_models),
             # Pin every executable the gateway may look up: nothing from the host.

@@ -98,11 +98,41 @@ def subscription_stream_fault_preserves_reported_charge(t):
 
 @case("accounting")
 def negative_charge_refused(t):
-    """A negative provider charge is an error ($0), never a credit."""
+    """A negative provider charge is an error, never a credit, but the 2xx call was billed: it settles at the
+    reservation (usage below it), amount equal to charged_usd, never $0 and never the negative figure."""
     t.vllm.chat["fake-paid"] = {"json": upstreams.chat_completion(cost=-1)}
-    b = t.gw.call(model_call("fake-paid")).json
-    sub(b, {"status": "error", "cost": {"amount": "0.000000"}, "error": {"class": "runtime_fault", "code": "gateway.transport_failed",
-                                                                      "message": "vllm: negative provider charge"}}, "negative")
+    b = t.gw.call(model_call("fake-paid", run_id="negative-charge")).json
+    sub(b, {"status": "error", "error": {"class": "runtime_fault", "code": "gateway.transport_failed",
+                                         "message": "vllm: negative provider charge"}}, "negative")
+    charge = b["cost"]["charged_usd"]
+    eq(charge > 0, True, "billed 2xx settles above $0")
+    eq(b["cost"]["amount"], f"{charge:.6f}", "amount agrees with charged_usd")
+    absent(b["cost"], ["charged"], "the negative figure is not reported")
+    path = t.gw.home / ".contextstack/gateway/traces/negative-charge.jsonl"
+    spans = [json.loads(line) for line in path.read_text().splitlines()]
+    settlements = [span["attributes"] for span in spans if span["kind"] == "settlement"]
+    eq(len(settlements), 1, "settlement count")
+    sub(settlements[0], {"basis": "measured", "partial": True, "charged_usd": charge}, "settlement")
+    usage = [span["attributes"] for span in spans if span["kind"] == "usage"]
+    eq(len(usage), 1, "usage count")
+    eq(0 < usage[0]["estimated_usd"] < charge, True, "measured price below the reservation")
+
+
+@case("accounting")
+def unparsable_2xx_body_settles_reservation(t):
+    """A paid 2xx whose body will not parse was billed: an error that settles at the reservation, flagged estimated."""
+    t.vllm.chat["fake-paid"] = {"raw": b"{not json", "status": 200, "type": "application/json"}
+    b = t.gw.call(model_call("fake-paid", run_id="unparsable-2xx")).json
+    eq(b["status"], "error", "status")
+    charge = b["cost"]["charged_usd"]
+    eq(charge > 0, True, "billed 2xx settles above $0")
+    eq(b["cost"]["amount"], f"{charge:.6f}", "amount agrees with charged_usd")
+    eq(len(t.run.calls(t.vllm)), 1, "never replayed")
+    path = t.gw.home / ".contextstack/gateway/traces/unparsable-2xx.jsonl"
+    spans = [json.loads(line) for line in path.read_text().splitlines()]
+    settlements = [span["attributes"] for span in spans if span["kind"] == "settlement"]
+    eq(len(settlements), 1, "settlement count")
+    sub(settlements[0], {"basis": "reservation_estimate", "charged_usd": charge}, "settlement")
 
 
 @case("accounting")

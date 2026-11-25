@@ -12,6 +12,8 @@ use std::{
     time::Duration,
 };
 
+mod hard_lines;
+
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS action_approvals (
     id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(job_id), run_id TEXT NOT NULL,
@@ -75,6 +77,76 @@ pub fn expire_reviews(db: &Connection) -> rusqlite::Result<()> {
         finish_review(db, &id, &verdict)?;
     }
     Ok(())
+}
+
+/// Pending and `needs_owner` approvals for a job that has ended; clients drop them on the change events.
+pub fn expire_for_job(db: &Connection, job: &str) -> rusqlite::Result<usize> {
+    expire_open(
+        db,
+        "SELECT id FROM action_approvals
+         WHERE job_id=?1 AND status IN ('pending','needs_owner')",
+        params![job],
+    )
+}
+
+/// At Director start: clear open approvals whose jobs are already `done` or `error`.
+pub fn expire_ended_jobs(db: &Connection) -> rusqlite::Result<usize> {
+    let tx = db.unchecked_transaction()?;
+    let changed = expire_open(
+        &tx,
+        "SELECT a.id FROM action_approvals a JOIN jobs j ON j.job_id=a.job_id
+         WHERE a.status IN ('pending','needs_owner') AND j.state IN ('done','error')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+fn expire_open<P: rusqlite::Params>(
+    db: &Connection,
+    select: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    let ids = db
+        .prepare(select)?
+        .query_map(params, |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut changed = 0;
+    for id in ids {
+        if mark_expired(db, &id)? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+/// Updates in the caller's transaction (job terminal) or autocommit (unit tests / per-statement).
+fn mark_expired(db: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let prior: Option<String> = db
+        .query_row(
+            "SELECT status FROM action_approvals WHERE id=?1 AND status IN ('pending','needs_owner')",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(prior) = prior else {
+        return Ok(false);
+    };
+    let changed = db.execute(
+        "UPDATE action_approvals SET status='expired',
+        review_reason=COALESCE(NULLIF(review_reason,''),'job ended'),
+        outcome=json_object('status','expired','reason','job ended'),
+        decided_at=?2
+        WHERE id=?1 AND status IN ('pending','needs_owner')",
+        params![id, crate::util::now_utc()],
+    )? > 0;
+    if changed {
+        touch(db, Record::ActionApproval, id)?;
+        if prior == "needs_owner" {
+            touch_conversations(db, id)?;
+        }
+    }
+    Ok(changed)
 }
 
 fn record(db: &Connection, id: &str) -> rusqlite::Result<Option<Value>> {
@@ -243,6 +315,8 @@ fn sensitive(word: &str) -> bool {
                     ".ssh"
                         | ".gnupg"
                         | ".aws"
+                        | ".kube"
+                        | "keychains"
                         | ".netrc"
                         | ".npmrc"
                         | ".git"
@@ -290,26 +364,29 @@ fn system_executable(path: &Path) -> bool {
     .any(|root| inside(path, Path::new(root)))
 }
 
-fn owner_only(request: &Value, context: &Value) -> Option<&'static str> {
+/// Hard lines: the action waits on the owner without a model review. See `hard_lines` and the
+/// "Action approval hard lines" section of `director/README.md`. In order:
+/// 1. Writing to a Git remote: any `git` or `gh` invocation that is not on the read-only list.
+/// 2. A workspace that cannot be shown to lie inside the user's home.
+/// 3. A credential, key, token or protected configuration path, by name anywhere in a path, or a
+///    credential store under the home (after expanding `~`/`$HOME`, `..` and symlinks).
+/// 4. A path outside the user's home (system executables excepted) or containing `..`.
+fn owner_only(request: &Value, context: &Value) -> Option<String> {
     let argv = strings(&request["argv"]).unwrap_or_default();
     let paths = strings(&request["write_paths"]).unwrap_or_default();
-    if argv
-        .iter()
-        .flat_map(|word| word.split_ascii_whitespace())
-        .any(|word| matches!(word, "push" | "--force-push" | "--force-with-lease"))
-    {
-        return Some("Git push requires an owner decision.");
+    let resolved_executable = context["resolved_executable"].as_str();
+    if let Some(reason) = hard_lines::remote_write(&argv, resolved_executable) {
+        return Some(reason);
     }
     let (Some(home), Some(workspace)) = (context["home"].as_str(), context["workspace"].as_str())
     else {
-        return Some("The workspace cannot be verified as lying inside the user's home.");
+        return Some("The workspace cannot be verified as lying inside the user's home.".into());
     };
     let (home, workspace) = (Path::new(home), Path::new(workspace));
     if !home.is_absolute() || home.parent().is_none() || !inside(workspace, home) {
-        return Some("The workspace cannot be verified as lying inside the user's home.");
+        return Some("The workspace cannot be verified as lying inside the user's home.".into());
     }
     let tmp = context["job_tmp"].as_str().map(Path::new);
-    let resolved_executable = context["resolved_executable"].as_str();
     let operands = strings(&context["resolved_operands"]).unwrap_or_default();
     let mut arguments = argv.iter().flat_map(|word| {
         [
@@ -326,9 +403,28 @@ fn owner_only(request: &Value, context: &Value) -> Option<&'static str> {
         .chain(operands.iter().copied())
         .chain(resolved_executable)
         .any(|word| protected_path(word, workspace, tmp))
+        || {
+            let roots = [Some(workspace), tmp]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let listing = hard_lines::shallow_listing(&argv, resolved_executable);
+            hard_lines::credential_store(
+                argv.iter().chain(&operands).copied(),
+                home,
+                &roots,
+                listing,
+            ) || hard_lines::credential_store(
+                paths.iter().copied().chain(resolved_executable),
+                home,
+                &roots,
+                false,
+            )
+        }
     {
         return Some(
-            "The action references a credential, key, token, or protected configuration path.",
+            "The action references a credential, key, token, or protected configuration path."
+                .into(),
         );
     }
     if resolved_executable.is_some_and(|word| {
@@ -344,7 +440,7 @@ fn owner_only(request: &Value, context: &Value) -> Option<&'static str> {
             && !(argv.first() == Some(&word) && system_executable(path)))
             || path.components().any(|part| part == Component::ParentDir)
     }) {
-        return Some("The action references a path outside the user's home.");
+        return Some("The action references a path outside the user's home.".into());
     }
     None
 }
@@ -380,23 +476,90 @@ fn no_go(reason: &str) -> Verdict {
     }
 }
 
-/// None when the reviewer's answer holds no well-formed verdict; the caller tries the next reviewer.
-fn parse_verdict(answer: &Value) -> Option<Verdict> {
-    let parsed: Value = answer["message"]["content"]
-        .as_str()
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
-    let reason = parsed["reason"]
-        .as_str()
-        .filter(|s| !s.trim().is_empty() && s.len() <= 800)?;
-    match parsed["verdict"].as_str() {
-        Some("go") => Some(Verdict {
-            word: "go",
-            reason: reason.into(),
-        }),
-        Some("no_go") => Some(no_go(reason)),
-        _ => None,
+/// End index (inclusive) of the balanced `{…}` object that begins at `start`, or none if it never closes.
+fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    if start >= bytes.len() || bytes[start] != b'{' {
+        return None;
     }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (offset, &byte) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Top-level JSON objects in document order, including those wrapped in fences or prose.
+fn json_objects(raw: &str) -> Vec<Value> {
+    let mut objects = Vec::new();
+    let mut index = 0;
+    let bytes = raw.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] != b'{' {
+            index += 1;
+            continue;
+        }
+        let Some(end) = balanced_object_end(raw, index) else {
+            break;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(&raw[index..=end]) {
+            objects.push(value);
+        }
+        index = end + 1;
+    }
+    objects
+}
+
+fn truncate_reason(reason: &str) -> String {
+    reason.chars().take(800).collect()
+}
+
+/// None when the reviewer's answer holds no well-formed verdict; the caller tries the next reviewer.
+/// Accepts plain JSON, a fenced block, or leading/trailing prose: the first balanced top-level object
+/// must carry `verdict` ∈ {`go`, `no_go`} and a non-empty `reason` (truncated at 800 characters). A later
+/// object with a conflicting verdict makes the answer invalid.
+fn parse_verdict(answer: &Value) -> Option<Verdict> {
+    let raw = answer["message"]["content"].as_str()?;
+    let objects = json_objects(raw);
+    let first = objects.first()?;
+    let reason = first["reason"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(truncate_reason)?;
+    let word = match first["verdict"].as_str() {
+        Some("go") => "go",
+        Some("no_go") => "no_go",
+        _ => return None,
+    };
+    for other in &objects[1..] {
+        match other["verdict"].as_str() {
+            Some(next) if matches!(next, "go" | "no_go") && next != word => return None,
+            _ => {}
+        }
+    }
+    Some(Verdict { word, reason })
 }
 
 fn select_reviewer(models: &Value, requester: &str) -> Vec<String> {
@@ -613,7 +776,7 @@ async fn review_request(
     reviewer: impl std::future::Future<Output = Verdict>,
 ) -> Verdict {
     match owner_only(request, context) {
-        Some(reason) => no_go(reason),
+        Some(reason) => no_go(&reason),
         None => reviewer.await,
     }
 }
@@ -963,6 +1126,270 @@ mod tests {
         }
     }
 
+    fn hard_line(argv: Value, context: &Value) -> Option<String> {
+        let mut request = action();
+        request["argv"] = argv;
+        owner_only(&request, context)
+    }
+
+    const PUSH: &str = "Git push requires an owner decision.";
+    const CREDENTIAL: &str =
+        "The action references a credential, key, token, or protected configuration path.";
+
+    #[test]
+    fn hard_line_verdicts_distinguish_commands_and_listing() {
+        for (argv, owner) in [
+            (json!(["grep", "git", "."]), false),
+            (json!(["rg", "push", "src/"]), false),
+            (json!(["echo", "git push later"]), false),
+            (json!(["echo", "send-pack", "gh"]), false),
+            (json!(["sh", "-c", "echo git push later"]), false),
+            (json!(["sh", "-c", "echo ok > git"]), false),
+            (json!(["env", "grep", "git", "."]), false),
+            (
+                json!(["sh", "-c", "echo 'git push later' # git push"]),
+                false,
+            ),
+            (json!(["ls", "~"]), false),
+            (json!(["ls", "-la", "~/.config"]), false),
+            (
+                json!(["find", "~", "-maxdepth", "1", "-name", "*.md"]),
+                false,
+            ),
+            (json!(["git", "config", "user.name", "x"]), false),
+            (
+                json!(["git", "config", "--get", "remote.origin.url"]),
+                false,
+            ),
+            (json!(["git", "status"]), false),
+            (json!(["git", "log"]), false),
+            (json!(["git", "diff"]), false),
+            (json!(["git", "push"]), true),
+            (json!(["env", "git", "push"]), true),
+            (json!(["find", ".", "-exec", "git", "push", ";"]), true),
+            (json!(["git", "publish"]), true),
+            (json!(["git", "-c", "alias.x=push", "x"]), true),
+            (json!(["send-pack", "origin"]), true),
+            (json!(["git", "http-push", "origin"]), true),
+            (json!(["gh", "pr", "merge", "12"]), true),
+            (json!(["cat", "~/.git-credentials"]), true),
+            (json!(["cp", "~/.config/gh/hosts.yml", "."]), true),
+            (json!(["tar", "-c", "~"]), true),
+            (json!(["cp", "-r", "~/.config", "."]), true),
+            (json!(["rsync", "-a", "~", "."]), true),
+            (json!(["open", "~/.config/gh/hosts.yml"]), true),
+            (json!(["grep", "-r", "host", "~"]), true),
+            (json!(["ls", "-R", "~"]), true),
+            (json!(["find", "~", "-name", "*.md"]), true),
+            (json!(["git", "config", "credential.helper", "store"]), true),
+        ] {
+            assert_eq!(hard_line(argv.clone(), &lane()).is_some(), owner, "{argv}");
+        }
+    }
+
+    /// C2: forms that wrote to a remote without the old `push` word check noticing.
+    #[test]
+    fn remote_writes_are_hard_lines() {
+        for argv in [
+            json!(["git", "-c", "alias.x=push", "x"]),
+            json!(["git", "-c", "Alias.Up=push --force", "up", "origin"]),
+            json!(["git", "-c", "alias.x=!git pu''sh", "x"]),
+            json!(["git", "--config-env=alias.x=PUSH_ALIAS", "x"]),
+            json!(["git", "send-pack", "https://example.com/r.git", "main"]),
+            json!([
+                "/usr/bin/git",
+                "http-push",
+                "https://example.com/r.git",
+                "main"
+            ]),
+            json!(["git", "remote-https", "origin", "https://example.com/r.git"]),
+            json!(["git-send-pack", "https://example.com/r.git", "main"]),
+            json!(["/usr/libexec/git-core/git-remote-https", "origin"]),
+            json!(["sh", "-c", "cd lane && git send-pack origin main"]),
+            json!(["sh", "-c", "git -c alias.x='!git pu\"\"sh' x"]),
+            json!([
+                "python3",
+                "-c",
+                "import subprocess; subprocess.run(['git','push'])"
+            ]),
+            json!([
+                "git",
+                "-c",
+                "core.sshCommand=ssh -o ProxyCommand=evil",
+                "fetch"
+            ]),
+            json!(["git", "submodule", "foreach", "git send-pack origin main"]),
+            json!(["git", "rebase", "-x", "make", "main"]),
+            json!(["git", "fetch", "--upload-pack=git-receive-pack", "origin"]),
+            json!(["gh", "repo", "sync"]),
+            json!(["gh", "pr", "merge", "12", "--squash"]),
+            json!(["gh", "release", "create", "v1.0.0"]),
+            json!(["gh", "api", "-X", "POST", "repos/o/r/issues"]),
+            json!(["gh", "api", "--method=PUT", "repos/o/r/pulls/1/merge"]),
+            json!(["gh", "api", "-XPATCH", "repos/o/r"]),
+            json!([
+                "gh",
+                "api",
+                "--method",
+                "delete",
+                "repos/o/r/git/refs/heads/x"
+            ]),
+            json!(["gh", "api", "repos/o/r/issues", "-f", "title=x"]),
+            json!(["gh", "api", "graphql", "-F", "query=@mutation.graphql"]),
+            json!(["sh", "-c", "gh pr merge 12"]),
+        ] {
+            let reason = hard_line(argv.clone(), &lane()).unwrap_or_default();
+            assert!(
+                reason.starts_with(PUSH.trim_end_matches('.')),
+                "{argv}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_git_and_gh_still_reach_the_reviewer() {
+        for argv in [
+            json!(["git", "fetch", "origin"]),
+            json!([
+                "/usr/bin/git",
+                "-C",
+                "/workspace/agent-home/lane",
+                "log",
+                "--oneline"
+            ]),
+            json!(["git", "-c", "alias.st=status --short", "st"]),
+            json!(["git", "-c", "alias.log=push", "log"]),
+            json!(["git", "clone", "https://example.com/r.git"]),
+            json!(["git", "ls-remote", "origin"]),
+            json!(["sh", "-c", "git fetch origin && git log -1"]),
+            json!(["gh", "pr", "view", "12"]),
+            json!(["gh", "pr", "checks", "12", "--repo", "o/r"]),
+            json!([
+                "gh",
+                "api",
+                "repos/o/r/pulls",
+                "--paginate",
+                "-q",
+                ".[].title"
+            ]),
+            json!(["gh", "api", "-X", "GET", "repos/o/r"]),
+            json!(["gh", "run", "view", "42", "--log"]),
+            json!(["/usr/bin/curl", "-q", "--", "https://docs.rs/serde"]),
+        ] {
+            assert_eq!(hard_line(argv.clone(), &lane()), None, "{argv}");
+        }
+    }
+
+    /// C3: credential stores the component-name check did not know about, and `~`, `$HOME`,
+    /// `..` and shell-string forms of them.
+    #[test]
+    fn credential_stores_are_hard_lines() {
+        let home = "/workspace/agent-home";
+        for argv in [
+            json!(["/bin/cat", format!("{home}/.config/gh/hosts.yml")]),
+            json!(["/bin/cat", "~/.docker/config.json"]),
+            json!(["/bin/ls", "~/.kube"]),
+            json!(["/bin/cat", "~agent-home/.kube/config"]),
+            json!(["sh", "-c", "cat $HOME/.kube/config"]),
+            json!([
+                "sh",
+                "-c",
+                "cat \"${HOME}\"/.config/gcloud/configurations/config_default"
+            ]),
+            json!([
+                "/bin/cat",
+                format!("{home}/Library/Keychains/login.keychain-db")
+            ]),
+            json!(["/bin/cat", format!("{home}/.codex/auth.json")]),
+            json!(["/bin/cat", format!("{home}/.claude/.credentials.json")]),
+            json!(["/bin/cat", format!("{home}/.gemini/oauth_creds.json")]),
+            json!([
+                "/bin/cat",
+                format!("{home}/.local/share/opencode/opencode.db")
+            ]),
+            json!([
+                "/bin/cat",
+                format!("{home}/.contextstack/credentials/director")
+            ]),
+            json!(["/bin/cat", format!("{home}/lane/../.config/gh/hosts.yml")]),
+            json!([
+                "sh",
+                "-c",
+                format!("cat {home}/lane/../.docker/config.json")
+            ]),
+            json!(["/usr/bin/tar", "czf", "out.tgz", "~/.config"]),
+            json!(["/usr/bin/tar", "czf", "out.tgz", "--directory=~", "."]),
+            json!(["sh", "-c", "d=gh; cat ~/.config/$d/hosts.yml"]),
+            json!(["sh", "-c", "cat ~/.config/g[h]/hosts.yml"]),
+            json!(["sh", "-c", "cat ~/.c*/gh/hosts.yml"]),
+            json!(["sh", "-c", "cat /workspace/$USER/.config/gh/hosts.yml"]),
+            json!(["sh", "-c", "cd ~ && cat .docker/config.json"]),
+        ] {
+            assert_eq!(
+                hard_line(argv.clone(), &lane()).as_deref(),
+                Some(CREDENTIAL),
+                "{argv}"
+            );
+        }
+        // A workspace symlink the node resolved onto a credential store.
+        let mut context = lane();
+        context["resolved_operands"] = json!([format!("{home}/.kube/config")]);
+        assert_eq!(
+            hard_line(json!(["/bin/cat", "kube/config"]), &context).as_deref(),
+            Some(CREDENTIAL)
+        );
+        // A lane whose workspace lies inside a store directory may still use its own files.
+        let mut context = lane();
+        context["workspace"] = json!(format!("{home}/.config/gcloud/lane"));
+        assert_eq!(hard_line(json!(["/bin/cat", "README.md"]), &context), None);
+        assert_eq!(
+            hard_line(
+                json!(["/bin/cat", "~/.config/gcloud/credentials.db"]),
+                &context
+            )
+            .as_deref(),
+            Some(CREDENTIAL)
+        );
+        // Node-resolved operands keep the listing verdict only for containing directories.
+        let mut context = lane();
+        context["resolved_operands"] = json!([format!("{home}/.config")]);
+        assert_eq!(hard_line(json!(["ls", "~/.config"]), &context), None);
+        context["resolved_operands"] = json!([format!("{home}/.config/gh")]);
+        assert_eq!(
+            hard_line(json!(["ls", "notes"]), &context).as_deref(),
+            Some(CREDENTIAL)
+        );
+        // A write path that contains a credential store.
+        let mut request = action();
+        request["argv"] = json!(["ls", "~/.config"]);
+        request["write_paths"] = json!([format!("{home}/.config")]);
+        assert_eq!(owner_only(&request, &lane()).as_deref(), Some(CREDENTIAL));
+    }
+
+    #[test]
+    fn symlinked_credential_store_is_a_hard_line() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?.join("home");
+        let workspace = home.join("lane");
+        std::fs::create_dir_all(home.join(".config/gh"))?;
+        std::fs::create_dir_all(&workspace)?;
+        std::os::unix::fs::symlink(home.join(".config/gh"), workspace.join("notes"))?;
+        let context = json!({"home": home, "workspace": workspace});
+        for argv in [
+            json!(["/bin/cat", "notes/hosts.yml"]),
+            json!(["/bin/cat", workspace.join("notes/hosts.yml")]),
+            json!(["sh", "-c", "cat notes/hosts.yml"]),
+        ] {
+            assert_eq!(
+                hard_line(argv.clone(), &context).as_deref(),
+                Some(CREDENTIAL),
+                "{argv}"
+            );
+        }
+        assert_eq!(hard_line(json!(["/bin/cat", "README.md"]), &context), None);
+        Ok(())
+    }
+
     #[test]
     fn reviewer_uses_independent_gateway_model() {
         let models = json!({"models":[
@@ -986,5 +1413,102 @@ mod tests {
                 "same-provider"
             ],
         );
+    }
+
+    fn content(raw: &str) -> Value {
+        json!({"message": {"content": raw}})
+    }
+
+    #[test]
+    fn parse_verdict_accepts_plain_fenced_and_prose() -> Result<(), Box<dyn std::error::Error>> {
+        let plain =
+            parse_verdict(&content(r#"{"verdict":"go","reason":"looks safe"}"#)).ok_or("plain")?;
+        assert_eq!((plain.word, plain.reason.as_str()), ("go", "looks safe"));
+
+        let fenced = parse_verdict(&content(
+            "```json\n{\n  \"verdict\": \"no_go\",\n  \"reason\": \"touches keys\"\n}\n```",
+        ))
+        .ok_or("fenced")?;
+        assert_eq!(
+            (fenced.word, fenced.reason.as_str()),
+            ("no_go", "touches keys")
+        );
+
+        let prose = parse_verdict(&content(
+            "Here is my review:\n{\"verdict\":\"go\",\"reason\":\"bounded write\"}\nThanks.",
+        ))
+        .ok_or("prose")?;
+        assert_eq!((prose.word, prose.reason.as_str()), ("go", "bounded write"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_verdict_rejects_conflicting_objects() {
+        assert!(
+            parse_verdict(&content(
+                r#"{"verdict":"go","reason":"ok"} {"verdict":"no_go","reason":"not ok"}"#,
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_verdict_truncates_long_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let long = "x".repeat(850);
+        let verdict = parse_verdict(&content(&format!(
+            r#"{{"verdict":"go","reason":"{long}"}}"#
+        )))
+        .ok_or("long reason")?;
+        assert_eq!(verdict.word, "go");
+        assert_eq!(verdict.reason.chars().count(), 800);
+        assert!(verdict.reason.chars().all(|c| c == 'x'));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_approval_expires_when_job_ends() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, store) = store()?;
+        let db = store.db();
+        assert_eq!(expire_for_job(&db, "job")?, 1);
+        let row = record(&db, "action")?.ok_or("missing")?;
+        assert_eq!(row["status"], "expired");
+        assert_eq!(row["review_reason"], "job ended");
+        assert_eq!(
+            row["outcome"],
+            json!({"status": "expired", "reason": "job ended"})
+        );
+        assert_eq!(expire_for_job(&db, "job")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_sweep_expires_approvals_for_ended_jobs() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, store) = store()?;
+        let db = store.db();
+        db.execute_batch(
+            "
+            UPDATE jobs SET state='done' WHERE job_id='job';
+            INSERT INTO jobs(job_id,node_id,spec,task,trials,bundle_sha256,meta,state,created_at)
+              VALUES('running',1,'s','t',1,'sha','{}','accepted','now');
+            INSERT INTO action_approvals(id,job_id,run_id,request,status,created_at,verdict,review_reason)
+              VALUES('owner','job','run2','{}','needs_owner','now','no_go','review said no');
+            INSERT INTO action_approvals(id,job_id,run_id,request,created_at)
+              VALUES('live','running','run3','{}','now');
+        ",
+        )?;
+        assert_eq!(expire_ended_jobs(&db)?, 2);
+        assert_eq!(
+            record(&db, "action")?.ok_or("pending")?["status"],
+            "expired"
+        );
+        let owner = record(&db, "owner")?.ok_or("owner")?;
+        assert_eq!(owner["status"], "expired");
+        assert_eq!(owner["review_reason"], "review said no");
+        assert_eq!(
+            owner["outcome"],
+            json!({"status": "expired", "reason": "job ended"})
+        );
+        assert_eq!(record(&db, "live")?.ok_or("live")?["status"], "pending");
+        Ok(())
     }
 }

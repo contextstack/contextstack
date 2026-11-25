@@ -129,6 +129,39 @@ pub fn plan(effective: &Effective, links: &[(PathBuf, PathBuf)], tool: &Path) ->
     }
 }
 
+/// The roots the `.env` mask walks: every writable bind (the workspace, the call's tmp dir,
+/// granted `write_env` dirs, requested writes) and the repo view, the innermost read-only bind
+/// that holds the workspace (other than `/`). Runtime and build trees bound read-only elsewhere
+/// (`/usr`, a Python install, a browser cache) are not walked. A root inside another root is
+/// dropped, since the outer walk covers it. Any path is a root, whatever its prefix (`/var`, `/opt`).
+pub fn mask_roots(plan: &Plan, workspace: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = plan
+        .mounts
+        .iter()
+        .filter_map(|mount| match mount {
+            Mount::Rw(path) => Some(path.clone()),
+            Mount::Ro(_) | Mount::Link { .. } => None,
+        })
+        .collect();
+    let repo_view = plan
+        .mounts
+        .iter()
+        .filter_map(|mount| match mount {
+            Mount::Ro(path) if path != Path::new("/") && workspace.starts_with(path) => Some(path),
+            _ => None,
+        })
+        .max_by_key(|path| depth(path));
+    roots.extend(repo_view.cloned());
+    roots.sort();
+    roots.dedup();
+    let nested = |path: &PathBuf| {
+        roots
+            .iter()
+            .any(|other| other != path && path.starts_with(other))
+    };
+    roots.iter().filter(|path| !nested(path)).cloned().collect()
+}
+
 /// One `read` narrowing per readable path absent on this host.
 pub fn missing_narrowings(missing: &[PathBuf]) -> Vec<Narrowing> {
     missing
@@ -220,15 +253,7 @@ pub fn argv(plan: &Plan, launch: &Launch<'_>) -> Result<Vec<OsString>, Failure> 
         push_paths(&mut argv, "--ro-bind", socket, seen);
     }
     let null = Path::new("/dev/null");
-    let mask_roots: Vec<PathBuf> = plan
-        .mounts
-        .iter()
-        .filter_map(|mount| match mount {
-            Mount::Ro(path) | Mount::Rw(path) => Some(path.clone()),
-            Mount::Link { .. } => None,
-        })
-        .collect();
-    for path in env_deny::masked_paths(&mask_roots)? {
+    for path in env_deny::masked_paths(&mask_roots(plan, launch.workspace))? {
         push_paths(&mut argv, "--ro-bind", null, &path);
     }
     // Last mount step: the root tmpfs itself becomes read-only; the binds keep their own flags.
@@ -279,6 +304,7 @@ mod tests {
     fn effective(root: &Path, net: Net) -> Effective {
         let ws = root.join("code/runs/ws");
         Effective {
+            developer_dir: None,
             workspace: ws.clone(),
             read: vec![
                 root.join("code"),
@@ -524,6 +550,93 @@ mod tests {
                 .any(|w| w[1] == "/dev/null" && w[2].starts_with("/usr/")),
             "system /usr must not be walked for masks: {words:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mask_roots_are_the_writable_binds_and_the_repo_view_only() -> Result<(), String> {
+        let fx = layout()?;
+        let r = &fx.root;
+        let tool = r.join("code/tools/bin/fs_write");
+        let eff = effective(r, Net::None);
+        let got = mask_roots(&plan(&eff, &[], &tool), &eff.workspace);
+        // `code` holds the workspace (the repo view); the workspace inside it is covered by it.
+        // `usr` is a runtime tree and is not walked.
+        assert_eq!(
+            got,
+            vec![r.join("code"), r.join("state"), r.join("tmp/call")],
+            "{got:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mask_roots_skip_a_root_filesystem_bind_and_keep_the_workspace() {
+        let ws = PathBuf::from("/var/lib/cs/ws");
+        let plan = Plan {
+            mounts: vec![
+                Mount::Ro(PathBuf::from("/")),
+                Mount::Ro(PathBuf::from("/opt/runtime")),
+                Mount::Rw(ws.clone()),
+                Mount::Rw(PathBuf::from("/opt/state")),
+            ],
+            ..Plan::default()
+        };
+        assert_eq!(
+            mask_roots(&plan, &ws),
+            vec![PathBuf::from("/opt/state"), ws]
+        );
+    }
+
+    #[test]
+    fn argv_does_not_walk_runtime_trees_or_build_dirs() -> Result<(), String> {
+        let fx = layout()?;
+        let r = &fx.root;
+        std::fs::write(
+            r.join("usr/lib/.env"),
+            "RUNTIME=1
+",
+        )
+        .map_err(|e| e.to_string())?;
+        let deps = r.join("code/node_modules/pkg");
+        std::fs::create_dir_all(&deps).map_err(|e| e.to_string())?;
+        std::fs::write(
+            deps.join(".env"),
+            "DEP=1
+",
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(
+            r.join("code/runs/ws/.env"),
+            "WS=1
+",
+        )
+        .map_err(|e| e.to_string())?;
+        let tool = r.join("code/tools/bin/t");
+        let eff = effective(r, Net::None);
+        let plan = plan(&eff, &[], &tool);
+        let launch = Launch {
+            net: Net::None,
+            gateway: None,
+            sockets: &[],
+            workspace: &eff.workspace,
+            seccomp_fd: 3,
+            status_fd: 4,
+            tool: &tool,
+            args: &[],
+        };
+        let words: Vec<String> = argv(&plan, &launch)
+            .map_err(|f| f.message().to_owned())?
+            .iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect();
+        let masked: Vec<&String> = words
+            .windows(3)
+            .filter(|w| w[0] == "--ro-bind" && w[1] == "/dev/null")
+            .map(|w| &w[2])
+            .collect();
+        let ws_env = r.join("code/runs/ws/.env").display().to_string();
+        assert_eq!(masked, vec![&ws_env], "{words:?}");
         Ok(())
     }
 

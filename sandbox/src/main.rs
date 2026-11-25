@@ -291,6 +291,7 @@ fn launch(
     for (name, path) in &effective.sockets {
         command.env(policy::socket_var(name), path);
     }
+    seatbelt::apply_developer_dir(&mut command, effective);
     let mut child = command.spawn().map_err(|error| {
         unenforceable(format!("cannot start {}: {error}", seatbelt::SANDBOX_EXEC))
     })?;
@@ -434,6 +435,8 @@ fn execute(run: &cli::Run) -> Result<i32, Failure> {
     };
     let request = policy::load_request(descriptor.as_deref())?;
     // Removed when this function returns, on every path, after the child has exited.
+    // A call SIGKILLed by its runner never ran `Drop`; clear such leftovers first.
+    tmp::sweep_orphans(&env::temp_dir());
     let call_tmp = tmp::CallTmp::create(&env::temp_dir())?;
     let tmp = call_tmp.path();
     let (mut effective, mut narrowed) = policy::intersect(

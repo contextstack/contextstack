@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from _job_reason import redact
-from _muse import Cancelled, check_environment
+from _muse import Cancelled, check_environment, close_processes
 from _provider_limits import limit_from_event
 
 DIALECTS = {"claude": "claude", "codex": "codex", "gemini": "gemini", "cursor-agent": "claude", "agy": "antigravity"}
@@ -484,15 +484,30 @@ def run_streaming(command, workspace, env, timeout, on_line, memory_cap_mb=None,
 
     def read_err():
         err.append(proc.stderr.read())
+    killed = False
     def kill_group():
-        processes.kill()
+        nonlocal killed
+        if killed:
+            return
+        captured["returncode"] = proc.poll()
+        close_processes(processes, captured, processes.kill)
+        killed = True
 
     readers = [threading.Thread(target=f, daemon=True) for f in (read_out, read_err)]
     def text():
         for t in readers:
             t.join()
         decode = lambda parts: b"".join(parts).decode("utf-8", errors="replace")
+        captured["output"] = (decode(out), decode(err))
+        return captured["output"]
+
+    def snapshot():
+        # After a failed cleanup a surviving child may hold the pipes open: wait briefly, never forever.
+        for t in readers:
+            t.join(timeout=1)
+        decode = lambda parts: b"".join(parts).decode("utf-8", errors="replace")
         return decode(out), decode(err)
+    captured = {"snapshot": snapshot}
 
     try:
         try:
@@ -559,7 +574,8 @@ def run_streaming(command, workspace, env, timeout, on_line, memory_cap_mb=None,
                 try:
                     try:
                         try:
-                            processes.close()
+                            captured["returncode"] = proc.returncode
+                            close_processes(processes, captured)
                         finally:
                             if on_evidence is not None:
                                 on_evidence(processes.evidence)

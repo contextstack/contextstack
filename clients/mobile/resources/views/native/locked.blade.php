@@ -5,7 +5,7 @@
         <native:column class="w-full gap-4 items-center">
             <native:icon name="lock.fill" size="48" />
             <native:text class="text-xl font-bold text-theme-on-surface">Locked</native:text>
-            <native:text class="text-sm text-center text-theme-on-surface-variant">Unlock with Face ID, Touch ID or your passcode, whichever this device uses.</native:text>
+            <native:text class="text-sm text-center text-theme-on-surface-variant">Unlock with Face ID, Touch ID or your passcode, whichever this device uses. If Face ID does not recognise you, let it fail once: iOS then offers Enter Passcode. Cancel stops the attempt; tap Unlock to try again.</native:text>
 
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>

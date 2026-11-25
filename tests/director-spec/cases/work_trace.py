@@ -148,3 +148,16 @@ def unmarked_owner_message(ctx):
     ctx.expect(unmarked, "owner messages inventoried", trace)
     missing = ["5w: task %s owner message %s mark" % (trace["task_id"], mid) for mid in unmarked]
     run_check_trace(ctx, trace, {"result": "incomplete", "missing": missing})
+
+
+@case(C, "work-trace", "unknown-retry-of-refused")
+def _(ctx):
+    """A follow-on job whose meta.retry_of names no job is refused as invalid, not a server error."""
+    from cases.client import refused, submitted
+    n, o = ctx.node2(), owner(ctx)
+    first = submitted(ctx, o, n)
+    body = o.intent(n.name)
+    body["meta"] = {"retry_of": "job-that-does-not-exist"}
+    answer = o.call("POST", "intents/%s/jobs" % first["intent"]["intent_id"], body=body, key=new_key("wt-retry"))
+    refused(ctx, answer, 422, "invalid_request", "unknown retry_of")
+    ctx.expect("retry_of" in (answer.json or {}).get("detail", ""), "the refusal names retry_of", answer)

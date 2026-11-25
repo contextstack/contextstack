@@ -368,7 +368,7 @@ fn take_bytes(lines: &[Vec<u8>]) -> (usize, bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jail::CWD_TEST_LOCK;
+    use crate::jail::CwdRestore;
     use serde_json::json;
     use std::fs;
     use std::io::Write as _;
@@ -439,9 +439,6 @@ mod tests {
     #[test]
     fn list_reports_directory_read_failure() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let locked = dir.path().join("locked");
         fs::create_dir(&locked).unwrap_or_else(|e| panic!("mkdir: {e}"));
@@ -450,14 +447,12 @@ mod tests {
             .permissions();
         perms.set_mode(0o0);
         fs::set_permissions(&locked, perms).unwrap_or_else(|e| panic!("chmod: {e}"));
-        let old = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        std::env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         let err = list(&json!({"path": "locked"}), "locked");
-        let _ = std::env::set_current_dir(&old);
         match err {
             Err(failure) => assert!(failure.0.contains("cannot list directory")),
             Ok(_) => panic!("expected list failure on unreadable directory"),
@@ -491,22 +486,17 @@ mod tests {
 
     #[test]
     fn invalid_utf8_is_refused_as_binary() {
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let path = dir.path().join("bad.bin");
         fs::write(&path, [0xff, b'a']).unwrap_or_else(|e| panic!("write: {e}"));
-        let old = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        std::env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         let err = run(&json!({"path": "bad.bin"}))
             .err()
             .unwrap_or_else(|| panic!("expected error"));
-        let _ = std::env::set_current_dir(&old);
         assert!(err.0.contains("UnicodeDecodeError"));
         assert!(err.0.contains("looks binary"));
     }
@@ -562,9 +552,6 @@ mod tests {
 
     #[test]
     fn list_truncates_large_directories() {
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let list_dir = dir.path().join("many");
         fs::create_dir(&list_dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
@@ -572,14 +559,12 @@ mod tests {
             let name = format!("entry-{i:05}.txt");
             fs::write(list_dir.join(&name), b"x").unwrap_or_else(|e| panic!("write: {e}"));
         }
-        let old = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        std::env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         let out = run(&json!({"path": "many"})).unwrap_or_else(|e| panic!("list: {}", e.0));
-        let _ = std::env::set_current_dir(&old);
         let text = String::from_utf8(out).unwrap_or_else(|e| panic!("utf8: {e}"));
         assert!(text.contains("re-read with offset="));
         assert!(text.contains(" of 3500 "));
@@ -587,9 +572,6 @@ mod tests {
 
     #[test]
     fn final_symlink_to_outside_is_refused_even_after_check() {
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let outside = TempDir::new().unwrap_or_else(|e| panic!("outside: {e}"));
         fs::write(outside.path().join("secret.txt"), b"NO\n")
@@ -597,37 +579,30 @@ mod tests {
         let link = dir.path().join("trap.txt");
         symlink(outside.path().join("secret.txt"), &link)
             .unwrap_or_else(|e| panic!("symlink: {e}"));
-        let old = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        std::env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         let err = run(&json!({"path": "trap.txt"}))
             .err()
             .unwrap_or_else(|| panic!("expected error"));
-        let _ = std::env::set_current_dir(&old);
         assert!(err.0.starts_with("path escapes workspace: "));
     }
 
     #[test]
     fn in_workspace_symlink_still_reads() {
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         fs::write(dir.path().join("body.txt"), b"via-link\n")
             .unwrap_or_else(|e| panic!("write: {e}"));
         symlink("body.txt", dir.path().join("alias.txt"))
             .unwrap_or_else(|e| panic!("symlink: {e}"));
-        let old = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        std::env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         let out = run(&json!({"path": "alias.txt"})).unwrap_or_else(|e| panic!("read: {}", e.0));
-        let _ = std::env::set_current_dir(&old);
         assert_eq!(
             String::from_utf8(out).unwrap_or_else(|e| panic!("utf8: {e}")),
             "via-link\n"

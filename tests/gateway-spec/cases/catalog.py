@@ -407,8 +407,11 @@ def dgx_overlay_ids_resolve(t):
     d = overlay_dir(t, "dgx", {"dgx.json": dgx_overlay(t.run.vllm_url, url2)})
     cfg = t.run.config(deployments=[t.run.vllm_deployment()])
     gw = t.gateway("dgx", cfg, env={"CSGATEWAY_PROVIDERS_DIR": str(d)})
-    names = [m["name"] for m in gw.get("/v1/models").json["models"]]
-    eq("local-reasoner" in names, True, "overlay model on /v1/models")
+    rows = {m["name"]: m for m in gw.get("/v1/models").json["models"]}
+    sub(rows.get("local-reasoner", {}), {"provider": "vllm-spark2",
+                                       "picker": {"provider": "vllm", "provider_label": "vLLM",
+                                                  "label": "Local reasoner (vLLM, configured model)"}},
+        "overlay model and picker group on /v1/models")
     e = endpoints(gw)
     sub(e["vllm-spark2"], {"protocol": "openai_chat_completions", "endpoint": url2 + "/v1", "host": "example-host-2", "source": "overlay:dgx.json",
                            "capabilities": {"images": False, "tools": True, "streaming": False}}, "vllm-spark2")

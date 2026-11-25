@@ -136,13 +136,33 @@ pub fn open_in_repo(path: &Path, root: &Path) -> io::Result<File> {
     open_resolved_after(path, false, |p| p == path && p.starts_with(root), || {})
 }
 
-/// Does not truncate: the caller must validate identity before changing contents.
-pub fn open_for_write(path: &Path) -> io::Result<File> {
-    open_checked(path, true)
+#[cfg(test)]
+static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct CwdRestore {
+    prev: std::path::PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
-pub(crate) static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+impl CwdRestore {
+    pub(crate) fn chdir(path: &Path) -> Self {
+        let lock = CWD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
+        env::set_current_dir(path).unwrap_or_else(|e| panic!("chdir: {e}"));
+        Self { prev, _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CwdRestore {
+    fn drop(&mut self) {
+        let _ = env::set_current_dir(&self.prev);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -152,12 +172,8 @@ mod tests {
 
     #[test]
     fn final_component_swap_is_refused_before_read_or_truncate() {
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        let prev = env::current_dir().unwrap_or_else(|e| panic!("{e}"));
-        env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let _cwd = CwdRestore::chdir(dir.path());
         for writable in [false, true] {
             fs::write("target", "original").unwrap_or_else(|e| panic!("{e}"));
             fs::write("other", "untouched").unwrap_or_else(|e| panic!("{e}"));
@@ -172,11 +188,12 @@ mod tests {
             );
             fs::remove_file("target").unwrap_or_else(|e| panic!("{e}"));
         }
-        env::set_current_dir(prev).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
     fn lexical_rule_matches_python() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let _cwd = CwdRestore::chdir(dir.path());
         assert!(lexically_escapes("/etc/passwd", None));
         assert!(lexically_escapes("../x", None));
         assert!(lexically_escapes("a/../b", None));
@@ -187,68 +204,50 @@ mod tests {
 
     #[test]
     fn missing_paths_are_not_refused_here() {
-        assert!(!resolves_outside(Path::new("no-such-file-cs-tools-test")));
-        assert!(!link_leaves_workspace(Path::new(
-            "no-such-file-cs-tools-test"
-        )));
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let missing = dir.path().join("missing");
+        assert!(!resolves_outside(&missing));
+        assert!(!link_leaves_workspace(&missing));
     }
 
     #[test]
     fn resolves_outside_refuses_everything_when_workspace_is_gone() {
-        use super::CWD_TEST_LOCK;
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let gone = dir.path().join("inner");
         std::fs::create_dir(&gone).unwrap_or_else(|e| panic!("mkdir: {e}"));
-        let prev = env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
-        env::set_current_dir(&gone).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&gone);
         assert!(resolves_outside(Path::new("/tmp")));
-        env::set_current_dir(&prev).unwrap_or_else(|e| panic!("restore cwd: {e}"));
     }
 
     #[test]
     fn open_for_read_follows_in_workspace_symlink() {
-        use super::CWD_TEST_LOCK;
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let target = dir.path().join("target.txt");
         std::fs::write(&target, b"inside\n").unwrap_or_else(|e| panic!("write: {e}"));
         let link = dir.path().join("link.txt");
         symlink(&target, &link).unwrap_or_else(|e| panic!("symlink: {e}"));
-        let prev = env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         let mut file = open_for_read(Path::new("link.txt")).unwrap_or_else(|e| panic!("read: {e}"));
         let mut buf = String::new();
         file.read_to_string(&mut buf)
             .unwrap_or_else(|e| panic!("read body: {e}"));
-        let _ = env::set_current_dir(&prev);
         assert_eq!(buf, "inside\n");
     }
 
     #[test]
     fn open_for_read_uses_nofollow_on_regular_files() {
-        use super::CWD_TEST_LOCK;
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let path = dir.path().join("plain.txt");
         std::fs::write(&path, b"x").unwrap_or_else(|e| panic!("write: {e}"));
-        let prev = env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         open_for_read(Path::new("plain.txt")).unwrap_or_else(|e| panic!("open: {e}"));
-        let _ = env::set_current_dir(&prev);
     }
 }

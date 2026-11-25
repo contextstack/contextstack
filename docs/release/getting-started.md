@@ -22,19 +22,17 @@ Install the latest stable release:
 curl -fsSL https://github.com/contextstack/contextstack/releases/latest/download/install.sh | sh
 ```
 
-To install a 0.2.0 release candidate, use the `latest` channel:
+To install a pre-release, including a 0.2.0 release candidate, use the `latest` channel:
 
 ```sh
-curl -fsSL https://github.com/contextstack/contextstack/releases/latest/download/install.sh | sh -s -- --channel latest
+curl -fsSL https://github.com/contextstack/contextstack/releases/download/channel-latest/install.sh | sh -s -- --channel latest
 ```
 
 Releases are fetched from GitHub. The installer does not use `sudo` and does not send telemetry.
 
-You should see named stages: **Checking release…**, **Downloading ContextStack** *version*, **Verifying…**, **Installing…**, then `cs init` runs automatically. Install finishes with:
+You should see named stages: **Checking release…**, **Downloading ContextStack** *version*, **Verifying…**, **Installing…**, then `cs init` runs automatically. The installer reports the activated release, any missing optional runtimes, and the services configured by setup. Pass `--json` to see the full activation record.
 
-```text
-Open a new terminal (or run: `export PATH="$HOME/.local/bin:$PATH"`) to use `cs`
-```
+If you need a coding agent, the installer prints the next step and exits successfully. Standalone `cs init` still returns a nonzero exit status when it cannot complete the first job.
 
 `cs` is linked under `~/.local/bin`; new shells pick it up if that directory is on your PATH.
 

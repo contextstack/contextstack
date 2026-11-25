@@ -12,11 +12,13 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# Both OSes: the startup sweep's pid liveness check (`kill(pid, 0)`) and tmp dir owner.
+rustix = { version = "1", features = ["fs", "process"] }
 
 # Linux backend only (phase 3b): the seccomp filter, compiled in pure Rust and handed to bwrap by fd.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-rustix = { version = "1", features = ["fs", "pipe"] }
+rustix = { version = "1", features = ["fs", "pipe", "process"] }
 seccompiler = "0.5"
 
 [dev-dependencies]

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 import os
 import sys
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
@@ -57,18 +58,17 @@ with scratch_dir(prefix="scheduled-setup-preflight-") as raw:
     tick.schedule_pass = lambda: {}
     tick.audit_pass = lambda: None
     tick.occupied = lambda: 0
-    tick.jobs = lambda: [selected]
     tick.admit = lambda pending: pending[0]
     tick.local_model = lambda job: False
-    tick.refresh_job = lambda job: (_ for _ in ()).throw(
-        RuntimeError("setup-preflight: task check is missing or not executable (refusing at $0)"))
+    tick.append_q(selected)
     calls = []
     tick.run_spec = lambda *args, **kwargs: calls.append(args)
     held = []
     tick.hold_schedule = lambda schedule_id, reason: held.append((schedule_id, reason))
     emitted = []
     tick.emit = lambda row, swept: emitted.append(row)
-    tick.main()
+    with patch.object(tick, "call_op", side_effect=RuntimeError(refused.stderr.strip())):
+        tick.main()
 
     rows = [json.loads(line) for line in tick.Q.read_text().splitlines()]
     terminal = rows[-1]
@@ -81,6 +81,28 @@ with scratch_dir(prefix="scheduled-setup-preflight-") as raw:
     assert calls == []
     assert held == [("fixture-schedule", "preflight_refused")]
     assert emitted[-1]["refusal"] == "preflight_refused"
+
+    # A successful subprocess with invalid JSON still closes only its own job.
+    ops = root / "ops/bin"
+    ops.mkdir(parents=True)
+    refresh = ops / "setup-refresh"
+    refresh.write_text("#!/bin/sh\nprintf 'invalid JSON\\n'\n")
+    refresh.chmod(0o755)
+    broken = dict(selected, id="bad-refresh", job="bad-refresh", schedule_id="")
+    next_job = {"id": "next-job", "state": "pending", "spec": "specs/next.yaml"}
+    tick.append_q(broken)
+    tick.append_q(next_job)
+    tick.main()
+    terminal = tick.first_terminal(tick.Q, "bad-refresh")
+    assert terminal["failure_class"] == "machinery_preflight"
+    assert "Expecting value" in terminal["note"]
+    assert [tick.qid(job) for job in tick.jobs()] == ["next-job"]
+    tick.run_spec = lambda *args: (0, {"verdict": "pass"})
+    try:
+        tick.main()
+    except SystemExit as exit_status:
+        assert exit_status.code == 0
+    assert tick.first_terminal(tick.Q, "next-job")["state"] == "done"
 
 # Run both preparation ops in an estate with no corpus contract module.
 with scratch_dir(prefix="workspace-preparation-") as raw:

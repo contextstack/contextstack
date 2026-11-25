@@ -64,7 +64,9 @@ def models_listing(t):
     eq(rows["local-coder"], {"name": "local-coder", "provider": "vllm", "tier": 1, "capability": "coding", "available": True,
                              "preferred": True, "streaming": True, "cost_class": "free_local"}, "local-coder row")
     eq(rows["claude-code"], {"name": "claude-code", "provider": "anthropic", "tier": 1, "capability": "coding", "available": True,
-                             "preferred": False, "streaming": False, "executor": "cli", "cli_binary": "claude", "cost_class": "subscription"}, "claude-code row")
+                             "preferred": False, "streaming": False, "executor": "cli", "cli_binary": "claude", "cost_class": "subscription",
+                             "picker": {"provider_label": "Anthropic", "label": "Claude Code, uses its configured model",
+                                        "internal": False, "efforts": ["low", "medium", "high"]}}, "claude-code row")
     eq({n: r["streaming"] for n, r in rows.items()}, {"claude-code": False, "fake-paid": True, "fake-sub": True, "local-coder": True,
        "mock-echo": True, "ollama-small": True, "vllm-big": True, "vllm-extra": True}, "streaming capability (a CLI entry never streams)")
     eq({n: r["cost_class"] for n, r in rows.items()}, {"claude-code": "subscription", "fake-paid": "api", "fake-sub": "subscription",

@@ -341,6 +341,37 @@ class LanesTests(unittest.TestCase):
             self.assertEqual(signal.getsignal(signal.SIGINT), original)
             self.assert_clean(before)
 
+    def test_red_gate_restore_removes_only_merge_paths_and_keeps_gate_untracked_files(self):
+        ws = lanes.ensure_lane(self.cfg, 'safe')['path']
+        (Path(ws) / 'added').mkdir()
+        (Path(ws) / 'added/new').write_text('from the lane\n')
+        lanes.commit_lane(Path(ws), 'add a file', main=self.main, lane='safe')
+        self.configure(gate='mkdir -p gate-out && echo log > gate-out/artifact && echo note > gate-note && exit 1')
+        before = self.g('rev-parse', 'HEAD')
+        code, result = lanes.land('repo', 'safe')
+        self.assertEqual((code, result['status']), (1, 'red'))
+        self.assertEqual(self.g('rev-parse', 'HEAD'), before)
+        self.assertFalse((self.main / 'added').exists())
+        self.assertEqual((self.main / 'gate-note').read_text(), 'note\n')
+        self.assertEqual((self.main / 'gate-out/artifact').read_text(), 'log\n')
+        self.assertEqual(self.g('status', '--porcelain', '--untracked-files=no'), '')
+        self.assertTrue(result['main_unchanged'])
+
+    def test_sigterm_after_the_gate_refuses_and_rolls_back(self):
+        self.lane()
+        self.configure(gate='true')
+        before = self.g('rev-parse', 'HEAD')
+        real = lanes.red_marker
+        def term_then(message):  # the first call after the gate: deliver SIGTERM through the land's handler
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            return real(message)
+        original = signal.getsignal(signal.SIGTERM)
+        with patch.object(lanes, 'red_marker', side_effect=term_then):
+            code, result = lanes.land('repo', 'safe')
+        self.assertEqual((code, result.get('reason')), (2, 'land interrupted'))
+        self.assertEqual(signal.getsignal(signal.SIGTERM), original)
+        self.assert_clean(before)
+
     def test_secret_history_scan_cache_and_allowlist_pin_names_without_contents(self):
         # Decoy names only: construct the tree without writing a secret-named file.
         blob = self.g('rev-parse', 'HEAD:file')

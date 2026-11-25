@@ -23,6 +23,12 @@ class AppLock
 
     public const PromptId = 'app-lock';
 
+    /**
+     * A return sooner than this never locks, even on Immediately: the Face ID or passcode sheet, and the scanner,
+     * briefly take the app out of the foreground, and locking on that return would undo the unlock just given.
+     */
+    public const Glance = 2;
+
     private bool $unlocked = false;
 
     /** The screen that was asked for when the lock stepped in, to go back to once unlocked. */
@@ -101,7 +107,7 @@ class AppLock
      */
     public function returned(int $secondsAway): void
     {
-        if ($secondsAway >= $this->afterSeconds()) {
+        if ($secondsAway >= max($this->afterSeconds(), self::Glance)) {
             $this->unlocked = false;
             $this->returnTo = '/';
         }

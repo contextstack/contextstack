@@ -184,6 +184,11 @@ def part_layout(tmp, uv, managed):
            "release: bin/ holds all four binaries; cs/ has no ledger/, specs/, tasks/; no code_root entry (the link is dropped)")
     expect(not any(p.is_symlink() for p in (rel / "bin").iterdir()),
            "release: binaries have no compatibility symlinks")
+    files = json.loads((rel / "bundle.json").read_text())["files"]
+    expect((rel / "tracing/check-trace").is_file() and os.access(rel / "tracing/check-trace", os.X_OK)
+           and (rel / "tracing/CONTRACT.md").is_file() and not (rel / "tracing/fixtures").exists()
+           and all("release/tracing/" + name in files for name in ("check-trace", "CONTRACT.md")),
+           "release: executable tracing checker and contract are shipped and hashed without fixtures")
     expect(not (rel / "cs-kit").exists(), "release: only cs code root")
     expect(not any((rel / "bin" / n).exists() for n in ("code_root", "cs", "cs-go", "csgateway")),
            "release: no bin/cs, bin/cs-go or bin/csgateway (the release ships cs-harness and cs-gateway)")

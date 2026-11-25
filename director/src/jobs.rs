@@ -253,6 +253,8 @@ pub struct Plan {
     pub digest: String,
     scope: crate::reservations::JobScope,
     work_reason: Option<String>,
+    #[serde(default)]
+    auto_spec: Option<BundleFile>,
 }
 
 impl Plan {
@@ -307,6 +309,7 @@ impl Plan {
             files,
             scope: crate::reservations::JobScope::default(),
             work_reason: None,
+            auto_spec: None,
         })
     }
 
@@ -356,6 +359,40 @@ impl Plan {
 
     pub fn mark_coding(&mut self) {
         self.meta.insert("phase".into(), json!("coding"));
+    }
+
+    pub fn enable_auto(&mut self, spec: BundleFile) {
+        self.auto_spec = Some(spec);
+        self.meta.insert("model".into(), json!("auto"));
+    }
+
+    pub fn is_auto(&self) -> bool {
+        self.auto_spec.is_some()
+    }
+
+    pub fn node_name(&self, db: &Connection) -> Result<String, String> {
+        db.query_row(
+            "SELECT name FROM nodes WHERE id = ?1",
+            [self.node_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Record the auto route's model. The job stays on its node: routing picks a model, not a machine.
+    pub fn route(&mut self, route: Value) -> Result<(), String> {
+        if route["model"] == crate::planning::CODEX_MODEL {
+            let spec = self.auto_spec.take().ok_or("missing auto route spec")?;
+            let current = self
+                .files
+                .iter_mut()
+                .find(|f| f.path == self.spec)
+                .ok_or("missing coding spec")?;
+            *current = spec;
+        }
+        self.meta.insert("model".into(), route["model"].clone());
+        self.meta.insert("route".into(), route);
+        Ok(())
     }
 
     pub fn freeze_plan(&mut self, store: &Store, markdown: &str) -> Result<(), String> {
@@ -436,18 +473,27 @@ impl Plan {
             self.trials,
             &mut files,
         )?;
-        let node_name: String = tx
-            .query_row(
-                "SELECT name FROM nodes WHERE id = ?1",
-                params![self.node_id],
-                |r| r.get(0),
+        let node_name = self.node_name(tx)?;
+        // Retries use the intent's coding model. Route details belong to this job. The intent keeps its node, so
+        // the lead that started it still sees it.
+        if let (Some(intent), Some(model)) = (
+            intent,
+            self.meta
+                .get("route")
+                .and_then(|route| route["model"].as_str()),
+        ) {
+            tx.execute(
+                "UPDATE intents SET meta = json_set(json_remove(meta, '$.route'), '$.model', ?1)
+                 WHERE intent_id = ?2",
+                params![model, intent],
             )
             .map_err(|e| e.to_string())?;
+        }
         let state = if placed.waits() { "waiting" } else { "offered" };
         tx.execute(
             "INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, grant_id, grant_sha256, meta, state,
-                               created_at, intent_id, work_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                               created_at, intent_id, work_reason, offered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, CASE WHEN ?10 = 'offered' THEN ?11 END)",
             params![job_id, self.node_id, self.spec, self.task, self.trials, bundle_sha(&files), self.grant,
                     self.grant_sha, Value::Object(self.meta.clone()).to_string(), state, now_utc(), intent,
                     self.work_reason.as_deref()],

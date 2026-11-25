@@ -17,8 +17,8 @@
                 <native:list-item native:key="project-{{ $project['id'] }}"
                     headline="{{ $project['name'] }}"
                     supporting="Backlog"
-                    leading-icon="folder"
-                    trailing-icon="chevron.right"
+                    leadingIcon="folder"
+                    trailingIcon="chevron.right"
                     @navigate="'/projects/' . $project['id']" />
             @endforeach
         </native:column>

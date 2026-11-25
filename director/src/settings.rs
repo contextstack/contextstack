@@ -7,6 +7,7 @@
 //! | `--tls-cert PEM`, `--tls-key PEM` | `DIRECTOR_TLS_CERT`, `DIRECTOR_TLS_KEY` | none: plain HTTP |
 //! | `--allow-origin ORIGIN` (repeatable) | `DIRECTOR_ALLOWED_ORIGINS` (comma-separated) | none |
 //! | `--stale-after SECONDS` | `DIRECTOR_STALE_AFTER` | 300 |
+//! | `--offer-grace SECONDS` | `DIRECTOR_OFFER_GRACE` | 30 |
 //! | `--context-window MODEL=TOKENS` (repeatable) | `DIRECTOR_CONTEXT_WINDOWS` (comma-separated) | the table in `thread.rs` |
 //! | `--compact-at FRACTION` | `DIRECTOR_COMPACT_AT` | 0.6 |
 //! | `--gateway URL` (loopback only) | `DIRECTOR_GATEWAY` | `http://127.0.0.1:9200` |
@@ -114,6 +115,8 @@ pub struct Settings {
     pub allowed_origins: Vec<String>,
     /// A node not heard from for this long is shown as stale.
     pub stale_after_seconds: i64,
+    /// An offered job not pulled for this long shows `waiting: node_not_pulled` on its job and turn.
+    pub offer_grace_seconds: i64,
     /// Conversation compaction: context windows and the share of a window a thread may fill.
     pub compaction: crate::thread::Settings,
     /// The local model gateway, for source budgets.
@@ -150,6 +153,7 @@ impl Settings {
             _ => return Err("--tls-cert and --tls-key go together".into()),
         };
         let stale_after_seconds = seconds(args, "stale-after", "DIRECTOR_STALE_AFTER", 300)?;
+        let offer_grace_seconds = seconds(args, "offer-grace", "DIRECTOR_OFFER_GRACE", 30)?;
         let bounds = crate::reservations::Bounds::default();
         let reservations = crate::reservations::Bounds {
             node_stale: seconds(
@@ -206,6 +210,7 @@ impl Settings {
             tls,
             allowed_origins: args.many("allow-origin", "DIRECTOR_ALLOWED_ORIGINS"),
             stale_after_seconds,
+            offer_grace_seconds,
         })
     }
 }

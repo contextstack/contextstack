@@ -97,6 +97,10 @@ return [
         'content',
         'node_modules',
         '*/tests',
+        // This checkout's own device connection (connection.json holds a Director device token) and any other
+        // private storage, plus env files other than the release .env scripts/build-desktop writes.
+        'storage/app/private/*',
+        '.env.*',
     ],
 
     /**

@@ -25,8 +25,7 @@ pub struct OpenAi<'a> {
 struct Out {
     #[serde(default, deserialize_with = "nullable")]
     choices: Vec<Choice>,
-    #[serde(default, deserialize_with = "nullable")]
-    usage: OutUsage,
+    usage: Option<OutUsage>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -192,15 +191,20 @@ impl OpenAi<'_> {
         trace.begin_attempt(self.name, &raw, false);
         let start = std::time::Instant::now();
         let mut fields = json!({});
+        let mut measured = None;
         let result = until(deadline, "Post", &url, async {
             let resp = self.send(http, key, call, &url, raw, trace).await?;
             let latency = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
             let bytes = super::success_body(resp, "Post", &url).await?;
             let out: Out = first_value(&bytes).map_err(CallError::transport_local)?;
+            measured = rejected_usage(&out);
             reply(self.name, out, latency, &mut fields)
         })
         .await;
         trace.attempt_diagnostics(fields);
+        if let Some(bill) = measured {
+            trace.measured_usage(bill);
+        }
         result
     }
 
@@ -251,6 +255,10 @@ impl OpenAi<'_> {
         )
         .await?;
         let out: Out = first_value(&bytes).map_err(CallError::transport_local)?;
+        if let Some(bill) = rejected_usage(&out) {
+            trace.measured_usage(bill);
+        }
+        stream.acc.usage = out.usage;
         let r = reply(self.name, out, 0, &mut json!({}))?;
         stream.queued.push(Event::Stop(Stop {
             reason: r.stop_reason,
@@ -269,17 +277,33 @@ impl OpenAi<'_> {
     }
 }
 
+/// The usage of a 2xx body that [`reply`] refuses for its negative charge: the call was still billed,
+/// so settlement prices these tokens (never the bogus charge).
+fn rejected_usage(out: &Out) -> Option<crate::pricing::TokenBill> {
+    let usage = out.usage?;
+    usage.cost.is_some_and(|c| c < 0.0).then(|| {
+        let (input, cache_read, output) = usage.token_bill();
+        crate::pricing::TokenBill {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: 0,
+        }
+    })
+}
+
 /// The unary reply from a decoded body; a stream accumulates the same body and ends here too, so both
 /// paths share one set of rules (stop reasons, native and Hermes tool calls, argument parsing, charges).
 fn reply(name: &str, out: Out, latency_ms: i64, fields: &mut Value) -> Result<Reply, CallError> {
-    if out.usage.cost.is_some_and(|c| c < 0.0) {
+    let usage = out.usage.unwrap_or_default();
+    if usage.cost.is_some_and(|c| c < 0.0) {
         return Err(CallError::transport_local(format!(
             "{name}: negative provider charge"
         )));
     }
     fields["response_decoded"] = json!(true);
-    fields["input_tokens"] = json!(out.usage.prompt_tokens);
-    fields["output_tokens"] = json!(out.usage.completion_tokens);
+    fields["input_tokens"] = json!(usage.prompt_tokens);
+    fields["output_tokens"] = json!(usage.completion_tokens);
     let mut text = String::new();
     let mut stop = "end_turn".to_string();
     let mut tool_calls = Vec::new();
@@ -315,14 +339,14 @@ fn reply(name: &str, out: Out, latency_ms: i64, fields: &mut Value) -> Result<Re
             stop = "tool_use".into();
         }
     }
-    let (input, cache_read, output) = out.usage.token_bill();
+    let (input, cache_read, output) = usage.token_bill();
     Ok(Reply {
         text,
         input_tokens: input,
         output_tokens: output,
         cache_read_tokens: cache_read,
         cache_write_tokens: 0,
-        charged: out.usage.cost,
+        charged: usage.cost,
         provider: name.to_string(),
         latency_ms,
         stop_reason: stop,
@@ -348,7 +372,7 @@ struct Accum {
     name: String,
     /// The first choice as a unary body would carry it (tool-call arguments as concatenated text).
     choice: Choice,
-    usage: OutUsage,
+    usage: Option<OutUsage>,
 }
 
 #[derive(Deserialize, Default)]
@@ -402,6 +426,7 @@ impl Stream {
     pub fn metered_usage(&self) -> super::MeteredUsage {
         if let Some(Event::Stop(stop)) = self.queued.first() {
             return super::MeteredUsage {
+                known: self.acc.usage.is_some(),
                 input_tokens: stop.input_tokens,
                 output_tokens: stop.output_tokens,
                 cache_read_tokens: stop.cache_read_tokens,
@@ -409,9 +434,10 @@ impl Stream {
                 charged: stop.charged,
             };
         }
-        let u = &self.acc.usage;
+        let u = self.acc.usage.unwrap_or_default();
         let (input_tokens, cache_read_tokens, output_tokens) = u.token_bill();
         super::MeteredUsage {
+            known: self.acc.usage.is_some(),
             input_tokens,
             output_tokens,
             cache_read_tokens,
@@ -468,7 +494,7 @@ impl Accum {
             return Ok(Some(Event::UpstreamError(msg)));
         }
         if let Some(u) = chunk.usage {
-            self.usage = u;
+            self.usage = Some(u);
         }
         Ok(self.absorb(chunk.choices).map(Event::Delta))
     }
@@ -526,7 +552,7 @@ impl Accum {
         }
         let out = Out {
             choices: vec![choice],
-            usage: std::mem::take(&mut self.usage),
+            usage: self.usage,
         };
         let r = reply(&self.name, out, 0, &mut json!({}))?;
         Ok(Event::Stop(Stop {
@@ -855,11 +881,11 @@ mod partial_meter_tests {
         let stream = Stream {
             lines: None,
             acc: Accum {
-                usage: OutUsage {
+                usage: Some(OutUsage {
                     prompt_tokens: 23,
                     prompt_tokens_details: PromptDetails { cached_tokens: 19 },
                     ..OutUsage::default()
-                },
+                }),
                 ..Accum::default()
             },
             queued: Vec::new(),

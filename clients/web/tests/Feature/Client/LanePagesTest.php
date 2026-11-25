@@ -20,6 +20,7 @@ function laneIntentRecord(array $over = []): array
         'task' => 'tasks/ui-lanes',
         'trials' => 1,
         'meta' => ['source' => 'client-web-lane', 'repo' => 'contextstack', 'lane' => 'ui-lanes', 'model' => 'codex'],
+        'lane' => true,
         'created_at' => '2026-11-12T10:00:00Z',
         'revision' => 1,
     ], ...$over];
@@ -95,6 +96,94 @@ it('starts scratch work with neither repo nor lane name', function () {
 
     Http::assertSent(fn (Request $request) => $request->url() === director('intents')
         && ! array_key_exists('repo', $request['lane']) && ! array_key_exists('lane', $request['lane']));
+});
+
+function fakeLaneCreate(): void
+{
+    Http::fake([
+        director('nodes') => Http::response(['nodes' => [['name' => 'laptop', 'revoked_at' => null]]]),
+        director('models') => Http::response(laneModelsCatalog()),
+        director('repos') => Http::response(['repos' => [['name' => 'contextstack']]]),
+        director('intents') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [laneJobRecord(['state' => 'offered'])], 'runs' => []], 201),
+    ]);
+}
+
+it('defaults to Auto and sends model auto with no planner', function () {
+    fakeLaneCreate();
+
+    Livewire::test('pages::client.lane-create')
+        ->assertSet('model', 'auto')
+        ->assertSeeText('Auto (plans first, then picks the model)')
+        ->assertDontSee('data-test="lane-plan-with"', false)
+        ->set('title', 'Fix the widget')->set('goal', 'Make it work.')
+        ->call('submit')->assertHasNoErrors();
+
+    Http::assertSent(fn (Request $request) => $request->url() === director('intents')
+        && $request['lane']['model'] === 'auto' && ! array_key_exists('plan_with', $request['lane']));
+});
+
+it('sends plan_with for an explicitly chosen model that plans first', function () {
+    fakeLaneCreate();
+
+    Livewire::test('pages::client.lane-create')
+        ->set('model', 'codex')
+        ->assertSee('data-test="lane-plan-with"', false)
+        ->set('planWith', 'claude-code-sonnet')
+        ->set('title', 'Fix the widget')->set('goal', 'Make it work.')
+        ->call('submit')->assertHasNoErrors();
+
+    Http::assertSent(fn (Request $request) => $request->url() === director('intents')
+        && $request['lane']['model'] === 'codex' && $request['lane']['plan_with'] === 'claude-code-sonnet');
+});
+
+it('sends no planner when an explicit model does not plan first', function () {
+    fakeLaneCreate();
+
+    Livewire::test('pages::client.lane-create')->set('model', 'codex')
+        ->set('title', 'Fix the widget')->set('goal', 'Make it work.')
+        ->call('submit')->assertHasNoErrors();
+
+    Http::assertSent(fn (Request $request) => $request->url() === director('intents')
+        && $request['lane']['model'] === 'codex' && ! array_key_exists('plan_with', $request['lane']));
+});
+
+it('refuses a planner outside the offered list', function () {
+    fakeLaneCreate();
+
+    Livewire::test('pages::client.lane-create')->set('model', 'codex')->set('planWith', 'rm-rf')
+        ->set('title', 'Fix the widget')->set('goal', 'Make it work.')
+        ->call('submit')->assertHasErrors(['planWith']);
+
+    Http::assertNotSent(fn (Request $request) => $request->url() === director('intents'));
+});
+
+it('never sends auto or a planner for a scratch lane, using the catalog default model instead', function () {
+    fakeLaneCreate();
+
+    Livewire::test('pages::client.lane-create')
+        ->set('model', 'codex')->set('planWith', 'codex')
+        ->set('model', 'auto')
+        ->set('scratch', true)
+        ->assertSet('model', 'codex')
+        ->assertSeeText('Auto needs a repo to plan against')
+        ->set('title', 'Try an idea')->set('goal', 'Sketch it.')
+        ->call('submit')->assertHasNoErrors();
+
+    Http::assertSent(fn (Request $request) => $request->url() === director('intents')
+        && $request['lane']['model'] === 'codex' && ! array_key_exists('plan_with', $request['lane']));
+    Http::assertNotSent(fn (Request $request) => $request->url() === director('intents') && $request['lane']['model'] === 'auto');
+});
+
+it('sends the default model even when a scratch lane is submitted with auto still set', function () {
+    fakeLaneCreate();
+
+    // A client that never fired the scratch update (the property set directly) still must not send auto.
+    Livewire::test('pages::client.lane-create')
+        ->set(['scratch' => true, 'model' => 'auto'])
+        ->set('title', 'Try an idea')->set('goal', 'Sketch it.')
+        ->call('submit')->assertHasNoErrors();
+
+    Http::assertSent(fn (Request $request) => $request->url() === director('intents') && $request['lane']['model'] === 'codex');
 });
 
 it('lists lane jobs and shows the lane detail with live output and result', function () {
@@ -376,6 +465,30 @@ it('links every attempt of a retried lane from each attempt\'s page', function (
         ->assertSet('attempts', [['job_id' => 'job_lane', 'state' => 'error'], ['job_id' => 'job_retry', 'state' => 'accepted']]);
 });
 
+it('shows the model the router chose for the coding job, and why', function () {
+    $job = laneJobRecord(['meta' => ['route' => [
+        'model' => 'harness:local-coder', 'reason' => 'plan names rust → harness:local-coder', 'languages' => ['rust'],
+    ]]]);
+    Http::fake([
+        director('jobs/job_lane') => Http::response($job),
+        director('intents/int_lane') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [$job], 'runs' => []]),
+    ]);
+
+    Livewire::test('pages::client.lane', ['job' => 'job_lane'])
+        ->assertSeeText('harness:local-coder')
+        ->assertSeeText('Model routing')
+        ->assertSeeText('plan names rust → harness:local-coder');
+});
+
+it('shows the intent\'s model and no routing line when the job was not routed', function () {
+    Http::fake([
+        director('jobs/job_lane') => Http::response(laneJobRecord()),
+        director('intents/int_lane') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [laneJobRecord()], 'runs' => []]),
+    ]);
+
+    Livewire::test('pages::client.lane', ['job' => 'job_lane'])->assertDontSeeText('Model routing');
+});
+
 it('shows no attempts line on a lane that was never retried', function () {
     Http::fake([
         director('jobs/job_lane') => Http::response(laneJobRecord()),
@@ -416,4 +529,49 @@ it('does not take a refused transcript or diff for the run\'s evidence, and read
         ->assertSet('lastMessage', 'Done.')
         ->assertSet('transcriptRead', true);
     expect($page->get('diff')['files'])->toBe(['x']);
+});
+
+it('reads the diff, last message and decision again when another run becomes the lane\'s primary run', function () {
+    $transcript = fn (string $text) => '{"type":"assistant","message":{"content":[{"type":"text","text":"'.$text.'"}]}}'."\n";
+    $run = fn (string $id, int $revision, array $over = []) => [...['run_id' => $id, 'job_id' => 'job_lane', 'intent_id' => 'int_lane',
+        'verdict' => 'pass', 'revision' => $revision, 'files' => [['path' => 'evidence/candidate.diff'], ['path' => 'transcript.md']]], ...$over];
+    $job = laneJobRecord(['state' => 'running', 'run_id' => null, 'run_ids' => ['run_a'], 'trials' => 2]);
+    Http::fake([
+        director('jobs/job_lane') => Http::response($job),
+        director('intents/int_lane') => Http::response(['intent' => laneIntentRecord(['trials' => 2]), 'jobs' => [$job],
+            'runs' => [$run('run_a', 9, ['decision' => ['decision_id' => 'dec_a']])]]),
+        director('runs/run_a/decision') => Http::response(['decision_id' => 'dec_a', 'run_id' => 'run_a', 'decision' => 'reject']),
+        'http://director.test/api/v1/client/runs/run_a/files/evidence/candidate.diff' => Http::response("--- a/a.txt\n+++ b/a.txt\n+a\n"),
+        'http://director.test/api/v1/client/runs/run_a/files/transcript.md' => Http::response($transcript('Run A done.')),
+        'http://director.test/api/v1/client/runs/run_b/files/evidence/candidate.diff' => Http::response("--- a/b.txt\n+++ b/b.txt\n+b\n+b\n"),
+        'http://director.test/api/v1/client/runs/run_b/files/transcript.md' => Http::response($transcript('Run B done.')),
+    ]);
+
+    $page = Livewire::test('pages::client.lane', ['job' => 'job_lane'])
+        ->assertSet('lastMessage', 'Run A done.')
+        ->assertSet('receipt.decision_id', 'dec_a');
+    expect($page->get('diff')['files'])->toBe(['a.txt']);
+
+    $page->call('applyStream', [
+        ['kind' => 'run', 'id' => 'run_b', 'revision' => 12, 'record' => $run('run_b', 12)],
+        ['kind' => 'job', 'id' => 'job_lane', 'revision' => 13,
+            'record' => laneJobRecord(['state' => 'done', 'run_id' => 'run_b', 'run_ids' => ['run_a', 'run_b'], 'trials' => 2, 'revision' => 13])],
+    ]);
+
+    $page->assertSet('evidenceRunId', 'run_b')
+        ->assertSet('lastMessage', 'Run B done.')
+        ->assertSet('receipt', [])
+        ->assertSee('Run B done.')
+        ->assertDontSee('Run A done.');
+    expect($page->get('diff'))->toBe(['files' => ['b.txt'], 'added' => 2, 'removed' => 0]);
+});
+
+it('lets the Director decide which tasks are lanes, by its lane flag', function () {
+    $job = laneJobRecord();
+    Http::fake([director('intents?*') => Http::response([
+        'intents' => [laneIntentRecord(), laneIntentRecord(['intent_id' => 'int_other', 'title' => 'Not a lane by the Director', 'lane' => false])],
+        'jobs' => [$job, laneJobRecord(['job_id' => 'job_other', 'intent_id' => 'int_other'])],
+    ])]);
+
+    Livewire::test('pages::client.lanes')->assertSee('Fix the widget')->assertDontSee('Not a lane by the Director');
 });

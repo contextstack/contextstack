@@ -140,8 +140,9 @@ class ProjectBacklog extends DirectorScreen
     private function update(string $id, array $changes): void
     {
         try {
-            $answer = $this->director()->write($this->base().'/'.rawurlencode($id).'/update', $changes, DirectorClient::newKey());
+            $answer = $this->director()->write($this->base().'/'.rawurlencode($id).'/update', $changes, $this->keyFor('update:'.$id.':'.md5((string) json_encode($changes))));
         } catch (DirectorRefused $refused) {
+            $this->answered('update:'.$id.':'.md5((string) json_encode($changes)));
             if ($refused->status === 409) {
                 $this->refresh();
                 $this->problem = 'This item changed since you opened it. It now shows as it is; make your change again if it still applies.';
@@ -152,10 +153,12 @@ class ProjectBacklog extends DirectorScreen
 
             return;
         } catch (DirectorUnavailable) {
-            $this->problem = 'The Director could not be reached, so nothing changed. Try again.';
+            $this->problem = 'The Director could not be reached, so the change may not have arrived. Trying again is safe.';
 
             return;
         }
+
+        $this->answered('update:'.$id.':'.md5((string) json_encode($changes)));
 
         $this->problem = '';
         $updated = Json::record($answer->body['item'] ?? null);

@@ -2,7 +2,7 @@
 
 The ContextStack app for iPad and iPhone, built with [NativePHP Mobile](https://nativephp.com/docs/mobile) v4. Android comes later. Every screen is a native SwiftUI view (Jetpack Compose on Android) written as a PHP `NativeComponent` with an EDGE Blade view. There is no web view, so Livewire and Flux are not used here; `clients/web` is the desktop and browser client.
 
-Like `clients/web`, it is a client of the Director only (`tests/director-spec/CLIENT-API.md`). The app keeps one thing: this device's connection (Director URL and paired device token) in a 0600 file in its own container. Everything else is read from the Director.
+Like `clients/web`, it is a client of the Director only (`tests/director-spec/CLIENT-API.md`). The app keeps one thing: this device's connection. The Director URL and credential id are in a 0600 file in its own container; the paired device token is in the iOS Keychain. Everything else is read from the Director.
 
 ## Layout
 

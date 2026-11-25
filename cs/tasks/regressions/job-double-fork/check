@@ -117,6 +117,8 @@ def independent_signals_contract():
          patch.object(identity, 'suspect_pids', return_value=rows), \
          patch.object(jobs, '_signal_pid') as kill:
         assert tracker.pids() == set()
+        assert tracker.evidence == [], 'the suspect scan runs once in close(), never inside a sweep deadline'
+        tracker._record_suspects()
         assert tracker.evidence == rows
         tracker.kill()
         kill.assert_not_called()

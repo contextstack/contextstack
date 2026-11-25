@@ -358,6 +358,10 @@ def main():
             expect({"$HOME/.local/bin/uv", "$HOME/.local/share/uv/python"} <= set(reads)
                    and "$HOME/.local/bin" not in reads and not any(path.endswith(("/.cache/uv", "/Library/Caches/uv")) for path in reads),
                    "policy: %s reads uv and its Python without granting its bin directory or host cache" % os_)
+        expect("$DEVELOPER_DIR" in committed["runtime_read"]["macos"]
+               and "$DEVELOPER_DIR" not in committed["runtime_read"]["linux"]
+               and "/Applications" not in committed["runtime_read"]["macos"],
+               "policy: macOS reads the selected developer directory")
         tool_py = dict(GOOD, runtime_read=["$CODE_ROOT", "$TOOL_PYTHON"])
         expect(sp.load_policy(estate(scratch, "tool-python", tool_py)) == tool_py, "shape: $TOOL_PYTHON loads in a read list (only)")
         with_env = dict(GOOD, write_env={"CS_X": ["$HOME/.contextstack", "/srv/state"]})

@@ -15,7 +15,9 @@ use Livewire\Component;
  * the reconnect order (resources/js/director-stream.js) and calls refetch() then applyStream(); the page applies a
  * change only when its revision is newer than the record it holds (CLIENT-API.md §8 step 4).
  *
- * Records are held as "kind:id" => record, locked so a browser cannot change them.
+ * Records are held as "kind:id" => record, locked so a browser cannot set them directly. They are not a trusted copy:
+ * applyStream() is a public action and stores whatever newer-revision record it is sent, so an action that acts on a
+ * held record must not rely on it having come from the Director.
  */
 abstract class DirectorPage extends Component
 {

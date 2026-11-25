@@ -1,8 +1,11 @@
 """Client side: a Director's Client API against CLIENT-API.md, over HTTP only. Rust target only."""
 import json
 
+from unittest.mock import patch
+
 from harness import wire
 from harness.client import Client, bundle_files, new_key
+from harness.fake_gateway import BY_NAME
 from harness.run import case
 from harness.wire import run_fixture, sha
 
@@ -18,14 +21,166 @@ def models_list(ctx):
     names = {m["name"] for m in a.json.get("models") or []}
     ctx.expect({"codex", "local-coder"}.issubset(names), "subscription and local templates appear", a.json)
     labels = {m["name"]: m["label"] for m in a.json.get("models") or []}
-    ctx.expect(labels.get("codex") == "Codex (subscription)", "codex label", labels)
-    ctx.expect(labels.get("local-coder") == "Local coder (on this Mac)", "local label", labels)
+    ctx.expect(labels.get("codex") == "Codex CLI, uses its default model", "codex label", labels)
+    ctx.expect(labels.get("local-coder") == "Local coder (vLLM, configured model)", "local label", labels)
     ctx.expect(a.json.get("default_model") == "codex", "default is the first subscription model", a.json)
     by_name = {m["name"]: m for m in a.json.get("models") or []}
     ctx.expect(by_name.get("codex", {}).get("provider") == "openai", "codex provider", by_name.get("codex"))
     ctx.expect(by_name.get("codex", {}).get("billing") == "subscription", "codex billing", by_name.get("codex"))
     off = by_name.get("claude-code") or {}
     ctx.expect(off.get("available") is False and "claude" in (off.get("unavailable_reason") or ""), "unavailable cli reason", off)
+
+
+@case(C, "catalog", "harness-readiness")
+def harness_readiness(ctx):
+    limited, ready = ctx.node2(), ctx.node2()
+    limited.status([], agent_capabilities={"templates": ["codex", "cursor-sol"]},
+                   provider_limits=[{"template": "codex"}, {"template": "cursor-sol"}])
+    ready.status([], agent_capabilities={"templates": ["cursor-sol"]})
+    try:
+        catalog = owner(ctx).call("GET", "models").json["catalog"]
+    finally:
+        for node in (limited, ready):
+            node.status([], agent_capabilities={}, provider_limits=[])
+    harnesses = {row["id"]: row for row in catalog["harnesses"]}
+    for name in ("antigravity", "opencode"):
+        ctx.expect(harnesses[name]["unavailable_reason"] == "no machine reports this harness",
+                   "no reporting machine", harnesses[name])
+    ctx.expect(harnesses["codex"]["unavailable_reason"] == "reported executor templates are provider-limited"
+               and harnesses["codex"]["nodes"] == [], "all reporting machines limited", harnesses["codex"])
+    ctx.expect(harnesses["cursor-agent"]["unavailable_reason"] is None
+               and harnesses["cursor-agent"]["nodes"] == [ready.name], "one ready machine is sufficient",
+               harnesses["cursor-agent"])
+
+
+@case(C, "catalog", "models-picker-shape")
+def models_picker_shape(ctx):
+    """Picker metadata and fleet capabilities come from the server."""
+    first, second, unknown = ctx.node2(), ctx.node2(), ctx.node2()
+    for node, caps in [
+        (first, {"templates": ["codex"], "harness": True, "harness_models": ["local-coder"]}),
+        (second, {"templates": ["codex", "antigravity-hydrogen"], "harness": False,
+                  "harness_models": ["local-coder"]}),
+        (unknown, {"templates": [], "harness": True}),
+    ]:
+        report = node.call("POST", "status", body={"agent_capabilities": caps})
+        ctx.expect(report.status == 200, "capability report accepted", report)
+    answer = owner(ctx).call("GET", "models")
+    ctx.expect(answer.status == 200, "GET models is 200", answer)
+    rows = {row["name"]: row for row in answer.json["models"]}
+    for row in rows.values():
+        ctx.expect(all(isinstance(row[key], str) and row[key]
+                       for key in ("provider", "provider_label", "label"))
+                   and isinstance(row["internal"], bool)
+                   and all(isinstance(row[key], list) and all(isinstance(v, str) for v in row[key])
+                           for key in ("efforts", "nodes")),
+                   "all picker fields have the documented types", row)
+    codex = rows["codex"]
+    ctx.expect(codex["nodes"] == sorted([first.name, second.name]), "both CLI nodes", codex)
+    ctx.expect(codex["provider_label"] == "OpenAI" and not codex["internal"]
+               and codex["efforts"] == ["low", "medium", "high", "xhigh"], "Codex choices", codex)
+    local = rows["local-coder"]
+    ctx.expect(local["nodes"] == [first.name] and local["efforts"] == [], "reported harness catalog", local)
+    planner = rows["claude-code-sonnet-planner"]
+    ctx.expect(planner["internal"] and planner["nodes"] == [], "internal role remains listed", planner)
+    reasoner = rows["local-reasoner"]
+    ctx.expect(reasoner["provider"] == "vllm"
+               and reasoner["label"] == "Local reasoner (vLLM, configured model)",
+               "flat picker metadata comes from the provider overlay", reasoner)
+    hydrogen = rows["antigravity-hydrogen"]
+    ctx.expect(hydrogen["provider"] == "antigravity" and hydrogen["provider_label"] == "Antigravity"
+               and hydrogen["label"] == "Gemini 4 Hydrogen High (Antigravity)"
+               and hydrogen["nodes"] == [second.name] and not hydrogen["available"],
+               "picker provider differs from routing provider and node support is independent", hydrogen)
+
+
+@case(C, "catalog", "models-harnesses-and-providers")
+def models_harnesses_and_providers(ctx):
+    node = ctx.node2()
+    node.status([], agent_capabilities={
+        "templates": ["cursor-sol", "codex"], "harness": True, "harness_models": ["local-coder"],
+    })
+    answer = owner(ctx).call("GET", "models")
+    ctx.expect(answer.status == 200, "catalog loaded", answer)
+    catalog = answer.json["catalog"]
+    providers = {row["id"]: row["label"] for row in catalog["providers"]}
+    harnesses = {row["id"]: row for row in catalog["harnesses"]}
+    models = {row["id"]: row for row in catalog["models"]}
+    ctx.expect("legacy_models" not in answer.json, "flat choices use the original models key", answer)
+    ctx.expect(catalog["default"] == {"harness": "codex", "model": "codex", "value": "codex"},
+               "structured default resolves to the flat default", catalog)
+    for family in ("codex", "goose", "claude-code"):
+        choice = models[family]
+        ctx.expect(family in harnesses and choice["version"] is None
+                   and choice["harnesses"] == [{"harness": family, "value": family}],
+                   "each CLI has an executable default", choice)
+    ctx.expect(all(not row["internal"] for row in models.values()),
+               "structured choices are public", catalog)
+    ctx.expect(harnesses["cursor-agent"]["nodes"] == [node.name]
+               and node.name in harnesses["contextstack"]["nodes"],
+               "harness nodes reflect reported capabilities", harnesses)
+    ctx.expect(harnesses["pi"]["billing"] == "provider"
+               and harnesses["pi"]["provider_ids"] == ["openai"],
+               "Pi takes its billing from the model provider", harnesses["pi"])
+    ctx.expect(models["gpt-5.6-sol-high"]["version"] == "gpt-5.6-sol-high"
+               and models["gpt-5.6-sol-high"]["provider"] == "openai"
+               and models["gpt-5.6-sol-high"]["harnesses"] == [{"harness": "cursor-agent", "value": "cursor-sol"}],
+               "pinned model and exact executable value", models)
+    ctx.expect(models["opencode-go/kimi-k3"]["harnesses"] == [{"harness": "opencode", "value": "opencode-go"}],
+               "model read from the CLI profile", models)
+    ctx.expect(providers.get("vllm") == "vLLM" and "vllm-spark2" not in providers
+               and models["local-coder"]["provider"] == models["local-reasoner"]["provider"] == "vllm",
+               "vLLM deployments share a picker provider", catalog)
+    cloud = models["minimax-m2.1:cloud"]
+    ctx.expect(cloud["billing"] == "hosted" and "hosted" in cloud["label"],
+               "Ollama cloud models are labelled hosted", cloud)
+
+
+@case(C, "catalog", "cli-model-content")
+def cli_model_content(ctx):
+    gateway = ctx.target.gateway
+    extra = [{**BY_NAME[name], "available": True} for name in (
+        "claude-opus-5", "claude-sonnet-4-5-20250929", "gpt-4o", "gemini-2.5-pro",
+        "llama-3.3-70b-versatile", "meta-llama/Llama-3.3-70B-Instruct-Turbo", "z-ai/glm-5.3-flash",
+    )]
+    with patch.object(gateway, "models", [*gateway.models, *extra]):
+        catalog = owner(ctx).call("GET", "models").json["catalog"]
+    models = {row["id"]: row for row in catalog["models"]}
+    pairs = [pair for row in catalog["models"] for pair in row["harnesses"]]
+    values = [pair["value"] for pair in pairs]
+    codex_models = {
+        "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra",
+        "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    }
+    ctx.expect({pair["value"] for pair in pairs if pair["harness"] == "codex"}
+               == {"codex", *("codex:" + model for model in codex_models)}, "all Codex selections", pairs)
+    ctx.expect(len(values) == len(set(values)) and not {"pi", "opencode-go"} & models.keys(),
+               "pinned templates have unique values and no CLI default", values)
+    sol = models["gpt-6.1-sol"]
+    ctx.expect(sol["label"] == "GPT-6.1 Sol" and sol["harnesses"] == [
+        {"harness": "codex", "value": "codex:gpt-6.1-sol"}, {"harness": "pi", "value": "pi"},
+    ], "explicit Pi alias joins Codex", sol)
+    for model, label in {
+        "gpt-5.6-sol-high": "GPT-5.6 Sol High",
+        "gemini-4-hydrogen-high": "Gemini 4 Hydrogen High",
+        "opencode-go/kimi-k3": "Kimi K3",
+        "claude-opus-5": "Claude Opus 5",
+        "claude-sonnet-4-5-20250929": "Claude Sonnet 4.5 (2025-09-29)",
+        "gpt-4o": "GPT-4o",
+        "gemini-2.5-pro": "Gemini 2.5 Pro",
+    }.items():
+        ctx.expect(models[model]["label"] == label, "readable model label", models[model])
+    ctx.expect(models["gpt-5.6-sol-high"]["harnesses"] == [{"harness": "cursor-agent", "value": "cursor-sol"}]
+               and models["gpt-5.6-sol"]["harnesses"] == [{"harness": "codex", "value": "codex:gpt-5.6-sol"}],
+               "similar names without an alias stay separate", models)
+    providers = {row["id"]: row["label"] for row in catalog["providers"]}
+    ctx.expect(providers == {
+        "anthropic": "Anthropic", "google": "Google", "groq": "Groq", "ollama": "Ollama",
+        "openai": "OpenAI", "opencode": "OpenCode", "openrouter": "OpenRouter", "together": "Together AI",
+        "various": "Various providers", "vllm": "vLLM",
+    }, "provider labels", providers)
+    ctx.expect(models["goose"]["provider"] == "various" and models["codex"]["provider"] == "openai",
+               "CLI defaults carry their configured or fallback provider", models)
 
 
 @case(C, "catalog", "repos-listed")
@@ -1238,6 +1393,33 @@ def intents_list_project_filter(ctx):
                "lanes and limit combine with project", laned)
 
     refused(ctx, o.call("GET", "intents?project=prj_missing"), 422, "invalid_request", "unknown project")
+
+
+@case(C, "work", "intents-lane-flag")
+def intents_lane_flag(ctx):
+    """Every intent carries derived lane; lanes=1 returns exactly the lane:true intents."""
+    n, o = ctx.node2(), owner(ctx)
+    o.upload_bundle()
+    lane = o.submit(n.name, meta={"source": "client-web-lane"}, key=new_key("lane"))
+    plain = o.submit(n.name, meta={"source": "cs-cli"}, key=new_key("plain"))
+    ctx.expect(lane.status == 201 and plain.status == 201, "lane and plain intents created", (lane, plain))
+    lane_id = lane.json["intent"]["intent_id"]
+    plain_id = plain.json["intent"]["intent_id"]
+    ctx.expect(lane.json["intent"].get("lane") is True, "POST lane intent has lane true", lane)
+    ctx.expect(plain.json["intent"].get("lane") is False, "POST plain intent has lane false", plain)
+    got = o.call("GET", "intents/" + lane_id).json["intent"]
+    ctx.expect(got.get("lane") is True, "GET lane intent has lane true", got)
+    got = o.call("GET", "intents/" + plain_id).json["intent"]
+    ctx.expect(got.get("lane") is False, "GET plain intent has lane false", got)
+    listed = o.call("GET", "intents").json["intents"]
+    by_id = {i["intent_id"]: i for i in listed}
+    ctx.expect(by_id[lane_id].get("lane") is True, "list marks lane intent", by_id[lane_id])
+    ctx.expect(by_id[plain_id].get("lane") is False, "list marks plain intent", by_id[plain_id])
+    laned = o.call("GET", "intents?lanes=1").json["intents"]
+    ctx.expect(all(i.get("lane") is True for i in laned), "lanes=1 rows all have lane true", laned)
+    ctx.expect({i["intent_id"] for i in laned} == {i["intent_id"] for i in listed if i.get("lane")},
+               "lanes=1 returns exactly lane:true intents", (laned, listed))
+
 
 @case(C, "conversation", "conversation-archive-delete")
 def conversation_archive_delete(ctx):

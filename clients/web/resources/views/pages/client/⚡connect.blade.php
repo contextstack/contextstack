@@ -6,9 +6,7 @@ use App\Client\ConnectionStore;
 use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
-use App\Client\DesktopConnection;
 use App\Client\Exceptions\NotConnected;
-use App\Client\NativeDesktop;
 use Flux\Flux;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Locked;
@@ -115,12 +113,6 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
     public function mount(ConnectionStore $connections, ChiefOfStaff $chief): void
     {
         ['enabled' => $this->chiefOfStaff, 'name' => $this->chiefOfStaffName] = $chief->slot();
-
-        if (NativeDesktop::isRunning() && ! app(DesktopConnection::class)->isReady()) {
-            $this->redirect(route('desktop.gate'), navigate: true);
-
-            return;
-        }
 
         $this->url = $connections->url();
         $this->check();

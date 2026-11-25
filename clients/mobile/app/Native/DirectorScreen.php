@@ -6,6 +6,7 @@ use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Exceptions\NotConnected;
+use App\Client\Exceptions\TokenUnreadable;
 use Closure;
 use Illuminate\Support\Facades\Log;
 use Native\Mobile\Attributes\On;
@@ -22,6 +23,14 @@ abstract class DirectorScreen extends NativeComponent
     public string $problem = '';
 
     /**
+     * One Idempotency-Key per action until the Director has answered it: an answer lost on the way may still have
+     * been recorded, so trying again must replay the same request, not make a second one (CLIENT-API.md §7.1).
+     *
+     * @var array<string, string> action => key
+     */
+    public array $actionKeys = [];
+
+    /**
      * The app's own listener has already decided whether this return locks it (Laravel's listeners run before the
      * live screen hears the event).
      */
@@ -31,6 +40,19 @@ abstract class DirectorScreen extends NativeComponent
         if (app(AppLock::class)->locked()) {
             $this->replace('/locked');
         }
+    }
+
+    protected function keyFor(string $action): string
+    {
+        return $this->actionKeys[$action] ??= DirectorClient::newKey();
+    }
+
+    /**
+     * The Director answered the action (recorded it or refused it), so a new attempt is a new request.
+     */
+    protected function answered(string $action): void
+    {
+        unset($this->actionKeys[$action]);
     }
 
     protected function director(): DirectorClient
@@ -55,6 +77,8 @@ abstract class DirectorScreen extends NativeComponent
             $this->replace('/connect');
         } catch (DirectorRefused $refused) {
             $this->problem = $refused->explain();
+        } catch (TokenUnreadable $unreadable) {
+            $this->problem = $unreadable->getMessage();
         } catch (DirectorUnavailable $unavailable) {
             Log::warning('The Director could not be reached.', ['error' => $unavailable->getMessage()]);
             $this->problem = 'The Director could not be reached. Check that Tailscale is on, then pull to refresh.';

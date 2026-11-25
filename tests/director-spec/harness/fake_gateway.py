@@ -9,22 +9,38 @@ owner token sent or None), so a case can check what reached it. `after_get`, whe
 answered, so a case can play another writer changing the limits between the Director's reads."""
 import json
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 KNOWN = ("anthropic", "openai", "openrouter")
 
+CATALOG = json.loads((Path(__file__).resolve().parents[3] / "gateway/models.json").read_text())
+BY_NAME = {row["name"]: row for row in CATALOG["models"]}
 MODELS = [
-    {"name": "codex", "executor": "cli", "cli_binary": "codex", "provider": "openai", "cost_class": "subscription", "available": True},
-    {"name": "local-coder", "executor": "local-coder", "provider": "ollama", "cost_class": "free_local", "available": True},
-    {"name": "claude-code-sonnet", "executor": "cli", "cli_binary": "claude", "provider": "anthropic", "cost_class": "subscription", "available": True},
-    {"name": "claude-code", "executor": "cli", "cli_binary": "claude", "provider": "anthropic", "cost_class": "subscription", "available": False},
+    {**BY_NAME[name], "available": available}
+    for name, available in [
+        ("codex", True),
+        ("local-coder", True),
+        ("claude-code-sonnet", True),
+        ("claude-code", False),
+        ("claude-code-sonnet-planner", True),
+        ("antigravity-hydrogen", False),
+        ("pi", True),
+        ("goose", True),
+        ("cursor-sol", True),
+        ("opencode-go", True),
+        ("minimax-m2.1:cloud", False),
+    ]
 ]
+OVERLAY = json.loads((Path(__file__).resolve().parents[3] / "gateway/providers.d.example/dgx.json").read_text())
+MODELS.extend({**row, "available": False} for row in OVERLAY["models"])
 
 
 class FakeGateway:
     def __init__(self, owner_token):
         self.owner_token = owner_token
         self.limits = {"sources": {}}
+        self.models = MODELS
         self.spent = {}
         self.seen = []
         self.after_get = None
@@ -47,7 +63,7 @@ class FakeGateway:
             def do_GET(self):
                 if self.path.startswith("/v1/models"):
                     gateway.seen.append(("GET", self.headers.get("X-ContextStack-Owner-Token")))
-                    models = [*MODELS, *(
+                    models = [*gateway.models, *(
                         {"name": model, "available": True, "provider": provider, "cost_class": "api"}
                         for model, (provider, _) in gateway.review_responses.items()
                     )]

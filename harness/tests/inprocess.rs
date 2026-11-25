@@ -501,6 +501,43 @@ async fn partial_stream_error_charge_reaches_result_and_terminal() -> Result<(),
     Ok(())
 }
 
+/// A deadline mid-call still counts the charge the gateway settles, on the call span and the terminal.
+#[tokio::test]
+async fn deadline_keeps_the_charge_the_gateway_settles() -> Result<(), String> {
+    let late = r#"__late__{"status":"error","cost":{"class":"api","charged_usd":0.0042},"error":{"class":"runtime","code":"gateway.deadline","message":"late"}}"#;
+    let cs = ContextStack::build()?;
+    let spec = cs.write_spec(&yaml("{turns: 3, tool_calls: 5, usd: 1, seconds: 4}", ""))?;
+    let row = drive(&cs, &spec, vec![late.into()]).await?;
+    assert_eq!((row.stop.as_str(), row.cost), ("budget:seconds", 0.0042));
+    let run = fs::read_dir(cs.root.join("ledger/runs"))
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or("no run")?
+        .map_err(|e| e.to_string())?;
+    let trace = fs::read_to_string(run.path().join("trace.jsonl")).map_err(|e| e.to_string())?;
+    let spans = trace
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let call = spans
+        .iter()
+        .find(|span| span["kind"] == "model_call")
+        .ok_or("no model_call span")?;
+    assert_eq!(call["attributes"]["charged_usd"], 0.0042, "{call}");
+    assert_eq!(call["attributes"]["partial"], true, "{call}");
+    let terminal = spans
+        .iter()
+        .find_map(|span| span["attributes"]["terminal"].as_object())
+        .ok_or("no terminal")?;
+    assert_eq!(terminal["charged_usd"], 0.0042);
+    assert_eq!(
+        terminal["accounted_settlements"].as_array().map(Vec::len),
+        Some(1)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn ceiling_denial_sets_usd_ceiling_stop() -> Result<(), String> {
     let denied = r#"{"status":"error","error":{"class":"fatal_session","code":"gateway.policy_denied","message":"no","budget":{"reason":"ceiling"}}}"#;
@@ -709,6 +746,105 @@ async fn trusted_operations_and_hooks_have_watchdogs() -> Result<(), String> {
         assert!(
             !run.path().join("finalized.json").exists(),
             "{name} finalized despite watchdog"
+        );
+    }
+    Ok(())
+}
+
+/// A deadline that expires in setup or capture-stimulus is the run's timeout, not a void error.
+#[tokio::test]
+async fn a_deadline_during_setup_is_a_timeout() -> Result<(), String> {
+    for name in ["setup-workspace", "capture-stimulus"] {
+        let cs = ContextStack::build()?;
+        let path = cs.root.join("ops/bin").join(name);
+        fs::write(&path, "#!/bin/sh\nexec sleep 600\n").map_err(|e| e.to_string())?;
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+        if name == "setup-workspace" {
+            fs::create_dir_all(cs.root.join("tasks/fx/setup")).map_err(|e| e.to_string())?;
+        }
+        let spec = cs.write_spec(&yaml("{turns: 3, seconds: 1}", ""))?;
+        let task = cs.root.join("tasks/fx");
+        let task = task.to_str().ok_or("non-UTF8 path")?;
+        let row = estate_support::drive_task(&cs, &spec, task, vec![OK.into()], None)
+            .await
+            .map_err(|e| format!("drive {name}: {e}"))?;
+        assert_eq!(row.stop, "budget:seconds", "{name}: {:?}", row.error);
+        assert_ne!(row.verdict, "void", "{name}");
+        let error = row.error.unwrap_or_default();
+        assert!(
+            error.contains(name) && !error.contains("retry finalization"),
+            "{error}"
+        );
+        let run = fs::read_dir(cs.root.join("ledger/runs"))
+            .map_err(|e| e.to_string())?
+            .next()
+            .ok_or("no run")?
+            .map_err(|e| e.to_string())?;
+        let receipt = fs::read(run.path().join("execution-receipt.json"))
+            .map_err(|e| format!("{name}: receipt: {e}"))?;
+        let receipt: Value = serde_json::from_slice(&receipt).map_err(|e| e.to_string())?;
+        assert_eq!(
+            receipt["row"]["terminal_state"], "timeout",
+            "{name}: {receipt}"
+        );
+    }
+    Ok(())
+}
+
+/// Hooks die after the spec's `check_window` (SCHEMA Hooks; default 60), not the ops watchdog.
+#[tokio::test]
+async fn hooks_are_killed_after_the_check_window() -> Result<(), String> {
+    for (window, alive_after, killed_after) in [("", 0, 61), ("check_window: 300\n", 121, 301)] {
+        let cs = ContextStack::build()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let script = format!(
+            "#!/usr/bin/python3\nimport socket, time\ns = socket.socket()\ns.connect(('127.0.0.1', {port}))\ntime.sleep(600)\n"
+        );
+        let path = cs.root.join("hooks/bin/post_turn");
+        fs::write(&path, script).map_err(|e| e.to_string())?;
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+        let middle = format!("post_turn: [post_turn]\npre_tool: []\n{window}");
+        let spec = cs.write_spec(&yaml("{turns: 3, seconds: 0}", &middle))?;
+        let expire = async {
+            let (mut connection, _) = listener.accept().await.map_err(|e| e.to_string())?;
+            let mut byte = [0];
+            if alive_after > 0 {
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_secs(alive_after)).await;
+                tokio::time::resume();
+                let read = tokio::io::AsyncReadExt::read(&mut connection, &mut byte);
+                let waited = tokio::time::timeout(std::time::Duration::from_millis(500), read);
+                assert!(waited.await.is_err(), "hook killed before its check_window");
+            }
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(killed_after - alive_after)).await;
+            tokio::time::resume();
+            let read = tokio::io::AsyncReadExt::read(&mut connection, &mut byte);
+            let read = tokio::time::timeout(std::time::Duration::from_secs(10), read)
+                .await
+                .map_err(|_| format!("hook outlived check_window {window:?}"))?;
+            assert_eq!(
+                read.map_err(|e| e.to_string())?,
+                0,
+                "watchdog must kill the hook"
+            );
+            Ok::<_, String>(())
+        };
+        let (row, expired) = tokio::join!(
+            drive(&cs, &spec, vec![tool_reply("call", "{}"), OK.into()]),
+            expire
+        );
+        expired?;
+        let row = row?;
+        assert!(
+            row.error.as_ref().is_some_and(|e| e.contains("post_turn")),
+            "{:?}",
+            row.error
         );
     }
     Ok(())

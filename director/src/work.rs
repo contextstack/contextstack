@@ -536,14 +536,19 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
             Ok(o) => o,
             Err(no) => return no.reply(),
         };
-    let planner = stamp_and_check(
-        state,
-        &db,
-        &mut plan,
-        &intent_id,
-        stamped_before.as_deref(),
-        &node,
-    )
+    let planner = if m.get("lane").is_some_and(crate::planning::auto_requested) {
+        plan.stamp(&state.store, &intent_id, None)
+            .map_err(|e| No::internal(&format!("{e:?}")))
+    } else {
+        stamp_and_check(
+            state,
+            &db,
+            &mut plan,
+            &intent_id,
+            stamped_before.as_deref(),
+            &node,
+        )
+    }
     .and_then(|()| {
         crate::planning::prepare_if_requested(state, &db, &want, &m, &intent_id, &mut plan)
     });
@@ -652,8 +657,8 @@ pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> 
     if let Err(e) = plan.stamp(&state.store, intent_id, stamped.as_deref()) {
         return invalid(&format!("{e:?}"));
     }
-    if let Err(e) = crate::work_trace::stamp_job_reason(&mut plan, &db, intent_id, client) {
-        return internal(&e);
+    if let Err(no) = crate::work_trace::stamp_job_reason(&mut plan, &db, intent_id, client) {
+        return no.reply();
     }
     if let Err(e) = plan.refuse_if_node_lacks_capability(
         &state.store,
@@ -752,7 +757,8 @@ pub fn decide(state: &State, call: &Call, client: &Client, run_id: &str) -> Repl
 
 /// `POST jobs/{id}/cancel`: record a cancel request and the control message that carries it to the job's node
 /// (NODE-PROTOCOL.md §9.1). It is requested until the node reports. A job has at most one; asking again answers
-/// with it.
+/// with it. When that existing cancel is already applied and the job is still open with no run, asking again
+/// finishes the job as cancelled (same path as a newly applied cancel).
 pub fn cancel(state: &State, call: &Call, client: &Client, job_id: &str) -> Reply {
     let (key, m) = match (key(call), body(call)) {
         (Ok(k), Ok(m)) => (k, m),
@@ -779,9 +785,15 @@ pub fn cancel(state: &State, call: &Call, client: &Client, job_id: &str) -> Repl
     let made = match job {
         Err(e) => return internal(&e),
         Ok(None) => return not_found("job"),
-        Ok(Some((_, Some(earlier), _))) => (|| -> Result<(u16, String), String> {
-            remember(&db, &key, &sha, Record::Cancel, &earlier, client)
+        Ok(Some((job_state, Some(earlier), _))) => (|| -> Result<(u16, String), String> {
+            let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
+            // An applied cancel that left the job open with no run (pre-fix orphans): finish now.
+            if !matches!(job_state.as_str(), "done" | "error") {
+                crate::reservations::finish_orphan_applied_cancel(&state.store, &tx, job_id)?;
+            }
+            remember(&tx, &key, &sha, Record::Cancel, &earlier, client)
                 .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
             Ok((200, earlier))
         })(),
         Ok(Some((s, None, _))) if matches!(s.as_str(), "done" | "error") => {

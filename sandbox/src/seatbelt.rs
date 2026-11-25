@@ -5,6 +5,7 @@
 //! then narrow: reads are only the listed subtrees, there is no platform default read list.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::failure::{Failure, unenforceable};
 
@@ -19,6 +20,12 @@ pub const BACKEND: &str = "seatbelt";
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// The environment variable naming the gateway's unix socket for `net: gateway`.
 pub const GATEWAY_SOCKET_VAR: &str = "CS_GATEWAY_SOCKET";
+
+pub fn apply_developer_dir(command: &mut Command, effective: &Effective) {
+    if let Some(path) = &effective.developer_dir {
+        command.env("DEVELOPER_DIR", path);
+    }
+}
 
 fn subpath_rules(operation: &str, paths: &[impl AsRef<Path>]) -> Result<Vec<String>, Failure> {
     let mut rules = Vec::with_capacity(paths.len());
@@ -314,6 +321,7 @@ mod tests {
 
     fn effective(net: Net) -> Effective {
         Effective {
+            developer_dir: None,
             workspace: PathBuf::from("/private/tmp/ws"),
             read: vec![
                 PathBuf::from("/opt/homebrew"),

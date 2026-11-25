@@ -115,8 +115,13 @@ if [ ! -f "$REL/.complete" ]; then
   export UV_OFFLINE=1 UV_NO_PROGRESS=1 UV_PYTHON_PREFERENCE=only-managed
   export UV_PYTHON_INSTALL_DIR="$REL/python" UV_PYTHON_INSTALL_MIRROR="file://$BUNDLE/python"
   export UV_CACHE_DIR="$REL/.uv-cache"
-  echo "node-install: python $PYVER from $BUNDLE/python into $REL/python" >&2
-  "$UV" python install --no-bin "$PYVER"
+  echo "Unpacking the bundled Python…" >&2
+  python_install_rc=0
+  python_install_output=$("$UV" python install --no-bin "$PYVER" 2>&1) || python_install_rc=$?
+  if [ "$python_install_rc" -ne 0 ]; then
+    printf '%s\n' "$python_install_output" >&2
+    exit "$python_install_rc"
+  fi
   (cd "$REL/$KIT" && "$UV" sync --locked --offline --python "$PYVER")
   rm -rf "$REL/.uv-cache"
   rc=0

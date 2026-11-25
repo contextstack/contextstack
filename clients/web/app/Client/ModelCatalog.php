@@ -5,34 +5,43 @@ declare(strict_types=1);
 namespace App\Client;
 
 /**
- * Director GET models: choices for the new-conversation picker and the failed-turn model switch.
+ * Director GET models (CLIENT-API.md §4.5): the flat `models` rows, for the failed-turn model switch and for the
+ * two-step provider-then-model picker the new-lane and new-conversation pages fall back to when the answer has no
+ * `catalog` (HarnessCatalog builds the three-step picker from it). Role-only rows (`internal`) are never offered.
+ *
+ * @phpstan-type Choice array{
+ *     name: string,
+ *     label: string,
+ *     available: bool,
+ *     display_name: string,
+ *     provider: string,
+ *     billing: string,
+ *     reason: string|null,
+ *     lead: bool,
+ *     model_label: string,
+ *     provider_label: string,
+ *     nodes: list<string>,
+ *     option: string,
+ * }
+ * @phpstan-type ProviderGroup array{provider: string, label: string, ready: bool, models: list<Choice>}
  */
 final class ModelCatalog
 {
     public const string NoReadyHint = 'Sign in to a subscription CLI (for example `claude`) or add an API key (`cs init --api-key openai`), then reload this page.';
 
     /**
+     * Each row once, in the catalog's order, without role-only (`internal`) rows. `label` is the one-line text for a
+     * flat list; `option` is the text inside a provider group (the model's catalog label, billing, why it is not
+     * ready, and the machines that report support).
+     *
      * @param  array<string, mixed>  $catalog
-     * @return array{
-     *     choices: list<array{
-     *         name: string,
-     *         label: string,
-     *         available: bool,
-     *         display_name: string,
-     *         provider: string,
-     *         billing: string,
-     *         reason: string|null,
-     *         lead: bool,
-     *     }>,
-     *     default: string,
-     *     canStart: bool,
-     * }
+     * @return array{choices: list<Choice>, default: string, canStart: bool}
      */
     public static function parse(array $catalog): array
     {
         $choices = [];
-        foreach ((array) ($catalog['models'] ?? []) as $row) {
-            if (! is_array($row) || ! is_string($row['name'] ?? null)) {
+        foreach ((array) ($catalog['legacy_models'] ?? $catalog['models'] ?? []) as $row) {
+            if (! is_array($row) || ! is_string($row['name'] ?? null) || ($row['internal'] ?? false) === true) {
                 continue;
             }
             $name = $row['name'];
@@ -43,7 +52,7 @@ final class ModelCatalog
             $billing = is_string($row['billing'] ?? null) ? $row['billing'] : self::billingFromCostClass($costClass);
             $displayName = is_string($row['display_name'] ?? null)
                 ? $row['display_name']
-                : self::displayNameFromLabel((string) ($row['label'] ?? $name));
+                : self::displayNameFromLabel(is_string($row['label'] ?? null) ? $row['label'] : $name);
             $provider = is_string($row['provider'] ?? null) && $row['provider'] !== ''
                 ? $row['provider']
                 : 'local';
@@ -51,6 +60,9 @@ final class ModelCatalog
             $reason = is_string($row['unavailable_reason'] ?? null) ? $row['unavailable_reason'] : null;
             // Whether a hosted lead can run on it: the catalog always says.
             $lead = ($row['lead'] ?? false) === true;
+            $modelLabel = is_string($row['label'] ?? null) && $row['label'] !== '' ? $row['label'] : $displayName;
+            $providerLabel = is_string($row['provider_label'] ?? null) && $row['provider_label'] !== '' ? $row['provider_label'] : $provider;
+            $nodes = array_values(array_filter((array) ($row['nodes'] ?? []), fn (mixed $node): bool => is_string($node) && $node !== ''));
 
             $choices[] = [
                 'name' => $name,
@@ -61,6 +73,10 @@ final class ModelCatalog
                 'billing' => $billing,
                 'reason' => $reason,
                 'lead' => $lead,
+                'model_label' => $modelLabel,
+                'provider_label' => $providerLabel,
+                'nodes' => $nodes,
+                'option' => self::groupedOptionLabel($modelLabel, $billing, $available, $reason, $nodes),
             ];
         }
 
@@ -106,6 +122,64 @@ final class ModelCatalog
         }
 
         return $name;
+    }
+
+    /**
+     * The choices grouped by provider, in the order each provider first appears. A group is ready when one of its
+     * models is.
+     *
+     * @param  list<Choice>  $choices
+     * @return list<ProviderGroup>
+     */
+    public static function groups(array $choices): array
+    {
+        $groups = [];
+        foreach ($choices as $choice) {
+            $provider = $choice['provider'];
+            $groups[$provider] ??= ['provider' => $provider, 'label' => $choice['provider_label'], 'ready' => false, 'models' => []];
+            $groups[$provider]['models'][] = $choice;
+            $groups[$provider]['ready'] = $groups[$provider]['ready'] || $choice['available'];
+        }
+
+        return array_values($groups);
+    }
+
+    /**
+     * The provider group a model belongs to, or '' when the model is not among the choices.
+     *
+     * @param  list<Choice>  $choices
+     */
+    public static function providerOf(string $name, array $choices): string
+    {
+        foreach ($choices as $choice) {
+            if ($choice['name'] === $name) {
+                return $choice['provider'];
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * The model to select when a person picks a provider: its first ready model that the machine is not out of quota
+     * for, else its first ready model, else '' (none of its models is ready).
+     *
+     * @param  list<Choice>  $choices
+     * @param  array<string, string|null>  $limited  model name → reset time, for the machine the model would run on
+     */
+    public static function firstReadyOf(string $provider, array $choices, array $limited = []): string
+    {
+        $ready = [];
+        foreach ($choices as $choice) {
+            if ($choice['provider'] === $provider && $choice['available']) {
+                $ready[] = $choice['name'];
+            }
+        }
+        if ($ready === []) {
+            return '';
+        }
+
+        return ProviderLimits::prefer($ready[0], $ready, $limited);
     }
 
     /**
@@ -169,6 +243,36 @@ final class ModelCatalog
         return substr($label, 0, $paren);
     }
 
+    /**
+     * @param  list<string>  $nodes
+     */
+    private static function groupedOptionLabel(string $modelLabel, string $billing, bool $available, ?string $reason, array $nodes): string
+    {
+        $line = $modelLabel.' · '.self::billingLabel($billing);
+        if (! $available && filled($reason)) {
+            $line .= ' — '.$reason;
+        }
+        if ($nodes !== []) {
+            $line .= ' · '.__('runs on :machines', ['machines' => implode(', ', $nodes)]);
+        }
+
+        return $line;
+    }
+
+    /**
+     * Billing in words: "subscription", "paid API", "free on this Mac", "hosted".
+     */
+    public static function billingLabel(string $billing): string
+    {
+        return match ($billing) {
+            'subscription' => __('subscription'),
+            'paid_api' => __('paid API'),
+            'hosted' => __('hosted'),
+            'free_local' => __('free on this Mac'),
+            default => $billing,
+        };
+    }
+
     private static function optionLabel(
         string $displayName,
         string $provider,
@@ -176,13 +280,7 @@ final class ModelCatalog
         bool $available,
         ?string $reason,
     ): string {
-        $billingLabel = match ($billing) {
-            'subscription' => __('subscription'),
-            'paid_api' => __('paid API'),
-            'free_local' => __('free on this Mac'),
-            default => $billing,
-        };
-        $line = "{$displayName} · {$provider} · {$billingLabel}";
+        $line = "{$displayName} · {$provider} · ".self::billingLabel($billing);
         if (! $available && filled($reason)) {
             $line .= ' — '.$reason;
         }

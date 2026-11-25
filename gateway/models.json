@@ -97,6 +97,7 @@
     {
       "name": "local-coder",
       "provider": "vllm",
+      "picker": {"provider_label": "vLLM", "label": "Local coder (vLLM, configured model)"},
       "tier": 1,
       "capability": "coding",
       "preferred": true,
@@ -106,6 +107,7 @@
     {
       "name": "qwen3-coder:30b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Qwen3-Coder 30B"},
       "tier": 1,
       "capability": "coding",
       "preferred": false,
@@ -114,6 +116,7 @@
     {
       "name": "qwen2.5-coder:32b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Qwen2.5-Coder 32B"},
       "tier": 1,
       "capability": "coding",
       "preferred": false,
@@ -122,6 +125,7 @@
     {
       "name": "devstral:24b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Devstral 24B"},
       "tier": 1,
       "capability": "coding",
       "preferred": false,
@@ -130,6 +134,7 @@
     {
       "name": "deepseek-r1:latest",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "DeepSeek R1 (latest tag)"},
       "tier": 2,
       "capability": "reasoning",
       "preferred": false,
@@ -138,6 +143,7 @@
     {
       "name": "deepseek-r1:70b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "DeepSeek R1 70B"},
       "tier": 3,
       "capability": "reasoning",
       "preferred": false,
@@ -146,6 +152,7 @@
     {
       "name": "llama4:16x17b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Llama 4 Scout 16×17B"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -154,6 +161,7 @@
     {
       "name": "llama3:70b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Llama 3 70B"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -162,6 +170,7 @@
     {
       "name": "llama3.2:latest",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Llama 3.2 (latest tag)"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -170,6 +179,7 @@
     {
       "name": "firefunction-v2:70b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Firefunction v2 70B"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -178,6 +188,7 @@
     {
       "name": "gpt-oss:120b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "GPT-OSS 120B"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -186,6 +197,7 @@
     {
       "name": "gpt-oss:20b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "GPT-OSS 20B"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -194,6 +206,7 @@
     {
       "name": "gpt-oss:latest",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "GPT-OSS (latest tag)"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -202,6 +215,7 @@
     {
       "name": "glm-4.7-flash:latest",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "GLM-4.7 Flash (latest tag)"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -218,6 +232,7 @@
     {
       "name": "codellama:7b",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Code Llama 7B"},
       "tier": 2,
       "capability": "coding",
       "preferred": false,
@@ -226,6 +241,7 @@
     {
       "name": "minimax-m2.1:cloud",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "MiniMax M2.1 (cloud)"},
       "tier": 2,
       "capability": "general",
       "preferred": false,
@@ -234,6 +250,7 @@
     {
       "name": "kimi-k2-thinking:cloud",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Kimi K2 Thinking (cloud)"},
       "tier": 2,
       "capability": "reasoning",
       "preferred": false,
@@ -242,6 +259,7 @@
     {
       "name": "nomic-embed-text:latest",
       "provider": "ollama",
+      "picker": {"provider_label": "Ollama", "label": "Nomic Embed Text (latest tag)"},
       "tier": 2,
       "capability": "embedding",
       "preferred": false,
@@ -268,6 +286,7 @@
     {
       "name": "claude-code-sonnet",
       "provider": "anthropic",
+      "picker": {"provider_label": "Anthropic", "label": "Claude Sonnet (Claude Code CLI alias)", "efforts": ["low", "medium", "high"]},
       "tier": 3,
       "capability": "reasoning",
       "preferred": true,
@@ -279,6 +298,7 @@
     {
       "name": "claude-code-opus",
       "provider": "anthropic",
+      "picker": {"provider_label": "Anthropic", "label": "Claude Opus (Claude Code CLI alias)", "efforts": ["low", "medium", "high"]},
       "tier": 3,
       "capability": "reasoning",
       "preferred": false,
@@ -290,6 +310,7 @@
     {
       "name": "claude-code",
       "provider": "anthropic",
+      "picker": {"provider_label": "Anthropic", "label": "Claude Code, uses its configured model", "efforts": ["low", "medium", "high"]},
       "tier": 1,
       "capability": "coding",
       "preferred": true,
@@ -301,6 +322,7 @@
     {
       "name": "claude-code",
       "provider": "anthropic",
+      "picker": {"provider_label": "Anthropic", "label": "Claude Code, uses its configured model", "efforts": ["low", "medium", "high"]},
       "tier": 2,
       "capability": "coding",
       "preferred": true,
@@ -312,6 +334,7 @@
     {
       "name": "claude-code",
       "provider": "anthropic",
+      "picker": {"provider_label": "Anthropic", "label": "Claude Code, uses its configured model", "efforts": ["low", "medium", "high"]},
       "tier": 3,
       "capability": "coding",
       "preferred": true,
@@ -323,6 +346,7 @@
     {
       "name": "gemini-cli",
       "provider": "gemini",
+      "picker": {"provider": "google", "provider_label": "Google", "label": "Gemini CLI, uses its configured model"},
       "tier": 1,
       "capability": "coding",
       "preferred": false,
@@ -334,6 +358,7 @@
     {
       "name": "claude-code-sonnet-planner",
       "provider": "anthropic",
+      "picker": {"provider_label": "Anthropic", "label": "Claude Sonnet (Claude Code planner alias)", "internal": true, "efforts": ["low", "medium", "high"]},
       "tier": 3,
       "capability": "reasoning",
       "preferred": false,
@@ -345,6 +370,7 @@
     {
       "name": "claude-code-opus-judge",
       "provider": "anthropic",
+      "picker": {"provider_label": "Anthropic", "label": "Claude Opus (Claude Code judge alias)", "internal": true, "efforts": ["low", "medium", "high"]},
       "tier": 3,
       "capability": "reasoning",
       "preferred": false,
@@ -356,6 +382,7 @@
     {
       "name": "cursor-agent",
       "provider": "cursor",
+      "picker": {"provider_label": "Cursor", "label": "Cursor Agent, uses its configured model"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -367,6 +394,7 @@
     {
       "name": "cursor-sol",
       "provider": "cursor",
+      "picker": {"provider_label": "Cursor", "label": "GPT-5.6 Sol High (Cursor)"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -378,6 +406,7 @@
     {
       "name": "cursor-codex",
       "provider": "cursor",
+      "picker": {"provider_label": "Cursor", "label": "GPT-5.3 Codex High (Cursor)"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -389,6 +418,7 @@
     {
       "name": "cursor-composer",
       "provider": "cursor",
+      "picker": {"provider_label": "Cursor", "label": "Composer 2.5 (Cursor)"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -400,6 +430,7 @@
     {
       "name": "cursor-grok",
       "provider": "cursor",
+      "picker": {"provider_label": "Cursor", "label": "Grok 4.7 High (Cursor)"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -411,6 +442,7 @@
     {
       "name": "cursor-sonnet",
       "provider": "cursor",
+      "picker": {"provider_label": "Cursor", "label": "Claude Sonnet 5 Thinking High (Cursor)"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -422,6 +454,7 @@
     {
       "name": "antigravity",
       "provider": "gemini",
+      "picker": {"provider": "antigravity", "provider_label": "Antigravity", "label": "Antigravity, uses its configured model"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -433,6 +466,7 @@
     {
       "name": "antigravity-hydrogen",
       "provider": "gemini",
+      "picker": {"provider": "antigravity", "provider_label": "Antigravity", "label": "Gemini 4 Hydrogen High (Antigravity)"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -444,6 +478,7 @@
     {
       "name": "opencode-go",
       "provider": "opencode",
+      "picker": {"provider_label": "OpenCode", "label": "Kimi K3 (OpenCode Go)"},
       "tier": 2,
       "capability": "coding",
       "preferred": false,
@@ -455,6 +490,7 @@
     {
       "name": "pi",
       "provider": "pi",
+      "picker": {"provider_label": "Pi", "label": "GPT-6.1 Sol (Pi)", "efforts": ["low", "medium", "high", "xhigh"]},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -465,6 +501,7 @@
     {
       "name": "goose",
       "provider": "goose",
+      "picker": {"provider_label": "Goose", "label": "Goose, uses its configured model"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
@@ -475,11 +512,23 @@
     {
       "name": "grok",
       "provider": "grok",
+      "picker": {"provider": "xai", "provider_label": "xAI", "label": "Grok CLI, uses its default model"},
       "tier": 3,
       "capability": "coding",
       "preferred": false,
       "executor": "cli",
       "cli_binary": "grok",
+      "cost_class": "subscription"
+    },
+    {
+      "name": "codex",
+      "provider": "openai",
+      "picker": {"provider_label": "OpenAI", "label": "Codex CLI, uses its default model", "efforts": ["low", "medium", "high", "xhigh"]},
+      "tier": 1,
+      "capability": "coding",
+      "preferred": false,
+      "executor": "cli",
+      "cli_binary": "codex",
       "cost_class": "subscription"
     }
   ],

@@ -22,6 +22,7 @@ a release of the persistent ~/.contextstack layout (scripts/node-install). Stdli
           bin/cs-director
                          only with --director-rs (a host that serves the Rust Director, Director.Plan step 3): built
                          by cargo -p cs-director like the others; node-release --serve-director-rs runs it
+          tracing/       check-trace and CONTRACT.md for cs trace check
           gateway/models.json
                          the gateway's catalog (gateway/models.json)
           client-web/    only with --client-web (a host serving client-web, ADR 0017): the app from CLIENT_WEB_SRC, its
@@ -89,6 +90,8 @@ OPTIONAL_BINARIES = {"director-rs": ("cs-director", "target/release/cs-director"
 # Descriptors resolve target/release/{cs-tools,cs-sandbox}.
 TARGET_LINKS = {"cs-tools": "target/release/cs-tools", "cs-sandbox": "target/release/cs-sandbox"}
 KIT = "cs"
+TRACE_CHECKER = "tracing/check-trace"
+TRACE_FILES = (TRACE_CHECKER, "tracing/CONTRACT.md")
 CLIENT_WEB_SRC = "clients/web"  # client-web's folder in the checkout
 CLIENT_WEB = "client-web"  # its folder in a release, whatever the checkout calls it
 CLIENT_WEB_EXCLUDE = (".agents/", ".claude/", ".codex/", ".cursor/", ".factory/", ".github/", ".grok/", ".pi/", "tests/",
@@ -196,7 +199,7 @@ def release_files():
 def bundle_tree_porcelain(extra_paths=()):
     """Porcelain lines for changes under paths that feed the bundle (repo root), outside ledger/, specs/, tasks/."""
     repo, code = CODE_ROOT.parent, CODE_ROOT.name
-    paths = [code, "modelgateway", "harness", "sandbox", "tools", "gateway", "Cargo.lock", "Cargo.toml", *extra_paths]
+    paths = [code, "modelgateway", "harness", "sandbox", "tools", "gateway", "Cargo.lock", "Cargo.toml", *TRACE_FILES, *extra_paths]
     out = git_run(["git", "-C", str(repo), "status", "--porcelain", "--", *paths,
                           ":!%s/ledger" % code, ":!%s/specs" % code, ":!%s/tasks" % code],
                          capture_output=True, text=True, check=True).stdout
@@ -285,7 +288,7 @@ def build_binaries(target, dest, optional=()):
 
 
 def stage(out, target, bins):
-    """Write OUT/release/ (cs/, bin/, gateway/models.json) from this checkout and `bins` {name: file}.
+    """Write OUT/release/ (cs/, bin/, gateway/models.json, tracing/) from this checkout and `bins` {name: file}.
     Returns (files {"release/<rel>": sha256}, binaries [{name, path, bundled, reason?}])."""
     rel_root, files = out / "release", {}
     for rel in release_files():
@@ -295,6 +298,12 @@ def stage(out, target, bins):
     models = CODE_ROOT.parent / "gateway/models.json"
     (rel_root / "gateway").mkdir(parents=True, exist_ok=True)
     shutil.copy2(models, rel_root / "gateway/models.json")
+    (rel_root / "tracing").mkdir(parents=True, exist_ok=True)
+    for rel in TRACE_FILES:
+        src = CODE_ROOT.parent / rel
+        if not src.is_file() or (rel == TRACE_CHECKER and not os.access(src, os.X_OK)):
+            sys.exit("node-bundle: required release file missing or unusable: %s" % src)
+        shutil.copy2(src, rel_root / rel)
     binaries = []
     ship = list(BINARIES)
     for flag, spec in OPTIONAL_BINARIES.items():
@@ -351,7 +360,7 @@ def release_id(files, commit=None, extra_paths=()):
     short = git_run(["git", "-C", str(repo), "rev-parse", "--short=9", "HEAD"], capture_output=True,
                            text=True, check=True).stdout.strip()
     code = CODE_ROOT.name  # the checkout's code root (cs since the cs/ rename)
-    paths = [code, "modelgateway", "harness", "sandbox", "tools", "gateway", "Cargo.lock", "Cargo.toml", *extra_paths]
+    paths = [code, "modelgateway", "harness", "sandbox", "tools", "gateway", "Cargo.lock", "Cargo.toml", *TRACE_FILES, *extra_paths]
     dirty = git_run(["git", "-C", str(repo), "status", "--porcelain", "--", *paths, ":!%s/ledger" % code,
                             ":!%s/specs" % code, ":!%s/tasks" % code], capture_output=True, text=True, check=True).stdout.strip()
     rid = "%s-%s" % (datetime.now(timezone.utc).strftime("%Y%m%d"), short)
@@ -559,6 +568,12 @@ def verify(a):
     bad = []
     if meta["target"] != host_target():
         bad.append("bundle built for %s, host is %s" % (meta["target"], host_target()))
+    for rel in TRACE_FILES:
+        if "release/" + rel not in meta["files"]:
+            bad.append("bundle manifest missing release/" + rel)
+    for checker in (bundle / "release" / TRACE_CHECKER, prefix / TRACE_CHECKER):
+        if not checker.is_file() or not os.access(checker, os.X_OK):
+            bad.append("%s missing or not executable" % checker)
     for rel, want in meta["files"].items():
         for p in (bundle / rel, prefix / rel.split("/", 1)[1]):  # the bundle as shipped and the installed release
             if p.is_symlink():

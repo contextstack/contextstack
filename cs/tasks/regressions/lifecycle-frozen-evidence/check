@@ -195,7 +195,7 @@ dep_code_root = dep_root / "code_root"
 (dep_code_root / "ops/bin").mkdir(parents=True)
 # capture-stimulus resolves shared dependencies against its own code_root root, so
 # the fixture must run its own copy.
-for _name in ('_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "capture-stimulus", "capture-stimulus.json"):
+for _name in ('_lifecycle_evidence.py', '_estate_io.py', '_harvest_git.py', '_roots.py', "capture-stimulus", "capture-stimulus.json"):
     shutil.copy2(CODE_ROOT / "ops/bin" / _name, dep_code_root / "ops/bin" / _name)
 (dep_code_root / "ops/bin/capture-stimulus").chmod(0o755)
 git(dep_code_root, "init", "-q")

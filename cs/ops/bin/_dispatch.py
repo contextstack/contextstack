@@ -29,6 +29,25 @@ def spec_value(text, key):
     return ""
 
 
+def executor_template(templates, value):
+    """Resolve an exact template or a declared CLI model selection."""
+    if value in templates:
+        return templates[value]
+    name, separator, model = value.partition(":")
+    template = templates.get(name, {})
+    flag = template.get("model_flag")
+    if not separator or not flag or model not in template.get("models", {}) or "args" not in template:
+        return None
+    args = list(template["args"])
+    if flag in args:
+        args[args.index(flag) + 1] = model
+    else:
+        # Preserve the CLI subcommand and add options before prompt arguments.
+        index = next((i for i, arg in enumerate(args) if arg.startswith(("-", "{{"))), len(args))
+        args[index:index] = [flag, model]
+    return {**template, "args": args}
+
+
 def first_terminal_states(rows, *, terminal=TERMINAL):
     states = {}
     for row in rows:

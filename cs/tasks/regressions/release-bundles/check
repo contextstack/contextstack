@@ -250,6 +250,10 @@ def bundle(root, target, version, commit, marker):
 
 
 def workflow_contract():
+    preview_pipe = '/releases/download/channel-latest/install.sh | sh -s -- --channel latest'
+    for filename in ('getting-started.md', 'prerelease-notes.md'):
+        check(preview_pipe in (REPO / 'docs/release' / filename).read_text(),
+              filename + ' installs from the preview channel')
     sample = Yaml('''
 "on":
   push:
@@ -343,6 +347,8 @@ jobs:
         check(release['env']['GH_REPO'] == '${{ github.repository }}', 'publish in workflow repository')
         check('contextstack/monorepo' not in release['run'], 'no hard-coded release repository')
         check('assets=(cs/scripts/install.sh ' in release['run'], 'installer asset on every release')
+        check(release['run'].count('--notes-file docs/release/prerelease-notes.md') == 2,
+              'tagged and rolling previews use the pre-release notes')
         for endpoint in ('"repos/$GH_REPO/git/refs/tags/channel-latest"', '"repos/$GH_REPO/git/refs"'):
             check(endpoint in release['run'], 'channel tag API uses workflow repository')
         for command in ('gh release create "$GITHUB_REF_NAME" --verify-tag --latest=true',

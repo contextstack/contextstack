@@ -108,8 +108,11 @@ except subprocess.TimeoutExpired:
     proc.wait(timeout=5)
 
 interrupted_stdout, interrupted_stderr = proc.communicate(timeout=5)
-expect(state(main) == before, "interrupted land leaves main clean (no staged squash)", interrupted_stdout + interrupted_stderr)
+# Restore removes only what the merge introduced: the gate's own untracked file stays (no git clean on main).
+expect(state(main) == (before[0], "?? gate-started"), "interrupted land leaves main clean (no staged squash)",
+       interrupted_stdout + interrupted_stderr)
 expect(not (main / "slow.txt").exists(), "interrupted land did not commit the lane onto main")
+(main / "gate-started").unlink()  # the owner's to clear, not the land's
 
 # A TERM-ignoring descendant keeps the output pipe open unless the whole group is killed.
 cfg = json.loads(repos.read_text())

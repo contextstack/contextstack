@@ -69,6 +69,9 @@ with scratch_dir(prefix='env-allowlist-') as raw:
    assert 'UNLISTED_VALUE' not in recorded,(mode,dump.name)
    assert recorded.get('CS_JOB_ID')==env['CS_JOB_ID'] and recorded.get('CS_VIDEO_MUTATION')=='0',(mode,dump.name,'lost scoped context')
   assert (ws/'check-env.json').is_file()
+  check_env=json.loads((ws/'check-env.json').read_text())
+  assert check_env['GIT_CONFIG_GLOBAL']==os.devnull and check_env['GIT_CONFIG_NOSYSTEM']=='1'
+  assert len(os.fsencode(Path(check_env['TMPDIR']).resolve()))<32
   assert json.loads((run/'stimulus/manifest.json').read_text())['source']['job_id']==env['CS_JOB_ID'],'frozen dispatch binding lost'
   assert (ws/('model-env.json' if mode=='normal' else 'preflight-env.json')).is_file()
   assert 'fake-credential-for-fixture' not in r.stdout and 'fake-credential-for-fixture' not in r.stderr

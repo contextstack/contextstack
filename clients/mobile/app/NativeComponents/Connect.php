@@ -28,9 +28,14 @@ class Connect extends NativeComponent
 
     public string $problem = '';
 
+    /** The Director this device is already paired with, or '' when it is not paired. */
+    public string $pairedWith = '';
+
     public function mount(): void
     {
-        $this->url = app(ConnectionStore::class)->url();
+        $store = app(ConnectionStore::class);
+        $this->url = $store->url();
+        $this->pairedWith = $store->isConnected() ? $this->url : '';
 
         // Opened from a pairing link (the desktop's QR code scanned with the Camera app): fill both fields and let the
         // owner tap Pair, so a link from anywhere else cannot pair this device on its own.

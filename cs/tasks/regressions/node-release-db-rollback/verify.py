@@ -59,7 +59,7 @@ if os.environ.get("MISMATCH_SNAPSHOT"):
     snapshot, = db.parent.parent.glob("director-snapshots/director.sqlite.pre-*")
     with sqlite3.connect(snapshot) as conn:
         conn.execute("PRAGMA user_version=5")
-print(json.dumps({"ok": False, "checks": [{"name": "fixture", "ok": False, "reason": "forced"}]}))
+print(json.dumps({"ok": False, "checks": [{"name": "services", "ok": False, "reason": "forced"}]}))
 """)
         smoke.chmod(0o755)
         (kit / "scripts/cs_smoke.py").write_text("# present\n")

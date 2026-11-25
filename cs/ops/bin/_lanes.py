@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _lane_policy import lane_changed_names, refuse_agent_configs
-from _harvest_git import HARDEN as LANE_GIT_HARDEN, driver_overrides, environment as git_environment
+from _harvest_git import environment as git_environment, host_git
 
 LANE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 DEFAULTS = {"branch": "main", "hooks_path": None, "gate": None, "hook_gated": [], "gate_timeout_s": 3600,
@@ -53,6 +53,10 @@ TAIL = 4000
 
 class LaneError(ValueError):
     """A lane request refused before anything changed; the message says why."""
+
+
+class LaneBusy(LaneError):
+    """A lock another process holds: says nothing about the lane's content (never a Director land record)."""
 
 
 def repos_file():
@@ -165,22 +169,15 @@ def prepare_lane_refs(main, lane, git_dir):
     return ref
 
 
-def lane_git(main, lane, lane_path, *args, ident=None, env=None):
-    """Host git against a lane worktree: explicit git-dir and work-tree, hardened config."""
+def lane_git(main, lane, lane_path, *args, ident=None, env=None, index=None):
+    """Host git against a lane worktree with pinned admin metadata."""
     work_tree = Path(lane_path).resolve()
     git_dir = assert_lane_git_pointer(work_tree, main, lane)
     assert_lane_git_admin(git_dir, main, lane, work_tree)
     prepare_lane_refs(main, lane, git_dir)
-    # Lane admin config/info/hooks are denied to the sandbox. Disable even trusted
-    # drivers: agent attributes must not activate an owner's configured programs.
-    host_env = git_environment(env or clean_env())
-    if landing := _LAND_GIT.get():
-        host_env.update(GIT_ATTR_NOSYSTEM="1", GIT_ATTR_SOURCE=landing.attributes)
-    cmd = ["git", "--git-dir=%s" % git_dir, "--work-tree=%s" % work_tree, *LANE_GIT_HARDEN]
-    config = subprocess.run([*cmd, "config", "--name-only", "--get-regexp", r"^(filter|diff|merge)\."],
-                            capture_output=True, text=True, env=host_env, stdin=subprocess.DEVNULL)
-    cmd += [*driver_overrides(config.stdout), *(ident or []), *args]
-    return subprocess.run(cmd, capture_output=True, text=True, env=host_env, stdin=subprocess.DEVNULL)
+    landing = _LAND_GIT.get()
+    return host_git(work_tree, *args, git_dir=git_dir, env=env, ident=ident or (),
+                    index=index, attributes=landing.attributes if landing else None)
 
 
 def lane_out(main, lane, lane_path, *args, ident=None, env=None):
@@ -190,15 +187,11 @@ def lane_out(main, lane, lane_path, *args, ident=None, env=None):
     return done.stdout.strip()
 
 
-def workspace_git(ws, *args, lane_ctx=None, env=None):
-    """Host git in a workspace: pinned lane git when lane_ctx is {main, lane}, else hardened -C git."""
-    env = env or clean_env()
+def workspace_git(ws, *args, lane_ctx=None, env=None, index=None):
+    """Use pinned Git metadata for lanes."""
     if lane_ctx:
-        return lane_git(lane_ctx["main"], lane_ctx["lane"], ws, *args, env=env)
-    return subprocess.run(
-        ["git", "-C", str(Path(ws).resolve()), *LANE_GIT_HARDEN, *args],
-        capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL,
-    )
+        return lane_git(lane_ctx["main"], lane_ctx["lane"], ws, *args, env=env, index=index)
+    return host_git(ws, *args, env=env, index=index)
 
 
 def workspace_out(ws, *args, lane_ctx=None, env=None):
@@ -210,24 +203,19 @@ def workspace_out(ws, *args, lane_ctx=None, env=None):
 
 def workspace_changed_paths(ws, base, lane_ctx=None, env=None):
     """Paths touched since base through HEAD, index, and untracked (grant enforcement)."""
-    names = []
+    names = {}
     for spec in (
-        ("diff", "--name-only", "%s..HEAD" % base),
-        ("diff", "--cached", "--name-only"),
-        ("diff", "--name-only"),
-        ("ls-files", "--others", "--exclude-standard"),
+        ("diff", "--name-only", "-z", "%s..HEAD" % base),
+        ("diff", "--cached", "--name-only", "-z"),
+        ("diff", "--name-only", "-z"),
+        # No exclude sources: an in-workspace ignore rule cannot narrow a grant.
+        ("ls-files", "--others", "-z"),
     ):
         done = workspace_git(ws, *spec, lane_ctx=lane_ctx, env=env)
         if done.returncode != 0:
             raise LaneError("git %s: %s" % (" ".join(spec), (done.stderr or done.stdout).strip()))
-        names.extend((done.stdout or "").splitlines())
-    seen, out = set(), []
-    for n in names:
-        n = n.strip()
-        if n and n not in seen:
-            seen.add(n)
-            out.append(n)
-    return out
+        names.update(dict.fromkeys(filter(None, done.stdout.split("\0"))))
+    return list(names)
 
 
 # Shared validation helpers use git()/out() too. Scope the landing policy to this
@@ -618,7 +606,7 @@ def _lane_flock(path, lane):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise LaneError("lane %s is busy" % lane) from error
+            raise LaneBusy("lane %s is busy" % lane) from error
         yield lock
 
 
@@ -790,7 +778,7 @@ def land(name, lane, message=None, *, allow_agent_config=False):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return refused("another landing is running in %s" % main)
+            return refused("another landing is running in %s" % main, busy=True)
         try:
             with lane_lock(cfg, lane):
                 previous = os.read(fd, 128).strip()
@@ -802,10 +790,12 @@ def land(name, lane, message=None, *, allow_agent_config=False):
                     return _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock)
                 finally:
                     os.ftruncate(fd, 0)
+        except LaneBusy as error:
+            return refused(str(error), busy=True)
         except LaneError as error:
             return refused(str(error))
     except OSError as error:
-        return refused("cannot hold the landing lock in %s: %s" % (main, error))
+        return refused("cannot hold the landing lock in %s: %s" % (main, error), busy=True)
     finally:
         _LAND_GIT.reset(token)
         if fd is not None:
@@ -908,10 +898,25 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
     if not subjects:
         return refused("nothing to land: %s has no commits that %s lacks" % (branch, cfg["branch"]))
 
+    introduced = []  # paths the merge added; restore removes these and nothing else untracked
+
     def restore():
+        if not introduced:
+            listed = git(main, "diff", "--cached", "--name-only", "--diff-filter=A", "-z", before).stdout or ""
+            unmerged = git(main, "ls-files", "-u", "-z").stdout or ""
+            introduced[:] = [p for p in listed.split("\0") if p] + [
+                e.split("\t", 1)[1] for e in unmerged.split("\0") if "\t" in e]
         git(main, "reset", "-q", "--hard", before)
         git(main, "merge", "--abort")
-        git(main, "clean", "-fd")
+        tracked = set((git(main, "ls-files", "-z").stdout or "").split("\0"))
+        for rel in dict.fromkeys(introduced):
+            target = main / rel
+            if rel not in tracked and (target.is_file() or target.is_symlink()):
+                target.unlink()
+            parent = target.parent
+            while parent != main and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
         result["main_unchanged"] = out(main, "rev-parse", "HEAD") == before and not out(main, "status", "--porcelain",
                                                                                          "--untracked-files=no")
 
@@ -986,6 +991,8 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
             if red_marker(message):
                 restore()
                 return refused("the lane's commit message starts with check-red:; land it with -m")
+        if interrupted:  # a signal after the gate (gate_proc gone, so the handler only set the flag)
+            return refused("land interrupted")
         commit = _LAND_GIT.get().run(main, "commit", "-q", "-F", "-", input=message,
                                     env={"CS_LAND_COMMIT": "1"})
         after = out(main, "rev-parse", "HEAD")

@@ -22,6 +22,7 @@
         $status === 'pending' => [__('Under review'), 'zinc'],
         $status === 'needs_owner' => [__('Needs you'), 'amber'],
         $status === 'denied' => [__('Denied'), 'red'],
+        $status === 'expired' => [__('Expired'), 'zinc'],
         $status === 'approved' && $decidedByOwner => [__('Approved by you'), 'green'],
         $status === 'approved' => [__('Approved by the reviewer'), 'green'],
         default => [$status, 'zinc'],
@@ -108,6 +109,8 @@
                 {{ __('Approved. It runs if the agent asks again while its run is still going.') }}
             @elseif ($status === 'denied')
                 {{ __('It did not run.') }}
+            @elseif ($status === 'expired')
+                {{ __('Its job ended before it was decided, so it did not run.') }}
             @endif
             @if ($decidedByOwner && filled($approval['decided_at'] ?? null))
                 {{ __('Decided') }} <x-client.time :at="$approval['decided_at']" />.

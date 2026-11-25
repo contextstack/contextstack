@@ -216,6 +216,52 @@ class TickTests(unittest.TestCase):
             self.assertEqual(rows[-1]['run_id'],'r')
             self.assertEqual(rows[-2]['dispatch_seat'],'reserved')
 
+    def test_main_run_spec_crash_writes_a_first_terminal_error_row(self):
+        # B1: an exception in run_spec must not leave the job running.
+        self.prepare_main()
+        self.rows([{'id':'j','state':'pending','spec':'s.yaml','task':'t'}])
+        with patch.object(self.m,'run_spec',side_effect=KeyError('boom')):
+            with self.assertRaises(SystemExit) as exited:
+                self.m.main()
+        self.assertEqual(exited.exception.code,1)
+        rows=[r for r in map(json.loads,self.m.Q.read_text().splitlines()) if 'state' in r]
+        self.assertEqual([r['state'] for r in rows],['pending','running','error'],self.m.Q.read_text())
+        self.assertEqual(rows[-1]['verdict'],'void')
+        self.assertIn('boom',rows[-1]['stop'])
+        self.assertEqual(rows[-1]['task'],'t')
+
+    def test_main_refresh_failure_of_any_kind_closes_only_that_job(self):
+        # B2: a non-RuntimeError from refresh_job (bad op JSON, OSError) used to escape and
+        # leave the job pending at the head of the queue forever.
+        self.prepare_main()
+        for error in (ValueError('bad json'), OSError('gone'), IndexError('no output')):
+            self.rows([{'id':'bad','state':'pending','spec':'s.yaml','task':'t'}])
+            with patch.object(self.m,'refresh_job',side_effect=error):
+                self.m.main()
+            row=json.loads(self.m.Q.read_text().splitlines()[-1])
+            self.assertEqual((row['id'],row['state']),('bad','error'),error)
+            self.assertIn(str(error),row['note'])
+
+    def test_ledger_reader_skips_a_cut_off_line(self):
+        # B3: one torn ledger line must not break every later read.
+        self.m.LEDGER.write_text(json.dumps({'spec':'s','trial':1,'verdict':'pass'})+'\n{"spec": "s", "tri'
+                                 +json.dumps({'spec':'s','trial':2,'verdict':'fail'})+'\n')
+        self.assertEqual(self.m.execution_row('s','s')['trial'],1)
+        self.m.LEDGER.write_text(self.m.LEDGER.read_text()+json.dumps({'spec':'s','trial':3,'verdict':'fail'})+'\n')
+        self.assertEqual(self.m.execution_row('s','s')['trial'],3)
+
+    def test_no_row_after_job_process_cleanup_failure_is_retryable(self):
+        self.prepare_spec('id: s\nmodel: runner\n')
+        self.patch('one_trial', return_value=1)
+        self.patch('execution_row', return_value={})
+        self.patch('pending_row', return_value={})
+        self.m.TRIAL_STDERR[:]=['Traceback\nRuntimeError: job process cleanup deadline exceeded']
+        rc,row=self.m.run_spec('s.yaml')
+        self.assertTrue(row['error']['retryable'],row)
+        self.m.TRIAL_STDERR[:]=['spec refused']
+        rc,row=self.m.run_spec('s.yaml')
+        self.assertFalse(row['error']['retryable'],row)
+
     def prepare_spec(self, text='id: s\nmodel: fake\ntrials: 2\ntasks: ["a", "b"]\n'):
         (self.root/'s.yaml').write_text(text)
         self.m.TEMPLATES={'fake':{}}
@@ -237,6 +283,27 @@ class TickTests(unittest.TestCase):
         self.assertEqual([(c.args[2],c.args[3]) for c in run.call_args_list], [('a',1),('b',1),('a',2),('b',2)])
         self.assertEqual(completed.call_count,4)
         self.assertEqual(row['stop'],'test')
+
+    def test_selected_codex_model_uses_executor_and_reaches_cli_argv(self):
+        import _executor
+
+        self.prepare_spec('id: s\nmodel: "codex:gpt-6.2-sol"\ntasks: [a]\n')
+        self.m.TEMPLATES = json.loads((OPS / 'executor-templates.json').read_text())
+        self.rows([])
+        run = self.patch('run_teed', return_value=0)
+        self.patch('execution_row', return_value={'verdict': 'pass'})
+        rc, _ = self.m.run_spec('s.yaml', env={})
+        self.assertEqual(rc, 0)
+        self.assertEqual(run.call_args.args[0], [str(OPS / 'executor')])
+        order = json.loads(run.call_args.kwargs['input'])
+        self.assertEqual(order['executor'], 'codex:gpt-6.2-sol')
+        template = _executor.executor_template(self.m.TEMPLATES, order['executor'])
+        binary = template['binary']
+        args = _executor.cli_args(template, self.root, '4', 'test prompt', 'test goal')
+        self.assertEqual([binary, *args[:3]], ['codex', 'exec', '--model', 'gpt-6.2-sol'])
+        self.assertEqual(args[-1], 'test prompt')
+        self.assertNotIn('--model', self.m.TEMPLATES['codex']['args'])
+        self.assertIsNone(_executor.executor_template(self.m.TEMPLATES, 'codex:unknown'))
 
     def test_spec_missing_row_reports_stderr_and_pending_finalization_withholds_completion(self):
         self.prepare_spec('id: s\nmodel: runner\n')

@@ -3,7 +3,6 @@
 namespace App\NativeComponents;
 
 use App\Client\ConnectionStore;
-use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Json;
@@ -37,7 +36,8 @@ class Devices extends DirectorScreen
 
     public function mount(): void
     {
-        $this->thisDevice = (string) app(ConnectionStore::class)->resolve()->credentialId;
+        $credentialId = Json::nullableString(app(ConnectionStore::class)->saved()['credential_id'] ?? null);
+        $this->thisDevice = (string) $credentialId;
         $this->refresh();
     }
 
@@ -117,16 +117,19 @@ class Devices extends DirectorScreen
     private function issue(): void
     {
         try {
-            $answer = $this->director()->write('pairings', ['name' => $this->name], DirectorClient::newKey());
+            $answer = $this->director()->write('pairings', ['name' => $this->name], $this->keyFor('pair:'.$this->name));
         } catch (DirectorRefused $refused) {
+            $this->answered('pair:'.$this->name);
             $this->problem = $refused->is('owner_only') ? 'The Director does not let this credential pair devices.' : $refused->explain();
 
             return;
         } catch (DirectorUnavailable) {
-            $this->problem = 'The Director could not be reached, so no code was issued.';
+            $this->problem = 'The Director could not be reached, so the code may have been issued without reaching you. Asking again is safe: it shows the same code.';
 
             return;
         }
+
+        $this->answered('pair:'.$this->name);
 
         $this->problem = '';
         $this->issued = [
@@ -140,16 +143,19 @@ class Devices extends DirectorScreen
     private function remove(string $id): void
     {
         try {
-            $this->director()->remove('credentials/'.rawurlencode($id), DirectorClient::newKey());
+            $this->director()->remove('credentials/'.rawurlencode($id), $this->keyFor('revoke:'.$id));
         } catch (DirectorRefused $refused) {
+            $this->answered('revoke:'.$id);
             $this->problem = $refused->is('owner_only') ? 'The Director does not let this credential revoke devices.' : $refused->explain();
 
             return;
         } catch (DirectorUnavailable) {
-            $this->problem = 'The Director could not be reached, so nothing was revoked.';
+            $this->problem = 'The Director could not be reached, so the revoke may not have arrived. Revoking again is safe.';
 
             return;
         }
+
+        $this->answered('revoke:'.$id);
 
         $this->refresh();
     }

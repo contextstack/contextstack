@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""Check ContextStack tracing contract records."""
+import argparse
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from decimal import Decimal
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+
+KINDS = {
+    "run": {None},
+    "turn": {"run"},
+    "model_call": {"turn"},
+    "gateway_exchange": {"model_call"},
+    "provider_attempt": {"gateway_exchange"},
+    "usage": {"gateway_exchange"},
+    "settlement": {"gateway_exchange"},
+    "connection_open": {"provider_attempt"},
+    "first_output": {"provider_attempt"},
+    "retry_backoff": {"gateway_exchange"},
+    "tool_call": {"turn"},
+    "tool_process": {"tool_call"},
+    "pre_tool_hook": {"tool_call"},
+    "post_turn_hook": {"turn"},
+    "finalization": {"run"},
+    "cli_work_order": {"run"},
+    "cli_process": {"run"},
+    "cli_event": {"cli_process"},
+    "cli_usage": {"cli_process"},
+}
+COUNTED_TOOLS = {"executed", "invalid_arguments", "unknown_tool", "refused_by_hook"}
+TOOL_OUTCOMES = COUNTED_TOOLS | {"aborted_by_hook", "cancelled", "skipped_for_budget"}
+MICROSECOND = timedelta(microseconds=1)
+ACCEPTANCE_SCENARIOS = "ABCDEFGHIJKLMNORSTUVW"
+
+
+def count_value(value):
+    return type(value) is int and value >= 0
+
+
+def number(value):
+    return type(value) in (int, Decimal) and (
+        type(value) is int or value.is_finite()
+    ) and value >= 0
+
+
+def timestamp(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{1,6}Z", value
+    ):
+        raise ValueError("expected a UTC timestamp with fractional seconds")
+    return datetime.fromisoformat(value[:-1] + "+00:00")
+
+
+def attrs(span):
+    return span["attributes"]
+
+
+class Check:
+    def __init__(self):
+        self.missing = set()
+        self.findings = []
+
+    def require(self, condition, rule, item):
+        if not condition:
+            self.missing.add(f"{rule}: {item}")
+
+    def finding(self, kind, **details):
+        self.findings.append({"kind": kind, **details})
+
+    def result(self):
+        return {
+            "result": "incomplete" if self.missing else
+                      "complete_with_findings" if self.findings else "complete",
+            "missing": sorted(self.missing),
+            "findings": sorted(self.findings, key=lambda item: json.dumps(item, sort_keys=True)),
+        }
+
+
+class Run:
+    def __init__(self, check, trace_id, spans, directory):
+        self.check = check
+        self.trace_id = trace_id
+        self.spans = spans
+        self.directory = directory
+        self.children = defaultdict(list)
+        self.settlements = []
+        self.request_ids = set()
+
+    def require(self, condition, rule, item):
+        self.check.require(condition, rule, f"{self.trace_id}/{item}")
+
+    def children_of(self, span, kind):
+        return [child for child in self.children[span["span_id"]] if child["kind"] == kind]
+
+    def numbered(self, records, key, count, rule, item):
+        numbers = Counter(record.get(key) for record in records if count_value(record.get(key)))
+        for index in range(1, count + 1):
+            self.require(numbers[index] == 1, rule, f"{item} {index}")
+        self.require(
+            sum(numbers[index] for index in range(1, count + 1)) == len(records),
+            rule, f"{item} numbering",
+        )
+
+    def structure(self):
+        by_id = {}
+        roots = []
+        for span in self.spans:
+            sid = span["span_id"]
+            self.require(sid not in by_id, "1", f"span {sid} unique")
+            by_id[sid] = span
+            parent_id = span["parent_id"]
+            if parent_id is None:
+                roots.append(span)
+            else:
+                self.children[parent_id].append(span)
+
+        self.require(len(roots) == 1 and roots[0]["kind"] == "run", "1", "run root")
+        for span in self.spans:
+            sid = span["span_id"]
+            parent_id = span["parent_id"]
+            parent = by_id.get(parent_id)
+            kind = span["kind"]
+            self.require(
+                (parent_id is None or parent is not None)
+                and (parent["kind"] if parent else None) in KINDS.get(kind, set()),
+                "1", f"span {sid} parent",
+            )
+            if parent:
+                self.clock(span, parent)
+            self.pointers(span)
+        return roots[0] if len(roots) == 1 and roots[0]["kind"] == "run" else None
+
+    def clock(self, span, parent):
+        child_machine = attrs(span)["machine"]
+        parent_machine = attrs(parent)["machine"]
+        if child_machine == parent_machine:
+            return
+        bounds = [("start", timestamp(parent["start"]) - timestamp(span["start"]))]
+        if span["kind"] != "gateway_exchange" or parent["outcome"] == "completed":
+            bounds.append(("end", timestamp(span["end"]) - timestamp(parent["end"])))
+        for boundary, difference in bounds:
+            micros = difference // MICROSECOND
+            if micros > 0:
+                self.check.finding(
+                    "clock_skew", trace_id=self.trace_id, span_id=span["span_id"],
+                    parent_id=parent["span_id"], machine=child_machine,
+                    parent_machine=parent_machine, boundary=boundary, difference_us=micros,
+                )
+
+    def pointers(self, span):
+        for label, pointer in attrs(span).get("content", {}).items():
+            location = f"span {span['span_id']} content {label}"
+            valid = (
+                isinstance(pointer, dict) and isinstance(pointer.get("file"), str)
+                and pointer["file"] and not Path(pointer["file"]).is_absolute()
+                and ".." not in Path(pointer["file"]).parts
+                and count_value(pointer.get("line")) and pointer["line"] > 0
+                and isinstance(pointer.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", pointer["sha256"])
+            )
+            self.require(valid, "content", location)
+            if not valid:
+                continue
+            details = dict(trace_id=self.trace_id, span_id=span["span_id"], label=label,
+                           file=pointer["file"], line=pointer["line"])
+            self.require(self.directory is not None, "content", f"{location} run directory")
+            if self.directory is None:
+                continue
+            if not self.directory.exists():
+                self.check.finding("pruned_content", **details)
+                continue
+            path = (self.directory / pointer["file"]).resolve()
+            if not path.is_relative_to(self.directory.resolve()):
+                self.require(False, "content", f"{location} file")
+                continue
+            try:
+                with path.open("rb") as source:
+                    line = next((line for index, line in enumerate(source, 1)
+                                 if index == pointer["line"]), None)
+            except OSError:
+                line = None
+            if line is None:
+                self.require(False, "content", f"{location} line")
+                continue
+            actual = hashlib.sha256(line.removesuffix(b"\n")).hexdigest()
+            if actual != pointer["sha256"]:
+                self.check.finding("content_hash_mismatch", **details,
+                                   expected_sha256=pointer["sha256"], actual_sha256=actual)
+
+    def exchange(self, exchange, item):
+        data = attrs(exchange)
+        attempts = self.children_of(exchange, "provider_attempt")
+        count = data.get("attempts_started")
+        valid_count = count_value(count) and count <= 3
+        self.require(valid_count, "2", f"{item} attempts_started")
+        if valid_count:
+            self.numbered([attrs(attempt) for attempt in attempts], "attempt", count,
+                          "2", f"{item} attempt")
+            final = data.get("final_attempt_outcome")
+            self.require(
+                (count == 0 and "final_attempt_outcome" in data and final is None)
+                or (count > 0 and isinstance(final, str) and final),
+                "2", f"{item} final_attempt_outcome",
+            )
+            for attempt in attempts:
+                index = attrs(attempt).get("attempt")
+                if count_value(index) and 0 < index < count:
+                    self.require(attempt["outcome"] == "retryable_failure", "2",
+                                 f"{item} attempt {index} retryable failure")
+                if index == count:
+                    self.require(attempt["outcome"] == final, "2", f"{item} final attempt outcome")
+
+        termination = exchange["outcome"]
+        source = data.get("billing_source")
+        output = data.get("client_saw_output")
+        self.require(termination in {"completed", "refused_before_provider_contact",
+                     "upstream_error", "deadline", "stream_fault", "client_disconnect"},
+                     "3", f"{item} termination")
+        self.require(source in {"pay_as_you_go", "free_local", "subscription"},
+                     "3", f"{item} billing_source")
+        self.require(type(output) is bool, "3", f"{item} client_saw_output")
+        if termination == "refused_before_provider_contact":
+            self.require(count_value(count) and count == 0, "2", f"{item} refusal attempt count")
+            self.require(bool(data.get("refusal_code")), "3", f"{item} refusal_code")
+            self.require(output is False, "3", f"{item} refusal output")
+        paid = source == "pay_as_you_go"
+        reported = data.get("provider_charge_usd")
+        has_charge = number(reported) and reported > 0
+        if "provider_charge_usd" in data:
+            self.require(has_charge and termination != "refused_before_provider_contact",
+                         "3", f"{item} provider charge")
+        completed = termination == "completed"
+        partial = not completed and termination != "refused_before_provider_contact" and (
+            has_charge or (paid and output is True))
+        final_attempt = next((attrs(attempt) for attempt in attempts
+                              if attrs(attempt).get("attempt") == count), {})
+        status = final_attempt.get("http_status")
+        abort = (termination in {"deadline", "client_disconnect"}
+                 or termination in {"stream_fault", "upstream_error"}
+                 and final_attempt.get("connection_lost") is True)
+        reservation = final_attempt.get("reservation_usd")
+        ended = not completed and termination != "refused_before_provider_contact"
+        # A paid call the provider billed but that did not complete: aborted after the body was sent,
+        # or answered 2xx and then failed (unusable body, broken stream, spend write, shutdown).
+        answered = type(status) is int and 200 <= status < 300
+        billed = (paid and not has_charge and ended
+                  and (abort and final_attempt.get("request_body_sent") is True
+                       and (status is None or answered)
+                       or answered and final_attempt.get("request_body_sent") is not False))
+        usage = self.children_of(exchange, "usage")
+        settlements = self.children_of(exchange, "settlement")
+        usage_counts = {1} if completed or partial else {0, 1} if billed else {0}
+        self.require(len(usage) in usage_counts, "3", f"{item} usage")
+        self.require(len(settlements) == int((completed and (paid or has_charge)) or partial or billed),
+                     "3", f"{item} settlement")
+        for record in usage:
+            self.require(attrs(record).get("partial") is (partial or billed), "3", f"{item} usage partial")
+        measured = [attrs(record).get("estimated_usd") for record in usage]
+        measured = [value for value in measured if number(value)]
+        for settlement in settlements:
+            fields = attrs(settlement)
+            self.require(fields.get("partial") is (partial or billed), "3", f"{item} settlement partial")
+            charge = fields.get("charged_usd")
+            self.require(number(charge), "3", f"{item} settlement charge")
+            basis = fields.get("basis")
+            marked = basis == "provider_reported"
+            if has_charge or marked:
+                self.require(has_charge and marked and number(charge) and charge == reported,
+                             "3", f"{item} provider-reported settlement")
+            if basis == "reservation_estimate":
+                self.require(billed and number(reservation) and charge == reservation,
+                             "3", f"{item} reservation estimate")
+            if paid and not has_charge and ended and number(charge):
+                self.require(all(charge >= value for value in measured),
+                             "3", f"{item} charge below measured usage")
+            if number(charge):
+                self.settlements.append((data.get("request_id"), data.get("send_index"), charge))
+        if not paid and (completed or has_charge):
+            wallet = data.get("wallet_charge_usd")
+            self.require(number(wallet) and wallet == (reported if has_charge else 0),
+                         "3", f"{item} wallet charge")
+
+    def model_call(self, call):
+        data = attrs(call)
+        request_id = data.get("request_id")
+        item = f"request {request_id}"
+        valid_id = isinstance(request_id, str) and bool(request_id)
+        self.require(valid_id and request_id not in self.request_ids, "2", f"{item} identity")
+        if valid_id:
+            self.request_ids.add(request_id)
+        sends = data.get("sends")
+        if not isinstance(sends, list) or not sends:
+            self.require(False, "2", f"{item} sends")
+            sends = []
+        self.numbered(sends, "send_index", len(sends), "2", f"{item} send")
+        exchanges = defaultdict(list)
+        for exchange in self.children_of(call, "gateway_exchange"):
+            exchange_data = attrs(exchange)
+            index = exchange_data.get("send_index")
+            identity = (request_id == exchange_data.get("request_id")
+                        and count_value(index) and 1 <= index <= len(sends))
+            self.require(identity, "2", f"{item} exchange {exchange['span_id']} identity")
+            if identity:
+                exchanges[index].append(exchange)
+            self.exchange(exchange, f"{item} send {index}")
+        for send in sends:
+            index = send.get("send_index")
+            outcome = send.get("outcome")
+            found = len(exchanges[index])
+            item_send = f"{item} send {index}"
+            required = {"delivered": {1}, "connection_failed": {0}, "unknown": {0, 1}}
+            self.require(outcome in required, "2", f"{item_send} outcome")
+            if outcome in required:
+                self.require(found in required[outcome], "2", f"{item_send} exchange")
+            if outcome == "unknown":
+                self.check.finding("delivery_unconfirmed", trace_id=self.trace_id,
+                                   request_id=request_id, send_index=index, gateway_found=bool(found))
+
+    def full(self, root, terminal):
+        turns = self.children_of(root, "turn")
+        count = terminal.get("turns")
+        self.require(count_value(count), "4", "terminal turns")
+        if count_value(count):
+            self.numbered([attrs(turn) for turn in turns], "turn", count, "4", "turn")
+        counted = 0
+        for turn in turns:
+            label = f"turn {attrs(turn).get('turn')}"
+            calls = self.children_of(turn, "model_call")
+            self.require(len(calls) == 1, "4", f"{label} model call")
+            for call in calls:
+                self.model_call(call)
+            for tool in self.children_of(turn, "tool_call"):
+                outcome = tool["outcome"]
+                self.require(outcome in TOOL_OUTCOMES, "4", f"tool {tool['span_id']} outcome")
+                counted += outcome in COUNTED_TOOLS
+                self.require(len(self.children_of(tool, "tool_process")) == int(outcome == "executed"),
+                             "4", f"tool {tool['span_id']} process")
+        expected = terminal.get("tool_calls")
+        self.require(count_value(expected) and expected == counted, "4", "terminal tool_calls")
+        charge = terminal.get("charged_usd")
+        self.require(number(charge), "4", "terminal charged_usd")
+        if number(charge):
+            self.spend(terminal, charge)
+
+    def spend(self, terminal, charge):
+        settled = sum(amount for _, _, amount in self.settlements)
+        if settled == charge:
+            return
+        reflected = {(send["request_id"], send["send_index"])
+                     for send in terminal.get("accounted_settlements", [])}
+        requests = sorted({request for request, send, amount in self.settlements
+                           if (request, send) not in reflected and amount and isinstance(request, str)})
+        self.check.finding("spend_discrepancy", trace_id=self.trace_id,
+                           settled_usd=decimal_string(settled), terminal_usd=decimal_string(charge),
+                           request_ids=requests)
+
+    def observed(self, root):
+        processes = self.children_of(root, "cli_process")
+        self.require(len(processes) == 1, "4o", "CLI process")
+        for process in processes:
+            data = attrs(process)
+            self.require(type(data.get("exit_status")) is int, "4o", "CLI exit status")
+            events = self.children_of(process, "cli_event")
+            count = data.get("received_events")
+            self.require(count_value(count) and len(events) == count, "4o", "CLI event count")
+            for event in events:
+                self.require(attrs(event).get("timestamp_source") in {"producer", "adapter_receive"},
+                             "4o", f"CLI event {event['span_id']} timestamp source")
+            usage = self.children_of(process, "cli_usage")
+            reported = data.get("usage_reported")
+            self.require(type(reported) is bool and len(usage) == int(reported is True),
+                         "4o", "CLI usage")
+            for record in usage:
+                self.require(isinstance(attrs(record).get("source"), str)
+                             and attrs(record)["source"] and attrs(record)["source"] != "gateway",
+                             "4o", "CLI usage source")
+
+    def run(self, finalized):
+        root = self.structure()
+        if root is None:
+            return None
+        data = attrs(root)
+        run_id = data.get("run_id")
+        coverage = data.get("coverage")
+        self.require(isinstance(run_id, str) and bool(run_id), "1", "run identity")
+        self.require(coverage in {"full", "observed"}, "1", "run coverage")
+        if "job_id" in data:
+            self.require(isinstance(data["job_id"], str) and bool(data["job_id"])
+                         and isinstance(data.get("task"), str) and bool(data["task"])
+                         and count_value(data.get("trial")), "1", "dispatched run identity")
+        terminal = data.get("terminal", {})
+        if coverage == "full":
+            self.full(root, terminal)
+        elif coverage == "observed":
+            self.observed(root)
+        if root["outcome"] == "finalized" or run_id in finalized:
+            rule = "4o" if coverage == "observed" else "4"
+            finalizations = self.children_of(root, "finalization")
+            self.require(len(finalizations) == 1, rule, "finalization")
+            for finalization in finalizations:
+                self.require(bool(attrs(finalization).get("verdict")), rule, "finalization verdict")
+        return run_id, coverage
+
+
+def decimal_string(value):
+    result = format(value, "f")
+    return result.rstrip("0").rstrip(".") if "." in result else result
+
+
+def work_trace(check, task):
+    task_id = task["task_id"]
+    origin = task.get("origin", {})
+    check.require(
+        (origin.get("kind") == "conversation_turn" and bool(origin.get("conversation_id"))
+         and bool(origin.get("turn_id")))
+        or origin.get("kind") in {"schedule", "cs_cli", "api"},
+        "5w", f"task {task_id} origin",
+    )
+    jobs = task.get("jobs", [])
+    for index, job in enumerate(jobs):
+        label = f"task {task_id} job {job['job_id']}"
+        if index:
+            reason = job.get("reason", {})
+            check.require(reason.get("kind") in {"retry", "owner_request"}
+                          or (reason.get("kind") == "fallback" and bool(reason.get("template")))
+                          or (reason.get("kind") == "planned" and
+                              reason.get("planner_job_id") == jobs[index - 1]["job_id"])
+                          or (reason.get("kind") == "planning_fallback" and bool(reason.get("detail"))),
+                          "5w", f"{label} reason")
+        decisions = job.get("decisions", [])
+        if job["finished"]:
+            check.require(bool(decisions) or job.get("decision_status") == "none_yet",
+                          "5w", f"{label} decision")
+        for decision in decisions:
+            check.require(decision.get("kind") in {"approve", "reject", "land", "discard", "cancel"}
+                          and bool(decision.get("actor")) and bool(decision.get("at")),
+                          "5w", f"{label} decision record")
+    needs = {item["id"]: item for item in task.get("needs_you", [])}
+    for item_id in sorted(needs.keys() | set(task.get("raised_needs_you_ids", []))):
+        item = needs.get(item_id, {})
+        check.require(bool(item.get("raised_at")) and (
+            item.get("status") == "open" or (
+                item.get("status") == "cleared" and bool(item.get("cleared_at"))
+                and bool(item.get("cleared_by"))
+            )
+        ), "5w", f"task {task_id} needs you {item_id}")
+    messages = {item["message_id"]: item for item in task.get("owner_messages", [])}
+    for message_id in sorted(messages.keys() | set(task.get("owner_message_ids", []))):
+        check.require(messages.get(message_id, {}).get("mark") in {"instruction", "answer", "intervention"},
+                      "5w", f"task {task_id} owner message {message_id} mark")
+
+
+def director_spend(check, jobs, runs, settled_by_run):
+    for job in jobs:
+        job_id = job["job_id"]
+        members = [run["run_id"] for run in runs if run.get("job_id") == job_id]
+        if not members or any(run_id not in settled_by_run for run_id in members):
+            continue
+        settlements = [entry for run_id in members for entry in settled_by_run[run_id]]
+        settled = sum(amount for _, _, amount in settlements)
+        charged = job["charged_usd"]
+        if settled != charged:
+            check.finding("spend_discrepancy", job_id=job_id, settled_usd=decimal_string(settled),
+                          director_usd=decimal_string(charged))
+
+
+def validate_span(span):
+    try:
+        for key in ("trace_id", "span_id", "kind", "name", "outcome"):
+            if not isinstance(span[key], str) or not span[key]:
+                raise ValueError(f"invalid {key}")
+        if span["parent_id"] is not None and not (
+            isinstance(span["parent_id"], str) and span["parent_id"]
+        ):
+            raise ValueError("invalid parent_id")
+        timestamp(span["start"])
+        timestamp(span["end"])
+        if not number(span["duration_ms"]):
+            raise ValueError("invalid duration_ms")
+        if not isinstance(attrs(span)["machine"], str) or not attrs(span)["machine"]:
+            raise ValueError("invalid machine")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"span {span.get('span_id', '?')}: {error}") from error
+
+
+def evaluate(inputs):
+    check = Check()
+    traces = defaultdict(list)
+    directories = {}
+    finalized = []
+    work = []
+    jobs = []
+    fleet = False
+    for path, data in inputs:
+        fleet |= "finalized_runs" in data
+        finalized.extend(data.get("finalized_runs", []))
+        work.extend(data.get("work_traces", []))
+        jobs.extend(data.get("settled_jobs", []))
+        for trace_id, directory in data.get("run_directories", {}).items():
+            resolved = (path.parent / directory).resolve()
+            if trace_id in directories and directories[trace_id] != resolved:
+                raise ValueError(f"conflicting run directories for {trace_id}")
+            directories[trace_id] = resolved
+        for span in data.get("spans", []):
+            validate_span(span)
+            traces[span["trace_id"]].append(span)
+
+    finalized_ids = {run["run_id"] for run in finalized}
+    coverage_by_run = {}
+    settled_by_run = {}
+    for trace_id, spans in traces.items():
+        run = Run(check, trace_id, spans, directories.get(trace_id))
+        identity = run.run(finalized_ids)
+        if identity is None:
+            continue
+        run_id, coverage = identity
+        if not isinstance(run_id, str) or not run_id:
+            continue
+        check.require(run_id not in coverage_by_run, "1", f"run {run_id} unique trace")
+        coverage_by_run[run_id] = coverage
+        if coverage == "full":
+            settled_by_run[run_id] = run.settlements
+    if fleet:
+        for run_id in finalized_ids:
+            check.require(coverage_by_run.get(run_id) in {"full", "observed"},
+                          "5", f"run {run_id} trace with coverage")
+    for task in work:
+        work_trace(check, task)
+    director_spend(check, jobs, finalized, settled_by_run)
+    return check.result()
+
+
+def read_json(path):
+    raw = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw, parse_float=Decimal)
+    except json.JSONDecodeError:
+        data = [json.loads(line, parse_float=Decimal) for line in raw.splitlines() if line.strip()]
+    if isinstance(data, dict) and "trace_id" not in data:
+        if not set(data) & {"spans", "finalized_runs", "work_traces", "settled_jobs", "run_directories"}:
+            raise ValueError(f"{path}: expected a fixture object or span records")
+        return data
+    return {"spans": data if isinstance(data, list) else [data]}
+
+
+def self_test():
+    passed = True
+    paths = sorted(Path(__file__).resolve().with_name("fixtures").glob("*.json"))
+    for scenario in sorted(set(ACCEPTANCE_SCENARIOS) - {path.stem for path in paths}):
+        print(f"{scenario}: FAIL missing fixture")
+        passed = False
+    for path in paths:
+        try:
+            data = read_json(path)
+            result = evaluate([(path, data)])
+            if result != data["expected"]:
+                print(f"{path.stem}: FAIL {json.dumps(result, sort_keys=True)}")
+                passed = False
+            else:
+                print(f"{path.stem}: PASS")
+        except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
+            print(f"{path.stem}: FAIL {error}")
+            passed = False
+    return 0 if passed else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("files", nargs="*", type=Path)
+    parser.add_argument("--self-test", action="store_true")
+    options = parser.parse_args()
+    if options.self_test and not options.files:
+        return self_test()
+    if options.self_test or not options.files:
+        parser.error("provide files or --self-test")
+    try:
+        result = evaluate([(path, read_json(path)) for path in options.files])
+    except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
+        print(json.dumps({"error": str(error)}))
+        return 2
+    print(json.dumps(result, sort_keys=True))
+    return int(result["result"] == "incomplete")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

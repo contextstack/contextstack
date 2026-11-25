@@ -18,6 +18,10 @@ return [
     // This device's saved connection (URL, device token, credential id and name).
     'settings_path' => env('CLIENT_WEB_SETTINGS', storage_path('app/private/client-web/connection.json')),
 
+    // Host names served besides loopback, IP addresses and APP_URL's host (comma-separated), e.g. this machine's
+    // Tailscale MagicDNS name. Any other Host is refused, so DNS rebinding cannot reach client-web (RestrictHosts).
+    'trusted_hosts' => env('CLIENT_WEB_TRUSTED_HOSTS', ''),
+
     // Seconds to wait for one Client API answer.
     'timeout' => (int) env('CLIENT_WEB_DIRECTOR_TIMEOUT', 15),
 

@@ -25,7 +25,8 @@ def subscription_metadata(path):
     return {"schema_version": 2, "providers": {"meta": expected}}
 
 
-def sandbox_command(command, workspace, real_home, readonly_paths=(), extra=(), read_roots=(), *, adapter=None):
+def sandbox_command(command, workspace, real_home, readonly_paths=(), extra=(), read_roots=(), *,
+                    adapter=None, check_scratch=None):
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
         raise ValueError("Muse requires the macOS OS sandbox; no fallback")
     ws, home = Path(workspace).resolve(), Path(real_home).resolve()
@@ -41,6 +42,8 @@ def sandbox_command(command, workspace, real_home, readonly_paths=(), extra=(), 
     request.update(variant="adapter" if adapter is not None else "muse",
                    readonly_paths=[str(Path(p).resolve()) for p in readonly_paths],
                    adapter=adapter)
+    if check_scratch is not None:
+        request["check_scratch"] = str(Path(check_scratch).resolve())
     profile = render_native_sandbox(code_root, code_root / "policy/sandbox.json", request)
     return ["/usr/bin/sandbox-exec", "-p", profile.decode("utf-8"), *map(str, command)]
 
@@ -61,6 +64,28 @@ class Cancelled(RuntimeError):
     def __init__(self, stdout, stderr):
         super().__init__("executor cancelled")
         self.stdout, self.stderr = stdout, stderr
+
+
+class CleanupFailed(RuntimeError):
+    """Job-process cleanup or tracking failed after the CLI ran; carries what the CLI wrote."""
+    def __init__(self, error, stdout="", stderr="", returncode=None):
+        super().__init__(str(error))
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def close_processes(processes, captured, step=None):
+    """processes.close() (or `step`), re-raising a cleanup/tracking RuntimeError as CleanupFailed
+    with the output captured so far (captured["output"], or captured["snapshot"]() when given)."""
+    try:
+        (step or processes.close)()
+    except CleanupFailed:
+        raise
+    except RuntimeError as error:
+        output = captured.get("output")
+        if output is None and captured.get("snapshot") is not None:
+            output = captured["snapshot"]()
+        stdout, stderr = output or ("", "")
+        raise CleanupFailed(error, stdout, stderr, captured.get("returncode")) from error
 
 
 def run_process(command, workspace, env, timeout, input_text=None, on_started=None, memory_cap_mb=None, on_evidence=None):
@@ -91,11 +116,12 @@ def run_process(command, workspace, env, timeout, input_text=None, on_started=No
         signal.signal(signal.SIGTERM, previous)
         raise
     killed = False
+    captured = {}
     def kill_group():
         nonlocal killed
         if killed:
             return
-        processes.kill()
+        close_processes(processes, captured, processes.kill)
         killed = True
     def cancel(_signum, _frame):
         raise KeyboardInterrupt()
@@ -115,9 +141,11 @@ def run_process(command, workspace, env, timeout, input_text=None, on_started=No
             # communicate retains output read before the timeout. Reading pipes
             # directly loses it and can hang on a surviving child's open pipe.
             stdout, stderr = proc.communicate(timeout=5)
+            captured.update(output=(stdout, stderr), returncode=proc.returncode)
             if isinstance(error, subprocess.TimeoutExpired):
                 raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from None
             raise Cancelled(stdout, stderr) from None
+        captured.update(output=(stdout, stderr), returncode=proc.returncode)
         done = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
         done.job_process_evidence = processes.evidence
         if monitor is not None:
@@ -139,7 +167,7 @@ def run_process(command, workspace, env, timeout, input_text=None, on_started=No
             finally:
                 try:
                     try:
-                        processes.close()
+                        close_processes(processes, captured)
                     finally:
                         if on_evidence is not None:
                             on_evidence(processes.evidence)

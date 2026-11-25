@@ -233,6 +233,52 @@ pub fn start_summary(
     Ok(id)
 }
 
+/// Start the Director's summary of turns 1 to `through`. A summary whose job cannot be offered is rolled back on
+/// its own and recorded as failed (`Ok(false)`): the portion is not tried again, and the queue moves on to send
+/// the turn whole.
+fn try_summary(
+    store: &Store,
+    db: &Connection,
+    conv_id: &str,
+    through: i64,
+    based_on: Option<&str>,
+) -> Res<bool> {
+    let started = crate::reservations::savepoint(db, "summary", || {
+        start_summary(store, db, conv_id, through, based_on, None, "director")
+    });
+    match started {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            fail_summary(db, conv_id, through, based_on, &e)?;
+            Ok(false)
+        }
+    }
+}
+
+/// A summary that could not start: recorded as `error`, with no job, so it is not tried again on its own.
+fn fail_summary(
+    db: &Connection,
+    conv_id: &str,
+    through: i64,
+    based_on: Option<&str>,
+    why: &str,
+) -> Res<()> {
+    let id = format!("sum_{}", util::ulid()?.to_lowercase());
+    let now = now_utc();
+    let detail = format!("the summary's job could not be offered: {why}");
+    db.execute(
+        "INSERT INTO summaries (summary_id, conversation_id, through_seq, based_on, job_id, state, detail,
+                                requested_by, created_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, '', 'error', ?5, 'director', ?6, ?6)",
+        params![id, conv_id, through, based_on, detail, now],
+    )
+    .map_err(db_err)?;
+    touch(db, Record::Summary, &id).map_err(db_err)?;
+    touch(db, Record::Conversation, conv_id).map_err(db_err)?;
+    crate::logf!("conversation {conv_id}: summary of turns 1-{through} failed: {why}");
+    Ok(())
+}
+
 pub(crate) fn set_turn(
     db: &Connection,
     conv: &str,
@@ -356,15 +402,9 @@ fn step(store: &Store, db: &Connection, conv_id: &str) -> Res<bool> {
     let budget = thread::budget(&conv.model, instructions, conv.tools);
     match thread::choose(&turns, &message, best.as_ref(), &budget, failed) {
         Choice::Summarise { through, based_on } => {
-            start_summary(
-                store,
-                db,
-                conv_id,
-                through,
-                based_on.as_deref(),
-                None,
-                "director",
-            )?;
+            if !try_summary(store, db, conv_id, through, based_on.as_deref())? {
+                return Ok(true);
+            }
             set_turn(
                 db,
                 conv_id,

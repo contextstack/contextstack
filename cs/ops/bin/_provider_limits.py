@@ -330,13 +330,15 @@ def save(state_root, data):
     write_atomic(path, payload.encode("utf-8"))
 
 
-def record_limit(state_root, template, hit):
+def record_limit(state_root, template, hit, *, preserve_existing=False):
     import fcntl
     Path(state_root).mkdir(parents=True, exist_ok=True)
     with (Path(state_root) / "provider-limits.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         data = load(state_root)
         templates = data.setdefault("templates", {})
+        if preserve_existing and str(template) in templates:
+            return
         if templates.get(str(template), {}).get("via") == "login" and hit.get("via") != "login":
             return  # A quota window must never unpause a dead login.
         templates[str(template)] = {

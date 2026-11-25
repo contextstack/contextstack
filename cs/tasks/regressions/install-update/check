@@ -71,7 +71,13 @@ with scratch_dir(prefix='install-update-') as tmp:
     # cs init is tested separately. This shim records invocation then dispatches updates to real cs.
     (scripts / 'cs').rename(scripts / 'cs-real')
     (scripts / 'cs').write_text('''#!/bin/sh
-if [ "$1" = init ]; then echo init >> "$HOME/init-calls"; exit 0; fi
+if [ "$1" = init ]; then
+  echo init >> "$HOME/init-calls"
+  [ "$2" = --install-setup ] || exit 1
+  [ ! -f "$HOME/fail-init" ] || exit 1
+  echo 'Next: install a coding agent.'
+  exit 0
+fi
 exec python3 "$(dirname "$0")/cs-real" "$@"
 ''')
     (scripts / 'cs').write_text((scripts / 'cs').read_text().replace('exec python3 ', 'exec ' + __import__('shlex').quote(sys.executable) + ' '))
@@ -83,9 +89,12 @@ printf "%s\\n" "$@" > "$HOME/install-args"
 id=$(PYTHON_FOR_FIXTURE -c 'import json,sys; print(json.load(open(sys.argv[1]))["release"])' "$2/bundle.json")
 mkdir -p "$HOME/.contextstack/releases/$id"
 cp -R "$2/release/." "$HOME/.contextstack/releases/$id/"
+cp "$2/bundle.json" "$HOME/.contextstack/releases/$id/bundle.json"
 rm -f "$HOME/.contextstack/current"
 ln -s "releases/$id" "$HOME/.contextstack/current"
 echo "$id" >> "$HOME/installs"
+printf '%s\n' '{"director_rs": null, "client_web": null, "verify": {"missing_host_runtimes": [".estate/runtime/ms-playwright", "php >= 8.3"]}}'
+echo 'Open a new terminal to use cs' >&2
 ''')
     (scripts / 'node-install').write_text((scripts / 'node-install').read_text().replace('PYTHON_FOR_FIXTURE', shlex.quote(sys.executable)))
     import platform
@@ -128,7 +137,7 @@ echo "$id" >> "$HOME/installs"
     tools = root / 'tools'
     tools.mkdir()
     for name in ('sh', 'curl', 'tar', 'gzip', 'uname', 'shasum', 'sha256sum', 'awk', 'df',
-                 'mktemp', 'rm', 'mkdir', 'cp', 'ln'):
+                 'mktemp', 'rm', 'mkdir', 'cp', 'ln', 'cat'):
         executable = shutil.which(name)
         if executable:
             (tools / name).symlink_to(executable)
@@ -219,6 +228,34 @@ esac
         env.pop('CS_INSTALL_DEV')
         assert 'requires CS_INSTALL_DEV=1' in run('sh', str(SCRIPTS / 'install.sh'), ok=False)
         env['CS_INSTALL_DEV'] = '1'
+        release('v0.2.0-rc.3', 'latest')
+        output = run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        assert "'stable' channel manifest" in output and env['CS_INSTALL_BASE'] + '/stable.txt' in output
+        assert 'sh -s -- --channel latest' in output
+        assert 'curl: (22)' not in output, output
+        local_base = env['CS_INSTALL_BASE']
+        env['CS_INSTALL_BASE'] = 'http://127.0.0.1:1'
+        output = run('sh', str(SCRIPTS / 'install.sh'), ok=False)
+        env['CS_INSTALL_BASE'] = local_base
+        assert 'curl: (7)' in output and "'stable' channel manifest" in output, output
+        output = run('sh', str(SCRIPTS / 'install.sh'), '--channel', 'latest')
+        assert 'Installed ContextStack v0.2.0-rc.3' in output
+        assert 'Some optional extras are missing. Run `cs doctor` for details.' in output
+        assert '.estate/runtime/ms-playwright' not in output and 'php >= 8.3' not in output
+        assert '"director_rs"' not in output and output.count('Open a new terminal') == 1
+        assert 'Next: install a coding agent.' in output
+        cs = home / '.contextstack/current/cs/scripts/cs'
+        assert run(str(cs), '--version').strip() == (
+            'ContextStack v0.2.0-rc.3 (abc123)'
+        )
+        output = run('sh', str(SCRIPTS / 'install.sh'), '--channel', 'latest', '--json')
+        assert '"director_rs": null' in output
+        assert '.estate/runtime/ms-playwright' in output and 'php >= 8.3' in output
+        (home / 'fail-init').touch()
+        run('sh', str(SCRIPTS / 'install.sh'), '--channel', 'latest', ok=False)
+        (home / 'fail-init').unlink()
+        (home / 'init-calls').unlink()
+        (home / 'installs').unlink()
         release('v1.0.0')
         output = run('sh', str(SCRIPTS / 'install.sh'))
         assert 'WARNING: CS_INSTALL_DEV=1' in output
@@ -395,7 +432,7 @@ esac
                 'fixture', str(SCRIPTS / 'install.sh')], env=env,
                 stdout=subprocess.PIPE, stderr=slave, stdin=subprocess.DEVNULL)
             args = (home / 'curl-args').read_text()
-            assert result.returncode != 0 and '--progress-bar' in args and '--silent' not in args
+            assert result.returncode != 0 and '--progress-bar' not in args and '--silent' in args
         finally:
             os.close(slave)
             os.close(master)

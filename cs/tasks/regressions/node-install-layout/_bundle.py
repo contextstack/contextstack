@@ -124,6 +124,63 @@ def directory_snapshot(path):
             return None
 
 
+def path_link_names():
+    """Basenames node-install / node-release manage under the PATH link directory (_node_layout.LINKS + RETIRED_LINKS)."""
+    scripts = str(CODE_ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import _node_layout  # noqa: E402
+    return tuple(dict.fromkeys([*_node_layout.LINKS, *_node_layout.RETIRED_LINKS]))
+
+
+def entry_fingerprint(path):
+    """Fingerprint one path without following symlinks. None if absent; 'unreadable' if denied."""
+    import stat as statmod
+    path = Path(path)
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return "unreadable"
+    if statmod.S_ISLNK(st.st_mode):
+        try:
+            return ("link", os.readlink(path))
+        except OSError:
+            return ("link", "unreadable")
+    return ("node", st.st_mtime_ns, st.st_size, statmod.S_IFMT(st.st_mode))
+
+
+def scoped_directory_snapshot(directory, *, names=None, prefix=None):
+    """Map basename -> fingerprint for ContextStack-owned entries only.
+
+    `names` are exact basenames (PATH links). `prefix` keeps matching basenames when the
+    directory is listable (LaunchAgents com.contextstack.*); if listing is denied, only
+    `names` are probed so a foreign file's mtime cannot trip the check.
+    """
+    directory = Path(directory)
+    selected = set(names or ())
+    if prefix is not None:
+        try:
+            selected |= {p.name for p in directory.iterdir() if p.name.startswith(prefix)}
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            pass
+    elif names is None:
+        raise ValueError("scoped_directory_snapshot needs names and/or prefix")
+    return {name: entry_fingerprint(directory / name) for name in sorted(selected)}
+
+
+def contextstack_host_snapshots(home=None):
+    """(bin_links, launch_agents) fingerprints for paths ContextStack could write under home."""
+    home = Path(home if home is not None else Path.home())
+    return (
+        scoped_directory_snapshot(home / ".local/bin", names=path_link_names()),
+        scoped_directory_snapshot(home / "Library/LaunchAgents", prefix="com.contextstack."),
+    )
+
+
 def real_agents():
     """{label: pid} for every com.contextstack.* job in the real gui domain (read-only /bin/launchctl list)."""
     if sys.platform != "darwin":

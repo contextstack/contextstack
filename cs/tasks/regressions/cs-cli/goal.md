@@ -36,8 +36,9 @@ running the release's own `code_root/scripts/cs`, the check must show:
    PATH; no install is a clear error. The URL is never written to a log.
 9. No value from `config/node.env`, a credentials file, a plist's or
    launchctl's environment, or a `*_API_KEY=` log line appears in any output
-   or shim call; `security` is never called. The real `~/.local/bin` and
-   `~/Library/LaunchAgents` are untouched.
+   or shim call; `security` is never called. ContextStack-owned PATH links
+   under `~/.local/bin` and `com.contextstack.*` LaunchAgents plists are
+   untouched; other files there may change.
 
 Fails when `code_root/scripts/cs` is absent. Needs uv and the
 pinned uv-managed interpreter; else SKIP and why. About 25 s.

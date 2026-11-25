@@ -34,6 +34,14 @@ def check(m, scratch_dir):
     with patch.object(tools, "task_status", side_effect=m.Refused("sk-abcdefghijk")):
         assert "sk-abcdefghijk" not in call(tools, "task_status", {"job_id": "fake"})
 
+    # A JSON line that is not an object is an invalid request (-32600), and the server keeps serving
+    output = io.StringIO()
+    m.serve(tools, io.StringIO("[1, 2]\n42\n\"text\"\nnull\n" + json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}) + "\n"),
+            output)
+    lines = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+    invalid = [r for r in lines if (r.get("error") or {}).get("code") == -32600 and r.get("id") is None]
+    assert len(invalid) == 4 and any(r.get("id") == 7 and "result" in r for r in lines), lines
+
     with scratch_dir(prefix="mcp-timeout-") as root:
         stub = Path(root) / "land.py"
         marker = Path(root) / "terminated"
@@ -41,10 +49,39 @@ def check(m, scratch_dir):
                         "def stop(*a):\n Path(" + repr(str(marker)) + ").write_text('TERM')\n sys.exit(0)\n"
                         "signal.signal(signal.SIGTERM,stop)\ntime.sleep(30)\n")
         tools = m.Tools(None, "fake")
-        with patch.dict(os.environ, {"CS_MCP_LAND_STUB": str(stub)}), \
+        no_repos = str(Path(root) / "absent-repos.json")  # an unknown repo: the caller's timeout stands
+        with patch.dict(os.environ, {"CS_MCP_LAND_STUB": str(stub), "CS_REPOS_FILE": no_repos}), \
              patch.object(tools, "main_restored", return_value="main was restored (clean)"):
             answer = call(tools, "land_task", {"repo": "fake", "lane": "fake", "timeout_seconds": .2})
         assert marker.read_text() == "TERM" and "timed out" in answer and "main was restored" in answer
+
+        # A known repo: the land call outlives its full gate, so a timeout never SIGKILLs a staged squash
+        repos = Path(root) / "repos.json"
+        repos.write_text(json.dumps({"slow": {"path": str(root), "gate_timeout_s": 5000},
+                                     "plain": str(root)}))
+        class Borrower:
+            land_command = None
+
+            def _land_lock(self, repo):
+                return threading.Lock()
+
+        borrower = Borrower()
+        borrower.land_task = m.Tools.land_task.__get__(borrower)
+        with patch.dict(os.environ, {"CS_REPOS_FILE": str(repos)}), \
+             patch.object(m.subprocess, "Popen") as popen:
+            process = popen.return_value
+            process.communicate.return_value = ('{"ok": true}', "")
+            process.returncode = 0
+            assert borrower.land_task("slow", "x", timeout_seconds=60)["ok"]
+            process.communicate.assert_called_once_with(timeout=5600)
+
+        seen = []
+        tools = m.Tools(None, "fake", land_command=lambda repo, lane, message, timeout: seen.append(timeout) or
+                        m.subprocess.CompletedProcess([], 0, "{}", ""))
+        with patch.dict(os.environ, {"CS_REPOS_FILE": str(repos)}):
+            call(tools, "land_task", {"repo": "slow", "lane": "x", "timeout_seconds": 60})
+            call(tools, "land_task", {"repo": "plain", "lane": "x"})
+        assert len(seen) == 2 and seen[0] > 5000 and seen[1] > 3600, seen
 
     class Delayed:
         def get(self, path, timeout=30):

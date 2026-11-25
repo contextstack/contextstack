@@ -50,6 +50,13 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends ApprovalsPa
     public bool $transcriptRead = false;
 
     /**
+     * The run the decision receipt, diff stat and last message belong to. When the lane's primary run changes (a
+     * later trial reports), they are read again for the new run, so the owner never decides on another run's evidence.
+     */
+    #[Locked]
+    public string $evidenceRunId = '';
+
+    /**
      * Every job on this lane, oldest first, when there is more than one: a retry is another job on the same intent.
      *
      * @var list<array{job_id: string, state: string}>
@@ -139,6 +146,14 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends ApprovalsPa
         $run = $this->primaryRun();
         if ($run === null) {
             return;
+        }
+
+        if ($this->evidenceRunId !== (string) $run['run_id']) {
+            $this->evidenceRunId = (string) $run['run_id'];
+            $this->receipt = [];
+            $this->diff = null;
+            $this->lastMessage = '';
+            $this->transcriptRead = false;
         }
 
         $decisionId = $run['decision']['decision_id'] ?? null;
@@ -283,6 +298,24 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends ApprovalsPa
     public function meta(): array
     {
         return (array) ($this->intent()['meta'] ?? []);
+    }
+
+    /**
+     * Which model the coding job runs on and, when `start_task model: "auto"` chose it, why: the job's
+     * `meta.route` (`{model, reason, languages}`), falling back to the intent's `meta.model`.
+     *
+     * @return array{model: string, reason: string}
+     */
+    public function route(): array
+    {
+        $route = $this->job()['meta']['route'] ?? null;
+        $route = is_array($route) ? $route : [];
+        $model = is_string($route['model'] ?? null) && $route['model'] !== '' ? $route['model'] : ($this->meta()['model'] ?? '');
+
+        return [
+            'model' => is_string($model) ? $model : '',
+            'reason' => is_string($route['reason'] ?? null) ? $route['reason'] : '',
+        ];
     }
 
     /**
@@ -501,7 +534,11 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends ApprovalsPa
 
             <aside class="space-y-6 lg:border-s lg:border-black/[.06] lg:ps-6 lg:dark:border-white/[.06]" data-test="lane-state">
                 <x-client.facts>
-                    <x-client.fact :label="__('Model')" mono>{{ $meta['model'] ?? '—' }}</x-client.fact>
+                    @php($route = $this->route())
+                    <x-client.fact :label="__('Model')" mono>{{ $route['model'] !== '' ? $route['model'] : '—' }}</x-client.fact>
+                    @if ($route['reason'] !== '')
+                        <x-client.fact :label="__('Model routing')" data-test="model-routing">{{ $route['reason'] }}</x-client.fact>
+                    @endif
                     <x-client.fact :label="__('Machine')" mono>{{ $job['node'] }}</x-client.fact>
                     @if (filled($meta['repo'] ?? null))
                         <x-client.fact :label="__('Lane')" mono title="{{ $meta['repo'] }}/{{ $meta['lane'] }}">{{ $meta['repo'] }}/{{ $meta['lane'] }}</x-client.fact>

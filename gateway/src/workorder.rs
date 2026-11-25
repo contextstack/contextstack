@@ -308,7 +308,9 @@ pub fn parse(body: &[u8]) -> Result<Request, HttpReply> {
     let timeout = Duration::from_secs(u64::try_from(3 * timeout_s + 120).unwrap_or(1020));
     Ok(Request {
         order: fields.map_or_else(|| raw.clone(), |_| compact_preserving(&raw)),
-        executor: order.executor,
+        // The raw order keeps the selection for the executor. Admission and streaming
+        // share the base template's capacity and dialect across its model choices.
+        executor: order.executor.split(':').next().unwrap_or_default().into(),
         timeout,
         receipt: b.receipt,
         work_order_env,
@@ -693,6 +695,16 @@ fn reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_cli_model_keeps_order_and_uses_base_executor() {
+        let body = br#"{"work_order":{"executor":"codex:gpt-6.2-sol"}}"#;
+        let Ok(request) = parse(body) else {
+            panic!("valid CLI selection")
+        };
+        assert_eq!(request.executor, "codex");
+        assert_eq!(request.order, r#"{"executor":"codex:gpt-6.2-sol"}"#);
+    }
 
     #[test]
     fn parse_refusals_and_compaction() {

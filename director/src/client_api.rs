@@ -194,7 +194,10 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
 
 fn models_list(state: &State) -> Reply {
     match crate::models::list(&state.settings.gateway) {
-        Ok(body) => json(200, &body),
+        Ok(mut body) => match crate::models::add_nodes(&state.store.db(), &mut body) {
+            Ok(()) => json(200, &body),
+            Err(e) => internal(&e.to_string()),
+        },
         Err(crate::gateway::Fault::Unavailable(e)) => {
             refusal(502, "gateway_unavailable", &e, Value::Null)
         }
@@ -220,7 +223,8 @@ fn decision_of(state: &State, run_id: &str) -> Result<Value, String> {
 }
 
 /// `GET intents`: the work, newest first, with the jobs of the intents listed.
-/// `conversation=ID` keeps one lead's intents, `project=ID` keeps one project, `lanes=1` only task lanes,
+/// `conversation=ID` keeps one lead's intents, `project=ID` keeps one project, `lanes=1` only task lanes
+/// (same rule as each intent's derived `lane` field),
 /// `limit=N` (1..=500) caps the count. `dispatch_id=ID` recovers one submission by its key.
 fn work_list(state: &State, node: Option<&str>, call: &Call, client: &access::Client) -> Reply {
     let db = state.store.db();

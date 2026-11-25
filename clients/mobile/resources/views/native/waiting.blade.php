@@ -14,6 +14,10 @@
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
 
+            @if ($backlogProblem !== '')
+                <native:text class="text-sm text-theme-on-surface-variant">{{ $backlogProblem }}</native:text>
+            @endif
+
             @if ($loaded && $count === 0)
                 <native:text class="text-base text-theme-on-surface-variant">Nothing waits on you.</native:text>
             @endif
@@ -23,7 +27,7 @@
                     headline="{{ ActionApprovals::command($approval) }}"
                     supporting="{{ (string) ($approval['reason'] ?? '') }}"
                     overline="Action approval"
-                    leading-icon="shield"
+                    leadingIcon="shield"
                     @press="select('{{ $id }}')" />
             @endforeach
 
@@ -32,7 +36,7 @@
                     headline="{{ $waiting['title'] }}"
                     supporting="{{ $waiting['reason'] }}"
                     overline="Backlog · {{ $waiting['project'] }}"
-                    leading-icon="hand.raised"
+                    leadingIcon="hand.raised"
                     @press="openBacklogItem('{{ $waiting['project_id'] }}', '{{ $waiting['item_id'] }}')" />
             @endforeach
 
@@ -41,7 +45,9 @@
                     headline="{{ $question['title'] }}"
                     supporting="{{ $question['question'] }}"
                     overline="Your lead asks"
-                    leading-icon="chat" />
+                    leadingIcon="bubble.left.and.bubble.right"
+                    trailingIcon="chevron.right"
+                    @navigate="'/conversations/' . $question['id']" />
             @endforeach
         </native:column>
     </native:scroll-view>
@@ -54,10 +60,23 @@
 
                 <native:text class="text-sm text-theme-on-surface-variant">{{ ActionApprovals::status($selectedApproval) }}</native:text>
                 <native:text ref="command" class="font-mono text-base text-theme-on-surface">{{ $command }}</native:text>
+                @if (ActionApprovals::malformed($selectedApproval))
+                    <native:text class="text-sm text-theme-destructive">This request's command is malformed: an argument is not text. Deny it, or check it on the desktop.</native:text>
+                @endif
+                @if (ActionApprovals::hidden($selectedApproval))
+                    <native:text class="text-sm text-theme-destructive">The command contains invisible or text-reordering characters, shown above as \u{…}.</native:text>
+                @endif
 
-                @if (! empty($selectedApproval['write_paths']))
+                @php($needs = \App\Client\Json::strings($selectedApproval['needs'] ?? null))
+                @if ($needs !== [])
+                    <native:text class="text-sm font-bold text-theme-on-surface">It needs</native:text>
+                    <native:text class="font-mono text-sm text-theme-on-surface">{{ implode(', ', $needs) }}</native:text>
+                @endif
+
+                @php($paths = \App\Client\Json::strings($selectedApproval['write_paths'] ?? null))
+                @if ($paths !== [])
                     <native:text class="text-sm font-bold text-theme-on-surface">Writes to</native:text>
-                    @foreach ($selectedApproval['write_paths'] as $path)
+                    @foreach ($paths as $path)
                         <native:text class="font-mono text-sm text-theme-on-surface">{{ $path }}</native:text>
                     @endforeach
                 @endif
@@ -73,11 +92,12 @@
                 @endif
 
                 <native:text class="text-sm text-theme-on-surface-variant">{{ ActionApprovals::outcome($selectedApproval) }}</native:text>
+                <native:text class="text-xs text-theme-on-surface-variant">Job {{ (string) ($selectedApproval['job_id'] ?? '—') }} · run {{ (string) ($selectedApproval['run_id'] ?? '—') }}</native:text>
 
                 @if (($selectedApproval['status'] ?? null) === 'needs_owner')
                     <native:row class="w-full gap-3 mt-2">
-                        <native:button label="Approve" variant="success" class="flex-1" @tap="decide('{{ $selectedApproval['id'] }}', 'approve')" />
-                        <native:button label="Deny" variant="destructive" class="flex-1" @tap="decide('{{ $selectedApproval['id'] }}', 'deny')" />
+                        <native:button label="Approve" variant="success" @tap="decide('{{ $selectedApproval['id'] }}', 'approve')" />
+                        <native:button label="Deny" variant="destructive" @tap="decide('{{ $selectedApproval['id'] }}', 'deny')" />
                     </native:row>
                 @endif
             </native:column>

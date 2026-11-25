@@ -1,6 +1,6 @@
 @use('App\Native\Backlog')
 
-<native:top-bar title="{{ $projectName !== '' ? $projectName : 'Backlog' }}" subtitle="Backlog">
+<native:top-bar title="{{ $projectName !== '' ? $projectName : 'Backlog' }}" subtitle="Backlog" back="true">
     <native:top-bar-action id="closed" label="{{ $showClosed ? 'Hide done' : 'Show done' }}" icon="{{ $showClosed ? 'eye.slash' : 'eye' }}" @tap="toggleClosed" />
     <native:top-bar-action id="refresh" label="Refresh" icon="refresh" @tap="refresh" />
 </native:top-bar>
@@ -19,7 +19,7 @@
                     <native:list-item native:key="waiting-{{ $waiting['item_id'] }}"
                         headline="{{ $waiting['title'] }}"
                         supporting="{{ (string) ($waiting['blocked_reason'] ?? '') }}"
-                        leading-icon="hand.raised"
+                        leadingIcon="hand.raised"
                         @press="select('{{ $waiting['item_id'] }}')" />
                 @endforeach
                 <native:divider class="w-full my-2" />
@@ -33,7 +33,7 @@
                 <native:list-item native:key="item-{{ $row['item_id'] }}"
                     headline="{{ $row['title'] }}"
                     supporting="{{ Backlog::blockers($row) !== '' ? 'Blocked on '.Backlog::blockers($row) : '' }}"
-                    trailing-text="{{ Backlog::status($row) }}"
+                    trailingText="{{ Backlog::status($row) }}"
                     @press="select('{{ $row['item_id'] }}')" />
             @endforeach
         </native:column>

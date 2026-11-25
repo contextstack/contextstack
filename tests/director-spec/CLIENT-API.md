@@ -160,7 +160,8 @@ Live events are not records: they carry a sequence number per run, not a revisio
 The fields of each record:
 - **intent:** `intent_id, title, node, spec, task, trials, grant, meta, bundle_sha256, created_by, created_at,
   revision, job_ids, conversation_ids` (conversations attached to it, §11), `project_id` (§12, or null),
-  `lead_conversation_id` (the hosted-lead conversation that submitted this intent through `POST intents`, or null).
+  `lead_conversation_id` (the hosted-lead conversation that submitted this intent through `POST intents`, or null),
+  `lane` (derived Boolean: true when this intent is a task lane under the same rule as `lanes=1` below; not stored).
 - **job:** `job_id, intent_id` (null for a job made by the administrative command), `node, state`
   (`waiting | offered | accepted | done | error`; `waiting`: created but held by a budget, not offered, §12.3), `spec, task, trials, grant, meta, bundle_sha256, files, created_at,
   accepted_at, finished_at, run_id, run_ids, terminal_row, error, failure` (`error` is the raw reason text; `failure` is the object below when `state` is `error`, else null), `cancel` (`{cancel_id, state, outcome}` or null),
@@ -249,7 +250,8 @@ from provenance on `from_job`. An owner or device submission leaves `lead_conver
 `lead_conversation_id` is the value on its intent.
 
 Local and paired credentials can add an attempt with `POST intents/{id}/jobs`. Leads can add attempts on
-their own intents and descendants within their scope.
+their own intents and descendants within their scope. A `meta.retry_of` that names no job is
+refused with 422 `invalid_request`.
 
 Local and paired credentials can override a mark made with the local credential using
 `PUT intents/{id}/owner-messages/{message_id}/mark`. Leads can mark messages on their own intents
@@ -259,12 +261,12 @@ and descendants within scope. A lead overriding a local mark receives 403 `owner
 
 | Call | Answer |
 | --- | --- |
-| `GET intents[?node=NAME][&conversation=ID][&project=ID][&lanes=1][&limit=N]` | `{intents, jobs}`: intents newest first (at most 500), and the jobs of those intents. With `conversation`, only intents whose `lead_conversation_id` is that id. With `project`, only intents in that project. With `lanes=1`, only task lanes: `meta.source` is `client-web-lane` or `cs-mcp`, or `meta.lane` is set and not null. `limit` (1..500, applied after the filters) caps the intents; missing or out of range means 500. An unknown `project` is refused with 422 `invalid_request`. |
+| `GET intents[?node=NAME][&conversation=ID][&project=ID][&lanes=1][&limit=N]` | `{intents, jobs}`: intents newest first (at most 500), and the jobs of those intents. With `conversation`, only intents whose `lead_conversation_id` is that id. With `project`, only intents in that project. With `lanes=1`, only task lanes: `meta.source` is `client-web-lane`, `client-mobile-lane` or `cs-mcp`, or `meta.lane` is set and not null. Every intent record (list, get, and change/stream events) carries a derived Boolean `lane` computed by that same rule. `limit` (1..500, applied after the filters) caps the intents; missing or out of range means 500. An unknown `project` is refused with 422 `invalid_request`. |
 | `GET intents/{id}` | `{intent, jobs, runs}`: the intent, its jobs, and their runs with usage |
-| `GET jobs[?node=NAME]`, `GET jobs/{id}` | `{jobs}`, or one job |
+| `GET jobs[?node=NAME]`, `GET jobs/{id}` | `{jobs}`, or one job. Each job carries a derived `waiting`: null, or why it has not started (`node_not_pulled` or `held`), the same shape as a turn's (§11.2) |
 | `GET runs[?node=NAME]`, `GET runs/{id}` | `{runs}`, or one run, with its `usage` |
 | `GET nodes`, `GET nodes/{name}` | `{nodes, stale_after_seconds}`, or one node record (§4.3) |
-| `GET models` | Usable executor templates (gateway), labelled, with `default_model` and `lead` on each row (§4.5) | all |
+| `GET models` | Providers, harnesses and runnable model choices (§4.5) | all |
 | `GET repos` | `{repos}`: machine-reported `{node, name, path, branch}` rows; latest inventory per machine, excluding revoked machines | all |
 | `GET schedules[?node=NAME]` | `{schedules}`: every node's schedules in one list (§4.4) |
 | `GET schedules/{node}/{schedule_id}` | `{schedule, firings, changes}`: the schedule, its latest 100 firings, its changes |
@@ -318,10 +320,66 @@ Each node holds and fires its own schedules and reports them (outline §5). A sc
 
 ### 4.5 Models
 
-`GET models` answers `{models, default_model, gateway}`. Each model row includes `"lead": true` or `"lead": false`,
-whether that gateway id can host a hosted-lead conversation (today `claude-code-sonnet`, `claude-code` and
-`claude-code-opus`; see §11.1a). Each model name appears once: when the gateway has several deployments of one
-name, the list keeps an available one.
+`GET models` answers `{models, default_model, gateway, catalog}`. The unchanged flat
+`models` list uses the fields in the table below and includes CLI defaults and role-only
+entries. When the gateway reports several deployments of one name, the response prefers an
+available row.
+
+`catalog` contains `providers`, `harnesses`, `models`, and `default`.
+
+- Providers have `id` and `label`. Both vLLM deployments use the same picker provider.
+- Harnesses have `id`, `label`, `kind` (`cli` or `contextstack`), `provider_ids`, `nodes`,
+  `billing`, and a nullable `unavailable_reason`. A harness with `provider` billing uses the
+  selected provider's billing. The ContextStack harness runs gateway models. A harness
+  with no reporting machine has the reason `no machine reports this harness`. Reported
+  provider limits can make CLI templates unavailable until their limits reset. A template's
+  configured `unavailable_reason` marks its flat row and catalog choices unavailable,
+  even if a machine reports the template. When all of a harness's templates carry a
+  reason, the harness reports the first reason in template ID order.
+- Models have `id`, `label`, nullable `version`, `provider`, `harnesses`, `internal`,
+  `efforts`, and `lead`, plus the flat fields below. Each `harnesses` entry has a harness ID
+  in `harness` and its executable model string in `value`. Rolling aliases and locally
+  configured models have a null version when the catalog does not pin a version.
+  Ollama cloud models use `hosted` billing in the catalog.
+  CLI defaults use their configured harness provider or `various` (Various providers).
+  An unpinned CLI template has a default choice with a null version and its template
+  name as the executable value. Pinned choices use their template name. A selectable
+  model on an unpinned template uses `<template>:<model-id>`, for example
+  `codex:gpt-6.2-sol`. The node checks support for the base template and the executor
+  passes the declared model flag and ID to the CLI. Catalog entries can share an ID
+  and offer several harness pairs when the templates identify a shared model.
+  The structured picker includes public choices.
+- `catalog.default` has `harness`, `model` (the catalog model ID), and `value` (the exact
+  executable value). It uses the flat default when represented in the catalog, falls back to
+  an available catalog choice, and is null when neither is available.
+
+Lane intents accept `lane: {harness, model, ...}` and conversation create accepts
+`{harness, model, ...}`. Use a model ID or the pair's exact `value` with the harness ID.
+For example, `{harness: "claude-code", model: "sonnet"}` selects `claude-code-sonnet`.
+The `value` also works as a standalone `model` string. Invalid pairs or pairs the
+target node cannot run receive HTTP 422. Hosted leads still require a supported lead template.
+Conversation specs store gateway model IDs without the `harness:` prefix.
+
+| Row field | Meaning |
+| --- | --- |
+| `name` | Stable gateway model or executor template ID. Every listed name is valid as `lane.model`, subject to the assigned node's capabilities. The Director adds the `harness:` prefix for harness-only models. |
+| `provider` | Stable picker group ID such as `anthropic`, `openai`, `google`, `xai` or `cursor`. This can differ from the gateway routing provider. |
+| `provider_label` | Catalog display text for the provider group. |
+| `label` | Catalog display text for the underlying model, including its version when pinned. CLI defaults and rolling aliases are identified where the version can change. Uncataloged models use their gateway ID. |
+| `nodes` | Sorted names of non-revoked nodes whose last status reported the CLI template or both native harness support and the model in their harness catalog. Empty when no node reports support. |
+| `internal` | Boolean identifying role-only entries. Pickers hide these rows. |
+| `efforts` | Catalog-declared reasoning-effort values for the model or executor. Empty when the catalog exposes no selectable levels. |
+| `display_name` | Legacy display text retained for existing clients. |
+| `available` | Gateway availability. Node capability reports are independent of this flag. |
+| `billing` | `subscription`, `free_local`, or `paid_api`. |
+| `cost_class` | Gateway cost class, or null if omitted by the gateway. |
+| `executor` | Gateway executor kind, or the model ID when no executor kind is set. |
+| `lead` | Boolean indicating whether the model can host a lead conversation (see §11.1a). |
+| `unavailable_reason` | Optional explanation when the gateway reports the row unavailable. |
+
+`default_model` is a flat model name or null. `gateway` identifies the Director's gateway address.
+The current executor templates have no effort parameter. Passing `lane.effort` through intents
+and applying it at execution time is a follow-up. The `efforts` array is discovery metadata.
 
 ## 5. Evidence
 
@@ -440,9 +498,10 @@ The cancel travels to the node as a control message (NODE-PROTOCOL.md §9.1), an
   protocol 1 cannot receive control messages: its cancels stay `requested`, and `detail` says so.
 - Each change of state is a new revision of the cancel and of its job, published on the stream.
 
-A job has at most one cancel request. Asking again, under any key, answers 200 with the existing request. A job
-that is already `done` or `error` is refused with 409 `job_finished`. An unknown job is 404. `GET cancels/{id}`
-reads a cancel.
+A job has at most one cancel request. Asking again, under any key, answers 200 with the existing request. When that
+request is already `applied` and the job is still non-terminal with no run evidence, asking again finishes the job
+as cancelled and releases its reservation (the same terminal path as a newly applied cancel). A job that is already
+`done` or `error` is refused with 409 `job_finished`. An unknown job is 404. `GET cancels/{id}` reads a cancel.
 
 ### 6.3 Change a schedule: `POST schedules/{node}/{schedule_id}/changes` (Idempotency-Key)
 
@@ -722,7 +781,7 @@ Every conversation read includes `"lead": true` or `"lead": false`. New rows set
 ```json
 {"conversation_id": "con_…", "title": "…", "node": "laptop", "lead": false, "spec": "spec.yaml", "spec_version": "…",
  "model": "claude-sonnet-4-5", "intent_id": null, "held": false, "state": "running",
- "active_turn_id": "trn_…", "queued_turn_ids": ["trn_…"], "turns": 7, "summaries": 1,
+ "active_turn_id": "trn_…", "waiting": null, "queued_turn_ids": ["trn_…"], "turns": 7, "summaries": 1,
  "compaction": {"context_window": 200000, "window_source": "table", "threshold_tokens": 119000, "keep_tokens": 59500},
  "attention": null, "created_by": "cred_…", "created_at": "…", "revision": 90}
 ```
@@ -732,6 +791,7 @@ Every conversation read includes `"lead": true` or `"lead": false`. New rows set
 - `attention` is `null` or `{"question", "job_id"?, "set_at", "set_by"}`: the hosted lead (or owner) asks for one
   decision while child lanes keep running. Unlike `held`, the queue is not stopped.
 - `compaction` is the budget as it stands now (§11.4).
+- `waiting` is the active turn's `waiting` (below), or null when there is no active turn.
 
 `GET me` includes `conversation_id` for a lead credential (the conversation it may set attention on).
 
@@ -740,7 +800,7 @@ A turn:
 ```json
 {"turn_id": "trn_…", "conversation_id": "con_…", "seq": 3, "message": "…", "state": "done",
  "posted_by": "cred_…", "posted_by_name": "phone", "posted_at": "…", "job_id": "…", "run_id": "…",
- "reply": "…", "detail": null, "error": null, "cancel": null, "started_at": "…", "finished_at": "…",
+ "reply": "…", "detail": null, "error": null, "cancel": null, "waiting": null, "started_at": "…", "finished_at": "…",
  "context": {"conversation_revision": 81, "spec_version": "…", "model": "…", "context_window": 200000,
              "window_source": "table", "threshold_tokens": 119000, "tokens": 5100, "over_threshold": false,
              "summary_id": null, "summary_through_seq": null, "whole_from_seq": 1, "whole_through_seq": 2},
@@ -755,6 +815,19 @@ A turn:
   When the bundle includes a decision log, `context.decision_log` records its `revision` (the latest
   decision record revision in that project) and the `entry_count` included in the bundle.
 - `cancel` is its job's cancel (`{cancel_id, state, outcome}`), as on the job.
+- `waiting` gives the job's reason for waiting to start (§4.2) while the turn is `queued`, `summarising` or
+  `running`. A `summarising` turn with no job of its own uses the pending summary job's `waiting` field.
+  The turn's `job_id` stays null until it gets its own job. `waiting` is null once the turn is over.
+
+  | `waiting` | When |
+  | --- | --- |
+  | `null` | no job applies to the turn, or the job has been accepted (pulled) by its node, is running or over, or was offered less than `serve --offer-grace` seconds ago (default 30) |
+  | `{"reason": "node_not_pulled", "node": "laptop", "since": "2026-11-24T08:00:00Z"}` | the job is `offered` and its node has not accepted it for more than the grace; `since` is when it was offered |
+  | `{"reason": "node_not_pulled", "node": "laptop", "since": "…", "node_last_seen": "2026-11-24T07:40:00Z"}` | as above, and the node is stale (not heard from within `--stale-after`, §4.3); `node_last_seen` is its last-seen time, `null` if never seen. The key is absent while the node is fresh |
+  | `{"reason": "held", "detail": "budget_exhausted", "message": "…", "node": "laptop"}` | the job is held (`waiting` state, not offered); `detail` is its hold reason as in `budget.reason` (`budget_exhausted`, `budget_reserved`, `executor_unavailable`, …), `message` the hold's text (`budget.detail`, may be null) |
+
+  `waiting` is derived when the record is read. Crossing the grace does not by itself change the record's
+  `revision` or put a change on the stream; a client showing an active turn re-reads it (or the job) to learn it.
 
 A summary:
 
@@ -978,8 +1051,11 @@ before the job is fully known:
 runs have reported if that is more: what the job spent is not known, and each run is held to its reservation. Nothing
 is released to other work on a guess. Closing ends the hold: the job no longer counts as running work, and a day or
 month budget's presumed charge falls in the period it was counted, so it lifts when the period resets. A cancel of a
-job its node never accepted and says it will never start (`stopped` while `offered`) is different: the job ends
-`error`, with no run, and costs $0 (`no_run`).
+job with no live run that the node stops (`stopped` while `offered`, or while `accepted` with no run, live events or
+report) is different: the job ends `error` with terminal `cancelled`, costs $0 (`no_run`), and leaves active lists.
+An `accepted` job that already has run evidence still waits for the node's `job_terminal`. An applied cancel that
+left the job non-terminal with no run (for example a cancel applied before the Director finished such jobs) is
+finished the same way when cancel is asked again, and at Director start. Status reports do not reconcile them.
 
 **A late report settles it correctly.** Whenever a run linked to the job reports (its end names it, it sent live
 events for the job, or its `run_finalized` names the job with `job_id`), or the job's end arrives, the charge is
@@ -1217,11 +1293,12 @@ executable `tasks/<slug>/check`. A missing/empty check exits successfully; a che
 body without a shebang is prefixed with `#!/bin/sh`. The spec includes workspace
 repo/lane, one trial, budget and title hypothesis. The goal is preserved verbatim.
 
-Set the lane form's `model` to `harness:<gateway-model>` to run through the
-native harness, for example `harness:local-coder`. The Director checks the
+Use the model's `name` from `GET models` or an explicit
+`harness:<gateway-model>` selector for a native harness lane. For example,
+`local-coder` and `harness:local-coder` select the same model. The Director checks the
 assigned node's reported gateway catalog and harness capability. The spec
 contains the gateway model name without the prefix. The MCP tools `start_task`
-and `retry_task` accept the same selector. Agent profiles can also use it in
+and `retry_task` accept the explicit selector. Agent profiles can also use it in
 `model` and `fallback`. Native jobs can use scratch workspaces or repo lanes.
 Repo-only read views require a CLI executor.
 
@@ -1233,9 +1310,23 @@ capable node that reports the repo. The job reads a snapshot of the lane tip
 when present, or the repo's configured base. The node can publish a `plan.md`
 run file. After planning, the Director offers the original coding job on the
 requested node with `meta.phase: "coding"`, under the same intent. A usable plan
-is frozen in `tasks/<slug>/context/plan.md` and included in the coding goal. If
-planning is unavailable, fails, times out, or yields no usable plan, the coding
-job still starts and the work trace records the reason.
+is frozen in `tasks/<slug>/context/plan.md` and included in the coding goal; a
+plan over 64 KiB is cut at a line and ends with `[plan truncated by the Director]`.
+If planning is unavailable, fails, times out, yields no usable plan, or the
+Director cannot settle it, the coding job still starts and the work trace records
+the reason (`planning_fallback` with a `detail`). The node's envelope is
+acknowledged either way.
+
+For a coder repo lane, set `lane.model` to `auto` to let the Director choose the
+coding model. Planning runs first (with `lane.plan_with`, or `codex` when it is
+omitted). The plan ends with a `## Files` list of each file to change and its
+language. When it names two or more languages the coding job runs on `codex`;
+otherwise, or when planning fails or names no files, it runs on
+`harness:local-coder`. The languages come from the whole plan, so a long or
+truncated plan still routes on its `## Files` list. The coding job records the
+choice in `meta.route: {model, reason, languages}`, and its `meta.model` is the
+chosen model. Routing picks the model, not the node: the coding job stays on the
+requested node and the intent's `node` does not change.
 
 
 ### Agent profiles
@@ -1277,6 +1368,12 @@ this list and its model/fallback chain; `CS_AGENTS_DIR` does not affect MCP.
   owner decision records authorization even if the original run has ended.
   There is no execution on a finished job. A consumed claim with an unknown
   outcome must be treated as potentially executed.
+- When a job reaches a terminal state (`done` or `error`), its `pending` and
+  `needs_owner` approvals move to `expired` with reason `job ended` (recorded
+  on `outcome` and, when no review reason exists yet, on `review_reason`).
+  The usual `action_approval` change events are published so clients drop them.
+  At Director start, open approvals whose jobs are already terminal are expired
+  the same way.
 
 ### Project decision log
 

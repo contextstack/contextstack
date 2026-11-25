@@ -99,15 +99,13 @@ new #[Layout('layouts::client')] #[Title('Task lanes')] class extends DirectorPa
     }
 
     /**
+     * Whether an intent is a task lane: the Director decides (its derived `lane` flag, the same rule as `lanes=1`).
+     *
      * @param  array<string, mixed>  $intent
      */
     private function isLaneIntent(array $intent): bool
     {
-        $meta = (array) ($intent['meta'] ?? []);
-
-        return ($meta['source'] ?? null) === 'client-web-lane'
-            || ($meta['source'] ?? null) === 'cs-mcp'
-            || isset($meta['lane']);
+        return ($intent['lane'] ?? false) === true;
     }
 };
 ?>

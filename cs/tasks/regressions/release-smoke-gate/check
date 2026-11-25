@@ -157,8 +157,12 @@ print(json.dumps({"job_id": job}))
                                env=env, capture_output=True, text=True, timeout=30)
         assert smoke.returncode == 0 and "ok claude-code-sonnet " in smoke.stdout, smoke.stdout + smoke.stderr
         reset()
-        failure = activate(overrides={"FAIL_AGENT": "codex"}, ok=False)
-        assert "codex" in failure and "old release old is back" in failure
+        # Owner decision 2026-11-24: a non-default agent failing smoke warns; the default agent failing rolls back.
+        warned = json.loads(activate(overrides={"FAIL_AGENT": "codex"}))
+        assert any(w.get("name") == "codex" for w in warned.get("warnings", [])), warned
+        reset()
+        failure = activate(overrides={"FAIL_AGENT": "claude-code-sonnet"}, ok=False)
+        assert "claude-code-sonnet" in failure and "old release old is back" in failure
         for stop, reason in (("auth_expired", "not signed in (codex login)"),
                              ("provider_unavailable", "provider unavailable"),
                              ("provider_limit", "provider limit reached"), ("rate_limit", "rate limited")):
@@ -179,7 +183,9 @@ print(json.dumps({"job_id": job}))
         reset()
         report = json.loads(activate(overrides={"BAD_REPLY": "claude-code-sonnet"}))["smoke"]
         assert next(c for c in report["checks"] if c["name"] == "claude-code-sonnet")["reply"] == "wrong"
-        reset(); assert "run verdict fail" in activate(overrides={"FAIL_VERDICT": "codex"}, ok=False)
+        reset()
+        warned = json.loads(activate(overrides={"FAIL_VERDICT": "codex"}))
+        assert any(w.get("name") == "codex" and "run verdict fail" in w.get("reason", "") for w in warned.get("warnings", [])), warned
         reset()
         report = json.loads(activate(overrides={"NO_AGENTS": "1"}))["smoke"]
         assert report["ok"] and report["no_agents"] and not report["checks"]

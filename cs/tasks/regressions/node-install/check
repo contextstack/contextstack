@@ -88,6 +88,39 @@ def part_refusals(tmp):
 
 
 
+def part_python_progress(tmp):
+    bundle = tmp / "python-progress"
+    (bundle / "uv").mkdir(parents=True)
+    (bundle / "release/cs").mkdir(parents=True)
+    (bundle / "release/cs/.python-version").write_text("3.13.9\n")
+    (bundle / "bundle.json").write_text(json.dumps({
+        "target": load_node_bundle().host_target(), "release": "python-progress"
+    }, indent=2) + "\n")
+    uv = bundle / "uv/uv"
+    uv.write_text("""#!/bin/sh
+if [ "$1" = python ]; then
+  echo 'Downloading cpython-fixture' >&2
+  if [ "${FAIL_PYTHON:-}" = 1 ]; then
+    echo 'could not unpack Python archive' >&2
+    exit 7
+  fi
+  exit 0
+fi
+echo 'reached uv sync' >&2
+exit 9
+""")
+    uv.chmod(0o755)
+    env = {**hermetic_env(), "HOME": str(tmp / "python-progress-home")}
+    command = ["sh", str(INSTALL), "install", str(bundle), "--no-load"]
+    r = run(command, env=env)
+    expect(r.returncode == 9 and "reached uv sync" in r.stderr
+           and "Unpacking the bundled Python" in r.stderr and "Downloading cpython" not in r.stderr,
+           "offline Python install shows unpacking progress and hides uv's download message")
+    r = run(command, env={**env, "FAIL_PYTHON": "1"})
+    expect(r.returncode == 7 and "could not unpack Python archive" in r.stderr and "reached uv sync" not in r.stderr,
+           "offline Python install preserves uv's failure and diagnostics")
+
+
 def part_failed_build(tmp):
     """node-bundle build writes a temp tree and moves it onto OUT_DIR only when finished."""
     import argparse
@@ -180,6 +213,14 @@ def part_install(tmp):
              "--tool", "fs_read", "--tool", "okf"], env=env)
     (fail if r.returncode != 0 else ok)("installed release runs fs_read and okf (cs-tools, no ruby) fixtures: %s"
                                         % (r.stdout.strip().splitlines() or ["(no output)"])[-1])
+    checker = rel / "tracing/check-trace"
+    checker.chmod(0o644)
+    r = run([str(venv_py), "-I", str(rel / "cs/scripts/node-bundle"), "verify", str(bundle), str(rel)], env=env)
+    rep = json.loads(r.stdout or "{}")
+    expect(r.returncode == 1 and any("tracing/check-trace missing or not executable" in e for e in rep.get("errors", [])),
+           "verify refuses a release whose tracing checker is not executable")
+    checker.chmod(0o755)
+
     (rel / "target/release/cs-tools").unlink()
     r = run([str(venv_py), "-I", str(rel / "cs/scripts/node-bundle"), "verify", str(bundle), str(rel)], env=env)
     rep = json.loads(r.stdout or "{}")
@@ -250,10 +291,13 @@ def part_tracked_only(tmp):
     (cs / ".python-version").write_text("3.13.9\n")
     shutil.copy2(CODE_ROOT / "scripts/node-bundle", cs / "scripts/node-bundle")
     (cs / "scripts/tracked.txt").write_text("ok\n")
+    (repo / "tracing").mkdir()
+    for path in load_node_bundle().TRACE_FILES:
+        shutil.copy2(CODE_ROOT.parent / path, repo / path)
     env = {**hermetic_env(), "HOME": str(fake_home), "GIT_AUTHOR_NAME": "regression", "GIT_AUTHOR_EMAIL": "r@test",
            "GIT_COMMITTER_NAME": "regression", "GIT_COMMITTER_EMAIL": "r@test"}
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
-    subprocess.run(["git", "add", "cs/.python-version", "cs/scripts"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "add", "cs/.python-version", "cs/scripts", "tracing"], cwd=repo, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, env=env)
     (cs / "local-only.txt").write_text("must not ship\n")
     # The lane disables global Git config because the owner's file can be unreadable.
@@ -284,7 +328,8 @@ def part_export(tmp):
     K = CODE_ROOT.name  # the code root in the commit (cs)
     x.mkdir()
     arch = subprocess.run(["git", "-C", str(CODE_ROOT.parent), "archive", "HEAD", K + "/scripts", K + "/ops", K + "/tools",
-                           K + "/policy", K + "/.python-version"], capture_output=True, check=True).stdout
+                           K + "/policy", K + "/.python-version", *load_node_bundle().TRACE_FILES],
+                          capture_output=True, check=True).stdout
     subprocess.run(["tar", "-x", "-C", str(x)], input=arch, check=True, env={**hermetic_env()})
     shutil.copy2(CODE_ROOT / "scripts/node-bundle", x / K / "scripts/node-bundle")  # this checkout's version under test
     (x / K / "scripts/not-committed").write_text("an untracked file in the export dir itself\n")
@@ -328,6 +373,7 @@ def main():
         part_deps()
         part_director_retired(tmp)
         part_refusals(tmp)
+        part_python_progress(tmp)
         part_binaries(tmp)
         part_host_binaries(tmp)
         part_tracked_only(tmp)

@@ -140,9 +140,7 @@ async fn serve() -> Result<(), String> {
         let _ = task.await;
     }
     gw.health.stop();
-    if let Ok(g) = Arc::try_unwrap(graceful) {
-        let _ = tokio::time::timeout(SHUTDOWN_GRACE, g.shutdown()).await;
-    }
+    connection::drain(graceful, SHUTDOWN_GRACE).await;
     if let Some(p) = socket_path {
         let _ = std::fs::remove_file(p);
     }

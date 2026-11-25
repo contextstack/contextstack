@@ -14,7 +14,8 @@ final class Money
         if (! is_numeric($value)) {
             return '—';
         }
-        $micros = max(0, (int) round((float) $value * 1_000_000));
+        // Cut at the millionth; the inner round only clears float noise (0.29 * 1e6 is 289999.99999999994).
+        $micros = max(0, (int) floor(round((float) $value * 1_000_000, 3)));
         $whole = intdiv($micros, 1_000_000);
         $fraction = $micros % 1_000_000;
         if ($fraction % 10_000 === 0) {

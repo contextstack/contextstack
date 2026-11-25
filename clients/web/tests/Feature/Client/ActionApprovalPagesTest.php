@@ -35,7 +35,7 @@ function approvalLane(): array
     return [
         director('jobs/job_lane') => Http::response($job),
         director('intents/int_lane') => Http::response(['intent' => ['intent_id' => 'int_lane', 'title' => 'Fix the widget', 'node' => 'laptop', 'task' => 'tasks/fix',
-            'meta' => ['source' => 'client-web-lane'], 'created_at' => '2026-11-21T09:59:00Z', 'revision' => 1], 'jobs' => [$job], 'runs' => []]),
+            'meta' => ['source' => 'client-web-lane'], 'lane' => true, 'created_at' => '2026-11-21T09:59:00Z', 'revision' => 1], 'jobs' => [$job], 'runs' => []]),
     ];
 }
 
@@ -48,6 +48,16 @@ it('shows what waits on the owner with the exact command, both reasons and the v
     Livewire::test('pages::client.approvals')
         ->assertSeeInOrder(['Waiting on you', "git push origin 'lane/fix it'", 'network', 'Push the lane branch for review.', 'codex', 'no-go', 'Pushing leaves the machine.', 'local-coder', 'Approve', 'Deny'])
         ->assertSeeInOrder(['Recent', 'Approved by the reviewer', 'It ran and succeeded.']);
+});
+
+it('shows an approval that expired when its job ended as finished, not waiting', function () {
+    Http::fake([director('action-approvals') => Http::response(['action_approvals' => [
+        approvalRecord(['status' => 'expired', 'review_reason' => 'job ended', 'outcome' => null]),
+    ]])]);
+
+    Livewire::test('pages::client.approvals')
+        ->assertSeeInOrder(['Recent', 'Expired', 'Its job ended before it was decided, so it did not run.'])
+        ->assertDontSee('Approve');
 });
 
 it('says when no reviewer model was selected or called', function () {

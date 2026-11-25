@@ -184,6 +184,73 @@ impl Director {
         )?;
         Ok((status, serde_json::from_slice(&body).unwrap_or(Value::Null)))
     }
+
+    /// Stop and start again on the same data directory (for startup-sweep cases).
+    fn restart(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut child = Command::new(bin_path())
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--allow-origin",
+                "http://127.0.0.1:8740",
+            ])
+            .arg("--data-dir")
+            .arg(&self.data)
+            .env_clear()
+            .env("HOME", self.tmp.path())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stderr = child.stderr.take().ok_or("no stderr")?;
+        let mut lines = BufReader::new(stderr).lines();
+        let port = loop {
+            let line = lines
+                .next()
+                .ok_or("the Director exited before listening")??;
+            if let Some(rest) = line.split("://127.0.0.1:").nth(1) {
+                break rest.split_whitespace().next().ok_or("no port")?.parse()?;
+            }
+        };
+        std::thread::spawn(move || lines.for_each(drop));
+        self.child = child;
+        self.port = port;
+        Ok(())
+    }
+
+    /// Mark an existing cancel applied while leaving the job open (pre-fix orphan shape).
+    fn plant_orphan_applied_cancel(
+        &self,
+        job_id: &str,
+        control_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = self.data.join("director.sqlite");
+        // Quote identifiers safely: ids are ULID-shaped from the Director.
+        let sql = format!(
+            "UPDATE controls SET state = 'applied', outcome = 'stopped', detail = 'stopped',              settled_at = datetime('now'), received_at = COALESCE(received_at, datetime('now'))              WHERE control_id = '{control_id}';              SELECT state FROM jobs WHERE job_id = '{job_id}';"
+        );
+        let out = Command::new("sqlite3")
+            .arg(&db)
+            .arg("-cmd")
+            .arg("PRAGMA busy_timeout=5000;")
+            .arg(&sql)
+            .output()?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+        }
+        // `-cmd PRAGMA busy_timeout=…` prints the timeout before the SELECT result.
+        let state = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+        if state != "accepted" && state != "offered" {
+            return Err(format!("expected open job after plant, got {state:?}").into());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Director {
@@ -675,6 +742,11 @@ fn protocol_2_a_held_request_carries_a_cancel_and_the_node_settles_it() -> Res {
         &Value::Null,
     )?;
     assert_eq!(cancels["cancel"]["outcome"], "stopped");
+    assert_eq!(
+        cancels["state"], "error",
+        "offered cancel still ends the job"
+    );
+    assert_eq!(cancels["failure"]["code"], "cancelled");
     let (_, node) = d.client(
         "GET",
         "/api/v1/client/nodes/node-b",
@@ -682,5 +754,312 @@ fn protocol_2_a_held_request_carries_a_cancel_and_the_node_settles_it() -> Res {
         &Value::Null,
     )?;
     assert_eq!(node["protocol"], 2);
+    Ok(())
+}
+
+#[test]
+fn accepted_job_cancel_with_nothing_to_stop_ends_cancelled() -> Res {
+    // Live bug: accepted, no run; node applies cancel (nothing to stop); job must end cancelled.
+    let d = Director::start()?;
+    let owner = d.local_token()?;
+    let reg = d.admin(&["node", "register", "node-orphan"])?;
+    let (token, inst) = (
+        reg["token"].as_str().ok_or("token")?,
+        reg["installation"].as_str().ok_or("inst")?,
+    );
+    let bundle = d.tmp.path().join("bundle");
+    std::fs::create_dir_all(bundle.join("tasks/hello"))?;
+    std::fs::write(bundle.join("spec.yaml"), "id: orphan-cancel\n")?;
+    std::fs::write(bundle.join("tasks/hello/goal.md"), "Say done.\n")?;
+    let made = d.admin(&[
+        "job",
+        "create",
+        "--node",
+        "node-orphan",
+        "--bundle",
+        bundle.to_str().ok_or("path")?,
+    ])?;
+    let job_id = made["job_id"].as_str().ok_or("job")?.to_string();
+
+    let (status, listed) = d.node_v("2", "GET", "jobs", token, inst, &Value::Null)?;
+    assert_eq!(status, 200);
+    let digest = listed["jobs"][0]["bundle_sha256"].clone();
+    let (status, _) = d.node_v(
+        "2",
+        "POST",
+        &format!("jobs/{job_id}/accept"),
+        token,
+        inst,
+        &json!({"bundle_sha256": digest}),
+    )?;
+    assert_eq!(status, 200);
+
+    let auth = format!("Bearer {owner}");
+    let (status, _, body) = d.call(
+        "POST",
+        &format!("/api/v1/client/jobs/{job_id}/cancel"),
+        &[
+            ("Authorization", &auth),
+            ("Idempotency-Key", "orphan-cancel-1"),
+            ("Content-Type", "application/json"),
+        ],
+        b"{}",
+    )?;
+    assert_eq!(status, 202);
+    let cancel: Value = serde_json::from_slice(&body)?;
+    let control_id = cancel["control_id"].as_str().ok_or("control_id")?;
+    let (status, _) = d.node_v(
+        "2",
+        "POST",
+        &format!("control/{control_id}"),
+        token,
+        inst,
+        &json!({"state": "applied", "outcome": "stopped"}),
+    )?;
+    assert_eq!(status, 200);
+
+    let (_, job) = d.client(
+        "GET",
+        &format!("/api/v1/client/jobs/{job_id}"),
+        Some(&owner),
+        &Value::Null,
+    )?;
+    assert_eq!(job["state"], "error", "{job}");
+    assert!(job["finished_at"].as_str().is_some(), "{job}");
+    assert_eq!(job["cancel"]["state"], "applied");
+    assert_eq!(job["cancel"]["outcome"], "stopped");
+    assert_eq!(job["terminal_row"]["state"], "cancelled");
+    assert_eq!(job["failure"]["code"], "cancelled");
+    assert_eq!(job["budget"]["state"], "settled");
+    assert_eq!(job["budget"]["charge_basis"], "no_run");
+    assert_eq!(job["budget"]["charged_usd"].as_f64(), Some(0.0));
+    Ok(())
+}
+
+/// Accepted job + cancel requested; returns ids and credentials for the orphan cases.
+fn orphan_setup(d: &Director) -> Result<OrphanSetup, Box<dyn std::error::Error>> {
+    let owner = d.local_token()?;
+    let reg = d.admin(&["node", "register", "node-orphan-sweep"])?;
+    let (token, inst) = (
+        reg["token"].as_str().ok_or("token")?.to_string(),
+        reg["installation"].as_str().ok_or("inst")?.to_string(),
+    );
+    let bundle = d.tmp.path().join("bundle-orphan-sweep");
+    std::fs::create_dir_all(bundle.join("tasks/hello"))?;
+    std::fs::write(bundle.join("spec.yaml"), "id: orphan-cancel-sweep\n")?;
+    std::fs::write(bundle.join("tasks/hello/goal.md"), "Say done.\n")?;
+    let made = d.admin(&[
+        "job",
+        "create",
+        "--node",
+        "node-orphan-sweep",
+        "--bundle",
+        bundle.to_str().ok_or("path")?,
+    ])?;
+    let job_id = made["job_id"].as_str().ok_or("job")?.to_string();
+
+    let (status, listed) = d.node_v("2", "GET", "jobs", &token, &inst, &Value::Null)?;
+    assert_eq!(status, 200);
+    let digest = listed["jobs"][0]["bundle_sha256"].clone();
+    let (status, _) = d.node_v(
+        "2",
+        "POST",
+        &format!("jobs/{job_id}/accept"),
+        &token,
+        &inst,
+        &json!({"bundle_sha256": digest}),
+    )?;
+    assert_eq!(status, 200);
+
+    let auth = format!("Bearer {owner}");
+    let (status, _, body) = d.call(
+        "POST",
+        &format!("/api/v1/client/jobs/{job_id}/cancel"),
+        &[
+            ("Authorization", &auth),
+            ("Idempotency-Key", "orphan-sweep-setup"),
+            ("Content-Type", "application/json"),
+        ],
+        b"{}",
+    )?;
+    assert_eq!(status, 202);
+    let cancel: Value = serde_json::from_slice(&body)?;
+    let control_id = cancel["control_id"]
+        .as_str()
+        .ok_or("control_id")?
+        .to_string();
+    Ok(OrphanSetup {
+        job_id,
+        control_id,
+        token,
+        inst,
+        owner,
+    })
+}
+
+struct OrphanSetup {
+    job_id: String,
+    control_id: String,
+    token: String,
+    inst: String,
+    owner: String,
+}
+
+#[test]
+fn second_cancel_finishes_orphan_applied_cancel_with_no_run() -> Res {
+    // Live gap: cancel already applied, job still accepted; asking again finishes it.
+    let d = Director::start()?;
+    let o = orphan_setup(&d)?;
+    // Plant while the Director is up (mutex free between calls) so restart/sweep does not run first.
+    d.plant_orphan_applied_cancel(&o.job_id, &o.control_id)?;
+
+    let (_, job) = d.client(
+        "GET",
+        &format!("/api/v1/client/jobs/{}", o.job_id),
+        Some(&o.owner),
+        &Value::Null,
+    )?;
+    assert_eq!(
+        job["state"], "accepted",
+        "still open before second cancel: {job}"
+    );
+    assert_eq!(job["cancel"]["state"], "applied");
+
+    let auth = format!("Bearer {}", o.owner);
+    let (status, _, body) = d.call(
+        "POST",
+        &format!("/api/v1/client/jobs/{}/cancel", o.job_id),
+        &[
+            ("Authorization", &auth),
+            ("Idempotency-Key", "orphan-sweep-second"),
+            ("Content-Type", "application/json"),
+        ],
+        b"{}",
+    )?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let cancel: Value = serde_json::from_slice(&body)?;
+    assert_eq!(cancel["state"], "applied");
+
+    let (_, job) = d.client(
+        "GET",
+        &format!("/api/v1/client/jobs/{}", o.job_id),
+        Some(&o.owner),
+        &Value::Null,
+    )?;
+    assert_eq!(job["state"], "error", "{job}");
+    assert_eq!(job["terminal_row"]["state"], "cancelled");
+    assert_eq!(job["failure"]["code"], "cancelled");
+    assert_eq!(job["budget"]["charge_basis"], "no_run");
+    Ok(())
+}
+
+#[test]
+fn startup_sweep_finishes_orphan_applied_cancel_with_no_run() -> Res {
+    let mut d = Director::start()?;
+    let o = orphan_setup(&d)?;
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    // Plant while the Director is down so the apply path never runs.
+    let db = d.data.join("director.sqlite");
+    let sql = format!(
+        "UPDATE controls SET state = 'applied', outcome = 'stopped', detail = 'stopped',          settled_at = datetime('now'), received_at = COALESCE(received_at, datetime('now'))          WHERE control_id = '{}';",
+        o.control_id
+    );
+    let out = Command::new("sqlite3").arg(&db).arg(&sql).output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.restart()?;
+
+    let (_, job) = d.client(
+        "GET",
+        &format!("/api/v1/client/jobs/{}", o.job_id),
+        Some(&o.owner),
+        &Value::Null,
+    )?;
+    assert_eq!(job["state"], "error", "{job}");
+    assert_eq!(job["terminal_row"]["state"], "cancelled");
+    assert_eq!(job["failure"]["code"], "cancelled");
+    assert_eq!(job["budget"]["state"], "settled");
+    assert_eq!(job["budget"]["charge_basis"], "no_run");
+    Ok(())
+}
+
+#[test]
+fn orphan_applied_cancel_with_run_evidence_waits_for_job_terminal() -> Res {
+    let mut d = Director::start()?;
+    let o = orphan_setup(&d)?;
+    let run_id = format!("{}-live", o.job_id);
+    let (status, body) = d.node_v(
+        "2",
+        "POST",
+        &format!("runs/{run_id}/events"),
+        &o.token,
+        &o.inst,
+        &json!({
+            "job_id": o.job_id,
+            "events": [{
+                "seq": 1,
+                "kind": "delta",
+                "partial": true,
+                "payload": {"text": "working"},
+                "at": "2026-11-23T00:00:00Z"
+            }]
+        }),
+    )?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["accepted"], 1, "{body}");
+
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let db = d.data.join("director.sqlite");
+    let sql = format!(
+        "UPDATE controls SET state = 'applied', outcome = 'stopped', detail = 'stopped',          settled_at = datetime('now'), received_at = COALESCE(received_at, datetime('now'))          WHERE control_id = '{}';",
+        o.control_id
+    );
+    let out = Command::new("sqlite3").arg(&db).arg(&sql).output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.restart()?;
+
+    let (_, job) = d.client(
+        "GET",
+        &format!("/api/v1/client/jobs/{}", o.job_id),
+        Some(&o.owner),
+        &Value::Null,
+    )?;
+    assert_eq!(
+        job["state"], "accepted",
+        "run evidence must keep it open: {job}"
+    );
+    assert_eq!(job["cancel"]["state"], "applied");
+
+    let auth = format!("Bearer {}", o.owner);
+    let (status, _, _) = d.call(
+        "POST",
+        &format!("/api/v1/client/jobs/{}/cancel", o.job_id),
+        &[
+            ("Authorization", &auth),
+            ("Idempotency-Key", "orphan-sweep-with-run"),
+            ("Content-Type", "application/json"),
+        ],
+        b"{}",
+    )?;
+    assert_eq!(status, 200);
+    let (_, job) = d.client(
+        "GET",
+        &format!("/api/v1/client/jobs/{}", o.job_id),
+        Some(&o.owner),
+        &Value::Null,
+    )?;
+    assert_eq!(
+        job["state"], "accepted",
+        "second cancel must not finish a running job: {job}"
+    );
     Ok(())
 }

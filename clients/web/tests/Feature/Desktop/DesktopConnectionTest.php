@@ -109,3 +109,61 @@ it('treats a credential the Director rejects as not set up', function () {
     $this->get(route('intents.index'))->assertRedirect(route('desktop.gate'));
     $this->get(route('desktop.gate'))->assertOk()->assertSee('data-test="desktop-gate-not-set-up"', false);
 });
+
+it('lets a Mac without cs init reach Settings from the gate and pair with a Director on another machine', function () {
+    connectClientWeb();
+    unlink(config('client.local_credential'));
+    enableNativeDesktop();
+    Http::fake([
+        'http://other.test/api/v1/pair' => Http::response(['credential_id' => 'cred_mac', 'name' => 'mac', 'token' => 'csd_mac_token']),
+        'http://other.test/api/v1/client/me' => Http::response(['credential_id' => 'cred_mac', 'owner' => true]),
+        'http://other.test/api/v1/client/intents?*' => Http::response(['intents' => [], 'jobs' => []]),
+    ]);
+
+    $this->get(route('desktop.gate'))
+        ->assertOk()
+        ->assertSee('data-test="desktop-gate-not-set-up"', false)
+        ->assertSee('data-test="desktop-gate-pair"', false)
+        ->assertSee(route('connect'), false);
+
+    $this->get(route('connect'))->assertOk()->assertSee('Pair this device', false);
+
+    Livewire::test('pages::client.connect')
+        ->assertNoRedirect()
+        ->set('url', 'http://other.test')
+        ->set('code', 'ABCDE-FGHIJ')
+        ->call('pair')
+        ->assertHasNoErrors()
+        ->assertSee('this device, paired as mac');
+
+    $this->get(route('intents.index'))->assertOk();
+});
+
+it('serves pages on a desktop that has only a paired device token, with that token', function () {
+    $directory = connectClientWeb();
+    unlink(config('client.local_credential'));
+    mkdir($directory.'/settings', 0700);
+    file_put_contents($directory.'/settings/connection.json', json_encode([
+        'mode' => 'device', 'url' => 'http://other.test', 'token' => 'csd_mac_token', 'credential_id' => 'cred_mac', 'name' => 'mac',
+    ]));
+    enableNativeDesktop();
+    Http::fake([
+        'http://other.test/api/v1/client/me' => Http::response(['credential_id' => 'cred_mac', 'owner' => true]),
+        'http://other.test/api/v1/client/intents?*' => Http::response(['intents' => [], 'jobs' => []]),
+    ]);
+
+    $this->get(route('intents.index'))->assertOk();
+    $this->get(route('connect'))->assertOk()->assertSee('this device, paired as mac', false);
+
+    Http::assertSent(fn (Request $request) => $request->url() === 'http://other.test/api/v1/client/me'
+        && $request->header('Authorization') === ['Bearer csd_mac_token']);
+});
+
+it('offers Settings from the not-running gate, so a Director on another machine can be changed', function () {
+    connectClientWeb();
+    enableNativeDesktop();
+    Http::fake([director('me') => fn () => throw new ConnectionException('Connection refused')]);
+
+    $this->get(route('desktop.gate'))->assertOk()->assertSee('data-test="desktop-gate-settings"', false);
+    $this->get(route('connect'))->assertOk()->assertSee('Pair this device', false);
+});

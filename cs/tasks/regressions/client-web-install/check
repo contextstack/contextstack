@@ -169,8 +169,8 @@ def check_plist(home, root, php):
     expect(p["ProgramArguments"] == want and p["WorkingDirectory"] == str(app / "public") and p.get("KeepAlive") is True
            and p.get("RunAtLoad") is True, "client-web plist: php -S %s from current/client-web/public, Laravel's router, "
            "KeepAlive: %s" % (LISTEN, p["ProgramArguments"]))
-    expect(env.get("PHP_CLI_SERVER_WORKERS") == "4" and env.get("DIRECTOR_ENV_FILE") == str(root / "config/client-web/client-web.env"),
-           "client-web plist: PHP_CLI_SERVER_WORKERS=4, DIRECTOR_ENV_FILE is config/client-web/client-web.env")
+    expect(env.get("PHP_CLI_SERVER_WORKERS") == "16" and env.get("DIRECTOR_ENV_FILE") == str(root / "config/client-web/client-web.env"),
+           "client-web plist: PHP_CLI_SERVER_WORKERS=16, DIRECTOR_ENV_FILE is config/client-web/client-web.env")
     expect(env.get("PATH", "").split(":")[0] == os.path.dirname(php) and "/opt/homebrew/bin" in env["PATH"].split(":")
            and "~" not in text and "$HOME" not in text and str(home / ".local/bin") not in text,
            "client-web plist: explicit PATH (php's dir first), absolute paths only, no PATH link")
@@ -300,7 +300,7 @@ def part_run(home, root, p, php):
         code, body = get("http://127.0.0.1:%d/intents" % port)
     finally:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)  # the server and its 4 workers
+            os.killpg(proc.pid, signal.SIGTERM)  # the server and its workers
         except ProcessLookupError:
             pass
         proc.wait(10)

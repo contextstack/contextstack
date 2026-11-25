@@ -112,6 +112,7 @@ fn run(raw: &[String]) -> Result<(), String> {
             "tls-key",
             "allow-origin",
             "stale-after",
+            "offer-grace",
             "context-window",
             "compact-at",
             "gateway",
@@ -200,17 +201,31 @@ fn serve(args: &Args) -> Result<(), String> {
     let store = Store::open(&settings.data_dir)?;
     access::ensure_local_credential(&store)?;
     logf!("data directory {}", settings.data_dir.display());
+    // Applied cancels that left a job open with no run (before the Director finished those): end them now.
+    let orphans = reservations::sweep_orphan_applied_cancels(&store)?;
+    if orphans > 0 {
+        logf!("orphan applied cancels at start: {orphans} job(s) finished");
+    }
     // Reservations are rows: settle what finished while the service was down, then offer what now fits.
     let (settled, offered) = reservations::reconcile(&store)?;
     if settled + offered > 0 {
         logf!("budgets at start: {settled} job(s) settled, {offered} waiting job(s) offered");
+    }
+    let expired_approvals =
+        action_approvals::expire_ended_jobs(&store.db()).map_err(|e| e.to_string())?;
+    if expired_approvals > 0 {
+        logf!("action approvals at start: {expired_approvals} approval(s) expired (job ended)");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
     let hub = events::Hub::new(&store)?;
+    if expired_approvals > 0 {
+        hub.publish(&store);
+    }
     records::set_stale_after(settings.stale_after_seconds);
+    records::set_offer_grace(settings.offer_grace_seconds);
     thread::configure(settings.compaction.clone());
     runtime.block_on(server::serve(Arc::new(server::State {
         store,

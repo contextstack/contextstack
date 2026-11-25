@@ -25,6 +25,13 @@ pub(crate) fn model_name(model: &str) -> bool {
             && gateway
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
+    } else if let Some((template, selected)) = model.split_once(':') {
+        name(template)
+            && !selected.is_empty()
+            && model.len() <= 128
+            && selected
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
     } else {
         name(model)
     }
@@ -255,6 +262,12 @@ fn lane_check(check: Option<&str>, agent: Option<&str>, read_only: bool) -> Stri
 
 type BuiltBundle = (Map<String, Value>, Vec<(String, String, u32)>);
 
+pub(crate) fn unknown_template(model: &str) -> No {
+    No::invalid(&format!(
+        "unknown executor template {model}; use harness:<gateway-model> for a gateway model"
+    ))
+}
+
 fn spec_model_and_tools(
     model: &str,
     read_only: bool,
@@ -266,9 +279,7 @@ fn spec_model_and_tools(
     }
     let harness = model.strip_prefix("harness:");
     if harness.is_none() && !crate::capabilities::is_cli_template(model) {
-        return Err(No::invalid(&format!(
-            "unknown executor template {model}; use harness:<gateway-model> for a gateway model"
-        )));
+        return Err(unknown_template(model));
     }
     let spec_model = harness.map_or_else(|| model.to_owned(), |gateway| json!(gateway).to_string());
     let tools = match (harness.is_some(), read_only && !repo_view, agent) {
@@ -447,6 +458,7 @@ fn resolve_offer(
     code: &std::path::Path,
 ) -> Result<Value, No> {
     let mut lane = request.clone();
+    let paired = request.get("harness").is_some();
     if let (Some(repo), Some(requested)) = (request["repo"].as_str(), request["lane"].as_str()) {
         if !name(repo) || !name(requested) {
             return Err(No::invalid("invalid repo or lane name"));
@@ -454,13 +466,34 @@ fn resolve_offer(
         let entry = crate::repos::entry(repo).map_err(|e| No::invalid(&e))?;
         lane["lane"] = json!(crate::repos::lane_name(repo, requested, &entry));
     }
-    if request["agent"].is_string()
-        || request["model"]
+    if !paired && crate::planning::auto_requested(request) {
+        if !matches!(request["agent"].as_str(), None | Some("coder"))
+            || (!request["agent"].is_null() && !request["agent"].is_string())
+            || !lane["repo"].is_string()
+            || !lane["lane"].is_string()
+        {
+            return Err(No::invalid(
+                "lane.model auto requires a coder with a repo and lane",
+            ));
+        }
+        lane["agent"] = json!("coder");
+        lane["model"] = json!(crate::planning::LOCAL_MODEL);
+        return Ok(lane);
+    }
+    if let Some(fields) = lane.as_object_mut()
+        && let Some(model) = crate::models::resolve(&state.settings.gateway, fields, true)?
+    {
+        fields.remove("harness");
+        fields.insert("model".into(), json!(model));
+    }
+    if paired
+        || request["agent"].is_string()
+        || lane["model"]
             .as_str()
             .is_some_and(|m| m.starts_with("harness:"))
     {
         let (profile, _, _) = profile(request["agent"].as_str(), code)?;
-        let model = match request.get("model") {
+        let model = match lane.get("model") {
             None | Some(Value::Null) => profile["model"].as_str(),
             Some(Value::String(model)) => Some(model.as_str()),
             Some(_) => return Err(No::invalid("lane.model must be a string")),

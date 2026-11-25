@@ -15,6 +15,8 @@ it('shows dollars the way the Director does, honest for small amounts', function
     'a millionth' => [0.000001, '$0.000001'],
     'never rounded up to the whole' => [4.999999, '$4.9999'],
     'over a dollar' => [12.345678, '$12.3456'],
+    'a fraction of a millionth is cut, not rounded up' => [0.0049996, '$0.00499'],
+    'float noise is not cut' => [0.29, '$0.29'],
     'negative' => [-1, '$0.00'],
 ]);
 

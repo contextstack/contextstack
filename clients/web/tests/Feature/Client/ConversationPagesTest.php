@@ -1,5 +1,6 @@
 <?php
 
+use Carbon\CarbonImmutable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
@@ -459,8 +460,10 @@ it('creates the Director\'s built-in chat on the chosen model from the simple fo
 
     Livewire::test('pages::client.conversation-create')
         ->assertSet('model', 'codex')
-        ->assertSee('Codex · openai · subscription')
+        ->assertSet('provider', 'openai')
+        ->assertSee('Codex (subscription) · subscription')
         ->set('model', 'local-coder')
+        ->assertSet('provider', 'ollama')
         ->call('submit')
         ->assertHasNoErrors()
         ->assertRedirect(route('conversations.show', 'con_1'));
@@ -545,8 +548,11 @@ it('shows ready and unavailable models in the picker with reasons', function () 
     Livewire::test('pages::client.conversation-create')
         ->assertSet('model', 'codex')
         ->assertSet('canStart', true)
-        ->assertSee('Codex · openai · subscription')
-        ->assertSee('Claude Code · anthropic · subscription — sign in with `claude` first');
+        ->assertSet('provider', 'openai')
+        ->assertSee('Codex · subscription')
+        ->set('provider', 'anthropic')
+        ->assertSet('model', '')
+        ->assertSee('Claude Code · subscription — sign in with `claude` first');
 });
 
 it('defaults to the first ready subscription model when the Director default is unavailable', function () {
@@ -930,4 +936,27 @@ it('shows an approval the conversation\'s attention links, in place of a questio
         ->assertSee("git push origin 'lane/fix it'")
         ->assertSee('Approve')
         ->assertDontSee('Needs your answer');
+});
+
+it('says a turn is waiting for its machine or held, instead of waiting for the reply, and polls while it is', function () {
+    $this->travelTo(CarbonImmutable::parse('2026-11-24T10:00:00Z'));
+    fakeThread(conversationRecord(['state' => 'running', 'active_turn_id' => 'trn_1', 'turns' => 2]), [
+        turnRecord(['state' => 'running', 'reply' => null, 'run_id' => null, 'finished_at' => null,
+            'waiting' => ['reason' => 'node_not_pulled', 'node' => 'node-a', 'since' => '2026-11-24T09:59:00Z', 'node_last_seen' => '2026-11-24T09:50:00Z']]),
+        turnRecord(['turn_id' => 'trn_2', 'seq' => 2, 'state' => 'queued', 'reply' => null, 'job_id' => null, 'run_id' => null, 'context' => null, 'waiting' => ['reason' => 'held', 'detail' => 'over budget']]),
+    ], [], [
+        director('jobs/job_t1') => Http::response(['job_id' => 'job_t1', 'state' => 'offered', 'live_run_ids' => [], 'conversation_id' => 'con_1', 'revision' => 13]),
+    ]);
+
+    Livewire::test('pages::client.conversation', ['conversation' => 'con_1'])
+        ->assertSee('Waiting for node-a to pick this up (last heard from 10 minutes ago)…')
+        ->assertSee('Held: over budget.')
+        ->assertDontSee('Waiting for the reply…')
+        ->assertSeeHtml('wire:poll.10s="refetch"');
+});
+
+it('does not poll a conversation with nothing in progress', function () {
+    fakeThread(conversationRecord(['turns' => 1]), [turnRecord()]);
+
+    Livewire::test('pages::client.conversation', ['conversation' => 'con_1'])->assertDontSeeHtml('wire:poll.10s="refetch"');
 });

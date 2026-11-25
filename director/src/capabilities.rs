@@ -5,7 +5,6 @@ use crate::store::{Record, Store, touch};
 use crate::util;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 type Res<T> = Result<T, String>;
@@ -18,7 +17,7 @@ pub struct CapabilityWait {
 
 const TEMPLATES_PATH: &str = "ops/bin/executor-templates.json";
 
-fn templates_path() -> PathBuf {
+pub(crate) fn templates_path() -> PathBuf {
     if let Some(p) = std::env::var_os("CS_CODE_ROOT") {
         let root = PathBuf::from(p);
         let path = root.join(TEMPLATES_PATH);
@@ -41,19 +40,26 @@ fn templates_path() -> PathBuf {
         .join(TEMPLATES_PATH)
 }
 
-fn templates() -> HashSet<String> {
-    let path = templates_path();
-    let Ok(bytes) = std::fs::read(&path) else {
-        return HashSet::new();
-    };
-    let Ok(Value::Object(m)) = serde_json::from_slice::<Value>(&bytes) else {
-        return HashSet::new();
-    };
-    m.keys().cloned().collect()
+pub(crate) fn templates() -> serde_json::Map<String, Value> {
+    std::fs::read(templates_path())
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
 }
 
 pub fn is_cli_template(model: &str) -> bool {
-    templates().contains(model)
+    let templates = templates();
+    if templates.contains_key(model) {
+        return true;
+    }
+    let Some((name, selected)) = model.split_once(':') else {
+        return false;
+    };
+    templates.get(name).is_some_and(|template| {
+        template["model_flag"].is_string()
+            && template["models"].get(selected).is_some()
+            && template["args"].is_array()
+    })
 }
 
 pub fn model_in_spec(store: &Store, files: &[BundleFile], spec_path: &str) -> Option<String> {
@@ -80,12 +86,19 @@ pub(crate) fn node_status(db: &Connection, node_id: i64) -> Option<Value> {
     raw.and_then(|s| serde_json::from_str(&s).ok())
 }
 
-fn template_ready(model: &str, status: &Value) -> bool {
+pub(crate) fn base_template(value: &str) -> &str {
+    value.split_once(':').map_or(value, |(name, _)| name)
+}
+
+pub(crate) fn reports_template(model: &str, status: &Value) -> bool {
+    status["agent_capabilities"]["templates"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|v| v == model))
+}
+
+pub(crate) fn template_ready(model: &str, status: &Value) -> bool {
     let now = util::now_utc();
-    status["agent_capabilities"]
-        .get("templates")
-        .and_then(Value::as_array)
-        .is_some_and(|rows| rows.iter().any(|v| v.as_str() == Some(model)))
+    reports_template(model, status)
         && !status["provider_limits"].as_array().is_some_and(|rows| {
             rows.iter().any(|r| {
                 r["template"].as_str() == Some(model)
@@ -132,7 +145,7 @@ pub fn can_run(model: &str, status: &Value) -> bool {
         return false;
     }
     if is_cli_template(model) {
-        template_ready(model, status)
+        template_ready(base_template(model), status)
     } else {
         harness_ready(status)
     }
@@ -206,14 +219,17 @@ pub fn capability_wait(
     })
 }
 
+/// A new job its node cannot run waits for executor fit. Its budget row keeps its state (`held` or `free`): what it
+/// reserved still counts against its budgets, and `reservations::release` (which offers only `waiting` rows) leaves
+/// it alone.
 pub fn hold_capability(tx: &Connection, job_id: &str, wait: &CapabilityWait) -> Result<(), String> {
     tx.execute(
-        "UPDATE jobs SET state = 'waiting' WHERE job_id = ?1",
+        "UPDATE jobs SET state = 'waiting', offered_at = NULL WHERE job_id = ?1",
         params![job_id],
     )
     .map_err(|e| e.to_string())?;
     tx.execute(
-        "UPDATE job_budgets SET state = 'waiting', reason = ?1, detail = ?2 WHERE job_id = ?3",
+        "UPDATE job_budgets SET reason = ?1, detail = ?2 WHERE job_id = ?3",
         params![wait.reason, wait.detail, job_id],
     )
     .map_err(|e| e.to_string())?;
@@ -221,8 +237,15 @@ pub fn hold_capability(tx: &Connection, job_id: &str, wait: &CapabilityWait) -> 
     Ok(())
 }
 
-/// Offer jobs that were waiting only for executor fit. Returns how many were offered.
-pub fn offer_waiting(store: &Store, db: &Connection, node_id: i64, node_name: &str) -> Res<usize> {
+/// Offer jobs that were waiting only for executor fit, each in its own transaction, with the reservation they
+/// already hold (it never stopped counting, so no budget is checked again). Returns how many were offered; a job
+/// that fails is rolled back on its own and its error returned once the rest are done.
+pub fn offer_waiting(
+    store: &Store,
+    db: &mut Connection,
+    node_id: i64,
+    node_name: &str,
+) -> Res<usize> {
     let Some(status) = node_status(db, node_id) else {
         return Ok(0);
     };
@@ -233,7 +256,7 @@ pub fn offer_waiting(store: &Store, db: &Connection, node_id: i64, node_name: &s
         .prepare_cached(
             "SELECT j.job_id, j.spec, b.trials, b.reserved_micros
              FROM jobs j JOIN job_budgets b ON b.job_id = j.job_id
-             WHERE j.node_id = ?1 AND j.state = 'waiting' AND b.state = 'waiting'
+             WHERE j.node_id = ?1 AND j.state = 'waiting' AND b.state IN ('held', 'free')
                AND b.reason = 'executor_unavailable' ORDER BY j.rowid",
         )
         .map_err(|e| e.to_string())?;
@@ -244,31 +267,46 @@ pub fn offer_waiting(store: &Store, db: &Connection, node_id: i64, node_name: &s
         .map_err(|e| e.to_string())?
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
+    drop(stmt);
     let mut offered = 0;
+    let mut failed = Vec::new();
     for (job_id, spec_path, trials, reserved) in rows {
-        let files = crate::jobs::bundle_of_job(db, &job_id).map_err(|e| e.to_string())?;
-        let Some(model) = model_in_spec(store, &files, &spec_path) else {
-            continue;
-        };
-        if !can_run(&model, &status) {
-            let detail = if is_cli_template(&model) {
-                format!("no node can run executor template {model}; {node_name} does not report it")
-            } else {
-                format!(
-                    "no node can run the native harness for model {model}; {node_name} does not report harness"
+        let mut one = || -> Res<bool> {
+            let tx = crate::store::write_tx(db).map_err(|e| e.to_string())?;
+            // Still waiting for executor fit, now the transaction holds the lock.
+            let still = tx
+                .query_row(
+                    "SELECT 1 FROM jobs j JOIN job_budgets b ON b.job_id = j.job_id
+                     WHERE j.job_id = ?1 AND j.state = 'waiting' AND b.state IN ('held', 'free')
+                       AND b.reason = 'executor_unavailable'",
+                    params![job_id],
+                    |_| Ok(()),
                 )
-            };
-            db.execute(
-                "UPDATE job_budgets SET detail = ?1 WHERE job_id = ?2",
-                params![detail, job_id],
-            )
-            .map_err(|e| e.to_string())?;
-            continue;
+                .optional()
+                .map_err(|e| e.to_string())?
+                .is_some();
+            let sent = still
+                && crate::reservations::offer_job(
+                    store, &tx, &job_id, &spec_path, trials, reserved,
+                )?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(sent)
+        };
+        match one() {
+            Ok(sent) => offered += usize::from(sent),
+            Err(e) => {
+                crate::logf!(
+                    "job {job_id}: not offered after {node_name}'s capability report: {e}"
+                );
+                failed.push(format!("{job_id}: {e}"));
+            }
         }
-        crate::reservations::offer_job(store, db, &job_id, &spec_path, trials, reserved)?;
-        offered += 1;
     }
-    Ok(offered)
+    if failed.is_empty() {
+        Ok(offered)
+    } else {
+        Err(format!("offered {offered}; failed {}", failed.join("; ")))
+    }
 }
 
 #[cfg(test)]

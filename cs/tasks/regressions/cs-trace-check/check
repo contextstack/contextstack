@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""cs-trace-check regression (goal.md): cs trace check against a temp state root."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parents[2]
+REPO = KIT.parent
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from hermetic_env import hermetic_env  # noqa: E402
+
+sys.path.insert(0, str(HERE.parent / "node-install-layout"))
+from _bundle import node_bundle  # noqa: E402
+
+CS = KIT / "scripts/cs"
+FIXTURES = REPO / "tracing/fixtures"
+problems = []
+
+
+def expect(cond, msg, detail=""):
+    print(("ok   " if cond else "FAIL ") + msg + ((" " + str(detail)[:500]) if (detail and not cond) else ""))
+    if not cond:
+        problems.append(msg)
+
+
+def write_jsonl(path, spans):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(span, sort_keys=True) + "\n" for span in spans), encoding="utf-8")
+
+
+def rewrite(spans, run_id):
+    out = []
+    for span in spans:
+        span = json.loads(json.dumps(span))
+        span["trace_id"] = run_id
+        attrs = span.setdefault("attributes", {})
+        if span.get("kind") == "run":
+            attrs["run_id"] = run_id
+        out.append(span)
+    return out
+
+
+def load_fixture(name):
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))["spans"]
+
+
+def cs(env, *args, script=CS):
+    return subprocess.run([sys.executable, "-I", str(script), *args], capture_output=True, text=True,
+                          env=env, cwd="/", timeout=60)
+
+
+def main():
+    with tempfile.TemporaryDirectory(prefix="cs-trace-check-", suffix=".noindex") as raw:
+        home = Path(raw) / "home"
+        root = home / ".contextstack"
+        state = root / "state"
+        traces = root / "gateway/traces"
+        state.mkdir(parents=True)
+        traces.mkdir(parents=True)
+        # Fake HOME only: ROOT resolves here; the checker is the checkout's tracing/check-trace via this cs.
+        cli_id = "20260101-100000.000000000-cli-complete"
+        harness_id = "20260101-110000.000000000-harness"
+        finding_id = "20260101-120000.000000000-finding"
+
+        cli_spans = rewrite(load_fixture("U.json"), cli_id)
+        write_jsonl(state / "runs" / cli_id / "trace.jsonl", cli_spans)
+
+        b_spans = rewrite(load_fixture("B.json"), harness_id)
+        node = [s for s in b_spans if s["attributes"].get("machine") == "node"]
+        gw = [s for s in b_spans if s["attributes"].get("machine") == "gateway"]
+        write_jsonl(state / "runs" / harness_id / "trace.jsonl", node)
+
+        finding_spans = rewrite(load_fixture("L.json"), finding_id)
+        write_jsonl(state / "runs" / finding_id / "trace.jsonl", finding_spans)
+
+        env = {**hermetic_env(), "HOME": str(home), "CS_STATE_ROOT": str(state),
+               "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        for key in ("CS_CONFIG_ROOT", "CS_WORKSPACES_ROOT", "CS_CODE_ROOT", "CS_ROOT", "CS_INSTALL_ROOT"):
+            env.pop(key, None)
+
+        empty_env = {**env, "CS_STATE_ROOT": str(Path(raw) / "empty-state")}
+        for flags, expected in [((), "no runs yet"), (("--last", "2"), "no runs yet"), (("--json",), "[]")]:
+            r = cs(empty_env, "trace", "check", *flags)
+            expect(r.returncode == 0 and r.stdout.strip() == expected,
+                   "empty trace check is successful: %s" % (flags,), (r.returncode, r.stdout, r.stderr))
+
+        # 1. CLI-only: complete without a gateway trace.
+        r = cs(env, "trace", "check", cli_id, "--json")
+        try:
+            rows = json.loads(r.stdout)
+        except ValueError:
+            rows = []
+        expect(r.returncode == 0 and rows and rows[0]["result"] == "complete" and not rows[0]["gateway_trace"],
+               "CLI run checks complete without a gateway trace", (r.returncode, r.stdout, r.stderr))
+
+        # 2. Harness without gateway: incomplete.
+        r = cs(env, "trace", "check", harness_id, "--json")
+        try:
+            rows = json.loads(r.stdout)
+        except ValueError:
+            rows = []
+        expect(r.returncode == 2 and rows and rows[0]["result"] == "incomplete" and rows[0]["missing"],
+               "harness run without gateway trace is incomplete", (r.returncode, r.stdout, r.stderr))
+
+        write_jsonl(traces / (harness_id + ".jsonl"), gw)
+        r = cs(env, "trace", "check", harness_id, "--json")
+        try:
+            rows = json.loads(r.stdout)
+        except ValueError:
+            rows = []
+        expect(r.returncode == 0 and rows and rows[0]["result"] == "complete" and rows[0]["gateway_trace"],
+               "harness run with gateway trace is complete", (r.returncode, r.stdout, r.stderr))
+
+        # 3. Finding case.
+        r = cs(env, "trace", "check", finding_id, "--json")
+        try:
+            rows = json.loads(r.stdout)
+        except ValueError:
+            rows = []
+        kinds = sorted({f.get("kind") for f in (rows[0].get("findings") if rows else []) if isinstance(f, dict)})
+        expect(r.returncode == 1 and rows and rows[0]["result"] == "complete_with_findings"
+               and "delivery_unconfirmed" in kinds,
+               "finding run exits 1 with delivery_unconfirmed", (r.returncode, r.stdout, r.stderr))
+
+        # Text line + --last / default most-recent.
+        r = cs(env, "trace", "check", finding_id)
+        expect(r.returncode == 1 and finding_id in r.stdout and "complete_with_findings" in r.stdout
+               and "delivery_unconfirmed" in r.stdout and "missing=0" in r.stdout,
+               "text line names run, result, missing count and finding kinds", r.stdout)
+
+        r = cs(env, "trace", "check")
+        expect(r.returncode == 1 and finding_id in r.stdout and cli_id not in r.stdout,
+               "no args checks the most recent run only", r.stdout)
+
+        r = cs(env, "trace", "check", "--last", "2", "--json")
+        try:
+            rows = json.loads(r.stdout)
+        except ValueError:
+            rows = []
+        expect(r.returncode == 1 and [row["run_id"] for row in rows] == [finding_id, harness_id],
+               "--last 2 checks the two newest runs", (r.returncode, r.stdout))
+
+        # A leftover non-run folder (e.g. tempfile under the live runs root) must not
+        # sort ahead of timestamped run ids or consume --last slots.
+        junk = state / "runs" / "regression-zzz"
+        junk.mkdir()
+        (junk / "scratch.txt").write_text("not a run\n", encoding="utf-8")
+        r = cs(env, "trace", "check", "--last", "3", "--json")
+        try:
+            rows = json.loads(r.stdout)
+        except ValueError:
+            rows = []
+        expect(r.returncode == 1
+               and [row["run_id"] for row in rows] == [finding_id, harness_id, cli_id]
+               and "regression-zzz" not in r.stdout,
+               "--last skips non-run folders such as regression-zzz", (r.returncode, r.stdout))
+
+        # Run the shipped CLI from a fixture release assembled by node-bundle.
+        bundle = Path(raw) / "bundle"
+        nb = node_bundle()
+        nb.stage(bundle, nb.host_target(), {})
+        release = root / "releases/fixture"
+        release.parent.mkdir()
+        (bundle / "release").rename(release)
+        r = cs(env, "trace", "check", cli_id, "--json", script=release / "cs/scripts/cs")
+        rows = json.loads(r.stdout) if r.returncode == 0 else []
+        expect(rows and rows[0]["result"] == "complete",
+               "installed cs trace check finds and runs the bundled checker", (r.returncode, r.stdout, r.stderr))
+
+    print("check: cs-trace-check %d problem(s)" % len(problems))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

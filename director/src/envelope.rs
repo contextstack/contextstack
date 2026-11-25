@@ -683,6 +683,8 @@ fn record_terminal(
     // touch a re-listed cancel.
     if !had_terminal {
         crate::control::settle_on_terminal(tx, &p.subject).map_err(|e| format!("database: {e}"))?;
+        crate::action_approvals::expire_for_job(tx, &p.subject)
+            .map_err(|e| format!("database: {e}"))?;
     }
     // The run now shows which job (and intent) it belongs to.
     if let Some(run) = run_id

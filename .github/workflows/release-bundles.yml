@@ -224,14 +224,14 @@ jobs:
           set -euo pipefail
           assets=(cs/scripts/install.sh artifacts/bundle-*/*.tar.gz artifacts/bundle-*/*.sha256 "${{ runner.temp }}/channel/$RELEASE_CHANNEL.json" "${{ runner.temp }}/channel/$RELEASE_CHANNEL.txt")
           if [ "$RELEASE_CHANNEL" = latest ]; then
-            gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --latest=false --title "$GITHUB_REF_NAME" --generate-notes "${assets[@]}"
+            gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --latest=false --title "$GITHUB_REF_NAME" --notes-file docs/release/prerelease-notes.md --generate-notes "${assets[@]}"
             # The preview channel is separate from GitHub stable latest.
             if gh release view channel-latest >/dev/null 2>&1; then
               gh release delete channel-latest --yes --cleanup-tag
             fi
             gh api --method PATCH "repos/$GH_REPO/git/refs/tags/channel-latest" -f sha="$GITHUB_SHA" -F force=true || \
               gh api --method POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/channel-latest -f sha="$GITHUB_SHA"
-            gh release create channel-latest --target "$GITHUB_SHA" --prerelease --latest=false --title "Latest" --notes "Rolling latest build" "${assets[@]}"
+            gh release create channel-latest --target "$GITHUB_SHA" --prerelease --latest=false --title "Latest" --notes-file docs/release/prerelease-notes.md "${assets[@]}"
           else
             gh release create "$GITHUB_REF_NAME" --verify-tag --latest=true --title "$GITHUB_REF_NAME" --generate-notes "${assets[@]}"
           fi

@@ -15,18 +15,17 @@ durable writes live here rather than in the runner loop (INVARIANTS: a
 capability is a tool, hook, op, or MCP — never loop code).
 """
 from _lifecycle_evidence import task_sha as canonical_task_sha
-from _estate_io import hardened_git_env, digest, sha256_bytes
+from _estate_io import digest, sha256_bytes
 from _estate_io import read_jsonl
 import hashlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from _estate_io import git
+from _harvest_git import host_git
 from _roots import RootsError, job_dir_of, roots
 
 try:  # the four roots (_roots): code (specs, tools, hooks), config (prompts), state (the dispatch shelf)
@@ -174,7 +173,7 @@ def baseline(workspace):
     if not ws.is_dir():
         return {"kind": "absent"}
     if (ws / ".git").exists():
-        head = git(ws, "rev-parse", "HEAD", env=hardened_git_env(), errors="strict")
+        head = host_git(ws, "rev-parse", "HEAD")
         if head.returncode == 0:
             return {"kind": "git", "commit": head.stdout.strip()}
         return {"kind": "git", "commit": "", "note": "no commit yet"}
@@ -478,9 +477,7 @@ def main():
         # resolves to the live code_root and executes the live file. Making the
         # snapshot its own repository root redirects that resolution to the
         # frozen copy, so the check runs what was captured.
-        subprocess.run(["git", "init", "-q", str(staging)],
-                       capture_output=True, text=True,
-                       env=hardened_git_env())
+        host_git(staging, "init", "-q")
         for path in sorted(staging.rglob("*")):
             if path.is_file():
                 with path.open("rb") as fh:

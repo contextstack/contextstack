@@ -173,7 +173,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS lands_one_current ON lands(run_id) WHERE curre
 ";
 
 /// Schema version this binary creates and upgrades through.
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Numbered migrations after the v0 baseline path. Each entry is the `user_version` after it runs.
 type MigrationFn = fn(&Connection) -> rusqlite::Result<()>;
@@ -199,6 +199,8 @@ const MIGRATIONS: &[(u32, MigrationFn)] = &[
             ],
         )
     }),
+    // v9: when a job was last offered to its node, so a turn can say how long it has waited to be pulled.
+    (9, |db| add_columns(db, &[("jobs", "offered_at", "TEXT")])),
 ];
 
 /// v2: a turn says who started it: `person` (a posted message) or `wake` (a hosted lead's follow-up after a lane ended).

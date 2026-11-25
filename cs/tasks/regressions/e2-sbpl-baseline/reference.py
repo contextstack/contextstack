@@ -24,6 +24,7 @@ TEMPLATES = json.loads((OPS / 'executor-templates.json').read_text())
 ADAPTERS = json.loads((OPS / 'cli-profiles.json').read_text())
 V = Path('/e2-baseline/owner +[test]')
 WS, TMP = V / 'workspace', V / 'private'
+CHECK_SCRATCH = V / 'check-scratch'
 ROUTES = ('native-task', 'frozen-check', 'auth-refresh', 'muse', 'muse-check', 'cli-adapter', 'lead-host')
 REPRESENTATIVES = {'native-task': 'pi', 'frozen-check': 'goose', 'auth-refresh': 'pi',
                    'muse': 'pi', 'muse-check': 'pi', 'lead-host': 'antigravity'}
@@ -78,6 +79,8 @@ def render(route, name, state):
     tmpl = TEMPLATES[name] if name in TEMPLATES else ADAPTERS[name]
     files = {V / '.local/share/opencode/opencode.db': b'fake database', V / 'code/INVARIANTS.md': b'fixture'}
     dirs = {V, WS, TMP, V / 'Library/Keychains', V / '.contextstack/state', V / 'code', V / 'config'}
+    if route in ('frozen-check', 'muse-check'):
+        dirs.add(CHECK_SCRATCH)
     links = {}
     binary = V / '.local/bin' / Path(tmpl['binary']).name
     files[binary] = b'#!/usr/bin/env node\n'
@@ -198,14 +201,16 @@ def render(route, name, state):
                 caller['run_protection']['refresh_write_paths'] = [str(refresh)]
             executor.sandbox_cmd(str(selected), [], WS, TMP, profile, protected,
                                  read_links=staged, login_writes=login, read_roots=read_roots,
-                                 env=env, caller=caller, policy=ROOT / 'cs/policy/sandbox.json')
+                                 env=env, caller=caller, policy=ROOT / 'cs/policy/sandbox.json',
+                                 check_scratch=CHECK_SCRATCH if route == 'frozen-check' else None)
         elif route == 'lead-host':
             runtime = V / '.contextstack/state/lead-sessions/fixed/runtime-home'
             # make_session does not pass a template/login write grant.
             lead.sandbox_builder(WS, TMP, profile, read_links=[V / 'Library/Keychains'],
                                  write_roots=[runtime], allow_sockets=['/e2-baseline/lead-mcp-fixed'])(str(binary), [])
         elif route == 'muse-check':
-            profile.text = muse_adapter.check_command(run / 'stimulus/check', WS, V, [WS / 'protected'], extra=extra, tmp=TMP)[2]
+            profile.text = muse_adapter.check_command(run / 'stimulus/check', WS, V, [WS / 'protected'],
+                                                      extra=extra, tmp=TMP, check_scratch=CHECK_SCRATCH)[2]
         elif route == 'cli-adapter':
             profile.text = adapter.command(ADAPTERS[name], binary, WS, TMP, V, [WS / 'protected'], [], extra=extra)[2]
         else:

@@ -1,5 +1,6 @@
 {
   "claude-code": {
+    "harness": {"id": "claude-code", "label": "Claude Code", "provider": "anthropic"},
     "binary": "claude",
     "args": [
       "--print",
@@ -24,6 +25,9 @@
     "home_reads": []
   },
   "claude-code-sonnet": {
+    "harness": {"id": "claude-code", "label": "Claude Code", "provider": "anthropic"},
+    "model_flag": "--model",
+    "models": {"sonnet": null},
     "binary": "claude",
     "args": [
       "--print",
@@ -87,6 +91,9 @@
     "home_reads": []
   },
   "claude-code-opus": {
+    "harness": {"id": "claude-code", "label": "Claude Code", "provider": "anthropic"},
+    "model_flag": "--model",
+    "models": {"opus": null},
     "binary": "claude",
     "args": [
       "--print",
@@ -150,6 +157,21 @@
     "home_reads": []
   },
   "codex": {
+    "harness": {"id": "codex", "label": "Codex", "provider": "openai"},
+    "_comment": "Codex CLI 0.171.0: codex exec --help lists --model; codex debug models supplies the slugs with visibility=list.",
+    "model_flag": "--model",
+    "models": {
+      "gpt-6.2-sol": "gpt-6.2-sol",
+      "gpt-6.2-astra": "gpt-6.2-astra",
+      "gpt-6.1-terra": "gpt-6.1-terra",
+      "gpt-6.1-sol": "gpt-6.1-sol",
+      "gpt-6-astra": "gpt-6-astra",
+      "gpt-6-sol": "gpt-6-sol",
+      "gpt-6-luna": "gpt-6-luna",
+      "gpt-5.6-sol": "gpt-5.6-sol",
+      "gpt-5.6-terra": "gpt-5.6-terra",
+      "gpt-5.6-luna": "gpt-5.6-luna"
+    },
     "binary": "codex",
     "args": [
       "exec",
@@ -179,6 +201,8 @@
     "home_reads": []
   },
   "gemini-cli": {
+    "unavailable_reason": "Retired by Google for individual accounts; use Antigravity for Gemini models",
+    "harness": {"id": "gemini-cli", "label": "Gemini CLI", "provider": "google"},
     "binary": "gemini",
     "args": [
       "--yolo",
@@ -211,6 +235,7 @@
     "home_reads": []
   },
   "cursor-agent": {
+    "harness": {"id": "cursor-agent", "label": "Cursor Agent", "provider": "cursor"},
     "binary": "cursor-agent",
     "args": [
       "--print",
@@ -239,6 +264,9 @@
     "home_reads": []
   },
   "cursor-sol": {
+    "harness": {"id": "cursor-agent", "label": "Cursor Agent", "provider": "openai"},
+    "model_flag": "--model",
+    "models": {"gpt-5.6-sol-high": "gpt-5.6-sol-high"},
     "binary": "cursor-agent",
     "args": [
       "--print",
@@ -269,6 +297,9 @@
     "home_reads": []
   },
   "cursor-codex": {
+    "harness": {"id": "cursor-agent", "label": "Cursor Agent", "provider": "openai"},
+    "model_flag": "--model",
+    "models": {"gpt-5.3-codex-high": "gpt-5.3-codex-high"},
     "binary": "cursor-agent",
     "args": [
       "--print",
@@ -299,6 +330,9 @@
     "home_reads": []
   },
   "cursor-composer": {
+    "harness": {"id": "cursor-agent", "label": "Cursor Agent", "provider": "cursor"},
+    "model_flag": "--model",
+    "models": {"composer-2.5": "composer-2.5"},
     "binary": "cursor-agent",
     "args": [
       "--print",
@@ -329,6 +363,9 @@
     "home_reads": []
   },
   "cursor-grok": {
+    "harness": {"id": "cursor-agent", "label": "Cursor Agent", "provider": "xai"},
+    "model_flag": "--model",
+    "models": {"grok-4.7-high": "grok-4.7-high"},
     "binary": "cursor-agent",
     "args": [
       "--print",
@@ -359,6 +396,9 @@
     "home_reads": []
   },
   "cursor-sonnet": {
+    "harness": {"id": "cursor-agent", "label": "Cursor Agent", "provider": "anthropic"},
+    "model_flag": "--model",
+    "models": {"claude-sonnet-5-thinking-high": "claude-sonnet-5-thinking-high"},
     "binary": "cursor-agent",
     "args": [
       "--print",
@@ -389,6 +429,7 @@
     "home_reads": []
   },
   "antigravity": {
+    "harness": {"id": "antigravity", "label": "Antigravity", "provider": "google"},
     "binary": "agy",
     "args": [
       "--output-format",
@@ -413,6 +454,9 @@
     "home_reads": []
   },
   "antigravity-hydrogen": {
+    "harness": {"id": "antigravity", "label": "Antigravity", "provider": "google"},
+    "model_flag": "--model",
+    "models": {"gemini-4-hydrogen-high": "gemini-4-hydrogen-high"},
     "binary": "agy",
     "args": [
       "--output-format",
@@ -462,6 +506,9 @@
     "home_reads": []
   },
   "opencode": {
+    "harness": {"id": "opencode", "label": "OpenCode", "provider": "vllm"},
+    "model_flag": "--model",
+    "models": {"cs/local-coder": null},
     "binary": "/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe",
     "profile": "cli-profiles.json",
     "auth": "none",
@@ -478,6 +525,9 @@
     "home_reads": []
   },
   "opencode-go": {
+    "harness": {"id": "opencode", "label": "OpenCode", "provider": "opencode"},
+    "model_flag": "--model",
+    "models": {"opencode-go/kimi-k3": "kimi-k3"},
     "binary": "/opt/homebrew/lib/node_modules/@opencode/cli/bin/opencode.exe",
     "profile": "cli-profiles.json",
     "auth": "opencode_db",
@@ -494,6 +544,10 @@
     "home_reads": []
   },
   "pi": {
+    "harness": {"id": "pi", "label": "Pi", "provider": "openai"},
+    "model_flag": "--model",
+    "models": {"openai-codex/gpt-6.1-sol": "gpt-6.1-sol"},
+    "model_ids": {"openai-codex/gpt-6.1-sol": "gpt-6.1-sol"},
     "binary": "pi",
     "args": [
       "--print",
@@ -536,6 +590,8 @@
     ]
   },
   "goose": {
+    "unavailable_reason": "Needs the macOS Keychain for its key; not set up",
+    "harness": {"id": "goose", "label": "Goose", "provider": null},
     "binary": "goose",
     "args": [
       "run",
@@ -575,6 +631,7 @@
     "home_reads": []
   },
   "grok": {
+    "harness": {"id": "grok", "label": "Grok CLI", "provider": "xai"},
     "binary": "~/.grok/bin/grok",
     "args": [
       "-p",

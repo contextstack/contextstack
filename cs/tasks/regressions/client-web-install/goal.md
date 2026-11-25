@@ -16,7 +16,7 @@ In a fake HOME, offline, the check must show:
 2. `--serve-client-web HOST:PORT` writes one agent,
    `com.contextstack.client-web.plist`: `php -S HOST:PORT -t
    current/client-web/public` with Laravel's router,
-   `PHP_CLI_SERVER_WORKERS=4`, KeepAlive, an explicit PATH, absolute paths,
+   `PHP_CLI_SERVER_WORKERS=16`, KeepAlive, an explicit PATH, absolute paths,
    logs under `logs/`. No schedule or queue agent, no database.
 3. HOST must be loopback or Tailscale (no login: whoever reaches it acts
    with its Director credential); anything else is refused before any

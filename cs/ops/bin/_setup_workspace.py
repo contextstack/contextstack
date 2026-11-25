@@ -1,10 +1,10 @@
 """Materialize a run workspace: git worktree, sparse-checkout, tagged installs."""
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 from _estate_io import state_dir
+from _harvest_git import host_git as git
 
 from _workspace_setup import (INSTALLS, clone_tree, install_tag, patterns,
                                seed_installs, thaw_tree)
@@ -19,13 +19,6 @@ RUNTIME_DIRS = (
     "storage/logs",
     "bootstrap/cache",
 )
-
-
-def git(cwd, *args, env=None):
-    merged = dict(env or os.environ)
-    merged["GIT_TERMINAL_PROMPT"] = "0"
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
-                          env=merged)
 
 
 def clone_installs(workspace, setup, code_root=CODE_ROOT):

@@ -181,6 +181,8 @@ pub enum Event {
 /// Usage the upstream reported (or accumulated) before a stream ended.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeteredUsage {
+    /// The provider sent a usage record, including when all counts were zero.
+    pub known: bool,
     /// Prompt tokens when known.
     pub input_tokens: i64,
     /// Completion tokens when known.

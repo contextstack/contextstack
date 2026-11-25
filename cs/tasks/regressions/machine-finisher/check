@@ -127,6 +127,8 @@ exit %d
             spec = spec.replace("id: fixture", "id: hosted-lead")
             order.update(conversation_id="fixture", turn_id="fixture-turn")
         if case == "grant":
+            exclude = Path(git_run("rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
+            exclude.write_text("candidate.txt\n")
             (code / "grants/fixture.yaml").write_text(
                 "id: fixture\nestate: fixture\nrepo: demo\nstatus: active\ncommit: true\nexpiry: 2099-01-01T00:00:00Z\npaths:\n  - allowed.txt\n"
                 "gates:\n  - check\neffects:\n  - edit\n")
@@ -186,6 +188,8 @@ exit %d
         row = load(state / "ledger.jsonl")
         assert load(path / "finalized.json")["verdict"] == row["verdict"]
         assert row["stop"] == expected_stop, (case, row)
+        if case == "grant":
+            assert "candidate.txt" in row["note"], row
         if case in ("read-only", "planning"):
             assert not list(path.glob("read-only-*"))
             assert "branch" not in row
@@ -207,6 +211,8 @@ exit %d
             if case == "lane":
                 planned_base = head
             assert evidence["candidate_archive"]["scope"] == "changed_files"
+        if case == "grant":
+            exclude.unlink()
         shutil.rmtree(state)
         state.mkdir()
         if case in ("lane", "grant"):

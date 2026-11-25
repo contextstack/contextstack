@@ -4,6 +4,7 @@ import json
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 
@@ -65,6 +66,9 @@ with tempfile.TemporaryDirectory(prefix='cs-rename-') as raw:
     (code / 'marker').write_text('code')
     (root / 'gateway').mkdir()
     (root / 'gateway/models.json').write_text('{}')
+    (root / 'tracing').mkdir()
+    for path in bundle.TRACE_FILES:
+        shutil.copy2(CODE_ROOT.parent / path, root / path)
     bins = {}
     for name in (*bundle.BINARIES, 'cs-director'):
         path = root / name
@@ -75,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='cs-rename-') as raw:
     release = root / 'bundle/release'
     assert sorted(p.name for p in (release / 'bin').iterdir()) == sorted(bins)
     assert all(not p.is_symlink() for p in (release / 'bin').iterdir())
-    assert sorted(p.name for p in release.iterdir()) == ['bin', 'cs', 'gateway', 'target']
+    assert sorted(p.name for p in release.iterdir()) == ['bin', 'cs', 'gateway', 'target', 'tracing']
     assert sorted(p.name for p in (release / 'target/release').iterdir()) == ['cs-sandbox', 'cs-tools']
     assert bundle.kit_root(release) == release / 'cs'
     before = env.stat().st_mtime_ns

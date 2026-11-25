@@ -176,31 +176,14 @@ pub fn escaping(root: &Path, files: &[PathBuf]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jail::CWD_TEST_LOCK;
+    use crate::jail::CwdRestore;
     use std::fs;
     use std::os::unix::fs::symlink;
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
-    struct InWorkspaceGuard {
-        _lock: MutexGuard<'static, ()>,
-        prev: std::path::PathBuf,
-    }
-
-    impl Drop for InWorkspaceGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.prev);
-        }
-    }
-
     fn in_workspace<F: FnOnce(&Path)>(f: F) {
-        let lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| panic!("cwd lock: {e}"));
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let prev = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
-        std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("chdir: {e}"));
-        let _guard = InWorkspaceGuard { _lock: lock, prev };
+        let _cwd = CwdRestore::chdir(dir.path());
         f(dir.path());
     }
     #[test]

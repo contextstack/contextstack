@@ -128,20 +128,23 @@ def measured(name, check):
         return {"name": name, "ok": False, "seconds": round(time.monotonic() - started, 1), "reason": str(error)}
 
 
-def smoke_template(cs, module, name):
+def smoke_template(templates, agents, name):
     preferred = {"claude": "claude-code-sonnet"}.get(name)
-    templates = cs.read_json(cs.KIT / "ops/bin/executor-templates.json", {})
-    return preferred if preferred in templates else module.AGENTS[name]
+    return preferred if preferred in templates else agents[name]
+
+
+def agent_for(model, agents):
+    if isinstance(model, str) and model.startswith("claude-code"):
+        return "claude"
+    return next((name for name, template in agents.items() if template and template == model), None)
+
+
+def default_agents(record, agents):
+    return {record.get("default_agent"), agent_for(record.get("default_model"), agents)}.intersection(agents)
 
 
 def used_agents(cs, module, record):
-    templates = {value: key for key, value in module.AGENTS.items() if value}
-    def agent_for(model):
-        if isinstance(model, str) and model.startswith("claude-code"):
-            return "claude"
-        return templates.get(model)
-
-    selected = set()
+    selected = default_agents(record, module.AGENTS)
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=14)
     try:
@@ -151,12 +154,11 @@ def used_agents(cs, module, record):
                     row = json.loads(line)
                     at = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
                     if row.get("stop") == "done" and row.get("verdict") == "pass" and cutoff <= at <= now:
-                        selected.add(agent_for(row.get("model")))
+                        selected.add(agent_for(row.get("model"), module.AGENTS))
                 except (ValueError, KeyError, TypeError):
                     continue
     except FileNotFoundError:
         pass
-    selected.update((record.get("default_agent"), agent_for(record.get("default_model"))))
     return selected.intersection(module.AGENTS)
 
 
@@ -177,17 +179,28 @@ def main(cs, args):
         return 0
     if selected is None:
         selected = used_agents(cs, module, init.nr.load_record())
-    path = init.agent_path()
-    names = [n for n, template in module.AGENTS.items() if template and n in selected]
+    templates = cs.read_json(cs.KIT / "ops/bin/executor-templates.json", {})
+    skipped, names = [], []
+    for n, template in module.AGENTS.items():
+        if not template or n not in selected:
+            continue
+        template = smoke_template(templates, module.AGENTS, n)
+        reason = templates.get(template, {}).get("unavailable_reason")
+        if isinstance(reason, str):
+            # Known not to work (owner-hidden harness): report it, don't trial it.
+            skipped.append({"name": template, "ok": True, "skipped": True, "seconds": 0, "reason": reason})
+        else:
+            names.append(n)
+    path = init.agent_path() if names else None
     with ThreadPoolExecutor(max_workers=max(1, len(names))) as pool:
         agents = list(pool.map(lambda n: init.probe(n, path), names))
     for agent in agents:
-        agent["template"] = smoke_template(cs, module, agent["name"])
+        agent["template"] = smoke_template(templates, module.AGENTS, agent["name"])
     checks = [(a["template"], lambda a=a: agent_check(init, a)) for a in agents if a["signed_in"] and a["path"]]
     no_agents = not checks
-    will_trial = checks or (selected and (cs.CONFIG / "hosted-lead.json").is_file())
+    hosted_lead = (cs.CONFIG / "hosted-lead.json").is_file()
     results = []
-    if will_trial:
+    if checks or hosted_lead:
         started = time.monotonic()
         wait_reason = service_wait(init)
         if wait_reason:
@@ -200,8 +213,8 @@ def main(cs, args):
                 print("FAIL services: %s" % wait_reason)
             return 0 if ok else 1
     with ThreadPoolExecutor(max_workers=max(1, len(checks))) as pool:
-        results = list(pool.map(lambda pair: measured(*pair), checks))
-    if selected and (cs.CONFIG / "hosted-lead.json").is_file():
+        results = skipped + list(pool.map(lambda pair: measured(*pair), checks))
+    if hosted_lead:
         results.append(measured("hosted-lead", lambda: lead_check(cs, init)))
     ok = all(r["ok"] for r in results)
     if args.json:

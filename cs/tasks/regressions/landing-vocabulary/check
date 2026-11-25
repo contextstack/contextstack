@@ -91,6 +91,19 @@ try:
     written = json.loads((code_root / "ledger/ledger.jsonl").read_text().splitlines()[-1])
     assert "exp" not in written and "intent" not in written
 
+    # Run ids match exactly: a fragment of a real id ("miss" in run-miss-1, "seat" in enq-seat-1) is not found
+    for reason, fragment in (("model_miss", "miss"), ("model_miss", "run-miss"), ("factory_gap", "seat"),
+                             ("factory_gap", "1")):
+        err = validate_operator_close(code_root, {"reason": reason, "run_id": fragment})
+        assert err, (reason, fragment, "a fragment of a run id must not match")
+    run_dir = code_root / "ledger/runs/20260923-run-dir-7"
+    run_dir.mkdir(parents=True)
+    (run_dir / "result.json").write_text(json.dumps({"verdict": "miss"}))
+    for fragment in ("run-dir", "dir-7"):
+        err = validate_operator_close(code_root, {"reason": "factory_gap", "run_id": fragment})
+        assert err, (fragment, "a fragment of a run directory name must not match")
+    shutil.rmtree(code_root / "ledger/runs")
+
     # Legal: factory_gap with run (dispatch id)
     err = validate_operator_close(code_root, {"reason": "factory_gap", "run_id": "enq-seat-1"})
     assert err == "", err

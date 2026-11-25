@@ -85,3 +85,21 @@ it('keeps an external link\'s query and quotes intact in the desktop app', funct
         ->not->toContain('&amp;amp;')
         ->toContain('href="https://b.test/it\'s" data-native-external-link');
 });
+
+it('tags scheme-relative links to another host as external in the desktop app', function () {
+    config(['nativephp-internal.running' => true]);
+    URL::forceRootUrl('http://127.0.0.1:8000');
+
+    expect(MarkdownHtml::isSameOrigin('//evil.example/login'))->toBeFalse()
+        ->and(MarkdownHtml::isSameOrigin('/\\evil.example/login'))->toBeFalse()
+        ->and(MarkdownHtml::render('[the report](//evil.example/login)'))
+        ->toContain('href="//evil.example/login" data-native-external-link');
+});
+
+it('keeps scheme-relative links to this app in the window', function () {
+    URL::forceRootUrl('http://127.0.0.1:8000');
+
+    expect(MarkdownHtml::isSameOrigin('//127.0.0.1:8000/intents'))->toBeTrue()
+        ->and(MarkdownHtml::isSameOrigin('/intents'))->toBeTrue()
+        ->and(MarkdownHtml::isSameOrigin('intents/new'))->toBeTrue();
+});

@@ -216,7 +216,9 @@ pub fn report(
     changed
         .and_then(|_| touch_owner(&tx, control_id))
         .map_err(|e| db_err(&e))?;
-    // An applied cancel closes the job's reservation (CLIENT-API.md §12.3); a job its node never started ends.
+    // An applied cancel closes the job's reservation (CLIENT-API.md §12.3). A job with no live run that the
+    // node stops (offered, or accepted with nothing to stop) ends here as cancelled; a running job waits for
+    // job_terminal. Log line: `control {id} (cancel): applied stopped`.
     if kind == "cancel"
         && state == "applied"
         && let Some(job) = tx
@@ -229,9 +231,7 @@ pub fn report(
             .map_err(|e| db_err(&e))?
     {
         let outcome = outcome.as_deref().unwrap_or_default();
-        crate::reservations::after_cancel(&tx, &job, outcome);
-        crate::settle::after_envelope(store, &tx, true, &job);
-        crate::reservations::release_logged(store, &tx, &job);
+        crate::reservations::on_cancel_applied(store, &tx, &job, outcome);
     }
     tx.commit().map_err(|e| db_err(&e))?;
     crate::logf!(

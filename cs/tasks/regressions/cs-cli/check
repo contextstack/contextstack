@@ -2,8 +2,8 @@
 """cs-cli regression (goal.md): `cs` against a fake-HOME install with launchctl, curl and ssh shims.
 
 Network-free. Builds the install as node-install-layout does (its _bundle); needs uv and a uv-managed interpreter of
-the pinned version, else SKIP with the reason. Temp dirs only; the real ~/.local/bin and ~/Library/LaunchAgents are
-never written (asserted).
+the pinned version, else SKIP with the reason. Temp dirs only; ContextStack-owned PATH links under ~/.local/bin and
+com.contextstack.* LaunchAgents plists are never written (asserted); foreign files there are ignored.
 """
 import sys
 from pathlib import Path
@@ -149,9 +149,9 @@ def plant(home, root, shim):
     tunnel_plist(home, T1, 8000, sockdir / "api-tunnel.sock", WorkingDirectory=str(home / "sites/contextstack/modelgateway"),
                  EnvironmentVariables={"OPENAI_API_KEY": PLIST_KEY})
     tunnel_plist(home, T2, 8001, sockdir / "api2-tunnel.sock")
-    gw_plist = home / "Library/LaunchAgents" / (GW + ".plist")  # as on prod-1: installed before --credentials existed
+    gw_plist = home / "Library/LaunchAgents" / (GW + ".plist")  # the Keychain, opted into explicitly
     p = plistlib.loads(gw_plist.read_bytes())
-    p["EnvironmentVariables"].pop("CSGATEWAY_CREDENTIALS", None)
+    p["EnvironmentVariables"]["CSGATEWAY_CREDENTIALS"] = "keychain"
     gw_plist.write_bytes(plistlib.dumps(p))
     loaded(shim, GW, "\tstate = running\n\tpid = 4242\n\tenvironment = {\n\t\tOPENAI_API_KEY => %s\n\t}\n" % PLIST_KEY)
     loaded(shim, NODE, "\tstate = not running\n\tlast exit code = 0\n")
@@ -203,6 +203,32 @@ def part_install(tmp, uv, managed):
     expect(r.returncode == 1 and "refused" in r.stdout and os.readlink(root / "current") == "releases/" + B,
            "release switch to an unknown id: refused, current unchanged")
 
+    verify = root / "current/verify.json"
+    saved = verify.read_bytes()
+    try:
+        extras = {
+            ".estate/runtime/ms-playwright": ("browser_fetch", "Browser tools (web fetch)"),
+            "~/.claude/skills/gstack/browse/dist/browse": ("browser_fetch", "Browser tools (web fetch)"),
+            "ops/bin/browser-broker granted by sandbox.json sockets": ("browser_session", "Browser tools (browser sessions)"),
+            "tools/defuddle/extract.mjs with its node_modules": ("defuddle_extract", "Article text extraction"),
+            "php >= 8.3": ("client-web", "Web client"),
+        }
+        verify.write_text(json.dumps({"missing_host_runtimes": {
+            requirement: [tool] for requirement, (tool, _) in extras.items()
+        }}))
+        output = cs(home, shim, "doctor").stdout
+        for requirement, (tool, label) in extras.items():
+            expect(requirement not in output
+                   and output.splitlines().count("info  %s: not installed. Optional; not needed to run tasks." % label) == 1,
+                   "doctor describes %s once in plain words without internal paths" % tool)
+        result = cs(home, shim, "doctor", "--json")
+        details = {f["detail"] for f in json.loads(result.stdout) if f.get("info") and f["ok"]}
+        expect(all("%s (needed by %s)" % (requirement, tool) in details
+                   for requirement, (tool, _) in extras.items()),
+               "doctor JSON keeps each optional runtime and its dependent tool")
+    finally:
+        verify.write_bytes(saved)
+
     plant(home, root, shim)
     r = cs(home, shim, "status", "--json")
     try:
@@ -228,7 +254,8 @@ def part_install(tmp, uv, managed):
                "status --json: :8000 answers, :8001 does not; free disk")
     r = cs(home, shim, "status")
     want = [B, "pid 4242", "spark-tunnel", "78: EX_CONFIG", "catalog r-test123", "answers HTTP 401", "token set",
-            "director unreachable", "outbox 2 waiting", ":8000 answers", ":8001 no answer", "GB free"]
+            "director unreachable", "outbox 2 waiting", ":8000 answers", ":8001 no answer", "GB free",
+            "client-web is not served (needs PHP 8.3+ and --serve-client-web; see alpha-known-issues)"]
     missing = [w for w in want if w not in r.stdout]
     expect(r.returncode == 0 and not missing and len(r.stdout.splitlines()) <= 24,
            "status: one screen with every field (missing %s)\n%s" % (missing, r.stdout))
@@ -339,6 +366,23 @@ def part_install(tmp, uv, managed):
     want = {"plist paths %s" % T1, "tunnel socket %s" % T1, "gateway credentials"}
     expect(bad == want and all(f[k]["fix"] for k in want) and r.returncode == 1,
            "doctor: exit-78 WorkingDirectory, stale tunnel socket, Keychain credential mode; nothing else: %s" % sorted(bad))
+    fix = f["gateway credentials"]["fix"]
+    expect("CSGATEWAY_CREDENTIALS=file" not in fix and "remove the CSGATEWAY_CREDENTIALS key" in fix,
+           "doctor: the Keychain fix is a value the gateway accepts (unset), never =file: %s" % fix)
+    gw_plist = home / "Library/LaunchAgents" / (GW + ".plist")
+    keychain = gw_plist.read_bytes()
+    for value, ok in ((None, True), ("", True), ("file", False), (str(root / "credentials"), True)):
+        p = plistlib.loads(keychain)
+        if value is None:
+            p["EnvironmentVariables"].pop("CSGATEWAY_CREDENTIALS")
+        else:
+            p["EnvironmentVariables"]["CSGATEWAY_CREDENTIALS"] = value
+        gw_plist.write_bytes(plistlib.dumps(p))
+        g = doctor(home, shim)[1].get("gateway credentials") or {}
+        expect(g.get("ok") is ok and "=file" not in g.get("fix", ""),
+               "doctor: CSGATEWAY_CREDENTIALS=%r is %s (unset/empty is the file store): %s"
+               % (value, "fine" if ok else "a problem", g))
+    gw_plist.write_bytes(keychain)
     calls = (shim / "calls.log").read_text()
     expect("ssh -S %s -O check spark" % (home / ".local/share/dgx-spark/ssh/api-tunnel.sock") in calls,
            "doctor asks ssh whether the control socket has a live master")
@@ -648,6 +692,36 @@ def part_init_agent():
     cs_mod = load("cs_check_mod", CS_SCRIPT)
     cs_mod.node_env = lambda: {}
     cs_mod.client_web_env = lambda: {}
+    # A malformed node.env never crashes cs: doctor names it (line, not values) and its values still redact
+    import contextlib as _ctx
+    import io as _io
+    from unittest.mock import patch as _patch
+    with scratch_dir(prefix="cs-nodeenv-") as tmp:
+        bad = Path(tmp) / "node-env.txt"  # the sandbox forbids creating *.env; cs reads NODE_ENV
+        bad.write_text("CONTEXTSTACK_NODE_TOKEN=%s\nthis line is not an assignment\n" % TOKEN)
+        fresh = load("cs_nodeenv_mod", CS_SCRIPT)
+        with _patch.multiple(fresh, NODE_ENV=bad, need_install=lambda: None, doctor=lambda: [],
+                             cli_pin_findings=lambda: [], toolchain_findings=lambda: [],
+                             client_web_env=lambda: {}):
+            buf, err = _io.StringIO(), _io.StringIO()
+            with _ctx.redirect_stdout(buf), _ctx.redirect_stderr(err):
+                rc = fresh.main(["doctor", "--json"])
+        found = {f["check"]: f for f in json.loads(buf.getvalue() or "[]")}
+        f = found.get("node.env") or {}
+        expect(rc == 1 and f.get("ok") is False and "line 2" in f.get("detail", "") and f.get("fix")
+               and TOKEN not in buf.getvalue() + err.getvalue() and TOKEN in fresh.SECRETS,
+               "a malformed node.env is a doctor finding, not a crash; its values still redact: rc=%s %s %s"
+               % (rc, f, err.getvalue()[-300:]))
+
+    # node-install switch/rollback drain jobs for up to DRAIN_DEFAULT_WAIT_S: never killed mid-switch
+    sys.path.insert(0, str(CODE_ROOT / "scripts"))
+    from _node_layout import DRAIN_DEFAULT_WAIT_S
+    seen = []
+    with _patch.object(cs_mod, "KIT", CODE_ROOT), _patch.object(cs_mod, "run", lambda argv, timeout=10, **kw: seen.append(timeout) or
+                       subprocess.CompletedProcess(argv, 0, "{}", "")):
+        cs_mod.node_install("switch", "fixture")
+    expect(seen and all(t is None or t > DRAIN_DEFAULT_WAIT_S for t in seen),
+           "cs release switch: node-install outlives the drain bound (%ss): %s" % (DRAIN_DEFAULT_WAIT_S, seen))
     # Exercise status without an installed release or access to the real HOME.
     from unittest.mock import patch
     with scratch_dir(prefix="cs-status-") as tmp:
@@ -735,24 +809,54 @@ def part_device():
         expect(result.returncode == 2, "cs device pair requires a name")
 
 
+def part_hermetic_scope():
+    """Scoped host snapshots ignore foreign files; ContextStack-owned ones still fail the compare."""
+    names = _bundle.path_link_names()
+    expect("cs" in names and "csgateway" in names and "node-install" in names,
+           "path_link_names follows _node_layout.LINKS: %s" % (names,))
+    with scratch_dir(prefix="cs-hermetic-scope-") as tmp:
+        home = Path(tmp)
+        bindir, agents = home / ".local/bin", home / "Library/LaunchAgents"
+        bindir.mkdir(parents=True)
+        agents.mkdir(parents=True)
+        owned_link = names[0]
+        (bindir / owned_link).symlink_to("/tmp/contextstack-owned-link")
+        (bindir / "agy").write_text("foreign-cli\n")
+        (agents / "com.contextstack.node.plist").write_text("owned-agent\n")
+        (agents / "com.other.app.plist").write_text("foreign-agent\n")
+        before = _bundle.contextstack_host_snapshots(home)
+        (bindir / "agy").write_text("foreign-cli-rewritten\n")
+        (agents / "com.other.app.plist").write_text("foreign-agent-rewritten\n")
+        expect(before == _bundle.contextstack_host_snapshots(home),
+               "foreign ~/.local/bin and LaunchAgents changes do not fail the scoped snapshot")
+        (bindir / owned_link).unlink()
+        (bindir / owned_link).symlink_to("/tmp/contextstack-owned-link-moved")
+        expect(before[0] != _bundle.contextstack_host_snapshots(home)[0],
+               "a ContextStack PATH link change fails the scoped ~/.local/bin snapshot")
+        before = _bundle.contextstack_host_snapshots(home)
+        (agents / "com.contextstack.node.plist").write_text("owned-agent-rewritten\n")
+        expect(before[1] != _bundle.contextstack_host_snapshots(home)[1],
+               "a com.contextstack.* plist change fails the scoped LaunchAgents snapshot")
+
+
 def main():
+    part_hermetic_scope()
     part_device()
     part_init_agent()
     uv, managed = _bundle.host_python()
     if uv is None:
         print("SKIP cs-cli: %s" % managed)
         return 1 if problems else 0
-    real = Path.home()
-    watched = [real / ".local/bin", real / "Library/LaunchAgents"]
-    before = [_bundle.directory_snapshot(w) for w in watched]
+    before = _bundle.contextstack_host_snapshots()
     agents = _bundle.real_agents()
     tmp = Path(tempfile.mkdtemp(prefix="cs-cli-", suffix=".noindex"))
     try:
         part_install(tmp, uv, managed)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    after = [_bundle.directory_snapshot(w) for w in watched]
-    expect(before == after, "the real ~/.local/bin and ~/Library/LaunchAgents are unchanged")
+    after = _bundle.contextstack_host_snapshots()
+    expect(before == after,
+           "ContextStack-owned ~/.local/bin links and ~/Library/LaunchAgents plists are unchanged")
     leak = _bundle.launchd_untouched(agents)
     expect(not leak, leak or "the real launchd domain gained no com.contextstack.* job and restarted none")
     print("check: cs-cli %d problem(s)" % len(problems))

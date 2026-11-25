@@ -267,6 +267,11 @@ fn status_body(body: &[u8]) -> Result<Value, String> {
 }
 
 /// `POST status`: the node's active jobs; each report replaces the last.
+///
+/// Status is a snapshot only: it does not reconcile Director-side orphans. A job left `accepted` with no run
+/// after a node restart (absent from `active`) is finished by an applied cancel (`on_cancel_applied`), or by a
+/// second cancel / the startup orphan sweep when the cancel was already applied. Running jobs the node lost go
+/// through the node's `orphaned_running` path and `job_terminal`.
 pub fn post_status(state: &State, call: &Call, node_id: i64, name: &str) -> Reply {
     let status = match status_body(&call.body) {
         Ok(s) => s,
@@ -285,11 +290,14 @@ pub fn post_status(state: &State, call: &Call, node_id: i64, name: &str) -> Repl
     })();
     match done {
         Ok(()) => {
-            if let Ok(offered) =
-                crate::capabilities::offer_waiting(&state.store, &db, node_id, name)
-                && offered > 0
-            {
-                crate::logf!("node {name}: offered {offered} job(s) after a capability report");
+            // The status is recorded either way; a job that could not be offered is rolled back on its own and
+            // stays waiting, and the failure is logged rather than dropped.
+            match crate::capabilities::offer_waiting(&state.store, &mut db, node_id, name) {
+                Ok(0) => {}
+                Ok(offered) => {
+                    crate::logf!("node {name}: offered {offered} job(s) after a capability report");
+                }
+                Err(e) => crate::logf!("node {name}: waiting jobs after a capability report: {e}"),
             }
             json(200, &json!({"recorded_at": stamp}))
         }

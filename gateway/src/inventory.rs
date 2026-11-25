@@ -16,6 +16,19 @@ pub const SUBSCRIPTION: &str = "subscription";
 /// Pay per token.
 pub const API: &str = "api";
 
+/// Optional client-facing metadata. Routing still uses `ModelEntry::provider`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct Picker {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub provider_label: String,
+    pub label: String,
+    #[serde(default)]
+    pub internal: bool,
+    #[serde(default)]
+    pub efforts: Vec<String>,
+}
+
 /// One model entry (models.json `models[]`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct ModelEntry {
@@ -25,6 +38,8 @@ pub struct ModelEntry {
     /// Catalog endpoint id.
     #[serde(default)]
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picker: Option<Picker>,
     /// 1..3.
     #[serde(default)]
     pub tier: i64,

@@ -262,7 +262,7 @@ def execute(folder, ws, real_home, binary, env, protected, identity, prompt, tim
     return _muse.run_process(bounded, ws, env, timeout, on_started=on_started, memory_cap_mb=memory_cap_mb, on_evidence=on_evidence)
 
 
-def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None):
+def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None, *, check_scratch=None):
     """Sandbox command for the frozen task check.
 
     Extra allows are emitted before the estate deny, so they do not keep a path
@@ -283,7 +283,7 @@ def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None)
     grants.append(dict(path=str(stim), access="read"))
     caller["caller_grants"] = grants
     return _muse.sandbox_command([os.path.abspath(str(check))], workspace, real_home, protected,
-                                 extra=caller, read_roots=roots)
+                                 extra=caller, read_roots=roots, check_scratch=check_scratch)
 
 
 def run(c):

@@ -64,6 +64,9 @@ from _provider_limits import status_limits  # noqa: E402
 
 HOLD_S, STATUS_S, SCHEDULES_S, TICK_SCHEDULES_S, REPROBE_S, KICK_S = 45, 60, 600, 60, 600, 15
 VITALS_CACHE_S = 30
+# A worker loop that raises is logged and restarted with backoff. LOOP_CRASH_LIMIT crashes inside
+# LOOP_CRASH_WINDOW_S mean it cannot continue: the listener exits non-zero so launchd restarts it.
+LOOP_CRASH_LIMIT, LOOP_CRASH_WINDOW_S, LOOP_BACKOFF_MAX_S = 5, 300, 30
 
 
 def say(**fields):
@@ -78,6 +81,25 @@ class Listener:
         self.turn_kicked = None
         self.downgraded_at = None
         self._held_seen = None
+        self.fatal = None
+
+    def guard(self, name, loop, now=time.monotonic):
+        """Run one worker loop; log and restart it after a crash, or stop the listener when it keeps crashing."""
+        crashes = []
+        while not self.stop.is_set():
+            try:
+                loop()
+                return
+            except Exception as error:  # noqa: BLE001 — a daemon thread that dies is never restarted by launchd
+                at = now()
+                crashes = [c for c in crashes if at - c < LOOP_CRASH_WINDOW_S] + [at]
+                say(event="error", what=name + "_loop", detail="%s: %s" % (type(error).__name__, str(error)[:500]))
+                if len(crashes) >= LOOP_CRASH_LIMIT:
+                    say(event="fatal", what=name + "_loop", crashes=len(crashes))
+                    self.fatal = name
+                    self.stop.set()
+                    return
+                self.stop.wait(min(2 ** len(crashes), LOOP_BACKOFF_MAX_S))
 
     def recover_orphaned_jobs(self):
         """Close dead running rows before listener duties; spool director terminals immediately."""
@@ -346,14 +368,17 @@ def main(config_root=None, env=None):
         say(event="recovered_orphans", count=len(recovered), jobs=recovered)
     signal.signal(signal.SIGTERM, lambda *_: listener.stop.set())
     say(event="listening", director=receiver_config(receiver)["url"], pid=os.getpid())
-    for loop in (listener.work_loop, listener.schedules_loop):
-        threading.Thread(target=loop, daemon=True).start()
+    for name, loop in (("work", listener.work_loop), ("schedules", listener.schedules_loop)):
+        threading.Thread(target=listener.guard, args=(name, loop), daemon=True).start()
     seconds = args.get("seconds") if isinstance(args, dict) else None
     if seconds:
         timer = threading.Timer(float(seconds), listener.stop.set)
         timer.daemon = True
         timer.start()
-    listener.duties_loop()
+    listener.guard("duties", listener.duties_loop)
+    if listener.fatal:
+        say(event="stopped", fatal=listener.fatal)
+        return 1
     say(event="stopped")
     return 0
 

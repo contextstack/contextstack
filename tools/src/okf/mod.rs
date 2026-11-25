@@ -163,15 +163,19 @@ fn stage(path: &Path, content: &str) -> Step<(tempfile::NamedTempFile, PathBuf)>
         fs::canonicalize(path)
     } else {
         path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
             .canonicalize()
             .map(|parent| parent.join(path.file_name().unwrap_or_default()))
     }
     .map_err(|e| Stop::Raise(corpus::errno(&e, "rb_sysopen", path)))?;
-    if crate::jail::resolves_outside(target.parent().unwrap_or(Path::new("."))) {
+    let dir = target
+        .parent()
+        .ok_or_else(|| Stop::Fail("path has no parent directory".into()))?;
+    if crate::jail::resolves_outside(dir) {
         return Err(Stop::Fail("path escapes workspace".into()));
     }
-    let mut temp = tempfile::NamedTempFile::new_in(target.parent().unwrap_or(Path::new(".")))
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| Stop::Raise(corpus::errno(&e, "rb_sysopen", path)))?;
     if target.exists() {
         let permissions = fs::metadata(&target)
@@ -185,12 +189,42 @@ fn stage(path: &Path, content: &str) -> Step<(tempfile::NamedTempFile, PathBuf)>
         .map_err(|e| Stop::Raise(corpus::errno(&e, "rb_sysopen", path)))?;
     temp.flush()
         .map_err(|e| Stop::Raise(corpus::errno(&e, "rb_sysopen", path)))?;
+    // The data must be on disk before the rename publishes it, or a crash can leave an empty file.
+    sync_file(temp.as_file(), temp.path())
+        .map_err(|e| Stop::Raise(corpus::errno(&e, "rb_sysopen", path)))?;
     Ok((temp, target))
 }
 
 fn publish(temp: tempfile::NamedTempFile, path: &Path) -> Step<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| Stop::Fail("path has no parent directory".into()))?;
     temp.persist(path)
         .map_err(|e| Stop::Raise(corpus::errno(&e.error, "rb_file_s_rename", path)))?;
+    // Make the rename itself durable.
+    sync_dir(dir).map_err(|e| Stop::Raise(corpus::errno(&e, "rb_file_s_rename", path)))?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every fsync this thread issued, in order: `("file" | "dir", path)`.
+    static SYNCS: std::cell::RefCell<Vec<(&'static str, PathBuf)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg_attr(not(test), allow(unused_variables))]
+fn sync_file(file: &fs::File, path: &Path) -> std::io::Result<()> {
+    file.sync_all()?;
+    #[cfg(test)]
+    SYNCS.with(|s| s.borrow_mut().push(("file", path.to_path_buf())));
+    Ok(())
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(test)]
+    SYNCS.with(|s| s.borrow_mut().push(("dir", dir.to_path_buf())));
     Ok(())
 }
 
@@ -732,33 +766,9 @@ fn first(items: &[String], n: usize) -> &[String] {
 #[cfg(test)]
 mod tests {
     use super::run;
-    use crate::jail::CWD_TEST_LOCK;
+    use crate::jail::CwdRestore;
     use std::fs;
-    use std::path::Path;
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
-
-    struct CwdRestore {
-        prev: std::path::PathBuf,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl CwdRestore {
-        fn chdir(path: &Path) -> Self {
-            let lock = CWD_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prev = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
-            std::env::set_current_dir(path).unwrap_or_else(|e| panic!("chdir: {e}"));
-            Self { prev, _lock: lock }
-        }
-    }
-
-    impl Drop for CwdRestore {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.prev);
-        }
-    }
 
     fn corpus_workspace() -> TempDir {
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
@@ -785,6 +795,34 @@ mod tests {
             String::from_utf8_lossy(&o.stderr).into_owned(),
             o.code,
         )
+    }
+
+    #[test]
+    fn write_fsyncs_the_temp_before_rename_and_the_directory_after() {
+        let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let root = dir.path().canonicalize().unwrap_or_else(|e| panic!("{e}"));
+        let _guard = CwdRestore::chdir(&root);
+        let target = root.join("page.md");
+        fs::write(&target, "old\n").unwrap_or_else(|e| panic!("write: {e}"));
+        super::SYNCS.with(|s| s.borrow_mut().clear());
+        let (temp, resolved) =
+            super::stage(&target, "new\n").unwrap_or_else(|_| panic!("stage failed"));
+        let temp_path = temp.path().to_path_buf();
+        let staged = super::SYNCS.with(|s| s.borrow().clone());
+        assert_eq!(staged, vec![("file", temp_path)]);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap_or_else(|e| panic!("{e}")),
+            "old\n",
+            "nothing is published before the rename"
+        );
+        super::publish(temp, &resolved).unwrap_or_else(|_| panic!("publish failed"));
+        let all = super::SYNCS.with(|s| s.borrow().clone());
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[1], ("dir", root.clone()));
+        assert_eq!(
+            fs::read_to_string(&target).unwrap_or_else(|e| panic!("{e}")),
+            "new\n"
+        );
     }
 
     #[test]

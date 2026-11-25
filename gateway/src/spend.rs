@@ -407,11 +407,27 @@ impl Guard {
     }
 
     /// Debit a provider-reported charge even when admission did not require a hold.
-    pub fn debit_reported(&self, source: &str, charged: f64) {
-        let _write = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Err(error) = self.record_charge(&source.to_ascii_lowercase(), charged) {
-            crate::logf!("paid API counter not updated: {error}");
+    /// Debit a provider-reported charge with no hold, retrying a failed write once.
+    pub fn debit_reported(&self, source: &str, charged: f64) -> Result<f64, String> {
+        let source = source.to_ascii_lowercase();
+        let result = self.charge_locked(&source, charged).or_else(|first| {
+            crate::logf!("paid API counter write failed, retrying once: {first}");
+            self.charge_locked(&source, charged)
+        });
+        if let Err(error) = &result {
+            crate::log::row(&json!({
+                "event": "spend_record_failed", "source": source,
+                "charged_usd": charged, "error": error,
+            }));
+            crate::logf!("paid API counter NOT updated, charge of ${charged:.6} lost: {error}");
         }
+        result.map(|()| charged)
+    }
+
+    /// Record `charged` under the writer lock.
+    fn charge_locked(&self, source: &str, charged: f64) -> Result<(), String> {
+        let _write = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        self.record_charge(source, charged)
     }
 
     // A positive charge requires the caller to hold `writing`.
@@ -663,8 +679,9 @@ impl Reservation {
         self.est
     }
 
-    /// Release the hold and return the charge recorded against its source.
-    pub fn settle(mut self, charged_usd: f64, over_reservation: bool) -> f64 {
+    /// Release the hold and record the charge against its source. A failed spend-file write is retried
+    /// once; a second failure is returned (the charge was not recorded) and logged loudly.
+    pub fn settle(mut self, charged_usd: f64, over_reservation: bool) -> Result<f64, String> {
         if over_reservation {
             crate::log::row(&json!({
                 "event": "spend_over_reservation",
@@ -673,12 +690,26 @@ impl Reservation {
                 "charged_usd": charged_usd,
             }));
         }
-        if let Err(e) = self.finish(charged_usd) {
-            crate::logf!("paid API counter not updated: {e}");
-            0.0
-        } else {
-            charged_usd
+        let first = self.finish(charged_usd);
+        let result = match first {
+            Ok(()) => Ok(charged_usd),
+            Err(first) => {
+                crate::logf!("paid API counter write failed, retrying once: {first}");
+                self.guard
+                    .charge_locked(&self.source, charged_usd)
+                    .map(|()| charged_usd)
+            }
+        };
+        if let Err(e) = &result {
+            crate::log::row(&json!({
+                "event": "spend_record_failed",
+                "source": self.source,
+                "charged_usd": charged_usd,
+                "error": e,
+            }));
+            crate::logf!("paid API counter NOT updated, charge of ${charged_usd:.6} lost: {e}");
         }
+        result
     }
 
     fn finish(&mut self, charged: f64) -> Result<(), String> {
@@ -744,7 +775,7 @@ mod tests {
             "exhausted",
             "held estimates count"
         );
-        h.settle(0.009, false);
+        h.settle(0.009, false)?;
         assert_eq!(
             reason(g.admit("or", "1", 0.002)),
             "exhausted",
@@ -760,7 +791,7 @@ mod tests {
     #[test]
     fn shared_budget_and_legacy() -> Res {
         let (_d, g) = guard(r#"{"api_usd_per_day": 0.01}"#)?;
-        g.admit("a", "", 0.0)?.settle(0.006, false);
+        g.admit("a", "", 0.0)?.settle(0.006, false)?;
         assert_eq!(
             reason(g.admit("b", "", 0.005)),
             "exhausted",
@@ -769,7 +800,7 @@ mod tests {
         let (_d, g) = guard(
             r#"{"sources": {"a": {"usd": 1, "period": "month"}, "*": {"usd": 0.01, "period": "day"}}}"#,
         )?;
-        g.admit("a", "", 0.0)?.settle(0.01, false);
+        g.admit("a", "", 0.0)?.settle(0.01, false)?;
         let d = g.admit("a", "", 0.0).err().ok_or("admitted")?;
         assert_eq!((d.reason, d.limit.as_deref()), ("exhausted", Some(ALL)));
         let (_d, g) = guard(
@@ -783,7 +814,7 @@ mod tests {
     #[test]
     fn exhausted_at_zero_estimate() -> Res {
         let (_d, g) = guard(r#"{"sources": {"a": {"usd": 0.01, "period": "day"}}}"#)?;
-        g.admit("a", "", 0.0)?.settle(0.01, false);
+        g.admit("a", "", 0.0)?.settle(0.01, false)?;
         assert_eq!(
             reason(g.admit("a", "", 0.0)),
             "exhausted",
@@ -935,7 +966,8 @@ mod tests {
                     .admit("a", "", 0.0)
                     .unwrap_or_else(|e| panic!("admitted: {e}"));
                 b.wait();
-                r.settle(charge, false);
+                r.settle(charge, false)
+                    .unwrap_or_else(|e| panic!("settled: {e}"));
             }));
         }
         for h in handles {
@@ -1003,8 +1035,31 @@ mod settlement_lock_tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let hold_available = guard.held.try_lock().is_ok();
         drop(writing);
-        assert_eq!(worker.join().map_err(|_| "settlement panicked")?, 0.5);
+        assert_eq!(worker.join().map_err(|_| "settlement panicked")?, Ok(0.5));
         assert!(hold_available);
+        Ok(())
+    }
+
+    #[test]
+    fn a_spend_file_that_cannot_be_written_reports_the_charge_lost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let guard = Arc::new(Guard::new(Some(dir.path())));
+        guard
+            .replace(br#"{"api_usd_per_day": 1}"#)
+            .map_err(|e| format!("{e:?}"))?;
+        let reserved = guard.admit("api", "", 0.5)?;
+        let counter = guard.counter.clone().ok_or("no counter")?;
+        std::fs::create_dir_all(&counter)?; // a directory where the file belongs: every write fails
+        assert!(
+            reserved.settle(0.25, false).is_err(),
+            "unrecorded charge is not reported"
+        );
+        assert!(guard.debit_reported("api", 0.25).is_err());
+        assert!(
+            guard.held.lock().map_err(|_| "held")?.is_empty(),
+            "hold released"
+        );
         Ok(())
     }
 }

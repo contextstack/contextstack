@@ -133,6 +133,14 @@ pub(crate) struct Resolved<'a> {
 
 /// Map a spec `model` (template name or model id) to what [`window_for_lookup`] should match.
 pub fn resolve(spec_model: &str) -> Resolved<'_> {
+    if let Some((_, model)) = spec_model.split_once(':')
+        && crate::capabilities::is_cli_template(spec_model)
+    {
+        return Resolved {
+            lookup: model,
+            template_window: None,
+        };
+    }
     if let Some((_, rule)) = TEMPLATES.iter().find(|(name, _)| *name == spec_model) {
         return match rule {
             TemplateRule::Window(w) => Resolved {
@@ -192,6 +200,9 @@ mod tests {
 
     #[test]
     fn templates_map_to_models_or_conservative_windows() {
+        let r = resolve("codex:gpt-6.2-sol");
+        assert_eq!(r.lookup, "gpt-6.2-sol");
+        assert!(r.template_window.is_none());
         let r = resolve("cursor-composer");
         assert_eq!(r.lookup, "composer-2.5");
         assert!(r.template_window.is_none());

@@ -267,6 +267,7 @@ impl Anthropic<'_> {
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            usage_known: false,
             stop: String::new(),
             tools: Vec::new(),
             done: false,
@@ -282,6 +283,7 @@ pub struct Stream {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    usage_known: bool,
     stop: String,
     /// `tool_use` blocks in arrival order.
     tools: Vec<ToolBlock>,
@@ -307,8 +309,7 @@ struct Sse {
     delta: SseDelta,
     #[serde(default, deserialize_with = "nullable")]
     content_block: Block,
-    #[serde(default, deserialize_with = "nullable")]
-    usage: OutUsage,
+    usage: Option<OutUsage>,
     #[serde(default, deserialize_with = "nullable")]
     message: SseMessage,
     #[serde(default, deserialize_with = "nullable")]
@@ -329,8 +330,7 @@ struct SseDelta {
 
 #[derive(Deserialize, Default)]
 struct SseMessage {
-    #[serde(default, deserialize_with = "nullable")]
-    usage: OutUsage,
+    usage: Option<OutUsage>,
 }
 
 #[derive(Deserialize, Default)]
@@ -343,6 +343,7 @@ impl Stream {
     /// Tokens accumulated from `message_start` / `message_delta` so far.
     pub fn metered_usage(&self) -> super::MeteredUsage {
         super::MeteredUsage {
+            known: self.usage_known,
             input_tokens: self.input,
             output_tokens: self.output,
             cache_read_tokens: self.cache_read,
@@ -381,7 +382,7 @@ impl Stream {
         };
         match evt.kind.as_str() {
             "message_start" => {
-                self.absorb_usage(&evt.message.usage, "");
+                self.absorb_usage(evt.message.usage.as_ref(), "");
             }
             "content_block_start" if evt.content_block.kind == "tool_use" => {
                 let b = evt.content_block;
@@ -404,7 +405,7 @@ impl Stream {
                 }
                 _ => {}
             },
-            "message_delta" => self.absorb_usage(&evt.usage, &evt.delta.stop_reason),
+            "message_delta" => self.absorb_usage(evt.usage.as_ref(), &evt.delta.stop_reason),
             "message_stop" => return self.finish().map(Some),
             "error" => return Ok(Some(Event::UpstreamError(evt.error.message))),
             _ => {}
@@ -452,18 +453,21 @@ impl Stream {
         }))
     }
 
-    fn absorb_usage(&mut self, usage: &OutUsage, stop: &str) {
-        if usage.input_tokens > 0 {
-            self.input = usage.input_tokens;
-        }
-        if usage.output_tokens > 0 {
-            self.output = usage.output_tokens;
-        }
-        if usage.cache_read_input_tokens > 0 {
-            self.cache_read = usage.cache_read_input_tokens;
-        }
-        if usage.cache_creation_input_tokens > 0 {
-            self.cache_write = usage.cache_creation_input_tokens;
+    fn absorb_usage(&mut self, usage: Option<&OutUsage>, stop: &str) {
+        if let Some(usage) = usage {
+            self.usage_known = true;
+            if usage.input_tokens > 0 {
+                self.input = usage.input_tokens;
+            }
+            if usage.output_tokens > 0 {
+                self.output = usage.output_tokens;
+            }
+            if usage.cache_read_input_tokens > 0 {
+                self.cache_read = usage.cache_read_input_tokens;
+            }
+            if usage.cache_creation_input_tokens > 0 {
+                self.cache_write = usage.cache_creation_input_tokens;
+            }
         }
         if !stop.is_empty() {
             self.stop = stop.to_string();

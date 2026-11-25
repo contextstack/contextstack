@@ -16,51 +16,19 @@ use std::path::{Path, PathBuf};
 use crate::failure::{Failure, unenforceable};
 use crate::sbpl;
 
-/// Maximum directory recursion depth when scanning readable user roots for secret env files.
+/// Maximum directory recursion depth when scanning a mask root for secret env files.
 pub const MAX_WALK_DEPTH: usize = 32;
-/// Maximum total filesystem entries inspected across one `masked_paths` scan.
+/// Maximum filesystem entries inspected under one mask root (each root has its own budget).
 pub const MAX_WALK_ENTRIES: usize = 50_000;
 
-/// System directory prefixes that hold OS packages and system configuration, not user or repo
-/// content. `masked_paths` skips these so bwrap startup never walks `/usr`, `/lib`, `/etc`, etc.
-const SYSTEM_ROOT_PREFIXES: &[&str] = &[
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/bin",
-    "/sbin",
-    "/etc",
-    "/private/etc",
-    "/opt",
-    "/var",
-    "/private/var",
-    "/System",
-    "/Library",
-    "/dev",
-    "/proc",
-    "/sys",
-    "/run",
-];
+/// Build-output and dependency trees the mask walk does not descend into: they are large (a
+/// `target/` or `node_modules` alone can exceed the entry cap) and hold generated or vendored
+/// content, not the repo's own secret env files.
+pub const SKIPPED_DIRS: &[&str] = &["target", "node_modules", ".git", "vendor"];
 
-/// Per-user temp trees under a system prefix that still hold user content.
-const TEMP_ROOT_PREFIXES: &[&str] = &["/var/folders", "/private/var/folders"];
-
-/// Whether `root` is a user/code/workspace root that should be walked for secret env files,
-/// rather than a system directory (`/usr`, `/lib`, `/etc`, …).
-pub fn is_user_content_root(root: &Path) -> bool {
-    if root == Path::new("/") {
-        return false;
-    }
-    // Per-user temp dirs (macOS) sit under /var: they hold user content, so walk them.
-    if TEMP_ROOT_PREFIXES
-        .iter()
-        .any(|prefix| root.starts_with(prefix))
-    {
-        return true;
-    }
-    !SYSTEM_ROOT_PREFIXES
-        .iter()
-        .any(|prefix| root.starts_with(prefix))
+/// Whether the walk skips a directory with this basename.
+pub fn is_skipped_dir(name: &std::ffi::OsStr) -> bool {
+    SKIPPED_DIRS.iter().any(|skip| name == *skip)
 }
 
 /// Whether a basename is a secret env file the host policy must not expose.
@@ -84,16 +52,15 @@ pub fn is_secret_env(path: &Path) -> bool {
         })
 }
 
-/// Every secret env file under user-content `roots`, without following symlinks (`lstat`).
-/// Fails with exit 101 (`Failure::Unenforceable`) if a directory cannot be read or if the walk
-/// exceeds `MAX_WALK_DEPTH` or `MAX_WALK_ENTRIES`.
+/// Every secret env file under `roots` (the caller passes the writable and repo-view roots, see
+/// `bwrap::mask_roots`), without following symlinks (`lstat`) and without descending into
+/// `SKIPPED_DIRS`. Any root is walked, including one under `/var` or `/opt`. Fails with exit 101
+/// (`Failure::Unenforceable`) if a directory cannot be read or if the walk of one root exceeds
+/// `MAX_WALK_DEPTH` or `MAX_WALK_ENTRIES`.
 pub fn masked_paths(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Failure> {
     let mut found = BTreeSet::new();
-    let mut entries_seen = 0usize;
     for root in roots {
-        if !is_user_content_root(root) {
-            continue;
-        }
+        let mut entries_seen = 0usize;
         let Ok(meta) = std::fs::symlink_metadata(root) else {
             continue;
         };
@@ -153,6 +120,9 @@ fn walk_secret_env(
             continue;
         }
         if ft.is_dir() {
+            if is_skipped_dir(&entry.file_name()) {
+                continue;
+            }
             walk_secret_env(&path, depth + 1, entries_seen, out)?;
         } else if ft.is_file() && is_secret_env(&path) {
             out.insert(path);
@@ -202,44 +172,84 @@ mod tests {
     }
 
     #[test]
-    fn system_roots_are_skipped_and_user_roots_are_walked() {
-        for sys in [
-            "/",
-            "/usr",
-            "/usr/lib",
-            "/lib",
-            "/lib64",
-            "/bin",
-            "/sbin",
-            "/etc",
-            "/etc/ssl",
-            "/private/etc",
-            "/opt",
-            "/opt/homebrew",
-            "/var/cache/fontconfig",
-            "/private/var/select",
-            "/System/Library",
-            "/Library",
-            "/dev",
-            "/proc",
-        ] {
-            assert!(
-                !is_user_content_root(Path::new(sys)),
-                "expected system root {sys} to be skipped"
-            );
+    fn build_and_dependency_dirs_are_skipped() {
+        for skip in ["target", "node_modules", ".git", "vendor"] {
+            assert!(is_skipped_dir(std::ffi::OsStr::new(skip)), "{skip}");
         }
-        for user in [
-            "/Users/me/src/repo",
-            "/home/me/code",
-            "/tmp/cs-sandbox-1",
-            "/var/folders/hm/x/T/fixture",
-            "/private/tmp/ws",
+        for walk in [
+            "src",
+            "targets",
+            "node_module",
+            ".github",
+            "vendored",
+            "config",
         ] {
-            assert!(
-                is_user_content_root(Path::new(user)),
-                "expected user root {user} to be walked"
-            );
+            assert!(!is_skipped_dir(std::ffi::OsStr::new(walk)), "{walk}");
         }
+    }
+
+    #[test]
+    fn walk_skips_build_trees_and_masks_the_rest() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let root = dir.path();
+        for sub in [
+            "target/debug",
+            "node_modules/pkg",
+            ".git/x",
+            "vendor/lib",
+            "app",
+        ] {
+            fs::create_dir_all(root.join(sub)).map_err(|e| e.to_string())?;
+            fs::write(root.join(sub).join(".env"), "x").map_err(|e| e.to_string())?;
+        }
+        let masks = masked_paths(&[root.to_path_buf()]).map_err(|f| f.message().to_owned())?;
+        assert_eq!(masks, vec![root.join("app/.env")]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_large_build_tree_does_not_trip_the_cap() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let root = dir.path();
+        let deps = root.join("node_modules");
+        fs::create_dir(&deps).map_err(|e| e.to_string())?;
+        for i in 0..(MAX_WALK_ENTRIES + 10) {
+            fs::File::create(deps.join(i.to_string())).map_err(|e| e.to_string())?;
+        }
+        fs::write(root.join(".env"), "x").map_err(|e| e.to_string())?;
+        let masks = masked_paths(&[root.to_path_buf()]).map_err(|f| f.message().to_owned())?;
+        assert_eq!(masks, vec![root.join(".env")]);
+        Ok(())
+    }
+
+    #[test]
+    fn entry_cap_is_per_root() -> Result<(), String> {
+        let a = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let b = tempfile::tempdir().map_err(|e| e.to_string())?;
+        // Each root alone is under the cap; together they exceed it.
+        for root in [a.path(), b.path()] {
+            for i in 0..(MAX_WALK_ENTRIES / 2 + 10) {
+                fs::File::create(root.join(i.to_string())).map_err(|e| e.to_string())?;
+            }
+            fs::write(root.join(".env"), "x").map_err(|e| e.to_string())?;
+        }
+        let masks = masked_paths(&[a.path().to_path_buf(), b.path().to_path_buf()])
+            .map_err(|f| f.message().to_owned())?;
+        assert_eq!(masks.len(), 2, "{masks:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn roots_under_system_prefixes_are_still_walked() -> Result<(), String> {
+        // A workspace under /var (here /var/tmp, world-writable on macOS and Linux) is a mask root
+        // like any other (review F3): its `.env` is masked.
+        let dir = tempfile::tempdir_in("/var/tmp").map_err(|e| e.to_string())?;
+        let root = dir.path().canonicalize().map_err(|e| e.to_string())?;
+        fs::write(root.join(".env"), "x").map_err(|e| e.to_string())?;
+        let masks =
+            masked_paths(std::slice::from_ref(&root)).map_err(|f| f.message().to_owned())?;
+        assert_eq!(masks, vec![root.join(".env")]);
+        Ok(())
     }
 
     #[test]
@@ -264,8 +274,7 @@ mod tests {
         symlink(outside.path().join(".env"), root.join("sub/.env.link"))
             .map_err(|e| e.to_string())?;
 
-        let masks = masked_paths(&[root.to_path_buf(), PathBuf::from("/usr")])
-            .map_err(|f| f.message().to_owned())?;
+        let masks = masked_paths(&[root.to_path_buf()]).map_err(|f| f.message().to_owned())?;
         assert_eq!(masks.len(), 8, "{masks:?}");
         for expected in [".env_prod", ".env-local", ".envrc.local", "x.env.bak"] {
             assert!(

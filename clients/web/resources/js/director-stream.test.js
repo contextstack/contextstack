@@ -1,7 +1,7 @@
 // npm test (node --test resources/js/)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SharedStream, directorStream } from './director-stream.js';
+import { BATCH_MAX, SharedStream, directorStream } from './director-stream.js';
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -228,4 +228,54 @@ test('a stream reached through a reactive proxy (Alpine data) does not close its
     assert.equal(SharedStream.for('/stream?conversation=proxied'), raw, 'still listed, so the next page can close it');
     assert.equal(server.opened, 1);
     raw.stop();
+});
+
+test('a failed applyStream leaves live: the page holds, then refetches and applies what came after', async () => {
+    const page = directorStream('unused');
+    page.calls = [];
+    let failNext = false;
+    page.$wire = new Proxy({}, {
+        get: (_, method) => async (...args) => {
+            page.calls.push([method, ...args]);
+            if (method === 'applyStream' && failNext) {
+                failNext = false;
+                throw { status: 413 };
+            }
+        },
+    });
+    page.begin();
+    await tick();
+    assert.equal(page.status, 'live');
+
+    failNext = true;
+    page.receive('change', { kind: 'job', revision: 2 });
+    page.flush();
+    await tick();
+    assert.equal(page.status, 'syncing', 'a lost batch is not shown as live');
+    assert.equal(page.phase, 'holding');
+
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+    assert.deepEqual(page.calls.map((call) => call[0]), ['refetch', 'applyStream', 'refetch']);
+    assert.equal(page.status, 'live');
+    page.destroy();
+});
+
+test('a large backlog is applied in bounded batches, in order', async () => {
+    const page = scope();
+    page.begin();
+    await tick();
+    for (let revision = 1; revision <= BATCH_MAX * 2 + 5; revision++) {
+        page.receive('change', { kind: 'job', revision });
+    }
+    page.receive('run_event', { run_id: 'r', seq: 1 });
+    await page.flush();
+    for (let i = 0; i < 3; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    const batches = page.calls.filter((call) => call[0] === 'applyStream');
+    assert.deepEqual(batches.map((call) => call[1].length + call[2].length), [BATCH_MAX, BATCH_MAX, 6]);
+    assert.deepEqual(batches.flatMap((call) => call[1].map((change) => change.revision)),
+        Array.from({ length: BATCH_MAX * 2 + 5 }, (_, i) => i + 1));
+    assert.deepEqual(batches.at(-1)[2], [{ run_id: 'r', seq: 1 }]);
+    page.destroy();
 });

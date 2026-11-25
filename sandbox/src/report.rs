@@ -59,6 +59,7 @@ mod tests {
     fn report_file_has_the_contract_fields() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
         let effective = Effective {
+            developer_dir: None,
             workspace: PathBuf::from("/ws"),
             read: vec![PathBuf::from("/ws")],
             write: vec![PathBuf::from("/ws")],
@@ -122,6 +123,7 @@ mod tests {
     #[test]
     fn unwritable_dir_is_an_error_text_not_a_panic() {
         let effective = Effective {
+            developer_dir: None,
             workspace: PathBuf::from("/ws"),
             read: vec![],
             write: vec![],

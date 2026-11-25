@@ -63,11 +63,6 @@ class ConnectionStore
         }
     }
 
-    public function hasLocalCredential(): bool
-    {
-        return $this->localToken() !== null;
-    }
-
     /**
      * The URL this device would use, connected or not.
      */

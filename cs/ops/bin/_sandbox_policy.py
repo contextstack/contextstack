@@ -55,7 +55,7 @@ OPTIONAL = ("write_env", "profiles", "sockets")
 SOCKET_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")  # cs-sandbox policy.rs socket_name_ok
 PROFILES = ("browser", "cli-executor")  # the names cs-sandbox knows (sandbox/src/profile.rs)
 ROOTED = ("/", "$CODE_ROOT", "$REPO_ROOT", "$HOME")
-READ_ROOTED = ROOTED + ("$TOOL_PYTHON",)  # read lists only: the venv interpreter's install (cs-sandbox policy.rs tool_python)
+READ_ROOTED = ROOTED + ("$TOOL_PYTHON",)  # read lists only, expanded by cs-sandbox
 OSES = ("macos", "linux")
 VAR = re.compile(r"[A-Z_][A-Z0-9_]*")
 BROWSER_STATE = ".contextstack/state/browser-state"  # under $HOME
@@ -111,8 +111,8 @@ def load_policy(code_root=CODE_ROOT):
 def _paths(where, rr):
     """A runtime_read-shaped value: absolute paths as a list, or one list per OS."""
     lists = list(rr.values()) if isinstance(rr, dict) and rr and set(rr) <= set(OSES) else [rr]
-    if not all(_strings(l) and all(p.startswith(READ_ROOTED) for p in l) for l in lists):
-        raise ValueError("%s: want absolute paths (or $CODE_ROOT, $REPO_ROOT, $HOME, $TOOL_PYTHON), as a list or {%s: [...]}, got %r"
+    if not all(_strings(l) and all(p == "$DEVELOPER_DIR" or p.startswith(READ_ROOTED) for p in l) for l in lists):
+        raise ValueError("%s: want absolute paths (or $CODE_ROOT, $REPO_ROOT, $HOME, $TOOL_PYTHON, $DEVELOPER_DIR), as a list or {%s: [...]}, got %r"
                          % (where, ", ".join(OSES), rr))
 
 

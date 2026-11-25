@@ -2,9 +2,9 @@
 """Finding 33: agent git metadata must never execute on or redirect the host."""
 import json
 import os
+import runpy
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
@@ -21,6 +21,7 @@ def git(path, *args):
 
 with scratch_dir(prefix="harvest-security-") as raw:
     root = Path(raw)
+    os.environ["HOME"] = str(root)
     other = root / "other"
     other.mkdir()
     git(other, "init", "-q")
@@ -37,13 +38,14 @@ with scratch_dir(prefix="harvest-security-") as raw:
         payload.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\ncat\n')
         payload.chmod(0o755)
         git(ws, "init", "-q")
-        for key, value in (("filter.x.clean", str(payload)), ("gpg.program", str(payload)),
+        for key, value in (("filter.x.clean", str(payload)), ("diff.x.textconv", str(payload)),
+                           ("core.fsmonitor", str(payload)), ("gpg.program", str(payload)),
                            ("commit.gpgsign", "true")):
             git(ws, "config", key, value)
         hook = ws / ".git/hooks/pre-commit"
         hook.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
         hook.chmod(0o755)
-        (ws / ".gitattributes").write_text("* filter=x\n")
+        (ws / ".gitattributes").write_text("* filter=x diff=x\n")
         (ws / "ordinary.txt").write_text("workspace content\n")
         if attack == "gitfile":
             import shutil
@@ -64,6 +66,8 @@ with scratch_dir(prefix="harvest-security-") as raw:
     # Lane admin metadata lives outside the worktree and is sandbox-protected.
     # Even owner-configured drivers must not be activated by agent attributes.
     sys.path.insert(0, str(OPS))
+    import _action_approval
+    import _executor
     import _lanes
     marker = root / "lane-executed"
     payload = root / "lane-payload"
@@ -85,4 +89,40 @@ with scratch_dir(prefix="harvest-security-") as raw:
     commit = _lanes.commit_lane(lane_path, "safe lane", main=other, lane="safe-lane")
     assert git(other, "show", commit + ":ordinary.txt") == "lane content"
     assert not marker.exists(), "lane commit executed a driver, signer or hook"
-print("PASS: harvest ignores agent metadata, drivers and pointers; ordinary files commit")
+
+    ws = root / "standalone"
+    ws.mkdir()
+    git(ws, "init", "-q")
+    (ws / "ordinary.txt").write_text("base\n")
+    git(ws, "add", ".")
+    git(ws, "-c", "user.name=test", "-c", "user.email=test@local", "commit", "-qm", "base")
+    (ws / "ordinary.txt").write_text("changed content\n")
+    (ws / ".gitattributes").write_text("* filter=x diff=x\n")
+    for key in ("filter.x.clean", "diff.x.textconv", "core.fsmonitor"):
+        git(ws, "config", key, f'touch "{marker}"')
+    for args in (("diff", "HEAD", "--"), ("status", "--porcelain")):
+        result = _lanes.workspace_git(ws, *args, env=hermetic_env())
+        assert result.returncode == 0, result.stderr
+        assert not marker.exists(), f"host {args[0]} executed a workspace driver"
+        assert "ordinary.txt" in result.stdout, result.stdout
+    (run / "stimulus").mkdir()
+    (run / "stimulus/goal.md").write_text("fixture")
+    context = _action_approval.lane_context(run, ["git", "status"],
+                                           {**hermetic_env(), "TMPDIR": raw}, ws)
+    assert "changed content" in context["diff"], context["diff"]
+    assert not marker.exists(), "action approval executed a workspace driver"
+
+    (ws / ".git/info/exclude").write_text("outside.txt\n")
+    (ws / "outside.txt").write_text("outside the grant\n")
+    base = git(ws, "rev-parse", "HEAD")
+    assert "outside.txt" in _executor.changed_paths(ws, base, env=hermetic_env())
+
+    publish = runpy.run_path(str(OPS / "publish-evidence"))
+    original_index = (ws / ".git/index").read_bytes()
+    diff, files, complete, error, _ = publish["candidate_diff"](ws, {"kind": "git", "commit": base})
+    assert complete, error
+    assert "+changed content" in diff, diff
+    assert {"status": "M", "path": "ordinary.txt"} in files, files
+    assert (ws / ".git/index").read_bytes() == original_index
+    assert not marker.exists(), "publish-evidence executed a workspace driver"
+print("PASS: host harvest, diff, status, approval and publish-evidence ignore workspace drivers and grant exclusions")

@@ -1,7 +1,7 @@
 //! Request-scoped traces. Buffer the small set of records and append them before the terminal frame.
 
 use crate::errors::CallError;
-use crate::pricing::TokenBill;
+use crate::pricing::{ResolvedRates, TokenBill, settle_usd};
 use crate::spend::{Guard, Reservation};
 use crate::wire::{Cost, Request};
 use bytes::Bytes;
@@ -38,6 +38,18 @@ struct Attempt {
     first_output: bool,
     body_sent: Option<Arc<AtomicBool>>,
     connection_lost: bool,
+    /// Usage the provider reported on a 2xx body the adapter then rejected.
+    measured: Option<TokenBill>,
+}
+
+/// A request body whose flag turns true once the transport has consumed its final frame.
+pub fn tracked_body(raw: Bytes) -> (reqwest::Body, Arc<AtomicBool>) {
+    let sent = Arc::new(AtomicBool::new(false));
+    let body = reqwest::Body::wrap(TrackedBody {
+        bytes: raw,
+        sent: Arc::clone(&sent),
+    });
+    (body, sent)
 }
 
 // The HTTP transport marks the body sent when it consumes the final frame.
@@ -93,7 +105,7 @@ pub struct Exchange {
     tool_choice_dropped: bool,
     guard: Option<Arc<Guard>>,
     hold: Option<Reservation>,
-    charge: Option<Box<dyn FnOnce() + Send>>,
+    rates: Option<ResolvedRates>,
     write: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -166,7 +178,7 @@ impl Exchange {
             tool_choice_dropped: false,
             guard: None,
             hold: None,
-            charge: None,
+            rates: None,
             write: None,
         }
     }
@@ -199,6 +211,7 @@ impl Exchange {
             first_output: false,
             body_sent: None,
             connection_lost: false,
+            measured: None,
         });
         if let Some(reserved) = reservation
             && let Some(attempt) = &mut self.attempt
@@ -212,15 +225,27 @@ impl Exchange {
         self.hold = hold;
     }
 
+    /// The resolved target's rates, used to price usage measured on a failed 2xx reply.
+    pub fn price_with(&mut self, rates: ResolvedRates) {
+        self.rates = Some(rates);
+    }
+
+    /// Usage a 2xx body reported before the adapter rejected the body (e.g. a negative charge).
+    pub fn measured_usage(&mut self, bill: TokenBill) {
+        if let Some(attempt) = &mut self.attempt {
+            attempt.measured = Some(bill);
+        }
+    }
+
     pub fn reservation(&self) -> Option<f64> {
         self.hold.as_ref().map(Reservation::reservation_usd)
     }
 
     pub fn request_body(&mut self, raw: Bytes) -> reqwest::Body {
         if let Some(attempt) = &mut self.attempt {
-            let sent = Arc::new(AtomicBool::new(false));
-            attempt.body_sent = Some(Arc::clone(&sent));
-            return reqwest::Body::wrap(TrackedBody { bytes: raw, sent });
+            let (body, sent) = tracked_body(raw);
+            attempt.body_sent = Some(sent);
+            return body;
         }
         raw.into()
     }
@@ -238,15 +263,27 @@ impl Exchange {
         }
     }
 
+    /// Whether the exchange was aborted rather than answered: deadline, disconnect or connection loss.
+    pub fn aborted(&self, outcome: &str) -> bool {
+        matches!(outcome, "deadline" | "client_disconnect")
+            || self.attempt.as_ref().is_some_and(|a| a.connection_lost)
+    }
+
+    /// The reservation a paid attempt owes when it ends without a usable reply: its body was sent and
+    /// the provider did not refuse, and either the exchange was aborted (deadline, disconnect,
+    /// connection loss) or the provider had already answered 2xx (the call is billed; a body the
+    /// gateway cannot use does not make it free).
     pub fn aborted_reservation(&self, outcome: &str) -> Option<f64> {
         let attempt = self.attempt.as_ref()?;
         let sent = attempt.body_sent.as_ref()?.load(Ordering::Relaxed);
-        let refused = attempt.fields["http_status"]
-            .as_u64()
-            .is_some_and(|s| s >= 300);
+        let status = attempt.fields["http_status"].as_u64();
+        let refused = status.is_some_and(|s| s >= 300);
+        let answered = status.is_some_and(|s| s < 300);
         if sent
             && !refused
-            && (attempt.connection_lost || matches!(outcome, "deadline" | "client_disconnect"))
+            && (answered
+                || attempt.connection_lost
+                || matches!(outcome, "deadline" | "client_disconnect"))
         {
             self.reservation()
         } else {
@@ -254,12 +291,24 @@ impl Exchange {
         }
     }
 
+    /// Settle an attempt that ended without a reply, keeping the reservation as a minimum.
     pub fn settle_abort(&mut self, outcome: &str) -> Option<Cost> {
         let reserved = self.aborted_reservation(outcome)?;
-        let mut cost = Cost::priced(format!("{reserved:.6}"), "api", None, false);
-        cost.est_usd = Some(reserved);
-        cost.charged_usd = Some(reserved);
-        self.settle("", None, &cost, true, true);
+        let measured = self.attempt.as_ref().and_then(|a| a.measured);
+        let list = measured
+            .zip(self.rates)
+            .map(|(bill, rates)| settle_usd(rates, bill))
+            .filter(|usd| usd.is_finite());
+        let charged = list.map_or(reserved, |usd| usd.max(reserved));
+        let mut cost = Cost::priced(
+            format!("{charged:.6}"),
+            "api",
+            None,
+            charged > reserved + 1e-9,
+        );
+        cost.est_usd = Some(charged);
+        cost.charged_usd = Some(charged);
+        self.settle("", measured, &mut cost, true, list.is_none());
         Some(cost)
     }
 
@@ -368,48 +417,71 @@ impl Exchange {
         );
     }
 
+    /// Record usage and settle the charge now, on the calling thread: a charge never waits on a task
+    /// the runtime may not run (shutdown). A spend-file write that fails twice clears `charged_usd` so
+    /// the reply never reports an unrecorded charge, and marks the settlement span `spend_write_failed`.
     pub fn settle(
         &mut self,
         source: &str,
         tokens: Option<TokenBill>,
-        cost: &Cost,
+        cost: &mut Cost,
         partial: bool,
         reservation_estimate: bool,
     ) {
         let now = Stamp::now();
+        let reported = cost.reported_charge();
+        let (settled, written) = if let Some(hold) = self.hold.take() {
+            let charged = cost.charged_usd.unwrap_or_default();
+            (Some(charged), hold.settle(charged, cost.over_reservation))
+        } else if let Some(charge) = reported
+            && let Some(guard) = self.guard.take()
+        {
+            (reported, guard.debit_reported(source, charge))
+        } else {
+            (reported, Ok(0.0))
+        };
+        let partial = partial || written.is_err();
         if let Some(tokens) = tokens {
+            // Completed replies already carry the rounded list price. Partial replies carry the
+            // settlement as their cost, so price the measured tokens independently for the floor.
+            let estimated_usd = if partial {
+                self.rates.map(|rates| settle_usd(rates, tokens))
+            } else {
+                cost.est_usd
+            };
             self.child("usage", now, json!({
-                "partial": partial, "estimated_usd": cost.est_usd,
+                "partial": partial, "estimated_usd": estimated_usd,
                 "input_tokens": tokens.input_tokens, "output_tokens": tokens.output_tokens,
                 "cache_read_tokens": tokens.cache_read_tokens, "cache_write_tokens": tokens.cache_write_tokens,
             }));
+        } else if partial && (self.saw_output || reported.is_some()) {
+            self.child("usage", now, json!({"partial": true}));
         }
-        let reported = cost.reported_charge();
-        let settled = if let Some(hold) = self.hold.take() {
-            let charged = cost.charged_usd.unwrap_or_default();
-            let over = cost.over_reservation;
-            self.charge = Some(Box::new(move || {
-                hold.settle(charged, over);
-            }));
-            Some(charged)
-        } else {
-            if let Some(charge) = reported
-                && let Some(guard) = self.guard.take()
-            {
-                let source = source.to_owned();
-                self.charge = Some(Box::new(move || guard.debit_reported(&source, charge)));
-            }
-            reported
-        };
         if let Some(charged) = settled {
             self.provider_charge_usd = reported;
-            let mut fields = json!({"partial": partial, "charged_usd": charged});
-            if reported.is_some() {
-                fields["basis"] = json!("provider_reported");
+            let basis = if reported.is_some() {
+                "provider_reported"
             } else if reservation_estimate {
-                fields["basis"] = json!("reservation_estimate");
-            }
-            self.child("settlement", now, fields);
+                "reservation_estimate"
+            } else {
+                "measured"
+            };
+            let mut fields = json!({"partial": partial, "basis": basis});
+            let outcome = if written.is_ok() {
+                fields["charged_usd"] = json!(charged);
+                "completed"
+            } else {
+                *cost = Cost::zero();
+                "spend_write_failed"
+            };
+            self.record(
+                "settlement",
+                &format!("{}-settlement", self.id),
+                &self.id.clone(),
+                (now, now),
+                outcome,
+                fields,
+            );
         }
     }
 
@@ -422,10 +494,6 @@ impl Exchange {
             "completed",
             extra,
         );
-    }
-
-    pub fn saw_output(&self) -> bool {
-        self.saw_output
     }
 
     pub fn failure(
@@ -487,20 +555,18 @@ impl Exchange {
             outcome,
             fields,
         );
-        let path = self.path.take();
-        let charge = self.charge.take();
-        if path.is_some() || charge.is_some() {
+        if let Some(path) = self.path.take() {
             let rows = std::mem::take(&mut self.rows);
-            self.write = Some(tokio::task::spawn_blocking(move || {
-                if let Some(charge) = charge {
-                    charge();
-                }
-                if let Some(path) = path
-                    && let Err(err) = append(&path, &rows)
-                {
+            let write = move || {
+                if let Err(err) = append(&path, &rows) {
                     crate::logf!("gateway trace append failed: {err}");
                 }
-            }));
+            };
+            // Outside a runtime (or from a drop during shutdown) write inline.
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => self.write = Some(runtime.spawn_blocking(write)),
+                Err(_) => write(),
+            }
         }
     }
 
@@ -562,7 +628,101 @@ fn append(path: &Path, rows: &[Value]) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub fn read_spans(home: &Path, run: &str) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+        let path = home
+            .join(".contextstack/gateway/traces")
+            .join(format!("{run}.jsonl"));
+        Ok(std::fs::read_to_string(path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn check_spans(
+        mut spans: Vec<Value>,
+        terminal_charge: f64,
+        missing: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let exchange = spans
+            .iter()
+            .find(|row| row["kind"] == "gateway_exchange")
+            .ok_or("missing exchange")?;
+        let envelope = |kind: &str, id: Value, parent: Value, fields: Value, outcome: &str| {
+            let mut span = exchange.clone();
+            span["kind"] = json!(kind);
+            span["name"] = json!(kind);
+            span["span_id"] = id;
+            span["parent_id"] = parent;
+            span["attributes"] = fields;
+            span["attributes"]["machine"] = exchange["attributes"]["machine"].clone();
+            span["outcome"] = json!(outcome);
+            span
+        };
+        let request = &exchange["attributes"]["request_id"];
+        let parents = [
+            envelope(
+                "model_call",
+                exchange["parent_id"].clone(),
+                json!("turn"),
+                json!({
+                    "request_id": request,
+                    "sends": [{"send_index": 1, "outcome": "delivered"}],
+                }),
+                "error",
+            ),
+            envelope(
+                "turn",
+                json!("turn"),
+                json!("run"),
+                json!({"turn": 1}),
+                "completed",
+            ),
+            envelope(
+                "run",
+                json!("run"),
+                Value::Null,
+                json!({
+                    "run_id": exchange["trace_id"], "coverage": "full",
+                    "terminal": {"turns": 1, "tool_calls": 0, "charged_usd": terminal_charge,
+                                 "accounted_settlements": [{"request_id": request, "send_index": 1}]},
+                }),
+                "error",
+            ),
+        ];
+        spans.extend(parents);
+        let input = tempfile::NamedTempFile::new()?;
+        serde_json::to_writer(input.as_file(), &spans)?;
+        let checker = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tracing/check-trace");
+        let output = std::process::Command::new("python3")
+            .arg(checker)
+            .arg(input.path())
+            .output()?;
+        let result: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(result["findings"], json!([]));
+        if let Some(missing) = missing {
+            assert_eq!(output.status.code(), Some(1), "{result}");
+            assert_eq!(result["result"], "incomplete");
+            assert_eq!(
+                result["missing"],
+                json!([format!(
+                    "3: {}/request r send 1 {missing}",
+                    spans[0]["trace_id"].as_str().ok_or("trace ID")?
+                )]),
+            );
+        } else {
+            assert!(output.status.success(), "{result}");
+            assert_eq!(result["result"], "complete");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{check_spans, read_spans};
     use super::*;
 
     #[tokio::test]
@@ -597,18 +757,182 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn trace_flush_waits_for_the_charge_on_a_blocking_worker()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let current = std::thread::current().id();
-        let (send, mut receive) = tokio::sync::oneshot::channel();
-        let mut trace = Exchange::new(None, Stamp::now(), &Request::default());
-        trace.charge = Some(Box::new(move || {
-            let _ = send.send(std::thread::current().id());
-        }));
+    fn paid(home: &Path, run: &str) -> Result<(Arc<Guard>, Exchange), Box<dyn std::error::Error>> {
+        let guard = Arc::new(Guard::new(Some(home)));
+        guard
+            .replace(br#"{"api_usd_per_day": 1}"#)
+            .map_err(|e| format!("{e:?}"))?;
+        let reservation = guard.admit("provider", "", 0.1)?;
+        let request = Request {
+            run_id: Some(run.into()),
+            request_id: "r".into(),
+            ..Request::default()
+        };
+        let mut trace = Exchange::new(Some(home), Stamp::now(), &request);
+        trace.wallet(Arc::clone(&guard), Some(reservation));
+        Ok((guard, trace))
+    }
+
+    fn send(trace: &mut Exchange, status: Option<u16>) {
+        trace.begin_attempt("provider", b"{}", false);
+        let body = trace.request_body(Bytes::from_static(b"{}"));
+        let mut body = std::pin::pin!(body);
+        let waker = std::task::Waker::noop();
+        while let Poll::Ready(Some(_)) =
+            Body::poll_frame(body.as_mut(), &mut Context::from_waker(waker))
+        {}
+        if let Some(status) = status {
+            trace.headers(status);
+        }
+    }
+
+    // G4: no runtime, no flush (a shutting-down runtime runs neither): the charge is already recorded.
+    #[test]
+    fn settlement_records_the_charge_without_a_runtime() -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let (guard, mut trace) = paid(home.path(), "sync")?;
+        send(&mut trace, Some(200));
+        let mut cost = Cost::priced("0.050000".into(), "api", None, false);
+        trace.settle("provider", None, &mut cost, false, false);
+        let report = guard.report(["provider".to_owned()]);
+        assert_eq!(report["total"]["spent_usd"], 0.05);
+        assert_eq!(report["total"]["held_usd"], 0.0);
         trace.finish("completed", None);
+        Ok(())
+    }
+
+    // G1: a 2xx whose body the gateway rejects is billed: the reservation, as an estimate.
+    #[tokio::test]
+    async fn a_rejected_2xx_body_settles_the_reservation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let home = tempfile::tempdir()?;
+        let (guard, mut trace) = paid(home.path(), "rejected")?;
+        send(&mut trace, Some(200));
+        let cost = trace
+            .settle_abort("upstream_error")
+            .ok_or("no settlement")?;
+        assert_eq!(cost.charged_usd, Some(0.1));
+        assert_eq!(cost.amount, "0.100000");
+        trace.finish("upstream_error", None);
         trace.flush().await;
-        assert_ne!(receive.try_recv()?, current);
+        assert_eq!(
+            guard.report(["provider".to_owned()])["total"]["spent_usd"],
+            0.1
+        );
+        let rows = read_spans(home.path(), "rejected")?;
+        let settlement = rows
+            .iter()
+            .find(|row| row["kind"] == "settlement")
+            .ok_or("no settlement")?;
+        assert_eq!(settlement["attributes"]["basis"], "reservation_estimate");
+        check_spans(rows, 0.1, None)?;
+        Ok(())
+    }
+
+    // G1: measured usage above the reservation is the floor.
+    #[test]
+    fn a_rejected_2xx_body_with_usage_settles_at_least_the_usage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let (guard, mut trace) = paid(home.path(), "measured")?;
+        trace.price_with(ResolvedRates {
+            input_per_1k: 1.0,
+            output_per_1k: 1.0,
+            cache_read_per_1k: 0.0,
+            cache_write_per_1k: 0.0,
+        });
+        send(&mut trace, Some(200));
+        trace.measured_usage(TokenBill {
+            input_tokens: 100,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        });
+        let cost = trace
+            .settle_abort("upstream_error")
+            .ok_or("no settlement")?;
+        assert_eq!(cost.charged_usd, Some(0.2));
+        assert!(cost.over_reservation);
+        assert_eq!(
+            guard.report(["provider".to_owned()])["total"]["spent_usd"],
+            0.2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_usage_is_priced_independently_of_the_charge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let (_, mut trace) = paid(home.path(), "usage-floor")?;
+        trace.price_with(ResolvedRates {
+            input_per_1k: 1.0,
+            output_per_1k: 0.0,
+            cache_read_per_1k: 0.0,
+            cache_write_per_1k: 0.0,
+        });
+        send(&mut trace, Some(200));
+        trace.measured_usage(TokenBill {
+            input_tokens: 25,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        });
+        let cost = trace.settle_abort("deadline").ok_or("no settlement")?;
+        assert_eq!(cost.charged_usd, Some(0.1));
+        trace.finish("deadline", None);
+        trace.flush().await;
+        let mut rows = read_spans(home.path(), "usage-floor")?;
+        let usage = rows
+            .iter()
+            .find(|row| row["kind"] == "usage")
+            .ok_or("no usage")?;
+        assert_eq!(usage["attributes"]["input_tokens"], 25);
+        assert_eq!(usage["attributes"]["estimated_usd"], 0.025);
+        check_spans(rows.clone(), 0.1, None)?;
+
+        let settlement = rows
+            .iter_mut()
+            .find(|row| row["kind"] == "settlement")
+            .ok_or("no settlement")?;
+        assert_eq!(settlement["attributes"]["basis"], "measured");
+        settlement["attributes"]["charged_usd"] = json!(0.02);
+        check_spans(rows, 0.02, Some("charge below measured usage"))?;
+        Ok(())
+    }
+
+    // A 2xx refusal of nothing: an HTTP refusal (>= 300) still releases at $0.
+    #[test]
+    fn an_http_refusal_still_releases() -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let (_guard, mut trace) = paid(home.path(), "refused")?;
+        send(&mut trace, Some(400));
+        assert!(trace.settle_abort("upstream_error").is_none());
+        Ok(())
+    }
+
+    // G6: an unrecorded charge is not reported as charged, and the trace says so.
+    #[tokio::test]
+    async fn a_failed_spend_write_is_not_reported_charged() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let home = tempfile::tempdir()?;
+        let (_guard, mut trace) = paid(home.path(), "unwritten")?;
+        std::fs::create_dir_all(home.path().join(".contextstack/gateway/spend.json"))?;
+        send(&mut trace, Some(200));
+        let mut cost = Cost::priced("0.050000".into(), "api", None, false);
+        trace.settle("provider", None, &mut cost, false, false);
+        assert_eq!(cost.charged_usd, None);
+        assert_eq!(cost.amount, "0.000000");
+        trace.finish("upstream_error", None);
+        trace.flush().await;
+        let rows = read_spans(home.path(), "unwritten")?;
+        let settlement = rows
+            .iter()
+            .find(|row| row["kind"] == "settlement")
+            .ok_or("no settlement")?;
+        assert_eq!(settlement["outcome"], "spend_write_failed");
+        assert!(settlement["attributes"].get("charged_usd").is_none());
+        check_spans(rows, 0.0, Some("settlement charge"))?;
         Ok(())
     }
 }

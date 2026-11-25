@@ -49,6 +49,7 @@ pub fn record(name: &str, args: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jail::CwdRestore;
     use serde_json::json;
 
     #[test]
@@ -62,15 +63,11 @@ mod tests {
 
     #[test]
     fn record_appends_jsonl_line_in_workspace() {
-        use crate::jail::CWD_TEST_LOCK;
         use std::fs;
         use tempfile::TempDir;
-        let _lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| panic!("lock: {e}"));
         let dir = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let prev = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
-        std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(dir.path());
         record("fs_read", &json!({"path": "a.txt"}));
-        let _ = std::env::set_current_dir(&prev);
         let text = fs::read_to_string(dir.path().join(".cs-calls.jsonl"))
             .unwrap_or_else(|e| panic!("read: {e}"));
         assert!(text.contains("fs_read"));
@@ -78,26 +75,19 @@ mod tests {
 
     #[test]
     fn record_skips_unwritable_destination_without_panicking() {
-        use crate::jail::CWD_TEST_LOCK;
-        let _lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| panic!("lock: {e}"));
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let prev = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
-        std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(dir.path());
         std::fs::create_dir(dir.path().join(LOG)).unwrap_or_else(|e| panic!("mkdir log: {e}"));
         record("fs_read", &json!({"path": "/nonexistent-root/nope.txt"}));
-        std::env::set_current_dir(&prev).unwrap_or_else(|e| panic!("restore cwd: {e}"));
+
         assert!(dir.path().join(LOG).is_dir());
     }
 
     #[test]
     fn record_silently_skips_when_call_log_path_is_not_a_file() {
-        use crate::jail::CWD_TEST_LOCK;
-        let _lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| panic!("lock: {e}"));
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let prev = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
-        std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(dir.path());
         std::fs::create_dir(dir.path().join(LOG)).unwrap_or_else(|e| panic!("mkdir log: {e}"));
         record("fs_read", &json!({"path": "a.txt"}));
-        std::env::set_current_dir(&prev).unwrap_or_else(|e| panic!("restore cwd: {e}"));
     }
 }

@@ -3,7 +3,7 @@
 //! with its own `revision` (CLIENT-API.md §3). One place renders them, for the API and the event stream alike.
 
 use crate::store::Record;
-use rusqlite::{Connection, Row, ToSql, params};
+use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -21,6 +21,92 @@ pub fn stale_after() -> i64 {
     STALE_AFTER.load(Ordering::Relaxed)
 }
 
+/// An offered job its node has not pulled for this long shows `waiting` (`serve --offer-grace`).
+static OFFER_GRACE: AtomicI64 = AtomicI64::new(30);
+
+/// Set how long an offered job may go unpulled before it shows `waiting`.
+pub fn set_offer_grace(seconds: i64) {
+    OFFER_GRACE.store(seconds, Ordering::Relaxed);
+}
+
+/// How long an offered job may go unpulled before it shows `waiting`.
+pub fn offer_grace() -> i64 {
+    OFFER_GRACE.load(Ordering::Relaxed)
+}
+
+/// What a job's `waiting` field is derived from.
+#[derive(Debug, Default)]
+pub(crate) struct Wait<'a> {
+    /// The job's state.
+    pub state: &'a str,
+    /// Its node's name.
+    pub node: &'a str,
+    /// When it was offered (or created, for a job offered before `offered_at` was kept).
+    pub since: &'a str,
+    /// Seconds since `since`; `None` when unparseable.
+    pub since_age: Option<i64>,
+    /// When its node was last heard from.
+    pub node_last_seen: Option<&'a str>,
+    /// Seconds since `node_last_seen`; `None` when never seen.
+    pub seen_age: Option<i64>,
+    /// The hold's reason (`job_budgets.reason`), for a held job.
+    pub hold_reason: Option<&'a str>,
+    /// The hold's text (`job_budgets.detail`), for a held job.
+    pub hold_detail: Option<&'a str>,
+}
+
+/// Why a job is not yet running, or null (CLIENT-API.md §11, "waiting"). Derived at read time; it does not by
+/// itself change a record's `revision`.
+pub(crate) fn waiting(w: &Wait, grace: i64, stale: i64) -> Value {
+    match w.state {
+        "offered" if w.since_age.is_none_or(|a| a > grace) => {
+            let mut out = json!({"reason": "node_not_pulled", "node": w.node, "since": w.since});
+            if w.seen_age.is_none_or(|a| a > stale) {
+                out["node_last_seen"] = json!(w.node_last_seen);
+            }
+            out
+        }
+        "waiting" => json!({"reason": "held", "detail": w.hold_reason.unwrap_or("waiting"),
+                            "message": w.hold_detail, "node": w.node}),
+        _ => Value::Null,
+    }
+}
+
+/// A job's `waiting` field, read from the store; null for an unknown job or one that is not waiting.
+pub(crate) fn job_waiting(db: &Connection, job_id: &str) -> rusqlite::Result<Value> {
+    let mut stmt = db.prepare_cached(
+        "SELECT j.state, n.name, COALESCE(j.offered_at, j.created_at), n.last_seen_at, b.reason, b.detail
+         FROM jobs j JOIN nodes n ON n.id = j.node_id LEFT JOIN job_budgets b ON b.job_id = j.job_id
+         WHERE j.job_id = ?1 AND j.state IN ('offered', 'waiting')",
+    )?;
+    let row = stmt
+        .query_row(params![job_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .optional()?;
+    let Some((state, node, since, seen, reason, detail)) = row else {
+        return Ok(Value::Null);
+    };
+    let w = Wait {
+        state: &state,
+        node: &node,
+        since: &since,
+        since_age: crate::util::seconds_since(&since),
+        node_last_seen: seen.as_deref(),
+        seen_age: seen.as_deref().and_then(crate::util::seconds_since),
+        hold_reason: reason.as_deref(),
+        hold_detail: detail.as_deref(),
+    };
+    Ok(waiting(&w, offer_grace(), stale_after()))
+}
+
 /// A record kind: its select, the column it is found by, and how a row becomes JSON.
 pub(crate) struct View {
     pub(crate) select: &'static str,
@@ -31,6 +117,23 @@ pub(crate) struct View {
 
 fn parse(s: Option<String>) -> Option<Value> {
     s.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+}
+
+/// SQL boolean for a task lane: same rule as [`is_lane_meta`] (`lanes=1` and derived `lane`).
+pub(crate) const INTENT_IS_LANE_SQL: &str = "CASE WHEN json_valid(i.meta) THEN
+               json_extract(i.meta, '$.source') IN ('client-web-lane', 'client-mobile-lane', 'cs-mcp')
+               OR json_extract(i.meta, '$.lane') IS NOT NULL
+             ELSE 0 END";
+
+/// Whether intent `meta` marks a task lane (same rule as `lanes=1` and the derived `lane` field).
+pub fn is_lane_meta(meta: &Value) -> bool {
+    let Value::Object(map) = meta else {
+        return false;
+    };
+    matches!(
+        map.get("source").and_then(Value::as_str),
+        Some("client-web-lane" | "client-mobile-lane" | "cs-mcp")
+    ) || map.get("lane").is_some_and(|v| !v.is_null())
 }
 
 const INTENTS: View = View {
@@ -49,13 +152,15 @@ const INTENTS: View = View {
         let conversations = stmt
             .query_map(params![id], |c| c.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        let meta = parse(r.get(7)?).unwrap_or(Value::Null);
         Ok(json!({"intent_id": id, "conversation_ids": conversations, "title": r.get::<_, Option<String>>(1)?, "node": r.get::<_, String>(2)?,
                   "spec": r.get::<_, String>(3)?, "task": r.get::<_, String>(4)?, "trials": r.get::<_, i64>(5)?,
-                  "grant": r.get::<_, Option<String>>(6)?, "meta": parse(r.get(7)?),
+                  "grant": r.get::<_, Option<String>>(6)?, "meta": meta,
                   "bundle_sha256": r.get::<_, String>(8)?, "created_by": r.get::<_, String>(9)?,
                   "created_at": r.get::<_, String>(10)?, "revision": r.get::<_, i64>(11)?, "job_ids": jobs,
                   "project_id": r.get::<_, Option<String>>(12)?,
-                  "lead_conversation_id": r.get::<_, Option<String>>(13)?}))
+                  "lead_conversation_id": r.get::<_, Option<String>>(13)?,
+                  "lane": is_lane_meta(&meta)}))
     },
 };
 
@@ -111,6 +216,7 @@ const JOBS: View = View {
                   "land": land_summary(r, 23, 32)?,
                   "land_state": r.get::<_, Option<String>>(24)?,
                   "budget": crate::scopes::job_view(db, &id)?,
+                  "waiting": job_waiting(db, &id)?,
                   "files": crate::jobs::files(db, &id)?}))
     },
 };
@@ -359,6 +465,28 @@ fn conversation_attention(r: &Row) -> rusqlite::Result<Value> {
     })
 }
 
+fn turn_waiting(
+    db: &Connection,
+    conversation: &str,
+    state: &str,
+    job: Option<String>,
+) -> rusqlite::Result<Value> {
+    if !matches!(state, "queued" | "summarising" | "running") {
+        return Ok(Value::Null);
+    }
+    let job = match job {
+        None if state == "summarising" => db
+            .query_row(
+                "SELECT job_id FROM summaries WHERE conversation_id = ?1 AND state = 'running'",
+                params![conversation],
+                |row| row.get(0),
+            )
+            .optional()?,
+        job => job,
+    };
+    job.map_or(Ok(Value::Null), |job| job_waiting(db, &job))
+}
+
 const CONVERSATIONS: View = View {
     select: "SELECT c.conversation_id, c.title, c.node, c.spec, c.spec_version, c.model, c.intent_id, c.held,
                     c.created_by, c.created_at, c.revision, c.instructions_tokens, c.tools, c.project_id,
@@ -370,14 +498,18 @@ const CONVERSATIONS: View = View {
     shape: |db, r| {
         let id: String = r.get(0)?;
         let mut stmt = db.prepare_cached(
-            "SELECT turn_id, state FROM turns WHERE conversation_id = ?1 AND state IN ('queued', 'summarising', 'running')
-             ORDER BY seq",
+            "SELECT turn_id, state, job_id FROM turns
+             WHERE conversation_id = ?1 AND state IN ('queued', 'summarising', 'running') ORDER BY seq",
         )?;
-        let open: Vec<(String, String)> = stmt
-            .query_map(params![id], |t| Ok((t.get(0)?, t.get(1)?)))?
+        let open: Vec<(String, String, Option<String>)> = stmt
+            .query_map(params![id], |t| Ok((t.get(0)?, t.get(1)?, t.get(2)?)))?
             .collect::<Result<_, _>>()?;
-        let active = open.iter().find(|(_, s)| s != "queued");
-        let queued: Vec<&String> = open.iter().filter(|(_, s)| s == "queued").map(|(t, _)| t).collect();
+        let active = open.iter().find(|(_, s, _)| s != "queued");
+        let queued: Vec<&String> = open.iter().filter(|(_, s, _)| s == "queued").map(|(t, _, _)| t).collect();
+        let waiting = match active {
+            Some((_, state, job)) => turn_waiting(db, &id, state, job.clone())?,
+            _ => Value::Null,
+        };
         let (turns, summaries): (i64, i64) = db.query_row(
             "SELECT (SELECT COUNT(*) FROM turns WHERE conversation_id = ?1),
                     (SELECT COUNT(*) FROM summaries WHERE conversation_id = ?1)",
@@ -387,7 +519,7 @@ const CONVERSATIONS: View = View {
         let held: bool = r.get(7)?;
         let state = match (held, active) {
             (true, _) => "held",
-            (false, Some((_, s))) => s.as_str(),
+            (false, Some((_, s, _))) => s.as_str(),
             (false, None) => "idle",
         };
         let model: String = r.get(5)?;
@@ -406,7 +538,8 @@ const CONVERSATIONS: View = View {
         Ok(json!({"conversation_id": id, "title": r.get::<_, Option<String>>(1)?, "node": r.get::<_, String>(2)?,
                   "spec": r.get::<_, String>(3)?, "spec_version": r.get::<_, String>(4)?, "model": model,
                   "intent_id": r.get::<_, Option<String>>(6)?, "held": held, "state": state,
-                  "active_turn_id": active.map(|(t, _)| t), "queued_turn_ids": queued, "turns": turns,
+                  "active_turn_id": active.map(|(t, _, _)| t), "waiting": waiting,
+                  "queued_turn_ids": queued, "turns": turns,
                   "summaries": summaries,
                   "compaction": {"context_window": budget.window, "window_source": budget.source,
                                  "threshold_tokens": budget.threshold, "keep_tokens": budget.keep},
@@ -444,7 +577,7 @@ const TURNS: View = View {
                LEFT JOIN controls x ON x.control_id = c.control_id",
     key: "t.turn_id",
     order: "t.seq",
-    shape: |_, r| {
+    shape: |db, r| {
         let cancel = r.get::<_, Option<String>>(16)?.map(|c| {
             json!({"cancel_id": c, "state": r.get::<_, Option<String>>(17).ok().flatten(),
                    "outcome": r.get::<_, Option<String>>(18).ok().flatten()})
@@ -455,6 +588,7 @@ const TURNS: View = View {
             ("wake", Some(d)) => serde_json::from_str(&d).unwrap_or(Value::String(d)),
             (_, d) => d.map_or(Value::Null, Value::String),
         };
+        let waiting = turn_waiting(db, r.get_ref(1)?.as_str()?, r.get_ref(4)?.as_str()?, r.get(7)?)?;
         Ok(json!({"turn_id": r.get::<_, String>(0)?, "conversation_id": r.get::<_, String>(1)?,
                   "seq": r.get::<_, i64>(2)?, "message": r.get::<_, String>(3)?, "state": r.get::<_, String>(4)?,
                   "posted_by": r.get::<_, String>(5)?, "posted_by_name": r.get::<_, Option<String>>(14)?,
@@ -464,7 +598,7 @@ const TURNS: View = View {
                       r.get::<_, Option<String>>(21)?.as_deref(), detail.as_str()),
                   "detail": detail, "context": parse(r.get(10)?), "cancel": cancel,
                   "started_at": r.get::<_, Option<String>>(11)?, "finished_at": r.get::<_, Option<String>>(12)?,
-                  "revision": r.get::<_, i64>(13)?, "origin": origin}))
+                  "revision": r.get::<_, i64>(13)?, "origin": origin, "waiting": waiting}))
     },
 };
 
@@ -568,8 +702,7 @@ pub fn one(db: &Connection, kind: Record, id: &str) -> rusqlite::Result<Option<V
 pub const MAX_INTENTS: u32 = 500;
 
 /// Intents, optionally filtered by node, lead conversation, and/or project, newest first, at most `limit`
-/// (clamped to 1..=[`MAX_INTENTS`]). With `lanes`, only task lanes: `meta.source` is
-/// `client-web-lane` or `cs-mcp`, or `meta.lane` is present and not null.
+/// (clamped to 1..=[`MAX_INTENTS`]). With `lanes`, only task lanes ([`is_lane_meta`] / [`INTENT_IS_LANE_SQL`]).
 pub fn list_intents(
     db: &Connection,
     node: Option<&str>,
@@ -579,14 +712,12 @@ pub fn list_intents(
     limit: u32,
     client: Option<&crate::access::Client>,
 ) -> rusqlite::Result<Vec<Value>> {
-    const FILTER: &str =
-        "(?1 IS NULL OR i.node = ?1) AND (?2 IS NULL OR i.lead_conversation_id = ?2)
-        AND (?3 = 0 OR CASE WHEN json_valid(i.meta) THEN
-               json_extract(i.meta, '$.source') IN ('client-web-lane', 'cs-mcp')
-               OR json_extract(i.meta, '$.lane') IS NOT NULL
-             ELSE 0 END) AND (?4 IS NULL OR i.project_id = ?4)";
     let v = view(Record::Intent);
-    let mut sql = format!("{} WHERE {FILTER}", v.select);
+    let mut sql = format!(
+        "{} WHERE (?1 IS NULL OR i.node = ?1) AND (?2 IS NULL OR i.lead_conversation_id = ?2)
+        AND (?3 = 0 OR {}) AND (?4 IS NULL OR i.project_id = ?4)",
+        v.select, INTENT_IS_LANE_SQL
+    );
     let mut bind = vec![
         node.map(String::from).into(),
         conversation.map(String::from).into(),
@@ -766,6 +897,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let store = Store::open(&tmp.path().join("data"))?;
         let db = store.db();
+        seed_intent_meta(&db, "mobile", None, r#"{"source":"client-mobile-lane"}"#)?;
         seed_intent_meta(&db, "web", None, r#"{"source":"client-web-lane"}"#)?;
         seed_intent_meta(&db, "mcp", None, r#"{"source":"cs-mcp"}"#)?;
         seed_intent_meta(&db, "laned", None, r#"{"source":"other","lane":"lane/x"}"#)?;
@@ -777,15 +909,30 @@ mod tests {
         let lanes = list_intents(&db, None, None, true, None, MAX_INTENTS, None)?;
         assert_eq!(
             ids(&lanes, "intent_id"),
-            ["lane_false", "laned", "mcp", "web"]
+            ["lane_false", "laned", "mcp", "web", "mobile"]
         );
         // The limit applies after the lane filter.
         let one = list_intents(&db, None, None, true, None, 1, None)?;
         assert_eq!(ids(&one, "intent_id"), ["lane_false"]);
-        assert_eq!(
-            list_intents(&db, None, None, false, None, MAX_INTENTS, None)?.len(),
-            8
-        );
+        let all = list_intents(&db, None, None, false, None, MAX_INTENTS, None)?;
+        assert_eq!(all.len(), 9);
+        // Predicate and SQL filter agree; derived `lane` matches the predicate.
+        let lane_ids: std::collections::HashSet<_> = ids(&lanes, "intent_id").into_iter().collect();
+        for intent in &all {
+            let id = intent["intent_id"].as_str().unwrap_or_default();
+            let predicted = is_lane_meta(&intent["meta"]);
+            assert_eq!(
+                predicted,
+                lane_ids.contains(id),
+                "predicate vs SQL for {id}: meta={}",
+                intent["meta"]
+            );
+            assert_eq!(
+                intent["lane"].as_bool(),
+                Some(predicted),
+                "derived lane field for {id}"
+            );
+        }
         Ok(())
     }
 
@@ -892,6 +1039,140 @@ mod tests {
         let proj =
             list_conversations(&db, None, None, false, Some("p1"), MAX_INTENTS, Some(false))?;
         assert_eq!(ids(&proj, "conversation_id"), ["c1"]);
+        Ok(())
+    }
+
+    fn wait(state: &str, since_age: Option<i64>, seen_age: Option<i64>) -> Wait<'_> {
+        Wait {
+            state,
+            node: "estate",
+            since: "2026-11-24T08:00:00Z",
+            since_age,
+            node_last_seen: seen_age.map(|_| "2026-11-24T07:59:00Z"),
+            seen_age,
+            ..Wait::default()
+        }
+    }
+
+    #[test]
+    fn waiting_names_an_offered_job_unpulled_past_the_grace() {
+        assert!(
+            waiting(&wait("offered", Some(10), Some(1)), 30, 300).is_null(),
+            "within the grace"
+        );
+        let late = waiting(&wait("offered", Some(31), Some(1)), 30, 300);
+        assert_eq!(
+            late,
+            json!({"reason": "node_not_pulled", "node": "estate", "since": "2026-11-24T08:00:00Z"})
+        );
+        let stale = waiting(&wait("offered", Some(400), Some(400)), 30, 300);
+        assert_eq!(stale["node_last_seen"], "2026-11-24T07:59:00Z");
+        let never = waiting(&wait("offered", Some(400), None), 30, 300);
+        assert!(
+            never
+                .as_object()
+                .is_some_and(|o| o["node_last_seen"].is_null())
+        );
+        for state in ["accepted", "done", "error"] {
+            assert!(
+                waiting(&wait(state, Some(400), None), 30, 300).is_null(),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn waiting_names_a_held_job_and_its_reason() {
+        let held = Wait {
+            hold_reason: Some("executor_unavailable"),
+            hold_detail: Some("estate cannot run claude"),
+            ..wait("waiting", Some(1), Some(1))
+        };
+        assert_eq!(
+            waiting(&held, 30, 300),
+            json!({"reason": "held", "detail": "executor_unavailable",
+                   "message": "estate cannot run claude", "node": "estate"})
+        );
+    }
+
+    #[test]
+    fn turn_conversation_and_job_show_waiting_until_the_node_pulls() -> Res {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open(&tmp.path().join("data"))?;
+        let db = store.db();
+        seed_conversation(&db, "c1", "now", false, None)?;
+        seed_job(&db, "j1", "i1")?;
+        db.execute(
+            "UPDATE jobs SET offered_at = '2026-01-01T00:00:00Z' WHERE job_id = 'j1'",
+            [],
+        )?;
+        db.execute(
+            "UPDATE nodes SET last_seen_at = ?1 WHERE id = 1",
+            params![crate::util::now_utc()],
+        )?;
+        db.execute(
+            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at, job_id)
+             VALUES ('t1', 'c1', 1, 'hi', 'running', 'owner', 'now', 'j1')",
+            [],
+        )?;
+        let want =
+            json!({"reason": "node_not_pulled", "node": "estate", "since": "2026-01-01T00:00:00Z"});
+        let turn = one(&db, Record::Turn, "t1")?.unwrap_or_default();
+        assert_eq!(turn["state"], "running");
+        assert_eq!(turn["waiting"], want);
+        let conversation = one(&db, Record::Conversation, "c1")?.unwrap_or_default();
+        assert_eq!(conversation["active_turn_id"], "t1");
+        assert_eq!(conversation["waiting"], want);
+        assert_eq!(
+            one(&db, Record::Job, "j1")?.unwrap_or_default()["waiting"],
+            want
+        );
+        assert_eq!(
+            thread_rows(&db, Record::Turn, "c1")?[0]["waiting"],
+            want,
+            "the thread view"
+        );
+
+        db.execute("UPDATE jobs SET state = 'accepted' WHERE job_id = 'j1'", [])?;
+        assert!(one(&db, Record::Turn, "t1")?.unwrap_or_default()["waiting"].is_null());
+        assert!(one(&db, Record::Conversation, "c1")?.unwrap_or_default()["waiting"].is_null());
+        assert!(one(&db, Record::Job, "j1")?.unwrap_or_default()["waiting"].is_null());
+
+        db.execute_batch(
+            "UPDATE jobs SET state = 'waiting' WHERE job_id = 'j1';
+             INSERT INTO job_budgets (job_id, state, trials, reason, detail, created_at)
+             VALUES ('j1', 'waiting', 1, 'budget_exhausted', 'the project budget is used up', 'now')",
+        )?;
+        let turn = one(&db, Record::Turn, "t1")?.unwrap_or_default();
+        assert_eq!(turn["waiting"]["reason"], "held");
+        assert_eq!(turn["waiting"]["detail"], "budget_exhausted");
+        Ok(())
+    }
+    #[test]
+    fn summarising_turn_shows_the_summary_jobs_waiting() -> Res {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open(&tmp.path().join("data"))?;
+        let db = store.db();
+        seed_conversation(&db, "c1", "now", false, None)?;
+        seed_job(&db, "j1", "i1")?;
+        db.execute_batch(
+            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at)
+             VALUES ('t1', 'c1', 2, 'hi', 'summarising', 'owner', 'now');
+             INSERT INTO summaries (summary_id, conversation_id, through_seq, job_id, state, requested_by, created_at)
+             VALUES ('s1', 'c1', 1, 'j1', 'running', 'owner', 'now');
+             UPDATE jobs SET state = 'waiting' WHERE job_id = 'j1';
+             INSERT INTO job_budgets (job_id, state, trials, reason, detail, created_at)
+             VALUES ('j1', 'waiting', 1, 'budget_exhausted', 'the project budget is used up', 'now')",
+        )?;
+        let turn = one(&db, Record::Turn, "t1")?.unwrap_or_default();
+        assert!(turn["job_id"].is_null());
+        assert_eq!(
+            turn["waiting"],
+            json!({"reason": "held", "detail": "budget_exhausted",
+                   "message": "the project budget is used up", "node": "estate"})
+        );
+        db.execute("UPDATE jobs SET state = 'accepted' WHERE job_id = 'j1'", [])?;
+        assert!(one(&db, Record::Turn, "t1")?.unwrap_or_default()["waiting"].is_null());
         Ok(())
     }
 }

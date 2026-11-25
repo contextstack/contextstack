@@ -229,22 +229,14 @@ def late_delivery(stack, label):
     run = stack.run_spec(spec("box-model" if fallback else "fake-paid", seconds=2))
     index = 2 if fallback else 1
     spans, _ = stack.merge_trace(run, exchanges=index)
-    finding_kinds = ["delivery_unconfirmed"]
-    if not fallback:
-        finding_kinds.append("spend_discrepancy")
-    findings = check_trace(stack, spans, run, "complete_with_findings", findings=finding_kinds)
-    expected = [{"send_index": 1, "outcome": "delivered"}] if fallback else []
-    assert sends(spans) == expected + [{"send_index": index, "outcome": "unknown"}], sends(spans)
-    request_id = one(spans, "model_call")["attributes"]["request_id"]
-    assert findings[0] == {"kind": "delivery_unconfirmed", "trace_id": run.name,
-                           "request_id": request_id, "send_index": index, "gateway_found": True}, findings
-    if not fallback:
-        settled = Decimal(str(one(spans, "settlement", partial=True,
-                                  basis="reservation_estimate")["attributes"]["charged_usd"]))
-        assert settled > 0
-        assert findings[1] == {"kind": "spend_discrepancy", "trace_id": run.name,
-                               "request_ids": [request_id], "settled_usd": str(settled),
-                               "terminal_usd": "0"}, findings
+    check_trace(stack, spans, run, "complete")
+    assert sends(spans) == [{"send_index": send, "outcome": "delivered"}
+                            for send in range(1, index + 1)], sends(spans)
+    settlement = one(spans, "settlement", send_index=index, partial=True, basis="reservation_estimate")
+    settled = Decimal(str(settlement["attributes"]["charged_usd"]))
+    terminal = one(spans, "run")["attributes"]["terminal"]
+    assert Decimal(str(terminal["charged_usd"])) == settled, (terminal, settlement)
+    assert settled == 0 if fallback else settled > 0, settlement
     if fallback:
         assert [s["attributes"]["send_index"] for s in spans_of(spans, "gateway_exchange")] == [2, 1]
         assert one(spans, "gateway_exchange", send_index=1)["outcome"] == "refused_before_provider_contact"
@@ -322,19 +314,18 @@ def native_lane(stack, *, read_only=False):
     for name in ("fs_read.json", "fs_edit.json", "repo_search.json"):
         descriptor = json.loads((REPO / "cs/tools/bin" / name).read_text())
         estate.write_json(root / "tools/bin" / name, dict(descriptor, bin=str(tools_bin)))
-    if read_only:
-        # Use this fixture's interpreter inside the sandbox, even when it lives outside /usr.
-        python = Path(sys.executable).resolve()
-        policy_path = root / "policy/sandbox.json"
-        policy = json.loads(policy_path.read_text())
-        for paths in policy["runtime_read"].values():
-            paths.extend([str(Path(sys.base_prefix).resolve()), str(python)])
-        estate.write_json(policy_path, policy)
-        for name in ("exec", "fs_write"):
-            tool_path = root / "tools/bin" / name
-            _, _, body = tool_path.read_text().partition("\n")
-            tool_path.write_text(f"#!{python}\n{body}")
-    else:
+    # Use this fixture's interpreter inside the sandbox, even when it lives outside /usr.
+    python = Path(sys.executable).resolve()
+    policy_path = root / "policy/sandbox.json"
+    policy = json.loads(policy_path.read_text())
+    for paths in policy["runtime_read"].values():
+        paths.extend([str(Path(sys.base_prefix).resolve()), str(python)])
+    estate.write_json(policy_path, policy)
+    for name in ("exec", "fs_write"):
+        tool_path = root / "tools/bin" / name
+        _, _, body = tool_path.read_text().partition("\n")
+        tool_path.write_text(f"#!{python}\n{body}")
+    if not read_only:
         fake_bin = stack.scratch / "cargo-bin"
         fake_bin.mkdir()
         cargo = fake_bin / "cargo"
@@ -343,10 +334,9 @@ def native_lane(stack, *, read_only=False):
         estate.write_json(repos.with_name("toolchains.json"),
                           [{"name": "cargo", "bin": str(fake_bin), "rustup": str(fake_bin),
                             "toolchain": str(fake_bin)}])
-    # The lane case pins environment wiring. The repo-view case exercises OS confinement.
+    # Tick builds the tool prefix from the staged policy and CS_SANDBOX_BIN.
     env = dict(stack.child_env, CS_RUNNER_BIN=str(estate.runner_bin()), CS_REPOS_FILE=str(repos),
-               CS_TOOLS_BIN=os.environ.get("CS_TOOLS_BIN") or str(REPO / "target/release/cs-tools"),
-               CS_TOOL_PREFIX="")
+               CS_TOOLS_BIN=str(tools_bin))
     with director(stack.scratch, "Z" if read_only else "Y") as ctx:
         node = ctx.node2()
         receiver = {"url": ctx.target.url, "installation": node.installation}
@@ -365,11 +355,13 @@ def native_lane(stack, *, read_only=False):
                     budget={"turns": 4, "tool_calls": 16, "seconds": 30})
                 assert submitted["workspace"] == {"repo": "sample", "read_only": True}, submitted
             else:
+                # run_check already runs under cs-sandbox. Exercise git directly
+                # inside it because Seatbelt cannot apply a second profile.
+                check = "cargo --version && git status --short && git diff && git log -1 --format=%s"
                 submitted = lead.start_task(
                     "Native lane", "Fix the code in the lane.", model="harness:local-coder",
                     agent="coder", repo="sample", lane="native",
-                    check="cargo --version && git status --short && git diff && git log -1 --format=%s"
-                          " && grep -qx 'edited by native harness' result.txt",
+                    check=check + " && grep -qx 'edited by native harness' result.txt",
                     budget={"turns": 3, "tool_calls": 5, "seconds": 30})
             assert submitted["model"] == "harness:local-coder", submitted
             job_id = submitted["job_id"]

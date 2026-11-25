@@ -17,8 +17,31 @@ final class RunEvidence
         $files = [];
         $plus = 0;
         $minus = 0;
+        // Lines still to come in the current hunk (from its `@@ -a,old +b,new @@` header): inside a hunk, a line
+        // starting `--- ` or `+++ ` is a removed `-- ` or added `++ ` line, not a file header.
+        $old = 0;
+        $new = 0;
         foreach (self::lines($raw) as $line) {
-            if (str_starts_with($line, '+++ ') || str_starts_with($line, '--- ')) {
+            if (($old > 0 || $new > 0) && ! str_starts_with($line, 'diff ')) {
+                if (str_starts_with($line, '+')) {
+                    $new--;
+                    $plus++;
+                } elseif (str_starts_with($line, '-')) {
+                    $old--;
+                    $minus++;
+                } elseif (! str_starts_with($line, '\\')) {
+                    $old--;
+                    $new--;
+                }
+
+                continue;
+            }
+            $old = 0;
+            $new = 0;
+            if (preg_match('/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/', $line, $hunk) === 1) {
+                $old = ($hunk[1] ?? '') === '' ? 1 : (int) $hunk[1];
+                $new = ($hunk[2] ?? '') === '' ? 1 : (int) $hunk[2];
+            } elseif (str_starts_with($line, '+++ ') || str_starts_with($line, '--- ')) {
                 $name = explode("\t", substr($line, 4))[0];
                 if ($name !== '/dev/null') {
                     $name = preg_replace('/^[ab]\//', '', $name) ?? $name;

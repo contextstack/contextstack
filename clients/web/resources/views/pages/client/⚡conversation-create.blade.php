@@ -2,11 +2,13 @@
 
 use App\Client\Bundle;
 use App\Client\DirectorClient;
+use App\Client\HarnessCatalog;
 use App\Client\ModelCatalog;
 use App\Client\ProviderLimits;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Locked;
 use Livewire\Attributes\Title;
@@ -18,6 +20,9 @@ use Livewire\WithFileUploads;
  * Start a conversation (CLIENT-API.md §11.1): one that runs tasks (`spec: hosted-lead`) or a plain chat. A chat is the
  * Director's built-in one (`spec: chat`) on the chosen model and machine; behind Advanced options you can instead
  * supply your own spec.yaml, system prompt and files, sent as a bundle like an intent's.
+ * The model is picked in three steps: provider, model, then (when more than one can run it) the harness that runs it
+ * (HarnessCatalog); the pair's `value` is sent as the model. One that runs tasks offers only `lead: true` models.
+ * A Director whose GET models has no `catalog` gets the two-step picker over its flat models (ModelCatalog::groups).
  */
 new #[Layout('layouts::client')] #[Title('New conversation')] class extends Component
 {
@@ -34,7 +39,25 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
 
     public string $title = '';
 
+    /** What is sent: the chosen pair's value (a model name). */
     public string $model = '';
+
+    /** The picker's first step: the provider group of the chosen model. */
+    public string $provider = '';
+
+    /** The picker's second step with a catalog: the catalog model id. */
+    public string $catalogModel = '';
+
+    /** The picker's third step with a catalog: the harness that runs the model. */
+    public string $harness = '';
+
+    /**
+     * The three-step picker's catalog (HarnessCatalog::fromAnswer), or null for the two-step fallback.
+     *
+     * @var array{providers: list<array{id: string, label: string, ready: bool}>, models: list<array{id: string, provider: string, label: string, available: bool, reason: string|null, lead: bool, option: string, pairs: list<array{harness: string, label: string, value: string, billing: string, nodes: list<string>, available: bool, reason: string|null, lead: bool|null, option: string}>}>, default: string}|null
+     */
+    #[Locked]
+    public ?array $catalog = null;
 
     public string $message = '';
 
@@ -78,7 +101,7 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
     #[Locked]
     public ?string $homeMachine = null;
 
-    /** @var list<array{name: string, label: string, available: bool, display_name: string, provider: string, billing: string, reason: string|null, lead: bool}> */
+    /** @var list<array{name: string, label: string, available: bool, display_name: string, provider: string, billing: string, reason: string|null, lead: bool, model_label: string, provider_label: string, nodes: list<string>, option: string}> */
     #[Locked]
     public array $modelChoices = [];
 
@@ -119,10 +142,15 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
             $parsed = ModelCatalog::parse($catalog);
             $this->modelChoices = $parsed['choices'];
             $this->canStart = $parsed['canStart'];
-            $this->model = $parsed['default'] !== '' ? $parsed['default'] : ($this->modelChoices[0]['name'] ?? '');
-            $this->model = ProviderLimits::prefer($this->model, $this->readyNames($this->modelChoices), $this->limitedHere());
+            $this->catalog = HarnessCatalog::fromAnswer($catalog);
+            if ($this->catalog !== null) {
+                $this->model = HarnessCatalog::defaultValue($this->catalog, $this->limitedHere());
+            } else {
+                $this->model = $parsed['default'] !== '' ? $parsed['default'] : ($this->modelChoices[0]['name'] ?? '');
+                $this->model = ProviderLimits::prefer($this->model, $this->readyNames($this->modelChoices), $this->limitedHere());
+            }
             $this->chatDefault = $this->model;
-            $leadReady = array_filter($this->leadModelChoices(), fn (array $choice): bool => $choice['available']) !== [];
+            $leadReady = $this->readyLeadValues() !== [];
             $this->kind = $leadReady ? 'lead' : 'chat';
             $this->updatedKind();
 
@@ -148,11 +176,136 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
     /**
      * Models a lead can run on: the catalog's `lead` flag (see ModelCatalog::parse).
      *
-     * @return list<array{name: string, label: string, available: bool, display_name: string, provider: string, billing: string, reason: string|null, lead: bool}>
+     * @return list<array{name: string, label: string, available: bool, display_name: string, provider: string, billing: string, reason: string|null, lead: bool, model_label: string, provider_label: string, nodes: list<string>, option: string}>
      */
     public function leadModelChoices(): array
     {
         return array_values(array_filter($this->modelChoices, fn (array $choice): bool => $choice['lead']));
+    }
+
+    /**
+     * The models this kind of conversation can start on: lead models for one that runs tasks, all for a chat.
+     *
+     * @return list<array{name: string, label: string, available: bool, display_name: string, provider: string, billing: string, reason: string|null, lead: bool, model_label: string, provider_label: string, nodes: list<string>, option: string}>
+     */
+    public function pickableChoices(): array
+    {
+        return $this->kind === 'lead' ? $this->leadModelChoices() : $this->modelChoices;
+    }
+
+    /**
+     * Provider groups for the picker.
+     *
+     * @return list<array{provider: string, label: string, ready: bool, models: list<array{name: string, label: string, available: bool, display_name: string, provider: string, billing: string, reason: string|null, lead: bool, model_label: string, provider_label: string, nodes: list<string>, option: string}>}>
+     */
+    public function modelGroups(): array
+    {
+        return ModelCatalog::groups($this->pickableChoices());
+    }
+
+    /**
+     * The catalog this kind of conversation picks from: lead models only for one that runs tasks.
+     *
+     * @return array{providers: list<array{id: string, label: string, ready: bool}>, models: list<array{id: string, provider: string, label: string, available: bool, reason: string|null, lead: bool, option: string, pairs: list<array{harness: string, label: string, value: string, billing: string, nodes: list<string>, available: bool, reason: string|null, lead: bool|null, option: string}>}>, default: string}|null
+     */
+    public function pickableCatalog(): ?array
+    {
+        if ($this->catalog === null) {
+            return null;
+        }
+
+        return $this->kind === 'lead' ? HarnessCatalog::forLead($this->catalog) : $this->catalog;
+    }
+
+    /**
+     * The chosen provider's catalog models, for the second step.
+     *
+     * @return list<array{id: string, provider: string, label: string, available: bool, reason: string|null, lead: bool, option: string, pairs: list<array{harness: string, label: string, value: string, billing: string, nodes: list<string>, available: bool, reason: string|null, lead: bool|null, option: string}>}>
+     */
+    public function catalogModels(): array
+    {
+        $catalog = $this->pickableCatalog();
+
+        return $catalog === null ? [] : HarnessCatalog::modelsOf($catalog, $this->provider);
+    }
+
+    /**
+     * The harnesses that can run the chosen catalog model, for the third step.
+     *
+     * @return list<array{harness: string, label: string, value: string, billing: string, nodes: list<string>, available: bool, reason: string|null, lead: bool|null, option: string}>
+     */
+    public function catalogPairs(): array
+    {
+        $catalog = $this->pickableCatalog();
+
+        return $catalog === null ? [] : HarnessCatalog::pairsOf($catalog, $this->provider, $this->catalogModel);
+    }
+
+    /**
+     * Picking a provider selects its first ready model (and that model's harness), preferring one in quota on the
+     * machine it would run on.
+     */
+    public function updatedProvider(): void
+    {
+        $catalog = $this->pickableCatalog();
+        if ($catalog !== null) {
+            $this->select(HarnessCatalog::choose($catalog, $this->provider, limited: $this->limitedHere()));
+        } else {
+            $this->model = ModelCatalog::firstReadyOf($this->provider, $this->pickableChoices(), $this->limitedHere());
+        }
+    }
+
+    /** Picking a catalog model selects the harness to run it: the catalog default's, else the first ready one. */
+    public function updatedCatalogModel(): void
+    {
+        $catalog = $this->pickableCatalog();
+        if ($catalog !== null) {
+            $this->select(HarnessCatalog::choose($catalog, $this->provider, $this->catalogModel, limited: $this->limitedHere()));
+        }
+    }
+
+    public function updatedHarness(): void
+    {
+        $catalog = $this->pickableCatalog();
+        if ($catalog !== null) {
+            $this->select(HarnessCatalog::choose($catalog, $this->provider, $this->catalogModel, $this->harness, $this->limitedHere()));
+        }
+    }
+
+    /** A model set directly (not through the steps) moves the steps to the pair or group that sends it. */
+    public function updatedModel(): void
+    {
+        $catalog = $this->pickableCatalog();
+        if ($catalog === null) {
+            $this->provider = ModelCatalog::providerOf($this->model, $this->pickableChoices());
+
+            return;
+        }
+        $found = HarnessCatalog::locate($catalog, $this->model);
+        $this->select($found ?? ['provider' => '', 'model' => '', 'harness' => '', 'value' => $this->model]);
+    }
+
+    /**
+     * @param  array{provider: string, model: string, harness: string, value: string}  $selection
+     */
+    private function select(array $selection): void
+    {
+        $this->provider = $selection['provider'];
+        $this->catalogModel = $selection['model'];
+        $this->harness = $selection['harness'];
+        $this->model = $selection['value'];
+    }
+
+    /**
+     * The values a conversation that runs tasks may start on.
+     *
+     * @return list<string>
+     */
+    private function readyLeadValues(): array
+    {
+        return $this->catalog !== null
+            ? HarnessCatalog::readyValues(HarnessCatalog::forLead($this->catalog))
+            : $this->readyNames($this->leadModelChoices());
     }
 
     public function updatedKind(): void
@@ -162,12 +315,13 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
         }
         if ($this->kind === 'lead') {
             $this->showAdvanced = false;
-            $names = array_column(array_filter($this->leadModelChoices(), fn (array $choice): bool => $choice['available']), 'name');
+            $names = $this->readyLeadValues();
             if (! in_array($this->model, $names, true)) {
                 $this->model = in_array('claude-code-sonnet', $names, true) ? 'claude-code-sonnet' : ($names[0] ?? '');
             }
             $this->model = ProviderLimits::prefer($this->model, $names, $this->limitedHere());
         }
+        $this->updatedModel();
     }
 
     /**
@@ -204,14 +358,11 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
             return;
         }
 
-        $modelNames = array_column(
-            array_filter($this->modelChoices, fn (array $choice): bool => $choice['available']),
-            'name',
-        );
+        $modelNames = $this->catalog !== null ? HarnessCatalog::readyValues($this->catalog) : $this->readyNames($this->modelChoices);
 
         $this->validate([
             'node' => ['required', 'string', 'max:128'],
-            'model' => ['required', 'string', 'max:128', 'in:'.implode(',', $modelNames ?: ['local-coder'])],
+            'model' => ['required', 'string', 'max:128', Rule::in($modelNames ?: ['local-coder'])],
             'title' => ['nullable', 'string', 'max:200'],
             'message' => ['nullable', 'string', 'max:200000'],
             'spec' => ['nullable', 'string', 'max:200000'],
@@ -278,11 +429,11 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
      */
     private function submitLead(DirectorClient $director): void
     {
-        $leadModels = array_column(array_filter($this->leadModelChoices(), fn (array $choice): bool => $choice['available']), 'name');
+        $leadModels = $this->readyLeadValues();
 
         $this->validate([
             'node' => ['required', 'string', 'max:128'],
-            'model' => ['required', 'string', 'max:128', 'in:'.implode(',', $leadModels ?: ['claude-code-sonnet'])],
+            'model' => ['required', 'string', 'max:128', Rule::in($leadModels ?: ['claude-code-sonnet'])],
             'title' => ['nullable', 'string', 'max:200'],
             'message' => ['nullable', 'string', 'max:200000'],
         ]);
@@ -424,13 +575,50 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
         @endif
 
         @php($limitedHere = $this->limitedHere())
-        <flux:select wire:model.live="model" :label="__('Model')" data-test="model-select">
-            @foreach ($kind === 'lead' ? $this->leadModelChoices() : $modelChoices as $choice)
-                <flux:select.option :value="$choice['name']" wire:key="model-{{ $choice['name'] }}" :disabled="! $choice['available']">
-                    {{ $choice['label'] }}@if (array_key_exists($choice['name'], $limitedHere)) — {{ \App\Client\ProviderLimits::phrase($limitedHere[$choice['name']]) }}@endif
-                </flux:select.option>
-            @endforeach
-        </flux:select>
+        @php($pickable = $this->pickableCatalog())
+        @if ($pickable !== null)
+            @php($pairs = $this->catalogPairs())
+            <div class="grid gap-4 sm:grid-cols-2">
+                <flux:select wire:model.live="provider" :label="__('Provider')" data-test="provider-select">
+                    @foreach ($pickable['providers'] as $catalogProvider)
+                        <flux:select.option :value="$catalogProvider['id']" wire:key="provider-{{ $kind }}-{{ $catalogProvider['id'] }}">{{ $catalogProvider['label'] }}@unless ($catalogProvider['ready']) — {{ __('not ready') }}@endunless</flux:select.option>
+                    @endforeach
+                </flux:select>
+                <flux:select wire:model.live="catalogModel" :label="__('Model')" :placeholder="$catalogModel === '' ? __('No model from this provider') : null" data-test="model-select">
+                    @foreach ($this->catalogModels() as $catalogChoice)
+                        <flux:select.option :value="$catalogChoice['id']" wire:key="model-{{ $kind }}-{{ $provider }}-{{ $catalogChoice['id'] }}" :disabled="! $catalogChoice['available']">{{ $catalogChoice['option'] }}</flux:select.option>
+                    @endforeach
+                </flux:select>
+            </div>
+            @if (count($pairs) > 1)
+                <flux:select wire:model.live="harness" :label="__('Harness')" :placeholder="$harness === '' ? __('No ready harness for this model') : null" data-test="harness-select">
+                    @foreach ($pairs as $pair)
+                        <flux:select.option :value="$pair['harness']" wire:key="harness-{{ $kind }}-{{ $catalogModel }}-{{ $pair['harness'] }}" :disabled="! $pair['available']">{{ $pair['option'] }}@if (array_key_exists($pair['value'], $limitedHere)) — {{ \App\Client\ProviderLimits::phrase($limitedHere[$pair['value']]) }}@endif</flux:select.option>
+                    @endforeach
+                </flux:select>
+            @elseif (count($pairs) === 1)
+                <flux:text class="text-sm text-zinc-600 dark:text-zinc-400" data-test="harness-text">{{ \App\Client\HarnessCatalog::runsIn($pairs[0]) }}@if (array_key_exists($pairs[0]['value'], $limitedHere)) — {{ \App\Client\ProviderLimits::phrase($limitedHere[$pairs[0]['value']]) }}@endif</flux:text>
+            @endif
+        @else
+            @php($groups = $this->modelGroups())
+            <div class="grid gap-4 sm:grid-cols-2">
+                <flux:select wire:model.live="provider" :label="__('Provider')" data-test="provider-select">
+                    @foreach ($groups as $group)
+                        <flux:select.option :value="$group['provider']" wire:key="provider-{{ $kind }}-{{ $group['provider'] }}">{{ $group['label'] }}@unless ($group['ready']) — {{ __('not ready') }}@endunless</flux:select.option>
+                    @endforeach
+                </flux:select>
+                <flux:select wire:model.live="model" :label="__('Model')" :placeholder="$model === '' ? __('No ready model from this provider') : null" data-test="model-select">
+                    @foreach ($groups as $group)
+                        @continue($group['provider'] !== $provider)
+                        @foreach ($group['models'] as $choice)
+                            <flux:select.option :value="$choice['name']" wire:key="model-{{ $kind }}-{{ $choice['name'] }}" :disabled="! $choice['available']">
+                                {{ $choice['option'] }}@if (array_key_exists($choice['name'], $limitedHere)) — {{ \App\Client\ProviderLimits::phrase($limitedHere[$choice['name']]) }}@endif
+                            </flux:select.option>
+                        @endforeach
+                    @endforeach
+                </flux:select>
+            </div>
+        @endif
 
         <flux:input wire:model="title" :label="__('Title')" :placeholder="__('optional')" />
 

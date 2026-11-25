@@ -222,6 +222,8 @@ def job_brief(job, intent=None, run=None):
              "finished_at": job.get("finished_at")}
     if (job.get("meta") or {}).get("phase"):
         brief["phase"] = job["meta"]["phase"]
+    if isinstance((job.get("meta") or {}).get("route"), dict):
+        brief["route"] = job["meta"]["route"]
     if job.get("error"):
         brief["error"] = job["error"]
     if job.get("failure"):
@@ -427,15 +429,16 @@ class Tools:
         repo_view = bool(profile and profile["writes"] is False and repo and not lane)
         if profile and not repo_view and profile["lane"] != bool(repo):
             raise Refused("agent needs a lane worktree" if profile["lane"] else "agent needs a scratch workspace")
-        validate_model(given["model"])
         node = node or self.node
-        limits = self._provider_limits_for_node(node)
         prior = given["model"]
-        chosen, skipped, limit_err = agents.choose_model(
-            given["model"], profile, limits, allow_fallback=not explicit_model)
-        if limit_err:
-            raise Refused(limit_err)
-        model = chosen
+        model, skipped = prior, []
+        if prior != "auto":
+            validate_model(prior)
+            limits = self._provider_limits_for_node(node)
+            model, skipped, limit_err = agents.choose_model(
+                prior, profile, limits, allow_fallback=not explicit_model)
+            if limit_err:
+                raise Refused(limit_err)
         if not node:
             raise Refused("no node: pass node, or run cs mcp --node NAME")
         # The Director resolves profile defaults. Only model selection stays here for provider limits.
@@ -460,7 +463,7 @@ class Tools:
         requested_lane = lane
         lane = meta.get("lane") or lane
         out = {"intent_id": answer["intent"]["intent_id"], "job_id": job.get("job_id"),
-               "state": job.get("state"), "node": node, "model": model,
+               "state": job.get("state"), "node": node if planning else job.get("node", node), "model": model,
                "task": answer["intent"].get("task") or "tasks/" + name}
         if planning:
             out["planning_job_id"] = job.get("job_id")
@@ -811,6 +814,20 @@ class Tools:
         return {"machines": nodes, "stale_after_seconds": body.get("stale_after_seconds"),
                 **({"provider_limits": limits} if limits else {})}
 
+    LAND_SLACK_S = 600  # merge, restore and the commit around the gate
+
+    @classmethod
+    def land_timeout(cls, repo, requested):
+        """At least the repo's gate bound plus slack: a land killed past SIGTERM's grace leaves a staged squash.
+        An unknown repo keeps the caller's value (cs land refuses it at once)."""
+        try:
+            config = Path(os.environ.get("CS_REPOS_FILE") or Path.home() / ".contextstack/config/repos.json")
+            entry = json.loads(config.read_text())[repo]
+            gate = float((entry if isinstance(entry, dict) else {}).get("gate_timeout_s") or 3600)
+        except (OSError, ValueError, KeyError, TypeError):
+            return min(float(requested), 7200)
+        return max(min(float(requested), 7200), gate + cls.LAND_SLACK_S)
+
     @staticmethod
     def main_restored(repo):
         """Inspect the configured main checkout without changing it."""
@@ -841,6 +858,7 @@ class Tools:
             raise Refused("land_task for repo %s is busy: another landing is already running" % repo)
         # Owner configuration overrides belong only to the CLI; never forward one from MCP.
         argv = [sys.executable, "-I", str(agents.kit_dir() / "scripts" / "cs"), "land", repo, lane, "--json"]
+        timeout_seconds = Tools.land_timeout(str(repo), timeout_seconds)
         if job_id:
             argv += ["--job", job_id]
         if message:
@@ -855,7 +873,7 @@ class Tools:
                 proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                         start_new_session=True)
                 try:
-                    stdout, stderr = proc.communicate(timeout=max(0.001, min(float(timeout_seconds), 7200)))
+                    stdout, stderr = proc.communicate(timeout=max(0.001, float(timeout_seconds)))
                 except subprocess.TimeoutExpired:
                     def stop_group(sig):
                         try:
@@ -898,7 +916,7 @@ TOOLS = [
       "node": S("string", "node name (default: this machine's node)"),
       "agent": S("string", "an agent profile from list_agents: its model, system prompt, check, budget and task_type "
                  "become the defaults (explicit arguments win)"),
-      "model": S("string", "executor template (default cursor-sol) or harness:<gateway-model>, e.g. harness:local-coder"),
+      "model": S("string", "executor template (default cursor-sol), harness:<gateway-model>, or auto to route coder lanes by the languages named in a plan"),
       "check": S("string", "the check script run in the workspace after the agent; exit 0 = pass (default: no check)"),
       "repo": S("string", "repo name from config/repos.json. With lane, use its isolated copy. A read-only profile can give repo alone to read the configured main line"),
       "lane": S("string", "lane name ([a-z0-9._-]): branch lane/<lane>, worktree beside the repo's main line"),
@@ -983,7 +1001,8 @@ TOOLS = [
      {"repo": S("string", "repo name from config/repos.json"), "lane": S("string", "lane name"),
       "message": S("string", "commit message on main (default: from the lane's commits)"),
       "job_id": S("string", "the job whose run this landing records (default: the newest finished job for this repo and lane)"),
-      "timeout_seconds": S("integer", "how long the check may take (default 1800)")}, ["repo", "lane"]),
+      "timeout_seconds": S("integer", "how long the check may take (default 1800; never less than the repo's gate "
+                                      "bound plus 10 minutes)")}, ["repo", "lane"]),
     ("needs_you", "Ask the owner for one decision in this conversation (a task ready to land on its lane, blocked, or needs owner action).",
      {"question": S("string", "one clear question the owner can answer in a message"),
       "job_id": S("string", "optional related job id")}, ["question"]),
@@ -1091,6 +1110,9 @@ def serve(tools, stdin=sys.stdin, stdout=sys.stdout):
                 message = json.loads(line)
             except ValueError:
                 emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+                continue
+            if not isinstance(message, dict):
+                emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request: not an object"}})
                 continue
             if "id" not in message:
                 continue  # a notification (notifications/initialized, cancelled): nothing to answer

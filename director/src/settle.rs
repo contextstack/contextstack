@@ -93,7 +93,7 @@ pub fn settle_job(store: &Store, db: &Connection, job_id: &str) -> Res<()> {
             &[&state, &reply, &detail, &now, &id],
         )?;
         crate::logf!("conversation {conv}: turn {id} {state}");
-        advance(store, db, &conv)?;
+        advance_apart(store, db, &conv);
     }
     if let Some((id, conv)) = summary {
         db.execute(
@@ -104,9 +104,17 @@ pub fn settle_job(store: &Store, db: &Connection, job_id: &str) -> Res<()> {
         touch(db, Record::Summary, &id).map_err(db_err)?;
         touch(db, Record::Conversation, &conv).map_err(db_err)?;
         crate::logf!("conversation {conv}: summary {id} {state}");
-        advance(store, db, &conv)?;
+        advance_apart(store, db, &conv);
     }
     Ok(())
+}
+
+/// Move the queue after a settlement, under its own savepoint: whatever fails there (the next turn or summary
+/// cannot be offered) is logged and rolled back alone, never undoing the settlement and its reply.
+fn advance_apart(store: &Store, db: &Connection, conv: &str) {
+    if let Err(e) = crate::reservations::savepoint(db, "advance", || advance(store, db, conv)) {
+        crate::logf!("conversation {conv}: the queue did not move after a settlement: {e}");
+    }
 }
 
 /// After an acked envelope: a job's end or a run's report may settle a turn. A failure here is logged and rolled
@@ -298,6 +306,57 @@ mod tests {
         finish(&store, &j1, "done", Some("   "))?;
         assert_eq!(turn(&store, "t1")?.0, "error");
         assert_eq!(turn(&store, "t2")?.0, "running");
+        Ok(())
+    }
+
+    #[test]
+    fn a_summary_that_cannot_be_offered_does_not_undo_the_turn() -> R {
+        let tmp = tempfile::tempdir()?;
+        let store = setup(tmp.path())?;
+        let long = "word ".repeat(400);
+        post(&store, "t1", &long)?;
+        post(&store, "t2", "second")?;
+        let j1 = turn(&store, "t1")?.1.ok_or("no job")?;
+        // The next turn needs a summary, and no job of this conversation can be offered any more: its spec is
+        // not a mapping, and a budget now applies.
+        let db = store.db();
+        db.execute("UPDATE conversations SET instructions_tokens = 1000000000 WHERE conversation_id = 'c1'", [])?;
+        let bad: &[u8] = b"- not a mapping\n";
+        store.put_object(bad)?;
+        db.execute(
+            "UPDATE conversation_files SET sha256 = ?1, bytes = ?2 WHERE conversation_id = 'c1' AND path = 'spec.yaml'",
+            params![sha256_hex(bad), i64::try_from(bad.len())?],
+        )?;
+        crate::scopes::set(
+            &db,
+            "conversation",
+            "c1",
+            5_000_000,
+            crate::budget::Period::Total,
+            "cred",
+        )?;
+        drop(db);
+        // As the node's envelope does: settle under a savepoint.
+        let reply = "REPLY ".repeat(200);
+        finish(&store, &j1, "done", Some(&reply))?;
+        let (s1, _, r1) = turn(&store, "t1")?;
+        assert_eq!(
+            (s1.as_str(), r1.as_deref()),
+            ("done", Some(reply.as_str())),
+            "the reply is kept"
+        );
+        let (state, detail): (String, Option<String>) = store.db().query_row(
+            "SELECT state, detail FROM summaries WHERE conversation_id = 'c1' ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(state, "error");
+        assert!(detail.is_some_and(|d| d.contains("mapping")));
+        assert_ne!(
+            turn(&store, "t2")?.0,
+            "summarising",
+            "the queue is not wedged"
+        );
         Ok(())
     }
 }

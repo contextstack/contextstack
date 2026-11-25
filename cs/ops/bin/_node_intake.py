@@ -13,7 +13,7 @@ A job naming a `grant` must carry grants/<id>.yaml hashing to its grant_sha256 (
 The node then enforces it before queueing (_grant.load_file, live_error: active, unexpired, estate = this node's
 ESTATE): a refused grant queues no run; the job is closed at once with a terminal row {state error, verdict void,
 stop "grant: <remedy>", error class node_config} that tick's outbox channel (_node_spool) delivers.
-`meta` schedule_id/slot/schedule_date/schedule_timezone and the grant id travel on the dispatch row.
+`meta` schedule_id/slot/schedule_date/schedule_timezone/agent/writes and the grant id travel on the dispatch row.
 """
 import fcntl
 import hashlib
@@ -34,7 +34,7 @@ from _roots import jobs_dir, outbox_dir, roots
 from _vitals import load_resources_policy, read_vitals, resource_held
 
 JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
-META = ("schedule_id", "slot", "schedule_date", "schedule_timezone")
+META = ("schedule_id", "slot", "schedule_date", "schedule_timezone", "agent", "writes")
 GRANT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -87,7 +87,7 @@ def materialise(job, client, target):
         record = {"job_id": job["job_id"], "bundle_sha256": job["bundle_sha256"], "spec": job["spec"],
                   "task": job["task"], "accepted_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                   "conversation_id": job.get("conversation_id"), "turn_id": job.get("turn_id"),
-                  "grant": grant, "meta": {k: str(meta[k]) for k in META if meta.get(k)}}
+                  "grant": grant, "meta": {k: (meta[k] if k == "writes" and isinstance(meta[k], bool) else str(meta[k])) for k in META if meta.get(k) not in (None, "")}}
         with open(stage / "job.json", "w", encoding="utf-8") as out:
             out.write(json.dumps(record, sort_keys=True) + "\n")
             out.flush()

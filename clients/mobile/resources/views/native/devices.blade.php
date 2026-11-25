@@ -1,4 +1,4 @@
-<native:top-bar title="Devices" />
+<native:top-bar title="Devices" back="true" />
 
 <native:scroll-view class="w-full h-full bg-theme-background">
     <native:column class="w-full px-4 md:px-24 lg:px-48 py-6">
@@ -26,12 +26,12 @@
                 @foreach ($devices as $device)
                     @php($id = (string) ($device['id'] ?? ''))
                     @if ($id === $thisDevice)
-                        <native:list-item native:key="device-{{ $id }}" headline="{{ $device['name'] ?? $id }}" supporting="This device" leading-icon="ipad" />
+                        <native:list-item native:key="device-{{ $id }}" headline="{{ $device['name'] ?? $id }}" supporting="This device" leadingIcon="ipad" />
                     @elseif (! empty($device['revoked_at']))
-                        <native:list-item native:key="device-{{ $id }}" headline="{{ $device['name'] ?? $id }}" supporting="Revoked" leading-icon="xmark.circle" />
+                        <native:list-item native:key="device-{{ $id }}" headline="{{ $device['name'] ?? $id }}" supporting="Revoked" leadingIcon="xmark.circle" />
                     @else
                         <native:list-item native:key="device-{{ $id }}" headline="{{ $device['name'] ?? $id }}" supporting="Paired"
-                            leading-icon="laptopcomputer.and.iphone"
+                            leadingIcon="laptopcomputer.and.iphone"
                             :trailing-actions="[['method' => 'revoke(\''.$id.'\')', 'label' => 'Revoke', 'icon' => 'trash', 'role' => 'destructive']]" />
                     @endif
                 @endforeach

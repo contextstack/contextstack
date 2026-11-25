@@ -37,6 +37,8 @@ def record_landing(result, job_id, root):
 
 
 def _record(result, job_id, root):
+    if result.get("busy"):  # a lock held elsewhere, not a verdict on the lane
+        return {"recorded": False, "record_skipped": "a busy refusal is not a landing outcome"}
     if job_id is not None and not JOB_ID.fullmatch(job_id):
         return _miss("invalid job id")
     config = root / "config"

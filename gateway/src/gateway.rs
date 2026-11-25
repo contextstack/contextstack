@@ -126,6 +126,15 @@ enum Upstream {
 }
 
 impl OpenStream {
+    /// A permitless open Anthropic stream (unit tests drive the stream state directly).
+    #[cfg(test)]
+    pub fn from_anthropic(stream: crate::protocol::anthropic::Stream) -> Self {
+        Self {
+            inner: Upstream::Anthropic(stream),
+            _permit: None,
+        }
+    }
+
     /// Tokens and charge the upstream reported before the stream ends (for partial settlement).
     pub fn metered_usage(&self) -> crate::protocol::MeteredUsage {
         match &self.inner {
@@ -643,7 +652,7 @@ impl Gateway {
         provider: &str,
         model: &str,
         request_id: &str,
-        body: bytes::Bytes,
+        body: reqwest::Body,
         deadline: Instant,
     ) -> Result<typesafe::Answer, CallError> {
         let ep = Self::endpoint(snap, provider, model)?;

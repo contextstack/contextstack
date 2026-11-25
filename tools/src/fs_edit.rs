@@ -7,7 +7,7 @@ use crate::py::{self, Failure};
 use serde_json::Value;
 use std::fs;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
@@ -41,7 +41,11 @@ pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
     } else if !meta.is_file() {
         return Err(Failure::exit(format!("not a file: {p}")));
     }
-    let file = jail::open_for_read(path).map_err(|e| open_error(&e, p))?;
+    let workspace = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(|e| open_error(&e, p))?;
+    let target = fs::canonicalize(workspace.join(path)).map_err(|e| py::os_error(&e, p))?;
+    let file = jail::open_in_repo(&target, &workspace).map_err(|e| open_error(&e, p))?;
     let expected = file.metadata().map_err(|e| py::os_error(&e, p))?;
     let mut bytes = Vec::new();
     file.take((MAX_FILE_BYTES + 1) as u64)
@@ -72,14 +76,12 @@ pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
             "edited output exceeds fs_edit 10 MB size cap",
         ));
     }
-    let mut out = jail::open_for_write(path).map_err(|e| open_error(&e, p))?;
-    let opened = out.metadata().map_err(|e| py::os_error(&e, p))?;
-    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
-        return Err(Failure::exit("file changed before write; retry fs_edit"));
-    }
-    out.set_len(0).map_err(|e| py::os_error(&e, p))?;
-    out.write_all(written.as_bytes())
-        .map_err(|e| py::os_error(&e, p))?;
+    commit(&target, written.as_bytes(), &raw, &expected, || {}).map_err(|e| match e {
+        Commit::Changed => {
+            Failure::exit("file changed since it was read; not written; retry fs_edit")
+        }
+        Commit::Io(e) => open_error(&e, p),
+    })?;
     let before = difflib::splitlines(&orig);
     let after = difflib::splitlines(&new);
     let mut diff = difflib::unified_diff(&before, &after, p, p, 3);
@@ -95,6 +97,64 @@ pub fn run(a: &Value) -> Result<Vec<u8>, Failure> {
         diff.push_str("diff truncated\n");
     }
     Ok(diff.into_bytes())
+}
+
+/// Why `commit` did not replace the file.
+#[derive(Debug)]
+enum Commit {
+    /// The file on disk is no longer the one that was read (other inode, or other contents).
+    Changed,
+    /// Creating, writing, syncing or renaming the replacement failed; the original is intact.
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for Commit {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Replace the canonical regular file `target` with `contents` atomically: write a temp file in
+/// the same directory with `target`'s permission bits, `fsync` it, recheck that `target` is still
+/// the inode `read_meta` describes and still holds `read_bytes`, `rename` the temp over it, then
+/// `fsync` the directory. A kill or a full disk before the rename leaves the original untouched
+/// (the temp file is removed on every error path). `before_rename` runs just before the recheck
+/// (a test seam for a concurrent writer).
+fn commit(
+    target: &Path,
+    contents: &[u8],
+    read_bytes: &str,
+    read_meta: &fs::Metadata,
+    before_rename: impl FnOnce(),
+) -> Result<(), Commit> {
+    let dir = target.parent().ok_or(Commit::Changed)?;
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".fs_edit.tmp")
+        .tempfile_in(dir)?;
+    tmp.write_all(contents)?;
+    tmp.as_file()
+        .set_permissions(fs::Permissions::from_mode(read_meta.mode() & 0o7777))?;
+    tmp.as_file().sync_all()?;
+    before_rename();
+    let current = fs::symlink_metadata(target)?;
+    if !current.is_file() || current.dev() != read_meta.dev() || current.ino() != read_meta.ino() {
+        return Err(Commit::Changed);
+    }
+    let mut now = Vec::new();
+    jail::open_in_repo(target, dir)?
+        .take((MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut now)?;
+    if now != read_bytes.as_bytes() {
+        return Err(Commit::Changed);
+    }
+    tmp.persist(target).map_err(|e| Commit::Io(e.error))?;
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 fn open_error(error: &std::io::Error, path: &str) -> Failure {
@@ -276,6 +336,7 @@ pub(crate) fn decode_error(bytes: &[u8], e: &std::str::Utf8Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jail::CwdRestore;
     use serde_json::json;
 
     fn edits(a: &Value) -> Result<Vec<(String, String)>, Failure> {
@@ -394,12 +455,86 @@ mod tests {
         assert!(failure.0.contains("position 1"));
     }
 
+    fn read_back(path: &Path) -> (String, fs::Metadata) {
+        let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read: {e}"));
+        let meta = fs::metadata(path).unwrap_or_else(|e| panic!("meta: {e}"));
+        (text, meta)
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("ls: {e}"))
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".fs_edit.tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn commit_renames_a_new_inode_into_place_keeping_permissions() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let root = dir.path().canonicalize().unwrap_or_else(|e| panic!("{e}"));
+        let target = root.join("a.txt");
+        fs::write(&target, "old\n").unwrap_or_else(|e| panic!("{e}"));
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (raw, meta) = read_back(&target);
+        commit(&target, b"new\n", &raw, &meta, || {}).unwrap_or_else(|e| panic!("{e:?}"));
+        let (text, after) = read_back(&target);
+        assert_eq!(text, "new\n");
+        assert_ne!(
+            after.ino(),
+            meta.ino(),
+            "expected a rename, not an in-place write"
+        );
+        assert_eq!(after.mode() & 0o7777, 0o640);
+        assert_eq!(leftovers(&root), Vec::<String>::new());
+    }
+
+    #[test]
+    fn commit_refuses_when_the_file_changed_after_it_was_read() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let root = dir.path().canonicalize().unwrap_or_else(|e| panic!("{e}"));
+        let target = root.join("a.txt");
+        fs::write(&target, "old\n").unwrap_or_else(|e| panic!("{e}"));
+        let (raw, meta) = read_back(&target);
+        // Same inode, other contents.
+        let got = commit(&target, b"new\n", &raw, &meta, || {
+            fs::write(&target, "theirs\n").unwrap_or_else(|e| panic!("{e}"));
+        });
+        assert!(matches!(got, Err(Commit::Changed)), "{got:?}");
+        assert_eq!(read_back(&target).0, "theirs\n");
+        // Replaced by another inode with the same contents.
+        let (raw, meta) = read_back(&target);
+        let replacement = root.join("replacement.txt");
+        fs::write(&replacement, "theirs\n").unwrap_or_else(|e| panic!("{e}"));
+        let got = commit(&target, b"new\n", &raw, &meta, || {
+            fs::rename(&replacement, &target).unwrap_or_else(|e| panic!("{e}"));
+        });
+        assert!(matches!(got, Err(Commit::Changed)), "{got:?}");
+        assert_eq!(read_back(&target).0, "theirs\n");
+        assert_eq!(leftovers(&root), Vec::<String>::new());
+    }
+
+    #[test]
+    fn commit_failure_leaves_the_original_intact() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let root = dir.path().canonicalize().unwrap_or_else(|e| panic!("{e}"));
+        let target = root.join("a.txt");
+        fs::write(&target, "old\n").unwrap_or_else(|e| panic!("{e}"));
+        let (raw, meta) = read_back(&target);
+        // The rename fails (the target became a directory); the temp file must not linger.
+        let got = commit(&target, b"new\n", &raw, &meta, || {
+            fs::remove_file(&target).unwrap_or_else(|e| panic!("{e}"));
+            fs::create_dir(&target).unwrap_or_else(|e| panic!("{e}"));
+        });
+        assert!(got.is_err());
+        assert!(target.is_dir());
+        assert_eq!(leftovers(&root), Vec::<String>::new());
+    }
+
     #[test]
     fn refuses_inputs_larger_than_cap() {
-        use crate::jail::CWD_TEST_LOCK;
-        let _lock = CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let path = dir.path().join("big.txt");
         let mut file = fs::File::create(&path).unwrap_or_else(|e| panic!("{e:?}"));
@@ -407,32 +542,26 @@ mod tests {
         for _ in 0..=MAX_FILE_BYTES / chunk.len() {
             file.write_all(&chunk).unwrap_or_else(|e| panic!("{e:?}"));
         }
-        let old = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
         let root = dir
             .path()
             .canonicalize()
             .unwrap_or_else(|e| panic!("canon: {e}"));
-        std::env::set_current_dir(&root).unwrap_or_else(|e| panic!("chdir: {e}"));
+        let _cwd = CwdRestore::chdir(&root);
         let err = run(&json!({"path": "big.txt", "edits": [{"oldText": "a", "newText": "b"}]}))
             .err()
             .unwrap_or_else(|| panic!("expected error"));
-        let _ = std::env::set_current_dir(&old);
         assert!(err.0.contains("refuses files larger than"));
     }
 
     #[test]
     fn emitted_diff_is_capped() {
-        let _lock = crate::jail::CWD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e:?}"));
-        let prev = std::env::current_dir().unwrap_or_else(|e| panic!("{e:?}"));
         let old = "old\n".repeat(10_000);
         let new = "🦀new\n".repeat(10_000);
         fs::write(dir.path().join("f"), &old).unwrap_or_else(|e| panic!("{e:?}"));
-        std::env::set_current_dir(dir.path()).unwrap_or_else(|e| panic!("{e:?}"));
+        let _cwd = CwdRestore::chdir(dir.path());
         let result = run(&json!({"path": "f", "oldText": old, "newText": new}));
-        std::env::set_current_dir(prev).unwrap_or_else(|e| panic!("{e:?}"));
+
         let diff = String::from_utf8(result.unwrap_or_else(|e| panic!("{e:?}")))
             .unwrap_or_else(|e| panic!("{e:?}"));
         assert!(diff.ends_with("diff truncated\n"));

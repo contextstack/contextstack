@@ -152,22 +152,8 @@ impl Palette {
 
     fn pause_reads(&self) -> Self {
         let mut paused = self.clone();
-        paused.restrict(
-            |name| {
-                !matches!(
-                    name,
-                    "fs_read"
-                        | "fs_list"
-                        | "repo_search"
-                        | "search"
-                        | "web_search"
-                        | "web_fetch"
-                        | "browser_fetch"
-                        | "defuddle_extract"
-                )
-            },
-            "read tools are paused for one turn",
-        );
+        let keep = |name: &str| !READ_TOOLS.split(' ').any(|read| read == name);
+        paused.restrict(keep, "read tools are paused for one turn");
         paused
     }
 
@@ -191,6 +177,10 @@ impl Palette {
         )
     }
 }
+
+/// The tools `pause_reads` withholds for one turn.
+const READ_TOOLS: &str =
+    "fs_read fs_list repo_search search web_search web_fetch browser_fetch defuddle_extract";
 
 fn is_write_tool(name: &str) -> bool {
     matches!(name, "fs_write" | "fs_edit")
@@ -264,6 +254,7 @@ struct Guidance {
     calls_since_hint: u64,
 }
 
+const FINAL_TURN_WRITES: &str = "read tools are unavailable on the final turn";
 const CONTINUE_CODING: &str = "You replied without using a tool. Continue: make your planned edit with fs_edit, then run_check.";
 
 impl Guidance {
@@ -338,6 +329,7 @@ fn wall_deadline(seconds_budget: i64) -> (Option<tokio::time::Instant>, bool) {
     (wall, seconds_budget > EARLY_WALL)
 }
 
+/// Trusted operations' watchdog; hooks are killed after the spec's `check_window` instead.
 const WATCHDOG: Option<Duration> = Some(Duration::from_secs(120));
 
 async fn op(root: &Path, name: &str, input: Value, control: &Control) -> (Value, Option<String>) {
@@ -361,9 +353,11 @@ async fn op(root: &Path, name: &str, input: Value, control: &Control) -> (Value,
     let parsed = serde_json::from_str(raw.trim().lines().last().unwrap_or(""))
         .map_err(|e| e.to_string())
         .and_then(op_object);
-    let error = output
-        .error
-        .map(|e| format!("{name}: {e}; inspect the run and retry finalization"));
+    // A deadline or cancel is the run's stop, not a fault that finalization could retry.
+    let error = output.error.map(|e| match control.reason() {
+        Some(_) => format!("{name}: {e}"),
+        None => format!("{name}: {e}; inspect the run and retry finalization"),
+    });
     match parsed {
         Ok(value) => (value, error),
         Err(parse) => (Value::Null, error.or(Some(parse))),
@@ -413,7 +407,7 @@ async fn hook(
         input,
         &env,
         Some(control),
-        WATCHDOG,
+        Some(seconds(cell.spec.check_window.max(60))),
         capture,
     )
     .await;
@@ -509,21 +503,20 @@ async fn tool(
         run_dir = cell.dir.to_string_lossy();
         view = cell.repo_view.map(Value::to_string).unwrap_or_default();
         words = vec![bin.as_ref(), &run_dir, &cell.model, &view];
-    } else if let Some(view) = cell.repo_view {
+    } else if let Some(bound) = cell.repo_view.map(Value::to_string).or(lane_binding) {
+        // Read-only views and writable lanes alike must reach cs-sandbox; never run unbound.
         let Some(separator) = prefix
             .split_whitespace()
             .position(|word| word == "--")
             .filter(|&i| i > 0)
         else {
-            return ("read-only repo views require cs-sandbox".into(), true, None);
+            return ("repo views require cs-sandbox".into(), true, None);
         };
-        binding = view.to_string();
+        binding = bound;
         words.splice(separator..separator, ["--repo-view", &binding]);
-        budget.push(("CS_REPO_VIEW".into(), text(view, "path").to_owned()));
-    } else if let Some(binding) = &lane_binding
-        && let Some(separator) = prefix.split_whitespace().position(|word| word == "--")
-    {
-        words.splice(separator..separator, ["--repo-view", binding]);
+        if let Some(view) = cell.repo_view {
+            budget.push(("CS_REPO_VIEW".into(), text(view, "path").to_owned()));
+        }
     }
     let capture = if is_check {
         Capture::Tail
@@ -907,10 +900,7 @@ impl Cell<'_> {
             }
             let remaining = sp.budget.turns - (turn - 1);
             if remaining == 1 && has_deliverable && palette.has_write_tools() {
-                palette.restrict(
-                    is_write_tool,
-                    "read tools are unavailable on the final turn",
-                );
+                palette.restrict(is_write_tool, FINAL_TURN_WRITES);
             }
             self.final_turn_retry = remaining == 0;
             let (content, pause) = self.guidance(&palette, &workspace, turn, remaining);
@@ -931,15 +921,9 @@ impl Cell<'_> {
             let mut span = self.trace.span("turn", "turn", "run");
             span.data = json!({"turn": turn, "content": {"prompt": prompt}});
             self.row.turns = turn;
-            let result = self
-                .turn(
-                    gateway,
-                    control,
-                    paused.as_ref().unwrap_or(&palette),
-                    &mut messages,
-                    &mut span,
-                )
-                .await;
+            let active = paused.as_ref().unwrap_or(&palette);
+            let result = self.turn(gateway, control, active, &mut messages, &mut span);
+            let result = result.await;
             messages[0] = original;
             span.close(trace::outcome(result.is_ok()))?;
             let stop = result?;
@@ -1023,16 +1007,10 @@ impl Cell<'_> {
             *seq += 1;
             stream_event(dir, turn, *seq, &partial)
         };
-        let response = gateway
-            .call(
-                messages,
-                palette.offer(turn >= self.spec.budget.turns && !self.deliverables.is_empty()),
-                ceiling,
-                control,
-                &mut sink,
-                &call,
-            )
-            .await;
+        let final_turn = turn >= self.spec.budget.turns && !self.deliverables.is_empty();
+        let offer = palette.offer(final_turn);
+        let response = gateway.call(messages, offer, ceiling, control, &mut sink, &call);
+        let response = response.await;
         span.stop();
         let sends = call.sends();
         let (charged, reported) = match &response {
@@ -1047,6 +1025,11 @@ impl Cell<'_> {
                 .push(json!({"request_id": call.id, "send_index": sends.len()}));
         }
         span.data = json!({"request_id": call.id, "sends": sends, "content": {"prompt": prompt}});
+        if response.is_err() && charged != 0.0 {
+            // A call that ended without completing settled partially (tracing CONTRACT rule 3).
+            span.data["charged_usd"] = json!(charged);
+            span.data["partial"] = json!(true);
+        }
         let (response, reply_pointer) = match response {
             Ok(reply) => {
                 let pointer = self.emit(Reply {
@@ -1255,10 +1238,8 @@ pub(crate) fn reserve_run(
     mut stamp: chrono::DateTime<Utc>,
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(runs).map_err(|e| e.to_string())?;
-    let task = Path::new(task)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let task = Path::new(task).file_name().unwrap_or_default();
+    let task = task.to_string_lossy();
     loop {
         let time = stamp.format("%Y%m%d-%H%M%S.%9f");
         let id = format!("{time}-{label}-{task}-t{trial}");
@@ -1312,17 +1293,10 @@ pub async fn run(
     } else {
         (None, lane)
     };
-    let workspace = lane
-        .as_ref()
-        .and_then(|lane| lane["path"].as_str())
-        .map_or_else(
-            || {
-                workspaces
-                    .join(dir.file_name().unwrap_or_default())
-                    .join("workspace")
-            },
-            PathBuf::from,
-        );
+    let run_name = dir.file_name().unwrap_or_default();
+    let fallback = || workspaces.join(run_name).join("workspace");
+    let workspace = lane.as_ref().and_then(|lane| lane["path"].as_str());
+    let workspace = workspace.map_or_else(fallback, PathBuf::from);
     let mut cell = Cell {
         spec: sp,
         root,
@@ -1347,7 +1321,11 @@ pub async fn run(
         .execute(gateway, &mut control)
         .await
         .unwrap_or_else(|error| {
-            let stop = format!("{ERROR_STOP}{error}");
+            // A deadline that expires in setup or capture-stimulus is a timeout, not an error.
+            let stop = match control.reason() {
+                Some(deadline @ "budget:seconds") => deadline.into(),
+                _ => format!("{ERROR_STOP}{error}"),
+            };
             cell.row.error = Some(error);
             stop
         });
@@ -1414,6 +1392,79 @@ mod tests {
                 .is_err()
         );
         assert!(cell.post_turn(&control, "test").await.is_err());
+        Ok(())
+    }
+
+    /// A sandbox binding without a `--` in `CS_TOOL_PREFIX` refuses the tool; with one it reaches cs-sandbox.
+    #[tokio::test]
+    async fn sandbox_bindings_fail_closed_without_a_prefix_separator()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir()?;
+        let root = scratch.path();
+        fs::create_dir_all(root.join("tools/bin"))?;
+        let script = |path: &Path, body: &str| -> std::io::Result<()> {
+            fs::write(path, format!("#!/bin/sh\n{body}\n"))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        };
+        let (ran, argv) = (root.join("ran"), root.join("argv"));
+        script(
+            &root.join("tools/bin/probe"),
+            &format!("touch {}", ran.display()),
+        )?;
+        let wrap = root.join("wrap");
+        script(
+            &wrap,
+            &format!("echo \"$@\" > {}; shift 3; exec \"$@\"", argv.display()),
+        )?;
+        let spec = Spec::default();
+        let trace = Trace::new(root);
+        let view = json!({"path": "/repo"});
+        let entry: Tool = serde_json::from_value(json!({"schema": {}}))?;
+        let invocation: ToolCall = serde_json::from_value(json!({"name": "probe"}))?;
+        for (read_only, prefix, refusal) in [
+            (false, "nice -n 0", Some("repo views require cs-sandbox")),
+            (true, "nice -n 0", Some("repo views require cs-sandbox")),
+            (false, &*format!("{} --", wrap.display()), None),
+        ] {
+            let _ = fs::remove_file(&ran);
+            let mut vars = vec![("CS_TOOL_PREFIX".to_string(), prefix.to_string())];
+            if !read_only {
+                vars.push(("CS_HARNESS_SANDBOX".into(), "lane-binding".into()));
+            }
+            let _env = process::ScopedEnv::set(vars);
+            let cell = Cell {
+                spec: &spec,
+                root,
+                task: "task",
+                trial: 1,
+                dir: root.into(),
+                workspace: root.into(),
+                repo_view: read_only.then_some(&view),
+                stimulus: Value::Null,
+                model: String::new(),
+                row: ResultRow::default(),
+                seq: 0,
+                messages: Transcript::default(),
+                trace: &trace,
+                metrics: RunMetrics::default(),
+                write_succeeded: false,
+                final_turn_retry: false,
+                guidance: Guidance::default(),
+                deliverables: Vec::new(),
+            };
+            let mut span = trace.span("tool_call", "probe", "test");
+            let (output, is_error, _) =
+                tool(&cell, &invocation, &entry, &Control::default(), &mut span).await;
+            if let Some(refusal) = refusal {
+                assert!(is_error && output.contains(refusal), "{prefix}: {output}");
+                assert!(!ran.exists(), "{prefix}: the tool ran without its binding");
+            } else {
+                assert!(!is_error, "{output}");
+                assert!(fs::read_to_string(&argv)?.starts_with("--repo-view lane-binding -- "));
+                assert!(ran.exists());
+            }
+        }
         Ok(())
     }
 

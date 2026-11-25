@@ -11,7 +11,7 @@
       "$CODE_ROOT/.venv",
       "$REPO_ROOT/target/release",
       "$REPO_ROOT/target/debug",
-      "/opt/homebrew", "/usr", "/bin", "/sbin", "/System", "/Library",
+      "$DEVELOPER_DIR", "/opt/homebrew", "/usr", "/bin", "/sbin", "/System", "/Library",
       "/private/etc", "/private/var/select", "/private/var/db/timezone", "/dev",
       "$HOME/.local/bin/uv", "$HOME/.local/share/uv/python", "$TOOL_PYTHON",
       "$HOME/Library/Application Support/Herd/config/nvm/versions/node/v22.21.1"

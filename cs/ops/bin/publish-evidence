@@ -12,6 +12,7 @@ found harvest had already committed the workspace, so the diff read empty while
 usable empty tree; incomplete capture is recorded as incomplete.
 """
 from _estate_io import digest, hardened_git_env, sha256_bytes
+from _harvest_git import host_git
 import gzip
 import io
 import tarfile
@@ -32,17 +33,11 @@ MAX_ARCHIVE_SOURCE = 256 << 20
 
 
 
-# Host git hardened against the workspace's own config; a repo lane pins its git dir through _lanes
-# (imported only then, so plain workspaces and fixture checkouts don't need it).
-_HARDEN = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
-
-
-def _workspace_git(ws, *args, lane_ctx=None, env=None):
+def _workspace_git(ws, *args, lane_ctx=None, env=None, index=None):
     if lane_ctx:
         import _lanes
-        return _lanes.workspace_git(ws, *args, lane_ctx=lane_ctx, env=env)
-    return subprocess.run(["git", "-C", str(Path(ws).resolve()), *_HARDEN, *args],
-                          capture_output=True, text=True, env=env or hardened_git_env(), stdin=subprocess.DEVNULL)
+        return _lanes.workspace_git(ws, *args, lane_ctx=lane_ctx, env=env, index=index)
+    return host_git(ws, *args, env=env, index=index)
 
 
 def refuse(message):
@@ -131,10 +126,9 @@ def candidate_diff(ws, base, lane_git=None):
         index = tempfile.NamedTemporaryFile(prefix="evidence-index-", delete=False)
         index.close()
         # Preserve our private index so evidence staging never changes the workspace index.
-        index_env = hardened_git_env(extra={"GIT_INDEX_FILE": index.name})
 
         def indexed(*args):
-            result = _workspace_git(ws, *args, lane_ctx=lane_ctx, env=index_env)
+            result = _workspace_git(ws, *args, lane_ctx=lane_ctx, env=git_env, index=index.name)
             if result.returncode:
                 raise ValueError(args[0] + " failed: " + (result.stderr or "").strip())
             return result.stdout

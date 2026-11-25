@@ -53,6 +53,10 @@ new #[Layout('layouts::desktop-gate')] #[Title('ContextStack')] class extends Co
                 class="text-sky-500 underline underline-offset-2 hover:text-sky-400"
             >{{ __('Getting started (install)') }}</a>
         </flux:text>
+        <flux:text class="text-zinc-600 dark:text-zinc-300">
+            {{ __('ContextStack runs on another machine?') }}
+            <a href="{{ route('connect') }}" class="text-sky-500 underline underline-offset-2 hover:text-sky-400" data-test="desktop-gate-pair">{{ __('Pair this Mac with its Director') }}</a>
+        </flux:text>
     @elseif ($status === \App\Client\DesktopConnectionStatus::NotRunning)
         <p class="text-6xl" aria-hidden="true">&#128721;</p>
         <flux:heading size="xl" level="1" data-test="desktop-gate-not-running">
@@ -64,6 +68,10 @@ new #[Layout('layouts::desktop-gate')] #[Title('ContextStack')] class extends Co
             {{ __('to see what is wrong, then') }}
             <code class="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-sm dark:bg-zinc-900">cs doctor</code>
             {{ __('to fix it.') }}
+        </flux:text>
+        <flux:text class="text-zinc-600 dark:text-zinc-300">
+            {{ __('Connecting to a Director on another machine?') }}
+            <a href="{{ route('connect') }}" class="text-sky-500 underline underline-offset-2 hover:text-sky-400" data-test="desktop-gate-settings">{{ __('Check its address in Settings') }}</a>
         </flux:text>
     @endif
 

@@ -177,6 +177,17 @@ pub fn models(gw: &Arc<Gateway>, q: &BTreeMap<String, String>) -> Response<Body>
     let tier = tier_filter(q);
     let capability = q.get("capability").cloned().unwrap_or_default();
     let available_only = q.get("available_only").map(String::as_str) != Some("false");
+    let provider_labels: BTreeMap<_, _> = inv
+        .all()
+        .iter()
+        .filter_map(|e| {
+            let picker = e.picker.as_ref()?;
+            picker
+                .provider
+                .is_none()
+                .then_some((e.provider.as_str(), picker.provider_label.as_str()))
+        })
+        .collect();
     let rows: Vec<Value> = inv
         .all()
         .iter()
@@ -190,6 +201,11 @@ pub fn models(gw: &Arc<Gateway>, q: &BTreeMap<String, String>) -> Response<Body>
                 "name": e.name, "provider": e.provider, "tier": e.tier, "capability": e.capability,
                 "available": e.available, "preferred": e.preferred, "streaming": streams(&snap, e),
             });
+            if let Some(picker) = &e.picker {
+                r["picker"] = json!(picker);
+            } else if let Some(label) = provider_labels.get(e.provider.as_str()) {
+                r["picker"] = json!({"provider_label": label, "label": e.name});
+            }
             if e.candidate {
                 r["candidate"] = json!(true);
             }

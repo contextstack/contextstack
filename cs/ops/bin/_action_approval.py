@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from _director_client import Client, DirectorUnreachable, receiver_config
+from _harvest_git import host_git
 from _roots import roots
 
 # Must fit inside request_action's 120 s tool budget after polling (about 22 s) and diffs.
@@ -78,16 +79,10 @@ def lane_context(run_dir, argv, env, workspace):
     home = Path.home().resolve()
     command = command_context(argv, workspace)
     goal = (run_dir / "stimulus/goal.md").read_text(encoding="utf-8")[:24_000]
-    diff_env = dict(env, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                    GIT_OPTIONAL_LOCKS="0")
     diff = ""
     with tempfile.TemporaryFile() as output:
         for base in ("main", "HEAD"):
-            result = subprocess.run(
-                ["/usr/bin/git", "-c", "core.fsmonitor=false", "--no-pager", "diff",
-                 "--no-ext-diff", "--no-textconv", base, "--"],
-                cwd=workspace, env=diff_env, stdout=output, stderr=subprocess.DEVNULL, timeout=3, check=False,
-            )
+            result = host_git(workspace, "diff", base, "--", env=env, stdout=output, timeout=3)
             if result.returncode == 0:
                 output.seek(0)
                 diff = output.read(48_000).decode(errors="replace")

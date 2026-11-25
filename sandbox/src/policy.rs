@@ -207,6 +207,9 @@ pub struct Effective {
     pub workspace: PathBuf,
     /// Every readable subtree.
     pub read: Vec<PathBuf>,
+    /// The resolved developer directory passed to macOS tools.
+    #[serde(skip_serializing)]
+    pub developer_dir: Option<PathBuf>,
     /// Every writable subtree.
     pub write: Vec<PathBuf>,
     /// The network capability granted.
@@ -357,8 +360,104 @@ fn read_narrowing(raw: &str, reason: String) -> Narrowing {
     }
 }
 
-/// One read-list entry, expanded; `$TOOL_PYTHON` resolved, or None when it does not resolve.
-fn expand_read(raw: &str, code_root: &Path, home: &Path) -> Result<Option<PathBuf>, Failure> {
+/// The macOS developer tools used by xcrun shims. Read lists only.
+const DEVELOPER_DIR: &str = "$DEVELOPER_DIR";
+
+const COMMAND_LINE_TOOLS: &str = "/Library/Developer/CommandLineTools";
+
+fn developer_dir(
+    configured: Option<OsString>,
+    command_line_tools: &Path,
+    selected: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let configured = configured
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let configured_dir = configured.as_deref().and_then(canonical_developer_dir);
+    // Preserve operator overrides outside Xcode bundles. Inside an .app, prefer
+    // CLT so xcrun does not invoke xcodebuild's first-launch checks in the sandbox.
+    let prefer_clt = configured.is_none()
+        || configured
+            .as_deref()
+            .into_iter()
+            .chain(configured_dir.as_deref())
+            .any(|path| {
+                path.ancestors()
+                    .any(|part| part.extension().is_some_and(|ext| ext == "app"))
+            });
+    if prefer_clt
+        && command_line_tools.is_absolute()
+        && ["usr/bin/git", "usr/bin/xcrun"]
+            .iter()
+            .any(|tool| command_line_tools.join(tool).is_file())
+        && let Some(path) = canonical_developer_dir(command_line_tools)
+    {
+        return Some(path);
+    }
+    match configured {
+        Some(_) => configured_dir,
+        None => canonical_developer_dir(&selected()?),
+    }
+}
+
+fn canonical_developer_dir(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = path.canonicalize().ok()?;
+    (path.parent().is_some() && path.is_dir()).then_some(path)
+}
+
+fn host_developer_dir(configured: Option<OsString>) -> Option<PathBuf> {
+    let command_line_tools = if cfg!(target_os = "macos") {
+        Path::new(COMMAND_LINE_TOOLS)
+    } else {
+        Path::new("")
+    };
+    developer_dir(configured, command_line_tools, selected_developer_dir)
+}
+
+fn selected_developer_dir() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = std::process::Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(PathBuf::from(
+        std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim_end_matches('\n'),
+    ))
+}
+
+fn developer_read_root(developer: &Path) -> &Path {
+    // Xcode tools read Info.plist and load frameworks outside Contents/Developer.
+    if developer.ends_with("Contents/Developer")
+        && let Some(bundle) = developer.ancestors().nth(2)
+        && bundle
+            .extension()
+            .is_some_and(|extension| extension == "app")
+    {
+        return bundle;
+    }
+    developer
+}
+
+/// Expand one read-list entry, dropping it when an optional token cannot be resolved.
+fn expand_read(
+    raw: &str,
+    code_root: &Path,
+    home: &Path,
+    resolve_developer_dir: &dyn Fn() -> Option<PathBuf>,
+) -> Result<Option<PathBuf>, Failure> {
+    if raw == DEVELOPER_DIR {
+        return Ok(resolve_developer_dir());
+    }
     let raw = if raw.contains(TOOL_PYTHON) {
         match tool_python(code_root) {
             Some(base) => raw.replace(TOOL_PYTHON, &base.to_string_lossy()),
@@ -505,8 +604,10 @@ fn runtime_paths(
     code_root: &Path,
     home: &Path,
     narrowed: &mut Vec<Narrowing>,
-) -> Result<BTreeSet<PathBuf>, Failure> {
+    resolve_developer_dir: &dyn Fn() -> Option<PathBuf>,
+) -> Result<(BTreeSet<PathBuf>, Option<PathBuf>), Failure> {
     let mut paths = BTreeSet::new();
+    let mut developer_dir = None;
     for raw in host.read_lists(env::consts::OS, profile)? {
         if raw.contains(TOOL_PYTHON) && tool_python(code_root).is_none() {
             narrowed.push(read_narrowing(
@@ -515,18 +616,22 @@ fn runtime_paths(
             ));
             continue;
         }
-        let Some(expanded) = expand_read(raw, code_root, home)? else {
+        let Some(expanded) = expand_read(raw, code_root, home, resolve_developer_dir)? else {
             continue;
         };
+        if raw == DEVELOPER_DIR {
+            paths.insert(developer_read_root(&expanded).to_path_buf());
+            developer_dir = Some(expanded);
+            continue;
+        }
         if !expanded.is_absolute() {
             return Err(unenforceable(format!(
                 "invalid policy: runtime_read entry is not absolute: {raw}"
             )));
         }
-        let canonical = expanded.canonicalize().unwrap_or(expanded);
-        paths.insert(canonical);
+        paths.insert(expanded.canonicalize().unwrap_or(expanded));
     }
-    Ok(paths)
+    Ok((paths, developer_dir))
 }
 
 /// Every symlink on the way to a `runtime_read` path, as (link, canonical target): `/lib64` on most
@@ -541,7 +646,10 @@ pub fn runtime_links(
 ) -> Result<Vec<(PathBuf, PathBuf)>, Failure> {
     let mut links = BTreeSet::new();
     for raw in host.read_lists(env::consts::OS, profile)? {
-        let Some(expanded) = expand_read(raw, code_root, home)? else {
+        let Some(expanded) = expand_read(raw, code_root, home, &|| {
+            host_developer_dir(env::var_os("DEVELOPER_DIR"))
+        })?
+        else {
             continue;
         };
         let mut prefix = PathBuf::new();
@@ -584,7 +692,10 @@ pub fn intersect(
         }
         other => other,
     };
-    let mut read = runtime_paths(host, profile, code_root, home, &mut narrowed)?;
+    let (mut read, developer_dir) =
+        runtime_paths(host, profile, code_root, home, &mut narrowed, &|| {
+            host_developer_dir(var("DEVELOPER_DIR"))
+        })?;
     read.insert(workspace.to_path_buf());
     read.insert(tmp.to_path_buf());
     for relative in &request.read {
@@ -635,6 +746,7 @@ pub fn intersect(
     let effective = Effective {
         workspace: workspace.to_path_buf(),
         read: read.into_iter().collect(),
+        developer_dir,
         write: write.into_iter().collect(),
         net,
         tmp: tmp.to_path_buf(),
@@ -816,6 +928,132 @@ mod tests {
     }
 
     #[test]
+    fn developer_dir_prefers_environment() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let path = canonical(&dir)?;
+        let resolved = developer_dir(Some(path.clone().into_os_string()), Path::new(""), || {
+            panic!("xcode-select should not run with DEVELOPER_DIR set")
+        });
+        assert_eq!(resolved, Some(path));
+        Ok(())
+    }
+
+    #[test]
+    fn developer_dir_uses_xcode_select_when_unset() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let path = canonical(&dir)?;
+        assert_eq!(
+            developer_dir(None, Path::new(""), || Some(dir.path().to_path_buf())),
+            Some(path)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn developer_dir_drops_failed_or_unsafe_resolution() {
+        assert_eq!(developer_dir(None, Path::new(""), || None), None);
+        assert_eq!(
+            developer_dir(None, Path::new(""), || Some(PathBuf::from("/"))),
+            None
+        );
+        assert_eq!(
+            developer_dir(None, Path::new(""), || Some(PathBuf::from("relative"))),
+            None
+        );
+    }
+
+    #[test]
+    fn developer_dir_grants_bundle_read_and_sets_environment() -> Result<(), String> {
+        check_developer_dir(
+            Some("Xcode.app/Contents/Developer"),
+            None,
+            "Xcode.app/Contents/Developer",
+            "Xcode.app",
+        )
+    }
+
+    #[test]
+    fn developer_dir_grants_command_line_tools_read_and_sets_environment() -> Result<(), String> {
+        check_developer_dir(None, Some("git"), "CommandLineTools", "CommandLineTools")
+    }
+
+    #[test]
+    fn developer_dir_prefers_clt_over_configured_xcode() -> Result<(), String> {
+        check_developer_dir(
+            Some("Xcode.app/Contents/Developer"),
+            Some("xcrun"),
+            "CommandLineTools",
+            "CommandLineTools",
+        )
+    }
+
+    #[test]
+    fn developer_dir_retains_custom_override_with_clt_installed() -> Result<(), String> {
+        check_developer_dir(Some("custom"), Some("git"), "custom", "custom")
+    }
+
+    fn check_developer_dir(
+        configured_path: Option<&str>,
+        clt_tool: Option<&str>,
+        developer_path: &str,
+        read_path: &str,
+    ) -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let root = canonical(&dir)?;
+        let developer = root.join(developer_path);
+        let read_root = root.join(read_path);
+        let clt = root.join("CommandLineTools");
+        if let Some(tool) = clt_tool {
+            std::fs::create_dir_all(clt.join("usr/bin")).map_err(|e| e.to_string())?;
+            std::fs::write(clt.join("usr/bin").join(tool), "").map_err(|e| e.to_string())?;
+        }
+        let configured = configured_path
+            .map(|path| {
+                let path = root.join(path);
+                std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+                let alias = root.join("configured");
+                std::os::unix::fs::symlink(path, &alias).map_err(|e| e.to_string())?;
+                Ok::<_, String>(alias.into_os_string())
+            })
+            .transpose()?;
+        let mut host = host(&[Net::None]);
+        host.runtime_read = RuntimeRead::All(vec![DEVELOPER_DIR.to_owned()]);
+        let (paths, chosen) = runtime_paths(
+            &host,
+            None,
+            Path::new("/code"),
+            Path::new("/home"),
+            &mut Vec::new(),
+            &|| {
+                developer_dir(configured.clone(), &clt, || {
+                    panic!("xcode-select should not run")
+                })
+            },
+        )
+        .map_err(|failure| failure.message().to_owned())?;
+        assert_eq!(paths, BTreeSet::from([read_root]));
+        assert_eq!(chosen.as_ref(), Some(&developer));
+        let (mut effective, _) = intersect(
+            &self::host(&[Net::None]),
+            &Request::default(),
+            Path::new("/workspace"),
+            Path::new("/tmp/sandbox"),
+            Path::new("/code"),
+            Path::new("/home"),
+            &no_env,
+        )
+        .map_err(|failure| failure.message().to_owned())?;
+        effective.developer_dir = chosen;
+        let mut command = std::process::Command::new(crate::seatbelt::SANDBOX_EXEC);
+        crate::seatbelt::apply_developer_dir(&mut command, &effective);
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            vec![("DEVELOPER_DIR".as_ref(), Some(developer.as_os_str()))]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn runtime_links_name_every_symlinked_prefix() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = dir
@@ -860,8 +1098,15 @@ mod tests {
         let mut policy = host(&[]);
         policy.runtime_read = RuntimeRead::All(vec!["/usr".to_owned(), TOOL_PYTHON.to_owned()]);
         let mut narrowed = Vec::new();
-        let paths = runtime_paths(&policy, None, &code, Path::new("/h"), &mut narrowed)
-            .map_err(|failure| failure.message().to_owned())?;
+        let (paths, _) = runtime_paths(
+            &policy,
+            None,
+            &code,
+            Path::new("/h"),
+            &mut narrowed,
+            &|| None,
+        )
+        .map_err(|failure| failure.message().to_owned())?;
         let canonical_usr = Path::new("/usr")
             .canonicalize()
             .map_err(|e| e.to_string())?;
@@ -888,8 +1133,15 @@ mod tests {
             let (_dir, code, _) = venv_root(home)?;
             assert_eq!(tool_python(&code), None, "{home:?}");
             let mut narrowed = Vec::new();
-            let paths = runtime_paths(&policy, None, &code, Path::new("/h"), &mut narrowed)
-                .map_err(|failure| failure.message().to_owned())?;
+            let (paths, _) = runtime_paths(
+                &policy,
+                None,
+                &code,
+                Path::new("/h"),
+                &mut narrowed,
+                &|| None,
+            )
+            .map_err(|failure| failure.message().to_owned())?;
             assert_eq!(paths, BTreeSet::from([usr.clone()]), "{home:?}");
             assert_eq!(narrowed.len(), 1, "{home:?}");
             assert_eq!(narrowed[0].capability, "read");

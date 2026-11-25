@@ -75,7 +75,7 @@ class Stack:
         self.scenario = scenario
         self.box = box
         self.no_gateway = no_gateway
-        # Start from the shared fixture policy, then allow only the host's tool search path.
+        # Use the host's tool search path in the hermetic fixture environment.
         self.env = {
             "PATH": hermetic_env().get("PATH", os.defpath),
             "HOME": str(self.scratch),
@@ -249,6 +249,7 @@ class Stack:
             "CSGATEWAY_ENDPOINT": self.gw_endpoint,
             "CS_SANDBOX_BIN": str(REPO / "target/release/cs-sandbox"),
         }
+        # This copies the host sandbox policy, including its macOS developer directory token.
         from native_runtime import stage_native_runtime
         stage_native_runtime(e / "ops/bin")
 

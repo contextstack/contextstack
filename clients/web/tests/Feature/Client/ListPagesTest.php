@@ -39,6 +39,7 @@ function busyIntentsAnswer(int $count): array
             'intent_id' => "int_$i", 'title' => "task $i", 'job_ids' => ["job_$i"],
             'bundle_sha256' => str_repeat('c', 64), 'spec' => str_repeat('s', 500),
             'meta' => $i % 2 === 0 ? ['source' => 'cs-mcp', 'repo' => 'contextstack', 'lane' => "lane-$i", 'agent' => 'coder', 'notes' => str_repeat('n', 500)] : ['notes' => str_repeat('n', 500)],
+            'lane' => $i % 2 === 0,
         ]);
         $jobs[] = listJobRecord([
             'job_id' => "job_$i", 'intent_id' => "int_$i", 'state' => 'done',

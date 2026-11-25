@@ -46,8 +46,9 @@ pub async fn accept_tcp(
             let gw = Arc::clone(&gw);
             let graceful = Arc::clone(&graceful);
             let gate = Arc::clone(&gate);
+            let stop = stop.clone();
             tokio::spawn(async move {
-                admit_tcp(stream, gw, addr.ip(), graceful, gate).await;
+                admit_tcp(stream, gw, addr.ip(), graceful, gate, stop).await;
             });
         }
     }
@@ -69,8 +70,9 @@ pub async fn accept_unix(
             let gw = Arc::clone(&gw);
             let graceful = Arc::clone(&graceful);
             let gate = Arc::clone(&gate);
+            let stop = stop.clone();
             tokio::spawn(async move {
-                admit_unix(stream, gw, graceful, gate).await;
+                admit_unix(stream, gw, graceful, gate, stop).await;
             });
         }
     }
@@ -82,18 +84,22 @@ async fn admit_tcp(
     peer_ip: IpAddr,
     graceful: Arc<GracefulShutdown>,
     gate: Arc<Gate>,
+    stop: CancellationToken,
 ) {
-    match tokio::time::timeout(gate.accept_timeout, gate.inflight.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => serve(
-            TokioIo::new(stream),
-            gw,
-            server::Peer::Tcp(peer_ip),
-            permit,
-            gate.header_read_timeout,
-            &graceful,
-        ),
-        _ => reject_busy(stream, gate.accept_timeout).await,
-    }
+    let Some(permit) = queued(&gate, &stop).await else {
+        // Never hold the drain open from the queue: shutting down refuses queued connects.
+        drop(graceful);
+        reject_busy(stream, gate.accept_timeout).await;
+        return;
+    };
+    serve(
+        TokioIo::new(stream),
+        gw,
+        server::Peer::Tcp(peer_ip),
+        permit,
+        gate.header_read_timeout,
+        &graceful,
+    );
 }
 
 async fn admit_unix(
@@ -101,18 +107,52 @@ async fn admit_unix(
     gw: Arc<Gateway>,
     graceful: Arc<GracefulShutdown>,
     gate: Arc<Gate>,
+    stop: CancellationToken,
 ) {
-    match tokio::time::timeout(gate.accept_timeout, gate.inflight.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => serve(
-            TokioIo::new(stream),
-            gw,
-            server::Peer::Unix,
-            permit,
-            gate.header_read_timeout,
-            &graceful,
-        ),
-        _ => reject_busy(stream, gate.accept_timeout).await,
+    let Some(permit) = queued(&gate, &stop).await else {
+        // Never hold the drain open from the queue: shutting down refuses queued connects.
+        drop(graceful);
+        reject_busy(stream, gate.accept_timeout).await;
+        return;
+    };
+    serve(
+        TokioIo::new(stream),
+        gw,
+        server::Peer::Unix,
+        permit,
+        gate.header_read_timeout,
+        &graceful,
+    );
+}
+
+/// Wait for an in-flight slot, or `None` on timeout or shutdown.
+async fn queued(gate: &Gate, stop: &CancellationToken) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        permit = tokio::time::timeout(gate.accept_timeout, gate.inflight.clone().acquire_owned()) => {
+            permit.ok()?.ok()
+        }
+        () = stop.cancelled() => None,
     }
+}
+
+/// Drain in-flight connections for up to `grace`. Connection tasks that are still being admitted hold
+/// a clone of `graceful`; wait for them to finish (instead of skipping the drain) within the same grace,
+/// so in-flight paid calls reach settlement. Returns whether the drain completed.
+pub async fn drain(mut graceful: Arc<GracefulShutdown>, grace: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + grace;
+    let g = loop {
+        match Arc::try_unwrap(graceful) {
+            Ok(g) => break g,
+            Err(shared) if tokio::time::Instant::now() < deadline => {
+                graceful = shared;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => return false,
+        }
+    };
+    tokio::time::timeout_at(deadline, g.shutdown())
+        .await
+        .is_ok()
 }
 
 async fn reject_busy<S>(mut stream: S, accept_timeout: Duration)
@@ -161,6 +201,20 @@ mod tests {
     use std::net::TcpListener as StdListener;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    // G4: a connection still being admitted (holding the shared drain handle) no longer skips the drain.
+    #[tokio::test]
+    async fn drain_waits_for_queued_connections_instead_of_skipping() {
+        let graceful = std::sync::Arc::new(super::GracefulShutdown::new());
+        let queued = std::sync::Arc::clone(&graceful);
+        let started = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(queued);
+        });
+        assert!(super::drain(graceful, Duration::from_secs(5)).await);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
 
     fn pick_port() -> Option<u16> {
         let l = StdListener::bind("127.0.0.1:0").ok()?;

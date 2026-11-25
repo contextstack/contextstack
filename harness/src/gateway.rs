@@ -123,6 +123,18 @@ pub struct CallFailure {
     pub cost_class: String,
 }
 
+/// The charge a reply settled, for a call stopped before it could be used.
+impl From<Response> for CallFailure {
+    fn from(reply: Response) -> Self {
+        Self {
+            message: String::new(),
+            charged_usd: reply.charged_usd,
+            provider_reported_usd: reply.provider_reported_usd,
+            cost_class: reply.cost_class,
+        }
+    }
+}
+
 impl From<String> for CallFailure {
     fn from(message: String) -> Self {
         Self {
@@ -164,6 +176,9 @@ pub const CEILING_STOP: &str = "budget:usd_ceiling";
 
 /// Where `call` reports a streamed reply's partials; an error aborts the call with that error.
 pub type Sink<'s> = dyn FnMut(Partial<'_>) -> Result<(), String> + 's;
+
+/// How long a stopped call waits for the gateway's settled terminal before dropping the exchange.
+const SETTLE_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) struct CallTrace<'a> {
     pub run: &'a str,
@@ -368,11 +383,25 @@ impl Gateway {
                 .await?;
             reply.ok_or_else(|| CallFailure::from("gateway refused a unary call as a stream"))
         };
-        let result = tokio::select! {
-            biased;
-            result = exchange => result,
-            () = control.stopped() => Err(self.cancel_error(control.reason() == Some("interrupted")).into()),
-            () = tokio::time::sleep(timeout) => Err(self.cancel_error(false).into()),
+        let result = {
+            let mut exchange = std::pin::pin!(exchange);
+            let stop = tokio::select! {
+                biased;
+                result = &mut exchange => Err(result),
+                () = control.stopped() => Ok(self.cancel_error(control.reason() == Some("interrupted"))),
+                () = tokio::time::sleep(timeout) => Ok(self.cancel_error(false)),
+            };
+            match stop {
+                Err(result) => result,
+                Ok(stop) => {
+                    // A sent call settles even when stopped (RETRY_ACCOUNTING): wait SETTLE_GRACE for it.
+                    let late = tokio::time::timeout(SETTLE_GRACE, exchange).await;
+                    let late = late.unwrap_or_else(|_| Err("".into()));
+                    let mut failure = late.map_or_else(|failure| failure, CallFailure::from);
+                    failure.message = stop;
+                    Err(failure)
+                }
+            }
         };
         if opened.get() {
             let reported = sink(if result.is_ok() {
@@ -662,8 +691,16 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> std::io::Result<String> {
+        let (socket, _) = listener.accept().await?;
+        serve_on(socket, content_type, body).await
+    }
+
+    async fn serve_on(
+        mut socket: tokio::net::TcpStream,
+        content_type: &str,
+        body: &str,
+    ) -> std::io::Result<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut socket, _) = listener.accept().await?;
         let mut request = Vec::new();
         let mut chunk = [0; 4096];
         loop {
@@ -931,6 +968,57 @@ mod tests {
             let body: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
             assert_eq!(body["budget"]["max_usd"].as_str(), expected, "{max_usd:?}");
             assert_eq!(body["budget"]["max_output_tokens"], 4096);
+        }
+        Ok(())
+    }
+
+    /// A stop mid-call still records what the gateway settles just after it (`RETRY_ACCOUNTING`).
+    #[tokio::test]
+    async fn a_stopped_call_keeps_the_charge_the_gateway_settles() -> Result<(), String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+        let gateway = Gateway::new(format!("http://{address}/"), "m".into())?;
+        let deadline_error = r#"{"status":"error","cost":{"class":"api","charged_usd":0.0042},"error":{"class":"runtime","code":"gateway.deadline","message":"late"}}"#;
+        let paid = r#"{"status":"ok","cost":{"class":"api","est_usd":0.01,"charged_usd":0.01,"charged":0.01}}"#;
+        for (interrupt, body, charged, reported) in [
+            (false, deadline_error, 0.0042, None),
+            (true, paid, 0.01, Some(0.01)),
+        ] {
+            let mut control = Control::default();
+            if !interrupt {
+                control.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+            }
+            let call_trace = CallTrace::new("r", None, 1);
+            let mut sink = |_: Partial<'_>| Ok(());
+            let late = async {
+                let (socket, _) = listener.accept().await?;
+                let reply = async { serve_on(socket, "application/json", body).await };
+                if interrupt {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    control.cancel_with("signal");
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                reply.await
+            };
+            let (served, response) = tokio::join!(
+                late,
+                gateway.call(
+                    &[],
+                    ToolOffer::default(),
+                    None,
+                    &control,
+                    &mut sink,
+                    &call_trace
+                )
+            );
+            served.map_err(|e| e.to_string())?;
+            let failure = response.err().ok_or("a stopped call succeeded")?;
+            assert_eq!(failure.message, gateway.cancel_error(interrupt));
+            assert_eq!(failure.charged_usd, charged);
+            assert_eq!(failure.provider_reported_usd, reported);
+            assert_eq!(failure.cost_class, "api");
         }
         Ok(())
     }

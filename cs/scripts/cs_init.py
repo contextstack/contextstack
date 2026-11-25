@@ -328,11 +328,11 @@ class Init:
     def activate(self, name):
         rec = self.nr.load_record()
         argv = [sys.executable, "-I", str(self.cs.KIT / "scripts/node-release"), "activate", os.readlink(self.cs.CURRENT).rsplit("/", 1)[-1], "--no-smoke",
-                "--node", name, "--director", self.url, "--serve-director-rs", "--director-rs-listen", self.listen,
+                "--skip-path-setup", "--node", name, "--director", self.url, "--serve-director-rs", "--director-rs-listen", self.listen,
                 "--director-token-from", str(self.pending)]
         if not rec.get("credentials"):
             argv += ["--credentials", "file"]  # the decided default: the file store, never the Keychain
-        r = self.run(argv, 300)
+        r = self.run(argv, None)  # activate drains for up to 30 min: never kill it mid-switch
         out = self.cs.read_body(r.stdout)
         if r.returncode != 0 or not out.get("ok"):
             raise self.cs.Stop("cs init: node-release activate refused: %s (the registration is kept in %s; rerun cs init)"
@@ -350,6 +350,13 @@ class Init:
             if not (director and gateway):
                 time.sleep(0.5)
         return director, gateway
+
+    def require_services(self):
+        with self.stage("Waiting for services"):
+            director, gateway = self.wait_up()
+        if not (director and gateway):
+            raise self.cs.Stop("cs init: %s does not answer yet (cs status; cs logs %s)"
+                               % ("the Director" if not director else "the gateway", "director" if not director else "gateway"))
 
     def step_services(self):
         r = self.receiver()
@@ -372,9 +379,10 @@ class Init:
             return
         _, gw = self.cs.load_plist(self.cs.GATEWAY)
         store = ((gw or {}).get("EnvironmentVariables") or {}).get("CSGATEWAY_CREDENTIALS")
-        if not store or store == "off":
-            raise self.cs.Stop("cs init: the gateway has no credential store (CSGATEWAY_CREDENTIALS=%s); "
-                               "run `cs doctor` for how to enable the file credential store" % (store or "unset"))
+        if store == "off":
+            raise self.cs.Stop("cs init: the gateway has no credential store (CSGATEWAY_CREDENTIALS=off); "
+                               "run `cs doctor` for how to enable the file credential store")
+        store = store or ""  # unset or empty is the gateway's default: the file store ~/.contextstack/credentials
         for provider in wanted:
             if provider not in PROVIDERS:
                 raise self.cs.Stop("cs init: --api-key %r: want one of %s" % (provider, " ".join(PROVIDERS)), 2)
@@ -383,7 +391,7 @@ class Init:
                                env=dict(os.environ, CSGATEWAY_CREDENTIALS=store), stdout=subprocess.PIPE, text=True)
             if r.returncode != 0:  # its prompt and its error went to the terminal (stderr)
                 raise self.cs.Stop("cs init: credentials set %s failed (exit %d)" % (provider, r.returncode))
-            self.detail("api keys: %s stored in %s" % (provider, store))
+            self.detail("api keys: %s stored in %s" % (provider, store or "~/.contextstack/credentials"))
         self.nr.launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), self.cs.GATEWAY))  # re-reads the store
 
     # ---- 5. the first job -----------------------------------------------------------------------------------------
@@ -444,13 +452,7 @@ class Init:
             ready = [a for a in ready if a["name"] == self.args.agent]
         if not ready:
             self.needs_agent = True
-            self.first_job_rc = 1
-            return 1
-        with self.stage("Waiting for services"):
-            director, gateway = self.wait_up()
-        if not (director and gateway):
-            raise self.cs.Stop("cs init: %s does not answer yet (cs status; cs logs %s)"
-                               % ("the Director" if not director else "the gateway", "director" if not director else "gateway"))
+            return 0
         if done.get("state") in ("offered", "waiting", "accepted", "running", "unknown"):
             self.cancel_job(done["job"])
         for index, agent in enumerate(ready):
@@ -526,13 +528,19 @@ class Init:
 
     def next_steps(self):
         if getattr(self, "needs_agent", False):
-            self.say("Almost ready: ContextStack needs a coding agent.")
+            from cs_smoke import smoke_template
+
+            templates = self.cs.read_json(self.cs.KIT / "ops/bin/executor-templates.json", {})
+            self.say("Next: install a coding agent.")
             for name, url in (
                 ("claude", "https://claude.com/claude-code"),
                 ("codex", "https://developers.openai.com/codex"),
                 ("cursor-agent", "https://cursor.com/cli"),
                 ("gemini", "https://github.com/google-gemini/gemini-cli"),
             ):
+                template = smoke_template(templates, AGENTS, name)
+                if isinstance(templates.get(template, {}).get("unavailable_reason"), str):
+                    continue
                 self.say("%s: %s · sign in: %s" % (LABELS[name], url, sign_in_command(name)))
             self.say("Then run: cs init")
             return
@@ -655,10 +663,12 @@ def main(cs, args):
     init.step_cli_pins()
     with init.stage("Starting services"):
         name = init.step_services()
+    init.require_services()
+    init.say("Services: Director at %s, gateway, node %s" % (init.url, name))
     rc = init.step_first_job(name, agents)
     init.step_keys()
     init.next_steps()
     repos = Path(os.environ.get("CS_REPOS_FILE") or cs.CONFIG / "repos.json")
     if not repos.exists() or not json.loads(repos.read_text(encoding="utf-8")):
         print("Add a repository: cs repo add ~/path/to/project")
-    return rc
+    return 0 if args.install_setup else rc

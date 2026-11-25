@@ -59,7 +59,7 @@ def _verdict_for_run(code_root, run_id):
         if not run:
             continue
         parts = [p.strip() for p in run.split(",") if p.strip()]
-        if run_id == run or run_id in parts or run.endswith(run_id) or run_id in run:
+        if run_id == run or run_id in parts:
             verdict = str(row.get("verdict") or "").strip()
             if verdict:
                 return verdict
@@ -68,7 +68,7 @@ def _verdict_for_run(code_root, run_id):
         for child in runs.iterdir():
             if not child.is_dir():
                 continue
-            if run_id == child.name or run_id in child.name:
+            if run_id == child.name:
                 meta = child / "result.json"
                 if meta.is_file():
                     try:
@@ -173,7 +173,8 @@ def validate_operator_close(code_root, payload):
             missing = [rid for rid in run_ids
                        if _verdict_for_run(code_root, rid) is None
                        and not _dispatch_exists(code_root, rid)
-                       and not any((state_dir(code_root) / "runs").glob("*" + rid + "*"))]
+                       and not ("/" not in rid and rid not in (".", "..")
+                                and (state_dir(code_root) / "runs" / rid).is_dir())]
             if missing:
                 return "close: %s — refused (run id not found: %s)" % (
                     RULE_FACTORY_GAP, ",".join(missing))

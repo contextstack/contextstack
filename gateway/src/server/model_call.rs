@@ -311,6 +311,7 @@ async fn handle_request(
         Err(e) => return refuse(&mut trace, req.stream, schema, &req.request_id, e).await,
     };
     trace.billing(&target.class);
+    trace.price_with(target.rates);
     if gw.settings.env.get("CSGATEWAY_AGENT_DEBUG", "") == "1" {
         let raw: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
         crate::log::row(&trace.attributes(agent_debug_row(&raw["messages"], body)));
@@ -355,17 +356,11 @@ async fn handle_request(
             request_id: req.request_id,
             target,
             revision: snap.revision.clone(),
-            est_input_tokens: i64::try_from(body.len().div_ceil(4)).unwrap_or(i64::MAX),
             index: 0,
-            streamed_bytes: 0,
             trace,
         }),
         Ok(UpstreamReply::Unary(reply)) => {
-            if !reply.text.is_empty() || !reply.tool_calls.is_empty() {
-                trace.output();
-            }
-            trace.end_attempt("success");
-            let response = ok(
+            let response = unary_response(
                 schema,
                 req.request_id,
                 &target,
@@ -373,7 +368,6 @@ async fn handle_request(
                 reply,
                 &mut trace,
             );
-            trace.finish("completed", None);
             trace.flush().await;
             response
         }
@@ -508,7 +502,7 @@ fn usage_line(
 }
 
 /// The ok envelope, priced by the resolved entry's rate and class.
-fn ok(
+fn unary_response(
     schema: &'static str,
     request_id: String,
     target: &Target,
@@ -522,7 +516,7 @@ fn ok(
         reply.cache_read_tokens,
         reply.cache_write_tokens,
     );
-    let cost = wire::price_call(
+    let mut cost = wire::price_call(
         target.rates,
         bill,
         &target.class,
@@ -537,7 +531,20 @@ fn ok(
         revision,
         false,
     ));
-    trace.settle(&target.provider, Some(bill), &cost, false, false);
+    trace.settle(&target.provider, Some(bill), &mut cost, false, false);
+    if cost.charged_usd.is_none() {
+        trace.end_attempt("success");
+        trace.finish("upstream_error", None);
+        return json(
+            200,
+            &Envelope::error(schema, &request_id, spend_write_error()),
+        );
+    }
+    if !reply.text.is_empty() || !reply.tool_calls.is_empty() {
+        trace.output();
+    }
+    trace.end_attempt("success");
+    trace.finish("completed", None);
     let stop = if reply.stop_reason.is_empty() {
         "end_turn".to_string()
     } else {
@@ -568,69 +575,61 @@ fn ok(
     )
 }
 
+fn spend_write_error() -> WireError {
+    WireError::runtime(
+        "gateway.spend_write_failed",
+        "could not record the provider charge",
+    )
+}
+
 struct PartialStreamBill<'a> {
     target: &'a Target,
     meter: MeteredUsage,
-    streamed_bytes: usize,
-    est_input_tokens: i64,
     provider: &'a str,
     request_id: &'a str,
     revision: &'a str,
 }
 
-/// After streamed output, a faulted stream still owes priced tokens (list-price settlement capped by the
-/// admission estimate; a provider-reported charge above the hold is recorded in full with `over_reservation`).
+/// A stream that opened 2xx and then failed still owes the call: a positive provider charge; else the
+/// measured usage at list price, never capped by the reservation; and when usage is unknown or the
+/// stream was aborted (deadline, disconnect, connection loss), no less than the reservation.
+/// The reply's `amount` and `charged_usd` carry the settled figure.
 fn settle_partial_stream(
     bill: &PartialStreamBill<'_>,
     trace: &mut Exchange,
-    estimated: Option<f64>,
+    aborted: bool,
 ) -> Cost {
     let reservation = trace.reservation();
-    let mut input = bill.meter.input_tokens;
-    let mut output = bill.meter.output_tokens;
-    if output == 0 && bill.streamed_bytes > 0 {
-        output = i64::try_from(bill.streamed_bytes.div_ceil(4))
-            .unwrap_or(i64::MAX)
-            .max(1);
-    }
-    if input == 0 && bill.meter.cache_read_tokens == 0 && bill.meter.cache_write_tokens == 0 {
-        input = bill.est_input_tokens;
-    }
-    let token_bill = token_bill(
-        input,
-        output,
-        bill.meter.cache_read_tokens,
-        bill.meter.cache_write_tokens,
+    let meter = &bill.meter;
+    let tokens = token_bill(
+        meter.input_tokens,
+        meter.output_tokens,
+        meter.cache_read_tokens,
+        meter.cache_write_tokens,
     );
-    let provider_charge = bill.meter.charged.filter(|c| c.is_finite() && *c > 0.0);
+    let provider_charge = meter.charged.filter(|c| c.is_finite() && *c > 0.0);
     let mut cost = wire::price_call(
         bill.target.rates,
-        token_bill,
+        tokens,
         &bill.target.class,
         provider_charge,
         reservation,
     );
-    let list = settle_usd(bill.target.rates, token_bill);
-    let wallet = match (provider_charge, estimated) {
-        (Some(c), _) if c > 0.0 => c,
-        (_, Some(reserve)) => reserve,
-        _ => {
-            let mut w = if list > 0.0 {
-                list
-            } else if output > 0 {
-                f64::EPSILON
-            } else {
-                0.0
-            };
-            w = w.min(reservation.unwrap_or_default());
-            w
-        }
+    let measured = settle_usd(bill.target.rates, tokens);
+    let wallet = match (provider_charge, reservation) {
+        (Some(charge), _) => charge,
+        (None, Some(held)) if !meter.known => held,
+        (None, Some(held)) if aborted => held.max(measured),
+        (None, _) => measured,
     };
-    let over = reservation.is_some_and(|held| wallet > held + 1e-9);
+    if provider_charge.is_none() {
+        cost.amount = format!("{wallet:.6}");
+        cost.est_usd = cost.amount.parse().ok();
+    }
     cost.charged_usd = Some(wallet);
-    cost.over_reservation = over;
+    cost.over_reservation = reservation.is_some_and(|held| wallet > held + 1e-9);
     log::line(&usage_line(
-        (bill.provider, input, output),
+        (bill.provider, meter.input_tokens, meter.output_tokens),
         bill.target,
         &cost.amount,
         bill.request_id,
@@ -639,10 +638,10 @@ fn settle_partial_stream(
     ));
     trace.settle(
         &bill.target.provider,
-        Some(token_bill),
-        &cost,
+        meter.known.then_some(tokens),
+        &mut cost,
         true,
-        estimated.is_some(),
+        !meter.known && reservation.is_some(),
     );
     cost
 }
@@ -653,9 +652,7 @@ struct StreamState {
     request_id: String,
     target: Target,
     revision: String,
-    est_input_tokens: i64,
     index: i64,
-    streamed_bytes: usize,
     trace: Exchange,
 }
 
@@ -665,22 +662,21 @@ impl StreamState {
         let reported = meter
             .charged
             .is_some_and(|charge| charge.is_finite() && charge > 0.0);
-        let reservation = self.trace.aborted_reservation(outcome);
-        if !(reported || self.trace.saw_output() && self.trace.reservation().is_some()) {
+        // The stream opened 2xx: a paid call is billed whether or not text was emitted.
+        if !(reported || self.trace.reservation().is_some()) {
             return self.trace.settle_abort(outcome);
         }
+        let aborted = self.trace.aborted(outcome);
         Some(settle_partial_stream(
             &PartialStreamBill {
                 target: &self.target,
                 meter,
-                streamed_bytes: self.streamed_bytes,
-                est_input_tokens: self.est_input_tokens,
                 provider,
                 request_id: &self.request_id,
                 revision: &self.revision,
             },
             &mut self.trace,
-            reservation,
+            aborted,
         ))
     }
 
@@ -702,6 +698,57 @@ impl StreamState {
         chunk
     }
 
+    async fn stop_frame(&mut self, stop: crate::protocol::Stop) -> String {
+        self.stream = None;
+        let bill = token_bill(
+            stop.input_tokens,
+            stop.output_tokens,
+            stop.cache_read_tokens,
+            stop.cache_write_tokens,
+        );
+        let mut cost = wire::price_call(
+            self.target.rates,
+            bill,
+            &self.target.class,
+            stop.charged,
+            self.trace.reservation(),
+        );
+        log::line(&usage_line(
+            (&stop.provider, stop.input_tokens, stop.output_tokens),
+            &self.target,
+            &cost.amount,
+            &self.request_id,
+            &self.revision,
+            false,
+        ));
+        self.trace
+            .settle(&self.target.provider, Some(bill), &mut cost, false, false);
+        if cost.charged_usd.is_none() {
+            self.trace.end_attempt("success");
+            self.trace.finish("upstream_error", None);
+            self.trace.flush().await;
+            return Chunk::error(self.family, &self.request_id, spend_write_error()).frame();
+        }
+        if !stop.tool_calls.is_empty() {
+            self.trace.output();
+        }
+        self.trace.end_attempt("success");
+        let mut c = Chunk::delta(self.family, &self.request_id, self.index, String::new());
+        c.kind = "stop";
+        c.stop_reason = stop.reason;
+        c.provider = stop.provider;
+        c.model.clone_from(&self.target.name);
+        c.tool_calls = stop.tool_calls;
+        c.usage = Some(Usage {
+            input_tokens: stop.input_tokens,
+            output_tokens: stop.output_tokens,
+        });
+        c.cost = Some(cost);
+        self.trace.finish("completed", None);
+        self.trace.flush().await;
+        c.frame()
+    }
+
     /// The next SSE frame; the upstream stream (and its permit) is dropped at the terminal chunk.
     async fn frame(&mut self) -> Option<String> {
         let stream = self.stream.as_mut()?;
@@ -710,55 +757,11 @@ impl StreamState {
                 if !text.is_empty() {
                     self.trace.output();
                 }
-                self.streamed_bytes += text.len();
                 let c = Chunk::delta(self.family, &self.request_id, self.index, text);
                 self.index += 1;
                 Some(c.frame())
             }
-            Ok(Some(Event::Stop(stop))) => {
-                if !stop.tool_calls.is_empty() {
-                    self.trace.output();
-                }
-                self.stream = None;
-                self.trace.end_attempt("success");
-                let bill = token_bill(
-                    stop.input_tokens,
-                    stop.output_tokens,
-                    stop.cache_read_tokens,
-                    stop.cache_write_tokens,
-                );
-                let cost = wire::price_call(
-                    self.target.rates,
-                    bill,
-                    &self.target.class,
-                    stop.charged,
-                    self.trace.reservation(),
-                );
-                log::line(&usage_line(
-                    (&stop.provider, stop.input_tokens, stop.output_tokens),
-                    &self.target,
-                    &cost.amount,
-                    &self.request_id,
-                    &self.revision,
-                    false,
-                ));
-                self.trace
-                    .settle(&self.target.provider, Some(bill), &cost, false, false);
-                let mut c = Chunk::delta(self.family, &self.request_id, self.index, String::new());
-                c.kind = "stop";
-                c.stop_reason = stop.reason;
-                c.provider = stop.provider;
-                c.model.clone_from(&self.target.name);
-                c.tool_calls = stop.tool_calls;
-                c.usage = Some(Usage {
-                    input_tokens: stop.input_tokens,
-                    output_tokens: stop.output_tokens,
-                });
-                c.cost = Some(cost);
-                self.trace.finish("completed", None);
-                self.trace.flush().await;
-                Some(c.frame())
-            }
+            Ok(Some(Event::Stop(stop))) => Some(self.stop_frame(stop).await),
             Ok(Some(Event::UpstreamError(msg))) => {
                 let provider = self.target.provider.clone();
                 let msg = if msg.is_empty() {
@@ -853,8 +856,14 @@ mod tests {
                 let mut trace = Exchange::new(Some(home.path()), Stamp::now(), &request);
                 trace.billing(class);
                 trace.wallet(Arc::clone(&guard), hold);
-                let cost = Cost::priced("0.100000".into(), class, reported, reported.is_some());
-                trace.settle("vllm", Some(token_bill(3, 2, 0, 0)), &cost, false, false);
+                let mut cost = Cost::priced("0.100000".into(), class, reported, reported.is_some());
+                trace.settle(
+                    "vllm",
+                    Some(token_bill(3, 2, 0, 0)),
+                    &mut cost,
+                    false,
+                    false,
+                );
                 trace.finish("completed", None);
                 trace.flush().await;
 
@@ -880,10 +889,211 @@ mod tests {
                 );
                 assert_eq!(
                     settlement.and_then(|row| row["attributes"]["basis"].as_str()),
-                    reported.map(|_| "provider_reported"),
+                    reported
+                        .map(|_| "provider_reported")
+                        .or((class == "api").then_some("measured")),
                 );
             }
         }
+        Ok(())
+    }
+
+    use crate::trace::test_support::{check_spans, read_spans};
+    use serde_json::Value;
+
+    /// Run a paid stream against a fake Anthropic server that sends `events` and closes.
+    async fn fake_anthropic_stream(
+        events: &str,
+        rates: ResolvedRates,
+        reserve: f64,
+        fail_spend_write: bool,
+    ) -> Result<(Value, Value, Vec<Value>), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let events = events.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).await?;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{events}",
+                events.len()
+            );
+            socket.write_all(reply.as_bytes()).await
+        });
+        let home = tempfile::tempdir()?;
+        let guard = Arc::new(Guard::new(Some(home.path())));
+        guard
+            .replace(br#"{"api_usd_per_day": 10}"#)
+            .map_err(|e| format!("{e:?}"))?;
+        let hold = guard.admit("anthropic", "", reserve)?;
+        let request = Request {
+            run_id: Some("stream".into()),
+            request_id: "r".into(),
+            ..Request::default()
+        };
+        let mut trace = Exchange::new(Some(home.path()), Stamp::now(), &request);
+        trace.billing("api");
+        trace.price_with(rates);
+        trace.wallet(Arc::clone(&guard), Some(hold));
+        let http = crate::protocol::Http::new()?;
+        let endpoint = crate::protocol::anthropic::Anthropic {
+            base: &base,
+            default_model: "test",
+        };
+        let call = Call {
+            model: "m".into(),
+            system: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tokens: 32,
+            request_id: String::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = endpoint
+            .stream(&http, "fake", &call, deadline, &mut trace)
+            .await?;
+        server.await??;
+        let spend_file = home.path().join(".contextstack/gateway/spend.json");
+        if fail_spend_write {
+            std::fs::create_dir_all(&spend_file)?;
+        }
+        let mut state = StreamState {
+            stream: Some(Box::new(OpenStream::from_anthropic(stream))),
+            family: wire::chunk_family(wire::REQUEST_V2),
+            request_id: "r".into(),
+            target: Target {
+                name: "m".into(),
+                provider: "anthropic".into(),
+                rates,
+                class: "api".into(),
+            },
+            revision: "rev".into(),
+            index: 0,
+            trace,
+        };
+        let mut last = None;
+        while let Some(frame) = state.frame().await {
+            last = Some(frame);
+        }
+        let frame = last.ok_or("no frame")?;
+        let data = frame
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .ok_or("no data")?;
+        let chunk: serde_json::Value = serde_json::from_str(data)?;
+        if fail_spend_write {
+            std::fs::remove_dir(spend_file)?;
+        }
+        Ok((
+            chunk,
+            guard.report(["anthropic".to_owned()])["total"].clone(),
+            read_spans(home.path(), "stream")?,
+        ))
+    }
+
+    fn per_1k(usd: f64) -> ResolvedRates {
+        ResolvedRates {
+            input_per_1k: usd,
+            output_per_1k: usd,
+            cache_read_per_1k: 0.0,
+            cache_write_per_1k: 0.0,
+        }
+    }
+
+    // G2 + G9: a tool-call-only turn that closes before message_stop owes its measured usage, uncapped by
+    // the reservation, and the reply's amount and charged_usd agree.
+    #[tokio::test]
+    async fn a_tool_only_stream_cut_before_stop_settles_the_measured_usage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"f\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1000}}\n\n",
+        );
+        let (chunk, spent, rows) =
+            fake_anthropic_stream(events, per_1k(0.001), 0.001, false).await?;
+        assert_eq!(chunk["kind"], "error");
+        assert_eq!(
+            chunk["cost"]["charged_usd"], 0.002,
+            "measured, not capped at $0.001"
+        );
+        assert_eq!(chunk["cost"]["amount"], "0.002000");
+        assert_eq!(chunk["cost"]["over_reservation"], true);
+        assert_eq!(spent["spent_usd"], 0.002);
+        let usage = rows
+            .iter()
+            .find(|row| row["kind"] == "usage")
+            .ok_or("no usage")?;
+        assert_eq!(usage["attributes"]["input_tokens"], 1000);
+        assert_eq!(usage["attributes"]["output_tokens"], 1000);
+        assert_eq!(usage["attributes"]["estimated_usd"], 0.002);
+        check_spans(rows, 0.002, None)?;
+        Ok(())
+    }
+
+    // G2: bad tool JSON at the end of a paid stream with unknown output still owes the reservation.
+    #[tokio::test]
+    async fn bad_tool_json_without_usage_settles_the_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"f\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{not json\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (chunk, spent, rows) = fake_anthropic_stream(events, per_1k(0.0), 0.05, false).await?;
+        assert_eq!(chunk["kind"], "error");
+        assert_eq!(chunk["cost"]["charged_usd"], 0.05);
+        assert_eq!(chunk["cost"]["amount"], "0.050000");
+        assert_eq!(spent["spent_usd"], 0.05);
+        check_spans(rows, 0.05, None)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bad_tool_json_preserves_reported_usage() -> Result<(), Box<dyn std::error::Error>> {
+        for tokens in [0, 500] {
+            let events = format!(
+                concat!(
+                    "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n\n",
+                    "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"f\"}}}}\n\n",
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{not json\"}}}}\n\n",
+                    "data: {{\"type\":\"message_stop\"}}\n\n",
+                ),
+                tokens = tokens
+            );
+            let (chunk, _, rows) =
+                fake_anthropic_stream(&events, per_1k(0.002), 0.05, false).await?;
+            let expected = if tokens == 0 { 0.0 } else { 0.001 };
+            assert_eq!(chunk["kind"], "error");
+            assert_eq!(chunk["cost"]["charged_usd"], expected);
+            let usage = rows
+                .iter()
+                .find(|row| row["kind"] == "usage")
+                .ok_or("no usage")?;
+            assert_eq!(usage["attributes"]["input_tokens"], tokens);
+            assert_eq!(usage["attributes"]["estimated_usd"], expected);
+            check_spans(rows, expected, None)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stream_stop_with_a_failed_spend_write_returns_an_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000}}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (chunk, spent, rows) = fake_anthropic_stream(events, per_1k(0.001), 0.05, true).await?;
+        assert_eq!(chunk["kind"], "error");
+        assert_eq!(chunk["error"]["code"], "gateway.spend_write_failed");
+        assert!(chunk["cost"].get("charged_usd").is_none());
+        assert_eq!(spent["spent_usd"], 0.0);
+        check_spans(rows, 0.0, Some("settlement charge"))?;
         Ok(())
     }
 

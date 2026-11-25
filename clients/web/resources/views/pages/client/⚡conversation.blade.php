@@ -758,6 +758,7 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
     under it, and a side panel for what goes with the thread: its lanes when it is a lead, and its details.
 --}}
 <div class="flex h-full" data-full-bleed
+     @if (\App\Client\TurnWaiting::anyInProgress($this->turns())) wire:poll.10s="refetch" @endif
      x-data="{
         side: false,
         tab: @js($isLead ? 'lanes' : 'details'),
@@ -902,6 +903,11 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                                                 </p>
                                             @endif
                                         </div>
+                                    @elseif (in_array($turn['state'], ['running', 'queued'], true) && \App\Client\TurnWaiting::words($turn) !== '')
+                                        <p class="flex items-center gap-2 text-sm text-zinc-500" data-test="turn-waiting">
+                                            <span class="size-1.5 rounded-full bg-amber-500"></span>
+                                            {{ \App\Client\TurnWaiting::words($turn) }}
+                                        </p>
                                     @elseif ($turn['state'] === 'running')
                                         @php($partial = $this->partial('turn', $turn['turn_id']))
                                         <x-client.markdown :text="$partial" :colour="false" class="!text-[15px] !leading-7" data-test="turn-partial" />

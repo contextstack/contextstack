@@ -1,8 +1,8 @@
 //! Muse, adapter and hosted lead ordering, including repeated final rules.
 use super::{
     ExecutorRequest, Failure, HOSTED_READS, Lead, Path, PathBuf, allow_write_subpath,
-    deny_write_subpath, env_deny, read_rules, socket_deny_rules, ssh_rules, toolchain_rules,
-    unenforceable,
+    check_scratch_rules, deny_write_subpath, env_deny, read_rules, socket_deny_rules, ssh_rules,
+    toolchain_rules, unenforceable,
 };
 
 fn path_rule(action: &str, operations: &str, kind: &str, path: &Path) -> Result<String, Failure> {
@@ -44,6 +44,7 @@ pub(super) fn muse_profile(request: &ExecutorRequest) -> Result<String, Failure>
     lines.extend(ssh_rules(request)?);
     lines.extend(toolchain_rules(request)?);
     lines.extend(env_deny::seatbelt_rules(std::slice::from_ref(&ws))?);
+    lines.extend(check_scratch_rules(request)?);
     for relative in HOSTED_READS {
         let path = home.join(relative);
         let resolved = crate::sbpl::resolve(&path)?;

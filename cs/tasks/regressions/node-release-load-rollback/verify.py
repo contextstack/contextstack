@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Service load failure rolls back current and restores the director database."""
+from contextlib import redirect_stderr
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -133,17 +135,55 @@ with tempfile.TemporaryDirectory(prefix="node-release-load-") as raw:
 
     scripts = mod.RELEASES / NEW / "cs/scripts"
     (scripts / "cs_smoke.py").touch()
-    (scripts / "cs").write_text("print(%r)" % json.dumps({"ok": False, "checks": []}))
+    def fail_check(name):
+        report = {"ok": False, "checks": [{"name": name, "ok": False, "reason": "forced failure"}]}
+        (scripts / "cs").write_text(f"""import sqlite3
+with sqlite3.connect({str(db)!r}) as conn:
+    conn.execute("UPDATE meta SET value='written during smoke'")
+print({json.dumps(report)!r})
+raise SystemExit(1)
+""")
+
     with patch.object(mod, "unload_agent"), patch.object(mod, "load_agent", return_value="bootstrapped"):
-        try:
-            mod.activate(NEW, {"smoke": True}, load=True)
-        except mod.Refused as error:
-            expect("smoke failed" in str(error), "failed smoke refuses activation")
-    record = mod.load_record()
-    expect(mod.current_id() == OLD, "failed smoke restores current")
-    expect(NEW not in record["history"] and record["previous"] != NEW, "failed smoke is excluded from rollback history")
-    expect(NEW in record.get("failed_releases", []), "smoke failure is recorded")
-    expect(not mod.rollback_target(record, OLD), "rollback cannot choose the failed release")
+        for name, default in (("claude-code-sonnet", {"default_agent": "claude"}),
+                              ("claude-code-sonnet", {"default_model": "claude-code"}),
+                              ("hosted-lead", {}), ("services", {})):
+            fail_check(name)
+            refused = None
+            try:
+                mod.activate(NEW, {"smoke": True, **default}, load=True)
+            except mod.Refused as error:
+                refused = str(error)
+            expect(refused and f"{name}: forced failure" in refused, f"{name} failure refuses activation", refused)
+            record = mod.load_record()
+            expect(mod.current_id() == OLD, f"{name} failure restores current")
+            expect(db_marker(db) == "v1", f"{name} failure restores the database")
+            expect(NEW not in record["history"] and record["previous"] != NEW,
+                   "failed smoke is excluded from rollback history")
+            expect(NEW in record.get("failed_releases", []), "smoke failure is recorded")
+            expect(not mod.rollback_target(record, OLD), "rollback cannot choose the failed release")
+
+        fail_check("grok")
+        limits = mod.ROOT / "state/provider-limits.json"
+        for has_limits in (False, True):
+            if has_limits:
+                limits.write_text('{"templates": {}}')
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                out = mod.activate(NEW, {"smoke": True, "default_agent": "codex"}, load=True)
+            expect(out["ok"] and out["warnings"] == [{"name": "grok", "reason": "forced failure"}],
+                   "non-default failure succeeds with a JSON warning", out)
+            expect("warning: grok: forced failure" in stderr.getvalue(), "non-default failure prints a warning")
+            expect(mod.current_id() == NEW and db_marker(db) == "written during smoke",
+                   "warning keeps the new release and database writes")
+            expect(NEW not in mod.load_record().get("failed_releases", []), "warning clears prior failure")
+            if has_limits:
+                from _provider_limits import status_limits
+                rows = status_limits(limits.parent).get("provider_limits", [])
+                expect(any(r["template"] == "grok" and "forced failure" in r["message"] for r in rows),
+                       "node status carries the smoke failure reason", rows)
+            else:
+                expect(not limits.exists(), "warning does not create a provider limits file")
 
 if problems:
     print("node-release-load-rollback: %d failed" % len(problems))

@@ -144,7 +144,7 @@ with scratch_dir(prefix='estate-capacity-') as raw:
         ops.mkdir(parents=True)
         task.mkdir(parents=True)
         (estate/'ESTATE').write_text('dev\n')
-        for name in ('capture-stimulus', 'finalize-run', 'publish-evidence', 'run-api', 'machine-finish', '_api_run.py', '_runner.py', '_estate_io.py', '_lifecycle_evidence.py', '_env_policy.py', '_roots.py', '_errors.py'):
+        for name in ('capture-stimulus', 'finalize-run', 'publish-evidence', 'run-api', 'machine-finish', '_api_run.py', '_runner.py', '_estate_io.py', '_harvest_git.py', '_lifecycle_evidence.py', '_env_policy.py', '_roots.py', '_errors.py'):
             shutil.copy2(CODE_ROOT/'ops/bin'/name, ops/name)
         (estate/'INVARIANTS.md').write_text('Isolated instrument fixture.\n')
         (estate/'prompts').mkdir()

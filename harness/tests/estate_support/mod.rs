@@ -278,6 +278,14 @@ pub async fn mock_gateway_observed(
                 }
                 continue;
             }
+            // `__late__<body>` answers after 4 s: past a short run deadline, as a gateway that settles late.
+            let body = match body.strip_prefix("__late__") {
+                Some(late) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    late.to_owned()
+                }
+                None => body,
+            };
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -305,6 +313,17 @@ pub async fn drive(
 pub async fn drive_observed(
     cs: &ContextStack,
     spec: &Spec,
+    bodies: Vec<String>,
+    received: Option<Arc<tokio::sync::Notify>>,
+) -> Result<runner::ResultRow, String> {
+    drive_task(cs, spec, "tasks/fx", bodies, received).await
+}
+
+/// `drive_observed` for a named task path (the default is relative to the test's cwd).
+pub async fn drive_task(
+    cs: &ContextStack,
+    spec: &Spec,
+    task: &str,
     bodies: Vec<String>,
     received: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<runner::ResultRow, String> {
@@ -346,7 +365,7 @@ pub async fn drive_observed(
         (endpoint, Some(server))
     };
     let gateway = Gateway::new(endpoint, spec.model.clone())?;
-    let mut row = runner::run(spec, "tasks/fx", 1, &cs.root, &gateway, Control::default()).await;
+    let mut row = runner::run(spec, task, 1, &cs.root, &gateway, Control::default()).await;
     if let Some((dir, lock)) = row.execution.take() {
         drop(lock);
         let receipt = fs::read(dir.join("execution-receipt.json")).map_err(|e| e.to_string())?;

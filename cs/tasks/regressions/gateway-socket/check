@@ -20,7 +20,7 @@ CODE_ROOT = HERE.parents[2]
 REPO = CODE_ROOT.parent
 WRAPPER = Path(os.environ.get("CS_SANDBOX_BIN") or REPO / "target/release/cs-sandbox")
 RUNTIME_READ = {
-    "macos": ["/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/private/var/select", "/dev"],
+    "macos": ["$DEVELOPER_DIR", "/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/private/var/select", "/dev"],
     "linux": ["/usr", "/bin", "/lib", "/lib64", "/etc"],
 }
 # One tool, one sandboxed process: the gateway over the socket, then TCP to the live port and :9200.

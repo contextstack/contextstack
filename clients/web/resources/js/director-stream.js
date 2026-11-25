@@ -25,6 +25,11 @@ const FLUSH_MS = 250;
 const LINGER_MS = 5000;
 /** How soon after a page joins to look again for streams the replaced page left behind. */
 const SWEEP_MS = 1000;
+/**
+ * Most events in one applyStream call. Records can be large (a job with its terminal rows), and Livewire refuses a
+ * request over its payload limit (1 MB), so a backlog goes in several calls rather than one that fails.
+ */
+export const BATCH_MAX = 100;
 
 /** The shared connections, by URL. */
 const streams = new Map();
@@ -340,8 +345,10 @@ export function directorStream(url) {
         },
 
         /**
-         * Send what is queued, one call at a time: while a call is out, new events wait for it, so a slow page is not
-         * sent a pile of overlapping calls.
+         * Send what is queued, one call at a time and at most BATCH_MAX events per call: while a call is out, new
+         * events wait for it, so a slow page is not sent a pile of overlapping calls. A call that fails (a refused or
+         * oversized request, a server error) lost its batch: the page is no longer live, so it holds, refetches and
+         * applies again (after RETRY_MS, so a page that keeps failing is not hammered).
          */
         async flush() {
             if (this.flushing) {
@@ -349,14 +356,24 @@ export function directorStream(url) {
             }
             clearTimeout(this.flushTimer);
             this.flushTimer = null;
-            const batch = this.queue;
-            this.queue = { changes: [], runEvents: [] };
-            if (batch.changes.length || batch.runEvents.length) {
+            const changes = this.queue.changes.slice(0, BATCH_MAX);
+            const runEvents = this.queue.runEvents.slice(0, BATCH_MAX - changes.length);
+            this.queue = {
+                changes: this.queue.changes.slice(changes.length),
+                runEvents: this.queue.runEvents.slice(runEvents.length),
+            };
+            if (changes.length || runEvents.length) {
                 this.flushing = true;
+                let applied;
                 try {
-                    await this.call('applyStream', batch.changes, batch.runEvents);
+                    applied = await this.call('applyStream', changes, runEvents);
                 } finally {
                     this.flushing = false;
+                }
+                if (!applied && !this.stopped && this.phase === 'live') {
+                    this.recover();
+
+                    return;
                 }
             }
             if (this.queue.changes.length || this.queue.runEvents.length) {
@@ -364,15 +381,34 @@ export function directorStream(url) {
             }
         },
 
-        /** A call on this scope's component, skipped once the scope has left (its page is gone). */
+        /** After a failed applyStream: hold what arrives, then refetch and apply as on hello. */
+        recover() {
+            this.phase = 'holding';
+            this.status = 'syncing';
+            this.quiet = false;
+            const round = ++this.round;
+            setTimeout(() => {
+                if (!this.stopped && this.phase === 'holding' && round === this.round) {
+                    this.begin();
+                }
+            }, RETRY_MS);
+        },
+
+        /**
+         * A call on this scope's component, skipped once the scope has left (its page is gone). True when it was
+         * answered; false when it failed (Livewire rejects a refused or failed request) or was skipped.
+         */
         async call(method, ...args) {
             if (this.stopped) {
-                return;
+                return false;
             }
             try {
                 await this.$wire[method](...args);
+
+                return true;
             } catch (error) {
                 // A component removed mid-call (navigation) has nothing left to update.
+                return false;
             }
         },
     };

@@ -35,7 +35,8 @@ it('opens one ContextStack window at the configured size when the native app boo
         ->and($options['height'])->toBe(860)
         ->and($options['minWidth'])->toBe(900)
         ->and($options['minHeight'])->toBe(600)
-        ->and($options['rememberState'])->toBeTrue();
+        ->and($options['rememberState'])->toBeTrue()
+        ->and($options['preventLeaveDomain'])->toBeTrue();
 });
 
 it('exposes php ini directives from the native app provider', function () {
@@ -162,3 +163,16 @@ it('opens only http, https and mailto links in the default browser', function ()
 
     expect($shell->openExternalCalls)->toBe(['https://example.com/a?b=1&c=2', 'mailto:someone@example.com']);
 });
+
+it('leaves this checkout\'s device connection and spare env files out of the desktop build', function (string $path, bool $shipped) {
+    $patterns = array_merge(config('nativephp-internal.cleanup_exclude_files', []), config('nativephp.cleanup_exclude_files', []));
+    $excluded = collect($patterns)->contains(fn (string $pattern): bool => fnmatch($pattern, $path));
+
+    expect($excluded)->toBe(! $shipped);
+})->with([
+    'the device connection folder' => ['storage/app/private/client-web', false],
+    'the device connection file' => ['storage/app/private/client-web/connection.json', false],
+    'the install env template' => ['.env.install.example', false],
+    'the release .env' => ['.env', true],
+    'public storage' => ['storage/app/public', true],
+]);

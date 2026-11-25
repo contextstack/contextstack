@@ -147,8 +147,12 @@ def _marked_pids(marker, deadline):
         if identity is None:
             continue
         previous = checked.get(pid)
-        if previous is not None and previous[0] == identity and previous[1]:
-            owned[pid] = identity
+        if previous is not None and previous[0] == identity and previous[1] is not None:
+            # Positive and negative results both stand for this birth identity: the
+            # tag is inherited at fork, so re-reading up to 1 MiB of environment per
+            # process on every scan buys nothing. Unreadable (None) is retried.
+            if previous[1]:
+                owned[pid] = identity
             continue
         if platform.system() == 'Darwin':
             env = _darwin_environment(pid)

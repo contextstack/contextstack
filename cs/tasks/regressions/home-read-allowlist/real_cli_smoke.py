@@ -2,8 +2,9 @@
 """Host-only installed CLI startup regression; output is statuses, never CLI output.
 
 Use the real HOME read-only so HOME-installed binaries and sibling resources are
-exercised. Only the disposable workspace/tmp beneath state/runs are writable.
-No staging or login-write grants are needed for --version.
+exercised. Disposable workspace/tmp live under a hermetic scratch tree — never
+under the live ~/.contextstack/state/runs. No staging or login-write grants are
+needed for --version.
 """
 import json
 import os
@@ -12,10 +13,13 @@ import pwd
 import shutil
 import subprocess
 import sys
-import tempfile
 from unittest.mock import patch
 
-OPS = Path(__file__).resolve().parents[3] / "ops/bin"
+HERE = Path(__file__).resolve().parent
+OPS = HERE.parents[2] / "ops/bin"
+sys.path.insert(0, str(HERE.parent / "_lib"))
+from hermetic_env import hermetic_env  # noqa: E402
+from scratch import scratch_dir  # noqa: E402
 
 
 def run(command, workspace, env):
@@ -49,31 +53,34 @@ def main():
     templates = json.loads((OPS / "executor-templates.json").read_text())
     search_path = os.pathsep.join((str(home / ".local/bin"), str(home / ".grok/bin"),
                                  os.environ.get("PATH", "/usr/bin:/bin")))
-    runs = home / ".contextstack/state/runs"
-    runs.mkdir(parents=True, exist_ok=True)
     failures = 0
     installed = 0
-    for name, template in templates.items():
-        raw_binary = template["binary"]
-        if raw_binary.startswith("~/"):
-            binary = str(home / raw_binary[2:])
-            binary = binary if os.access(binary, os.X_OK) else None
-        elif "/" in raw_binary and not raw_binary.startswith("/"):  # a repo-relative fixture CLI: not a HOME install
-            print("SKIP: %s is a repo fixture (%s)" % (name, raw_binary))
-            continue
-        else:
-            binary = shutil.which(raw_binary, path=search_path)
-        if not binary:
-            print("SKIP: %s is not installed" % name)
-            continue
-        installed += 1
-        with tempfile.TemporaryDirectory(prefix="cli-startup-", dir=runs) as raw:
-            root = Path(raw).resolve()
+    with scratch_dir(prefix="cli-startup-") as raw:
+        # One hermetic tree for every template; never mkdir under the live state root.
+        base = Path(raw).resolve()
+        for name, template in templates.items():
+            raw_binary = template["binary"]
+            if raw_binary.startswith("~/"):
+                binary = str(home / raw_binary[2:])
+                binary = binary if os.access(binary, os.X_OK) else None
+            elif "/" in raw_binary and not raw_binary.startswith("/"):  # a repo-relative fixture CLI: not a HOME install
+                print("SKIP: %s is a repo fixture (%s)" % (name, raw_binary))
+                continue
+            else:
+                binary = shutil.which(raw_binary, path=search_path)
+            if not binary:
+                print("SKIP: %s is not installed" % name)
+                continue
+            installed += 1
+            root = base / name
             ws, tmp = root / "ws", root / "tmp"
-            ws.mkdir()
+            ws.mkdir(parents=True)
             tmp.mkdir()
-            env = {"HOME": str(home), "PATH": search_path, "TMPDIR": str(tmp),
-                   "LANG": "en_US.UTF-8"}
+            env = {**hermetic_env(), "HOME": str(home), "PATH": search_path,
+                   "TMPDIR": str(tmp), "LANG": "en_US.UTF-8"}
+            for key in ("CS_CONFIG_ROOT", "CS_WORKSPACES_ROOT", "CS_CODE_ROOT",
+                        "CS_ROOT", "CS_INSTALL_ROOT", "CS_STATE_ROOT"):
+                env.pop(key, None)
             # Redirect startup caches/config exactly as declared, without reading or
             # staging credentials. Real HOME remains read-only in the sandbox.
             for key, value in template.get("env", {}).items():

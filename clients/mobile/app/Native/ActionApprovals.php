@@ -10,17 +10,50 @@ use App\Client\Json;
 final class ActionApprovals
 {
     /**
-     * The command as one shell-quoted line, so what is shown is exactly what would run.
+     * The command as one shell-quoted line. Characters a person cannot see or that reorder text (control characters,
+     * bidi overrides, zero-width marks) are shown as visible \u{…} escapes, so the line cannot read differently from
+     * what would run; `hidden()` says when that happened, and `malformed()` when an argv element is not a string.
      *
      * @param  array<string, mixed>  $approval
      */
     public static function command(array $approval): string
     {
-        return implode(' ', array_map(static function (string $part): string {
+        $argv = is_array($approval['argv'] ?? null) ? $approval['argv'] : [];
+
+        return implode(' ', array_map(static function (mixed $part): string {
+            if (! is_string($part)) {
+                return '<not a string: '.get_debug_type($part).'>';
+            }
+            $part = (string) preg_replace_callback('/\p{C}/u', fn (array $m): string => sprintf('\\u{%04X}', mb_ord($m[0])), $part);
+
             return $part !== '' && preg_match('/^[A-Za-z0-9_@%+=:,.\/-]+$/', $part) === 1
                 ? $part
                 : "'".str_replace("'", "'\\''", $part)."'";
-        }, Json::strings($approval['argv'] ?? null)));
+        }, array_values($argv)));
+    }
+
+    /**
+     * @param  array<string, mixed>  $approval
+     */
+    public static function hidden(array $approval): bool
+    {
+        foreach (is_array($approval['argv'] ?? null) ? $approval['argv'] : [] as $part) {
+            if (is_string($part) && preg_match('/\p{C}/u', $part) === 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, mixed>  $approval
+     */
+    public static function malformed(array $approval): bool
+    {
+        $argv = $approval['argv'] ?? null;
+
+        return ! is_array($argv) || $argv === [] || array_filter($argv, fn (mixed $part): bool => ! is_string($part)) !== [];
     }
 
     /**
@@ -32,6 +65,7 @@ final class ActionApprovals
             'pending' => 'Under review',
             'needs_owner' => 'Needs you',
             'denied' => 'Denied',
+            'expired' => 'Expired: its job ended before it was decided',
             'approved' => ($approval['decided_by'] ?? null) !== null ? 'Approved by you' : 'Approved by the reviewer',
             default => Json::string($approval['status'] ?? null, 'Unknown'),
         };

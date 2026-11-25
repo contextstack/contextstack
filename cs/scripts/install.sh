@@ -7,15 +7,17 @@ fail() { echo "install: $*" >&2; exit 1; }
 CHANNEL=stable
 LINK_DIR=
 YES=
+JSON=
 FORCE_PLATFORM=
 DOC_URL=https://github.com/contextstack/contextstack#documentation
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --channel) [ "$#" -ge 2 ] || fail '--channel needs stable or latest'; CHANNEL=$2; shift 2 ;;
     --link-dir) [ "$#" -ge 2 ] || fail '--link-dir needs a directory'; LINK_DIR=$2; shift 2 ;;
+    --json) JSON=1; shift ;;
     --yes) YES=--yes; shift ;;
     --force-platform) FORCE_PLATFORM=1; echo 'WARNING: --force-platform skips setup support checks (unsupported; developer test hosts only)' >&2; shift ;;
-    *) fail 'usage: sh install.sh [--channel stable|latest] [--link-dir DIR] [--yes] [--force-platform]' ;;
+    *) fail 'usage: sh install.sh [--channel stable|latest] [--link-dir DIR] [--yes] [--json] [--force-platform]' ;;
   esac
 done
 case "$CHANNEL" in stable|latest) ;; *) fail 'channel must be stable or latest';; esac
@@ -90,14 +92,26 @@ case "$base/$local_host" in http://*/no) fail 'CS_INSTALL_BASE requires HTTPS ex
 fetch() {
   url=$1 destination=$2
   set -- --fail --show-error --location --retry 3 --retry-delay 2 --connect-timeout 15
-  if [ -t 2 ]; then set -- "$@" --progress-bar; else set -- "$@" --silent; fi
+  if [ "$url" = "$channel_url" ]; then
+    set -- "$@" --silent --write-out '%{http_code}'
+  elif [ -t 2 ]; then
+    set -- "$@" --progress-bar
+  else
+    set -- "$@" --silent
+  fi
   if [ "$local_host" != yes ]; then set -- "$@" --proto '=https'; fi
   curl "$@" "$url" -o "$destination"
 }
 printf 'Checking release…\n'
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/cs-install-XXXXXXXX")
 trap 'rm -rf "$tmp"' 0 HUP INT TERM
-fetch "$base/$CHANNEL.txt" "$tmp/channel"
+channel_url="$base/$CHANNEL.txt"
+channel_rc=0
+channel_status=$(fetch "$channel_url" "$tmp/channel" 2>"$tmp/channel-error") || channel_rc=$?
+if [ "$channel_rc" -ne 0 ]; then
+  if [ "$channel_rc:$channel_status" != 22:404 ]; then cat "$tmp/channel-error" >&2; fi
+  fail "could not fetch the '$CHANNEL' channel manifest at $channel_url. For pre-releases, pipe the installer to sh -s -- --channel latest"
+fi
 entry=$(awk -v target="$target" '$1 == target { if (NF != 5) exit 1; count++; row=$0 } END { if (count != 1) exit 1; print row }' "$tmp/channel") || fail 'invalid or missing platform in channel manifest'
 # Disable glob expansion while splitting the five whitespace-separated fields.
 set -f
@@ -136,7 +150,7 @@ set -f
 mkdir "$tmp/py"
 tar -xzf "$1" -C "$tmp/py" || fail 'bundled Python archive did not unpack; current release unchanged'
 [ -x "$tmp/py/python/bin/python3" ] || fail 'bundled Python archive has no python/bin/python3; current release unchanged'
-"$tmp/py/python/bin/python3" - "$tmp/bundle" "$version" "$target" "$commit" "$LINK_DIR" "$YES" <<'PY'
+"$tmp/py/python/bin/python3" - "$tmp/bundle" "$version" "$target" "$commit" "$LINK_DIR" "$YES" "$JSON" <<'PY'
 import json
 from pathlib import Path
 import subprocess
@@ -153,22 +167,24 @@ try:
         terminal = None
     options = (["--link-dir", sys.argv[5]] if sys.argv[5] else []) + (["--yes"] if sys.argv[6] else [])
     try:
-        subprocess.run(['sh', str(bundle / 'release/cs/scripts/node-install'), 'install', str(bundle), *options],
-                       check=True, stdin=terminal)
-    except BaseException:
-        if terminal is not None:
-            terminal.close()
-        raise
-    command = [str(Path.home() / '.contextstack/current/cs/scripts/cs'), 'init']
-    if terminal is None or sys.argv[6]:
-        command.append('--yes')
-    try:
-        init = subprocess.run(command, stdin=terminal)
-        print('Open a new terminal (or run: `export PATH="$HOME/.local/bin:$PATH"`) to use `cs`')
-        if init.returncode != 0:
-            # ContextStack is installed; only setup is unfinished, and cs init said why just above.
-            print('ContextStack is installed, but setup is not finished: see the message above, then run `cs init` again.')
-            sys.exit(init.returncode)
+        activation = subprocess.run(
+            ['sh', str(bundle / 'release/cs/scripts/node-install'), 'install', str(bundle), '--json', *options],
+            stdin=terminal, stdout=subprocess.PIPE, text=True)
+        if activation.returncode:
+            print(activation.stdout, file=sys.stderr, end='')
+            activation.check_returncode()
+        report = json.loads(activation.stdout)
+        if sys.argv[7]:
+            print(activation.stdout, end='', flush=True)
+        else:
+            print(f'Installed ContextStack {meta["release"]}', flush=True)
+            missing = report['verify']['missing_host_runtimes']
+            if missing:
+                print('Some optional extras are missing. Run `cs doctor` for details.', flush=True)
+        command = [str(Path.home() / '.contextstack/current/cs/scripts/cs'), 'init', '--install-setup']
+        if terminal is None or sys.argv[6]:
+            command.append('--yes')
+        subprocess.run(command, stdin=terminal, check=True)
     finally:
         if terminal is not None:
             terminal.close()

@@ -138,7 +138,8 @@ def _(ctx):
 def _(ctx):
     """GET models rows include lead; claude-code-sonnet may host a lead."""
     o = owner(ctx)
-    models = o.call("GET", "models").json.get("models") or []
+    catalog = o.call("GET", "models").json
+    models = catalog["models"]
     by_name = {m.get("name"): m for m in models}
     ctx.expect("claude-code-sonnet" in by_name, "claude-code-sonnet is listed", by_name)
     ctx.expect(by_name["claude-code-sonnet"].get("lead") is True,

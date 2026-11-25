@@ -19,6 +19,7 @@ _GRACE_S = 5.0
 _POLL_S = 3.0
 _SAMPLE_DEADLINE_S = 5.0  # one background sample
 _CLEANUP_DEADLINE_S = 10.0  # the final sweep, measured after the sampler has stopped
+_SUSPECT_DEADLINE_S = 5.0  # the evidence-only suspect scan, once in close()
 _MAX_SAMPLE_FAILURES = 10  # consecutive failed samples before tracking is declared broken
 _RSS_LINE = re.compile(r"^\s*(\d+)\s*$")
 
@@ -178,15 +179,6 @@ class JobProcesses:
         if platform.system() == "Darwin" and self.root_identity is not None:
             from _job_darwin import owned_pids
             owned.update(owned_pids(self.pid, self.root_identity, deadline))
-            from _job_identity import suspect_pids
-            suspects = suspect_pids(self.root_identity, owned, deadline)
-            with self._lock:
-                evidence = getattr(self, "evidence", [])
-                seen = {(row["pid"], tuple(row["identity"])) for row in evidence}
-                for row in suspects:
-                    if (row["pid"], tuple(row["identity"])) not in seen:
-                        evidence.append(row)
-                self.evidence = evidence
         if platform.system() == "Linux":
             from _job_linux import owned_pids
             owned.update(owned_pids(self.pid, self.root_identity, deadline))
@@ -214,7 +206,9 @@ class JobProcesses:
                     return
 
     def kill(self, deadline=None):
-        deadline = deadline if deadline is not None else time.monotonic() + 2.0
+        # Early sweeps (kill_group, the memory cap) do the real cleanup: close() then
+        # finds the job cleaned, so they need close()'s budget, not a 2 s default.
+        deadline = deadline if deadline is not None else time.monotonic() + _CLEANUP_DEADLINE_S
         if not self._lock.acquire(timeout=max(0, deadline - time.monotonic())):
             raise RuntimeError("job process tracking busy")
         try:
@@ -226,7 +220,7 @@ class JobProcesses:
             self._lock.release()
 
     def _sweep(self, deadline=None):
-        deadline = deadline if deadline is not None else time.monotonic() + 2.0
+        deadline = deadline if deadline is not None else time.monotonic() + _CLEANUP_DEADLINE_S
         if platform.system() == "Darwin":
             from _job_darwin import finish
             finish(self.pid, self.root_identity, deadline)
@@ -251,14 +245,38 @@ class JobProcesses:
                 time.sleep(min(0.01, max(0, deadline - time.monotonic())))
         raise RuntimeError("job processes survived cleanup")
 
+    def _record_suspects(self):
+        """Evidence only, once per job, on its own budget: never inside the sweep deadline."""
+        if platform.system() != "Darwin" or self.root_identity is None:
+            return
+        from _job_identity import suspect_pids
+        try:
+            with self._lock:
+                owned = dict(self.known)
+            suspects = suspect_pids(self.root_identity, owned, time.monotonic() + _SUSPECT_DEADLINE_S)
+        except Exception as error:  # evidence must never fail a finished job
+            suspects = [{"reason": "evidence_failed", "pid": None, "identity": [], "error": str(error)[:200]}]
+        with self._lock:
+            evidence = getattr(self, "evidence", None)
+            if evidence is None:
+                evidence = []
+            seen = {(row["pid"], tuple(row["identity"])) for row in evidence}
+            for row in suspects:
+                if (row["pid"], tuple(row["identity"])) not in seen:
+                    evidence.append(row)
+            self.evidence = evidence
+
     def close(self):
         # The background sample may hold a scan for up to _SAMPLE_DEADLINE_S on a busy machine.
         # Cleanup gets its own budget after that join, or a slow last sample leaves the sweep no
         # time and a finished job ends void ('job process cleanup deadline exceeded', 2026-11-12).
         self._stop.set()
         self._thread.join(timeout=_SAMPLE_DEADLINE_S)
-        self.kill(deadline=time.monotonic() + _CLEANUP_DEADLINE_S)
-        forget_marker(self.marker)
+        try:
+            self.kill(deadline=time.monotonic() + _CLEANUP_DEADLINE_S)
+        finally:
+            self._record_suspects()
+            forget_marker(self.marker)
         if self.error is not None:
             raise RuntimeError("job process tracking failed") from self.error
 

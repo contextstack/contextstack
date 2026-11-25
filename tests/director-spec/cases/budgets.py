@@ -469,6 +469,11 @@ def _(ctx):
     a = submit(ctx, c, n, p["project_id"], usd=1)
     b = submit(ctx, c, n, p["project_id"], usd=1)
     accept(n, b["job_id"])
+    # A live event means the node started a run: cancel must wait for job_terminal (presumed charge).
+    from harness import node2 as n2
+    run_id = "%s-running" % ctx.serial_tag()
+    ev = n.events(run_id, b["job_id"], [n2.delta(1, "working")])
+    ctx.expect(ev.status == 200 and ev.json["accepted"] == 1, "live run evidence", ev)
     for j in (a, b):
         r = c.call("POST", "jobs/%s/cancel" % j["job_id"], key=new_key("cancel"))
         ctx.expect(r.status == 202, "cancel requested", r)

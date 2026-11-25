@@ -161,6 +161,7 @@
     {
       "name": "local-coder",
       "provider": "vllm",
+      "picker": {"provider_label": "vLLM", "label": "Local coder (vLLM, configured model)"},
       "tier": 1,
       "capability": "coding",
       "preferred": true,

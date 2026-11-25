@@ -39,6 +39,8 @@ DOC = """cs: see and control this machine's ContextStack install.
   cs backup init|run|status|restore          encrypted off-machine Director and eval backups
   cs device list|pair NAME|revoke ID        manage credentials from the Director host
   cs ui [--print]                            open or print a one-time Director UI pairing URL (five minutes, once)
+  cs trace check [RUN_ID ...] [--last N] [--json]
+                                             grade run traces with the release's tracing/check-trace
 
 Most commands read ~/.contextstack and change nothing. Exceptions: `cs land` commits locally; `cs init` and `cs update`
 write install configuration and activate releases. Pairing commands print a one-time code or URL. Env CS_PLATFORM overrides the platform
@@ -151,9 +153,26 @@ def parse_node_env(path):
     return values
 
 
+NODE_ENV = CONFIG / "node.env"
+NODE_ENV_ERROR = []  # the parse error, once: cs doctor reports it, every other command keeps working
+
+
 def node_env():
-    """{name: set?} from config/node.env; its values only ever reach the redactor."""
-    values = parse_node_env(CONFIG / "node.env")
+    """{name: set?} from config/node.env; its values only ever reach the redactor. A malformed file is {}."""
+    try:
+        values = parse_node_env(NODE_ENV)
+    except (ValueError, OSError) as error:
+        if not NODE_ENV_ERROR:
+            NODE_ENV_ERROR.append(str(error))
+        try:  # still redact whatever it holds: every word after an "=" on any line
+            text = Path(NODE_ENV).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            for word in re.split(r"[\s'\"]+", line.partition("=")[2]):
+                if len(word) >= 4:
+                    SECRETS.add(word)
+        return {}
     for value in values.values():
         if len(value) >= 4:
             SECRETS.add(value)
@@ -521,9 +540,11 @@ def credential_mode(env):
         return "off"
     if spec == "keychain":
         return "keychain, then ~/.contextstack/credentials (explicit opt-in)"
-    if spec:
+    if spec.startswith("/"):
         return "file store " + spec
-    return "keychain, then ~/.contextstack/credentials (default)" if PLATFORM == "macos" else "~/.contextstack/credentials"
+    if spec:  # the gateway refuses to start on anything else (gateway/src/credentials.rs Chain::from_spec)
+        return "invalid %r: the gateway won't start" % spec
+    return "file store ~/.contextstack/credentials (default)"
 
 
 def last_tick():
@@ -570,6 +591,9 @@ def print_status(d):
         for v in views:
             word = "up" if v["up"] else ("-" if not v["installed"] else "down")
             extra = "pid %d" % v["pid"] if v["pid"] else ("last exit %s" % v["last_exit"] if v["up"] and v["last_exit"] else "")
+            if v["label"] == CLIENT_WEB and not v["installed"]:
+                print("  client-web is not served (needs PHP 8.3+ and --serve-client-web; see alpha-known-issues)")
+                continue
             short = v["label"].replace("com.contextstack.", "")
             print("  %-8s %-5s %-24s %-22s %s" % (name, word, short, extra, v["reason"]))
     g = d["gateway"]
@@ -766,7 +790,7 @@ def node_install(*args):
     script = KIT / "scripts/node-install"
     if not script.is_file():
         raise Stop("cs: %s is missing: the current release is broken (cs doctor)" % script)
-    r = run(["sh", str(script), *args], timeout=300)
+    r = run(["sh", str(script), *args], timeout=None)  # its drain waits up to 30 min: never kill it mid-switch
     return r.returncode, read_body(r.stdout), r
 
 
@@ -930,6 +954,18 @@ def doctor():
     rid = os.readlink(CURRENT).rsplit("/", 1)[-1]
     add("current release", (CURRENT / ".complete").is_file(), "current -> releases/%s" % rid,
         "cs release switch ID (cs release list)")
+    missing = (read_json(CURRENT / "verify.json", {}) or {}).get("missing_host_runtimes", {})
+    extra_labels = {
+        "browser_fetch": "Browser tools (web fetch)",
+        "browser_session": "Browser tools (browser sessions)",
+        "defuddle_extract": "Article text extraction",
+        "client-web": "Web client",
+    }
+    for requirement, tools in sorted(missing.items()):
+        labels = ", ".join(extra_labels.get(tool, tool) for tool in tools)
+        out.append({"check": "optional extras at install", "ok": True, "info": True,
+                    "detail": "%s (needed by %s)" % (requirement, ", ".join(tools)), "fix": "",
+                    "summary": "%s: not installed. Optional; not needed to run tasks." % labels})
     for d in ROOT_DIRS:
         p = ROOT / d
         if not p.is_dir():
@@ -938,7 +974,7 @@ def doctor():
             add("root %s" % d, False, "%s is mode %o" % (p, p.stat().st_mode & 0o777), "chmod 700 %s" % p)
         else:
             add("root %s" % d, True)
-    for p, want in ((CONFIG / "node.env", 0o600), (ROOT / "credentials", 0o700)):  # stat only: never read
+    for p, want in ((NODE_ENV, 0o600), (ROOT / "credentials", 0o700)):  # stat only: never read
         if p.exists():
             mode = p.stat().st_mode & 0o777
             add("mode %s" % p.name, not mode & 0o077, "%s is mode %o" % (p, mode), "chmod %o %s" % (want, p))
@@ -1021,12 +1057,17 @@ def doctor():
             selectable = hasattr(node_release(), "CREDENTIALS")
         except Stop:
             selectable = False
-        add("gateway credentials", "keychain" not in mode,
-            "a node's gateway uses the login Keychain (CSGATEWAY_CREDENTIALS unset): repeated `security` prompts",
-            "set CSGATEWAY_CREDENTIALS=file in %s, then cs restart gateway (or run cs init on a fresh machine)" % (
-                AGENTS / (GATEWAY + ".plist")) if selectable
-            else "run `cs update` to install a current release, then `cs init`; or set "
-                 "CSGATEWAY_CREDENTIALS=off in %s and cs restart gateway" % (AGENTS / (GATEWAY + ".plist")))
+        plist = AGENTS / (GATEWAY + ".plist")
+        unset = "remove the CSGATEWAY_CREDENTIALS key from %s (unset or empty is the file store " \
+                "~/.contextstack/credentials), then cs restart gateway" % plist
+        if mode.startswith("invalid"):
+            add("gateway credentials", False, "CSGATEWAY_CREDENTIALS is %s" % mode, unset)
+        else:
+            add("gateway credentials", "keychain" not in mode,
+                "a node's gateway uses the login Keychain (CSGATEWAY_CREDENTIALS=keychain): repeated `security` prompts",
+                unset if selectable
+                else "run `cs update` to install a current release, then `cs init`; or set "
+                     "CSGATEWAY_CREDENTIALS=off in %s and cs restart gateway" % plist)
     for label in TUNNELS:
         _, data = load_plist(label)
         if data is None:
@@ -1056,14 +1097,23 @@ def cmd_doctor(args):
         return cmd_repin_cli(args.repin)
     need_install()
     findings = doctor() + cli_pin_findings() + toolchain_findings()
+    if NODE_ENV_ERROR:
+        findings.append({"check": "node.env", "ok": False, "detail": NODE_ENV_ERROR[0],
+                         "fix": "fix that line of %s (NAME=value, one per line; quote values with spaces)" % NODE_ENV})
     if args.json:
         print(json.dumps(findings, indent=2))
     else:
+        printed_summaries = set()
         for f in findings:
             if f.get("warn"):
                 print("WARN  %s: %s\n      fix: %s" % (f["check"], f["detail"], f["fix"]))
             elif f.get("info"):
-                print("info  %s: %s" % (f["check"], f["detail"]))
+                summary = f.get("summary")
+                if summary is None:
+                    print("info  %s: %s" % (f["check"], f["detail"]))
+                elif summary not in printed_summaries:
+                    print("info  " + summary)
+                    printed_summaries.add(summary)
             elif f["ok"]:
                 print("ok    %s%s" % (f["check"], " (%s)" % f["detail"] if "not supported" in f["detail"] else ""))
             else:
@@ -1095,7 +1145,7 @@ def cmd_land(args):
     except Exception as error:
         recorded = {"recorded": False, "record_error": str(error).split("\n", 1)[0][:300]}
     result.update(recorded)
-    if not result.get("recorded"):
+    if not result.get("recorded") and not result.get("record_skipped"):
         print("cs land: warning: the landing couldn't be recorded: %s" % result.get("record_error", ""),
               file=sys.stderr)
     if args.json:
@@ -1176,6 +1226,11 @@ def cmd_ui(args):
         args, argparse.Namespace(**globals()))
 
 
+def cmd_trace(args):
+    return load_script("cs_trace", Path(__file__).resolve().parent / "cs_trace.py").main(
+        args, argparse.Namespace(**globals()))
+
+
 def cmd_status(args):
     if not installed():
         if args.json:
@@ -1195,6 +1250,13 @@ def main(argv=None):
         return load_script("cs_mcp", Path(__file__).resolve().parent / "cs_mcp.py").main(argv[1:], ROOT)
     sys.stdout, sys.stderr = Redacting(sys.stdout), Redacting(sys.stderr)
     ap = argparse.ArgumentParser(prog="cs", description=DOC, formatter_class=argparse.RawDescriptionHelpFormatter)
+    if argv == ["--version"]:
+        release_root = Path(__file__).resolve().parents[2]
+        meta = read_json(release_root / "bundle.json", {}) or {}
+        print("ContextStack %s (%s)" % (meta.get("release") or "development",
+                                       meta.get("code_commit") or "unknown commit"))
+        return 0
+    ap.add_argument("--version", action="store_true", help="show the release version and commit")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("status", "models", "jobs", "doctor"):
         parser = sub.add_parser(name)
@@ -1219,6 +1281,8 @@ def main(argv=None):
     smoke.add_argument("--json", action="store_true")
     smoke.add_argument("--agents", help="comma-separated agent names")
     it = sub.add_parser("init")
+    it.add_argument("--install-setup", action="store_true",
+                    help="check installed services and allow an incomplete first job")
     it.add_argument("--yes", action="store_true", help="never prompt: defaults for everything not given")
     it.add_argument("--name", help="this machine's node name (default: from the host name)")
     it.add_argument("--director-listen", metavar="ADDR", help="the Director's loopback address (default 127.0.0.1:8780)")
@@ -1291,6 +1355,9 @@ def main(argv=None):
     ui = sub.add_parser("ui", help="open a one-time Director UI pairing URL")
     ui.add_argument("--print", dest="print_url", action="store_true",
                     help="print the URL instead of opening it (one-time, expires in five minutes)")
+    trace = sub.add_parser("trace", help="grade run traces with tracing/check-trace")
+    if argv[:1] == ["trace"]:
+        load_script("cs_trace", Path(__file__).resolve().with_name("cs_trace.py")).add_arguments(trace)
     args = ap.parse_args(argv)
     if args.cmd == "backup":
         return backup_module.main(args, ROOT)
@@ -1298,7 +1365,7 @@ def main(argv=None):
         args.action = args.cmd
     handler = {"status": cmd_status, "logs": cmd_logs, "models": cmd_models, "jobs": cmd_jobs, "doctor": cmd_doctor,
                "smoke": cmd_smoke, "update": cmd_update, "release": cmd_release, "land": cmd_land, "init": cmd_init, "lead": cmd_lead,
-               "review": cmd_review, "ui": cmd_ui, "repo": cmd_repo, "device": cmd_device}.get(args.cmd, cmd_service)
+               "review": cmd_review, "ui": cmd_ui, "repo": cmd_repo, "device": cmd_device, "trace": cmd_trace}.get(args.cmd, cmd_service)
     node_env()  # its values join the redactor before anything prints
     client_web_env()  # and client-web's APP_KEY
     try:

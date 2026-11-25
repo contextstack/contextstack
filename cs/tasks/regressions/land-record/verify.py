@@ -376,6 +376,17 @@ def main():
                    "a dirty main is refused, reported with that text, and unchanged", (code, out, err))
             (main_repo / "stray.txt").unlink()
 
+            # A busy refusal (another landing holds the lock) says nothing about the lane: never posted
+            import fcntl
+            lock_path = Path(git(main_repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "cs-land.lock"
+            mark = len(director.calls)
+            with open(lock_path, "a+") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                code, out, err = cs_land(home, "demo", "dirty")
+            expect(code == 2 and "another landing" in out.get("reason", "") and not posts_since(director, mark)
+                   and "couldn't be recorded" not in err,
+                   "a lock/busy refusal is not posted as a refused land record", (code, out, err))
+
             make_lane("red", {"red.txt": "r\n"})
             mark = len(director.calls)
             code, out, err = cs_land(home, "demo", "red")

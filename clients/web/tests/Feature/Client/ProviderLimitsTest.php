@@ -69,8 +69,11 @@ it('marks out-of-quota models in the new task lane picker and does not preselect
 
     Livewire::test('pages::client.lane-create')
         ->assertSet('node', 'laptop')
-        ->assertSet('model', 'codex')
-        ->assertSeeText('Cursor Sol (subscription) — out of quota until Nov 17')
+        ->assertSet('model', 'auto')
+        ->assertSet('defaultModel', 'codex')
+        ->set('provider', 'cursor')
+        ->assertSet('model', 'cursor-sol')
+        ->assertSeeText('Cursor Sol (subscription) · subscription — out of quota until Nov 17')
         ->set('node', 'workstation')
         ->assertDontSeeText('out of quota');
 });

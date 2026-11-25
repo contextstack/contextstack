@@ -185,6 +185,49 @@ def recheck_current(expected, rid):
     return before
 
 
+def smoke_warnings(smoke, record):
+    from cs_smoke import agent_for, default_agents
+
+    ops = str(Path(_SCRIPTS).parent / "ops/bin")
+    if ops not in sys.path:
+        sys.path.insert(0, ops)
+    from _agent_discovery import AGENTS
+    from _provider_limits import record_limit, state_path
+
+    try:
+        result = json.loads(smoke.stdout)
+        checks = result["checks"]
+        if (type(result["ok"]) is not bool or not isinstance(checks, list)
+                or any(not isinstance(c, dict) or not isinstance(c.get("name"), str)
+                       or type(c.get("ok")) is not bool for c in checks)):
+            raise ValueError("invalid smoke report")
+    except (ValueError, TypeError, KeyError):
+        reason = (smoke.stderr or smoke.stdout).strip()[-500:] or "invalid smoke report"
+        result = {"ok": False, "checks": [{"name": "smoke", "ok": False, "reason": reason}]}
+
+    defaults = default_agents(record, AGENTS)
+    failures = [{"name": c["name"], "reason": c.get("reason") or "failed"}
+                for c in result["checks"] if not c["ok"]]
+    critical = [c for c in failures if c["name"] in ("services", "hosted-lead", record.get("default_model"))
+                or c["name"] in defaults or agent_for(c["name"], AGENTS) in defaults]
+    if critical:
+        raise SmokeFailed("smoke failed: " + "; ".join("{name}: {reason}".format(**c) for c in critical))
+    if not failures and (smoke.returncode or not result["ok"]):
+        failures.append({"name": "smoke", "reason": "smoke returned no failed check details"})
+
+    state = ROOT / "state"
+    for warning in failures:
+        name, reason = warning["name"], warning["reason"]
+        print(f"node-install: warning: {name}: {reason}", file=sys.stderr)
+        if agent_for(name, AGENTS) is not None and state_path(state).is_file():
+            try:
+                record_limit(state, name, {"via": "smoke", "message": f"Post-install smoke failed: {reason}"},
+                             preserve_existing=True)
+            except OSError as error:
+                print(f"node-install: warning: could not record smoke failure for {name}: {error}", file=sys.stderr)
+    return result, failures
+
+
 def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
     if not complete(rid):
         raise Refused("release %s is not installed (no %s)" % (rid, RELEASES / rid / ".complete"))
@@ -335,17 +378,7 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
                                         "smoke", "--json"], capture_output=True, text=True, timeout=300)
             except (OSError, subprocess.TimeoutExpired) as error:
                 smoke = subprocess.CompletedProcess([], 1, "", str(error))
-            try:
-                result = json.loads(smoke.stdout)
-                if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
-                    raise ValueError("invalid smoke report")
-            except ValueError:
-                result = {"ok": False, "checks": [{"name": "smoke", "ok": False,
-                           "reason": (smoke.stderr or smoke.stdout)[-500:]}]}
-            if smoke.returncode or not result.get("ok"):
-                failed = "; ".join("%s: %s" % (c["name"], c.get("reason", "failed"))
-                                   for c in result.get("checks", []) if not c.get("ok")) or "smoke exited %s" % smoke.returncode
-                raise SmokeFailed("smoke failed: %s" % failed)
+            result, warnings = smoke_warnings(smoke, rec)
             rec["failed_releases"] = [h for h in rec.get("failed_releases", []) if h != rid]
         failed = rec.get("failed_releases", [])
         history = [h for h in rec.get("history", []) if h != rid and h not in failed]
@@ -360,7 +393,8 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
         bundle_dir = migrate_churn_dirs()
         verify = RELEASES / rid / "verify.json"
         v = json.loads(verify.read_text(encoding="utf-8")) if verify.is_file() else {}
-        setup_path(link_dir, opts.get("yes", False))
+        if not opts.get("skip_path_setup"):
+            setup_path(link_dir, opts.get("yes", False))
         save_record(rec)
         for h in pruned:
             shutil.rmtree(RELEASES / h, ignore_errors=True)
@@ -369,7 +403,7 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
         if not activated or rollback_record is not None:
             raise
         rollback_failed_activation(before, rid, original, rec, load, snapshot, error)
-    out = {"ok": True, "release": rid, "previous": before, "root": str(ROOT), "node": is_node(), "kit": code,
+    out = {"ok": True, "warnings": [], "release": rid, "previous": before, "root": str(ROOT), "node": is_node(), "kit": code,
            "runner": rec["runner"], "gateway": rec["gateway"], "credentials": rec["credentials"],
            "drain": drain,
            "links": {n: str(p) for n, (p, _) in links.items()}, "retired_links_removed": [str(p) for p in retired],
@@ -382,7 +416,7 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
            "node_token": None if token is None else ("written to %s" % (CONFIG / "node.env") if token_changed else "unchanged"),
            "verify": {"errors": v.get("errors"), "missing_host_runtimes": sorted(v.get("missing_host_runtimes", {}))}}
     if opts.get("smoke") and load and (RELEASES / rid / code / "scripts/cs_smoke.py").is_file():
-        out["smoke"] = result
+        out.update(smoke=result, warnings=warnings)
     if linux:
         out["linger"] = LINGER_NOTE
         print("node-install: %s" % LINGER_NOTE, file=sys.stderr)
@@ -464,6 +498,7 @@ def main():
     a.add_argument("--credentials", choices=sorted(CREDENTIALS))
     a.add_argument("--link-dir")
     a.add_argument("--yes", action="store_true")
+    a.add_argument("--skip-path-setup", action="store_true", help=argparse.SUPPRESS)
     a.add_argument("--skip-link", action="append", default=[], choices=sorted(LINKS))
     a.add_argument("--adopt", action="append", default=[], choices=[GATEWAY_LABEL, NODE_LABEL, LISTEN_LABEL, DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL])
     a.add_argument("--serve-director", nargs="?", const="", default=None, help=argparse.SUPPRESS)
@@ -528,7 +563,7 @@ def run_command(args):
         opts = {"estate": args.estate, "adopt": args.adopt, "node": args.node, "director": args.director,
                 "token_env": args.token_env, "installation": args.installation, "runner": args.runner, "credentials": args.credentials,
                 "gateway": args.gateway, "link_dir": args.link_dir, "skip_links": args.skip_link, "keep": args.keep,
-                "from_bundle": args.from_bundle, "yes": args.yes,
+                "from_bundle": args.from_bundle, "yes": args.yes, "skip_path_setup": args.skip_path_setup,
                 "serve_director_rs": args.serve_director_rs, "director_rs_listen": args.director_rs_listen,
                 "director_token_from": args.director_token_from,
                 "serve_client_web": args.serve_client_web, "client_web_php": args.php,

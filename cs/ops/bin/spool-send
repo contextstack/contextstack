@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 from _estate_io import write_atomic
+from _harvest_git import host_git
 
 from _director_client import Client, DirectorUnreachable, receiver_config
 from _roots import RootsError, ledger_path, outbox_dir, roots, workspace_dir
@@ -227,12 +228,10 @@ def prune_acked(envelope, ack, outbox):
               "workspace": str(ws), "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     if ws.is_dir():
         if (ws / ".git").is_file():  # a git worktree: let its repository forget it as well
-            import subprocess
-            common = subprocess.run(["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                                    capture_output=True, text=True)
-            gone = common.returncode == 0 and subprocess.run(
-                ["git", "--git-dir", common.stdout.strip(), "worktree", "remove", "--force", str(ws)],
-                capture_output=True).returncode == 0
+            common = host_git(ws, "rev-parse", "--path-format=absolute", "--git-common-dir")
+            gone = common.returncode == 0 and host_git(
+                ws, "worktree", "remove", "--force", str(ws), git_dir=common.stdout.strip(),
+            ).returncode == 0
             if not gone:
                 return None
             record["mode"] = "worktree"

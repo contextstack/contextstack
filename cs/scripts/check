@@ -269,6 +269,8 @@ bg_rule "the installed-release trial no longer starts agent jobs before the gate
   tasks/regressions/release-smoke-wait/check
 bg_rule "cs no longer reads the install: status, models, jobs, logs, launchctl start/stop, node-install release delegation, a doctor failure, the Linux fallback, or it printed a secret" \
   tasks/regressions/cs-cli/check
+bg_rule "cs trace check no longer assembles run + gateway traces with run_directories, or misgrades complete / findings / incomplete" \
+  tasks/regressions/cs-trace-check/check
 bg_rule "a repo-lane job no longer works in its worktree beside main on lane/<lane>, its sandbox writes the repo outside that worktree, its evidence diff is wrong, or cs land lands on red, on a conflict or a dirty main, or leaves the lane behind on green (Plan.RealWork.Install 2026-11-11)" \
   tasks/regressions/repo-lanes/check
 bg_rule "cs land no longer reports landed, failed and refused outcomes to the Director, --job no longer wins over lookup, lookup misses the newest finished job, or an unreachable Director changes the landing" \
@@ -301,6 +303,8 @@ bg_rule "the hosted lead session host no longer reuses one stream-json CLI per c
   tasks/regressions/lead-session-host/check
 bg_rule "trusted Claude refresh writeback or OAuth retry timeout receipts regressed" \
   tasks/regressions/executor-timeout-receipt/check
+bg_rule "a job-process cleanup or tracking failure crashes the executor before its row, loses the CLI output, or ends non-retryable" \
+  tasks/regressions/executor-cleanup-failure/check
 bg_rule "hosted Claude private login copies or guarded refresh regressed (issue #28)" \
   tasks/regressions/lead-session-host/check --login-copies-only
 bg_rule "the hosted lead no longer wakes on child lane end via events (one batched nudge recorded as a wake turn on the Director), or permits unauthenticated watch registration (#39; Design.HostedLead lane 6)" \

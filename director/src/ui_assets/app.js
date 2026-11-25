@@ -203,6 +203,7 @@ async function conversationsPage(parent) {
   model.id = 'new-model';
   modelLabel.htmlFor = model.id;
   for (const choice of options.models) {
+    if (choice.internal) continue;
     const option = element('option', choice.label);
     option.value = choice.name;
     option.disabled = !choice.available;

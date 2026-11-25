@@ -479,8 +479,15 @@ def step_row(run_dir, term, check, steps, result, by_tool=None):
 
 def append_row(row, steps, result):
     result["row_line"] = go_json(row).encode("utf-8")
-    with LEDGER.open("ab") as out:
-        out.write(result["row_line"] + b"\n")
+    with LEDGER.open("a+b") as out:
+        # A crash mid-append can leave a cut-off last line. Start on a fresh line so this
+        # row stays whole instead of fusing with the fragment (readers skip the fragment).
+        out.seek(0, os.SEEK_END)
+        torn = False
+        if out.tell():
+            out.seek(-1, os.SEEK_END)
+            torn = out.read(1) != b"\n"
+        out.write((b"\n" if torn else b"") + result["row_line"] + b"\n")
         out.flush()
         os.fsync(out.fileno())
     steps["row"] = "appended"

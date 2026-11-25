@@ -309,6 +309,108 @@ class JobMemoryTest(unittest.TestCase):
             self.assertNotEqual(probe.returncode, 0, msg=(probe.stdout or probe.stderr))
 
 
+class JobCleanupBudgetTest(unittest.TestCase):
+    """2026-11 review: cleanup sweeps, scan caching and the suspect scan budget."""
+
+    def tracker(self):
+        return JobMemoryTest.tracker(self)
+
+    def test_kill_without_deadline_uses_the_cleanup_budget(self):
+        # F1: kill_group/MemoryMonitor sweep before close() and used to get 2 s.
+        import _job_memory as jobs
+        tracker = self.tracker()
+        seen = []
+        with patch.object(tracker, "_sweep", side_effect=lambda deadline: seen.append(deadline - time.monotonic())):
+            tracker.kill()
+        self.assertEqual(len(seen), 1)
+        self.assertGreater(seen[0], jobs._CLEANUP_DEADLINE_S - 1)
+
+    def test_negative_environment_results_are_cached(self):
+        # F3: a pid already known to lack the marker is not re-read on every scan.
+        import _job_identity as identity
+        identity.forget_marker("negative-cache")
+        reads = []
+        def environment(pid):
+            reads.append(pid)
+            return [b"PATH=/bin"]
+        with patch.object(identity.platform, "system", return_value="Darwin"), \
+                patch.object(identity, "_darwin_pids", return_value=[4242]), \
+                patch.object(identity, "_pid_identity", return_value=(1, 2, 3)), \
+                patch.object(identity, "_darwin_environment", side_effect=environment):
+            for _ in range(3):
+                self.assertEqual(identity._marked_pids("negative-cache", time.monotonic() + 5), {})
+        identity.forget_marker("negative-cache")
+        self.assertEqual(reads, [4242])
+
+    def test_pids_does_not_run_the_suspect_scan(self):
+        # F4: the evidence-only scan must not share the sweep's deadline.
+        import _job_memory as jobs
+        tracker = self.tracker()
+        with patch.object(jobs.platform, "system", return_value="Darwin"), \
+                patch.object(jobs, "_marked_pids", return_value={}), \
+                patch("_job_darwin.owned_pids", return_value={}), \
+                patch("_job_identity.suspect_pids", return_value=[]) as suspects, \
+                patch.object(jobs, "_pid_identity", return_value=100):
+            tracker.pids()
+        suspects.assert_not_called()
+
+    def test_close_runs_the_suspect_scan_once_with_its_own_budget(self):
+        import _job_memory as jobs
+        tracker = self.tracker()
+        tracker._stop, tracker.error = threading.Event(), None
+        tracker._thread = type("Done", (), {"join": staticmethod(lambda timeout=None: None)})()
+        budgets = []
+        def suspects(root, owned, deadline):
+            budgets.append(deadline - time.monotonic())
+            return [{"pid": 5, "identity": [1], "reason": "membership_unreadable"}]
+        def slow_kill(deadline):
+            time.sleep(max(0, deadline - time.monotonic()))
+        with patch.object(jobs.platform, "system", return_value="Darwin"), \
+                patch.object(tracker, "kill", side_effect=slow_kill), \
+                patch.object(jobs, "_CLEANUP_DEADLINE_S", 0.2), \
+                patch("_job_identity.suspect_pids", side_effect=suspects):
+            tracker.close()
+        self.assertEqual(len(budgets), 1)
+        self.assertGreater(budgets[0], 0.5)
+        self.assertEqual([row["pid"] for row in tracker.evidence], [5])
+
+    def test_streaming_kill_group_kills_once(self):
+        # F5: run_streaming's kill_group calls processes.kill at most once.
+        import _agent_stream as stream
+        import _job_memory as jobs
+        kills = []
+        real_kill = jobs.JobProcesses.kill
+        def counting(self, deadline=None):
+            if deadline is None:  # kill_group; close() passes its own deadline
+                kills.append(self.pid)
+            return real_kill(self, deadline)
+        with tempfile.TemporaryDirectory() as raw, patch.object(jobs.JobProcesses, "kill", counting):
+            done = stream.run_streaming([sys.executable, "-c", "print('ok')"], raw,
+                                        {"PATH": os.environ["PATH"]}, 10, lambda line: None)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(len(kills), 1, kills)
+
+    def test_failed_early_kill_keeps_the_cli_output(self):
+        # F2: kill_group's sweep fails (deadline exceeded); the runner raises CleanupFailed with the output.
+        import _agent_stream as stream
+        import _job_memory as jobs
+        from _muse import CleanupFailed, run_process
+        real_kill = jobs.JobProcesses.kill
+        def flaky(self, deadline=None):
+            if deadline is None:
+                raise RuntimeError("job process cleanup deadline exceeded")
+            return real_kill(self, deadline)
+        command = [sys.executable, "-c", "print('agent output')"]
+        with tempfile.TemporaryDirectory() as raw, patch.object(jobs.JobProcesses, "kill", flaky):
+            for run in (lambda: stream.run_streaming(command, raw, {"PATH": os.environ["PATH"]}, 10, lambda line: None),
+                        lambda: run_process(command, raw, {"PATH": os.environ["PATH"]}, 10)):
+                with self.assertRaises(CleanupFailed) as failed:
+                    run()
+                self.assertIn("agent output", failed.exception.stdout)
+                self.assertEqual(failed.exception.returncode, 0)
+                self.assertIn("deadline exceeded", str(failed.exception))
+
+
 class JobLaunchTest(unittest.TestCase):
     def test_check_keeps_its_own_group_and_workspace(self):
         from _muse import run_process

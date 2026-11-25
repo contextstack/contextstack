@@ -37,6 +37,8 @@ MISSED_GRACE_MINUTES = 60
 
 
 read_jsonl = partial(estate_rows, strict=True)
+# The ledger is append-only evidence: a cut-off line from a crash mid-append is skipped, never fatal.
+read_ledger = partial(estate_rows, strict=False)
 
 
 def field_values(text, low, high, sunday=False):
@@ -482,7 +484,7 @@ def main():
         dispatch = dispatch_by_job(dispatch_history)
         scheduled_dispatch = dispatch_by_schedule_slot(dispatch)
         ledger_path = state_dir(CODE_ROOT) / "ledger.jsonl"
-        ledger_rows = read_jsonl(ledger_path) if ledger_path.is_file() else []
+        ledger_rows = read_ledger(ledger_path) if ledger_path.is_file() else []
         admitted = []
         due = []
         deferred = []

@@ -78,7 +78,7 @@ fn select(argv: &[OsString]) -> Option<(Tool, usize)> {
 /// Python's order: decode stdin, record the call, then run the tool.
 fn run(tool: Tool, input: &[u8]) -> Result<Vec<u8>, Failure> {
     let args = pyjson::load(input)?;
-    if !matches!(tool, Tool::RepoSearch) {
+    if matches!(tool, Tool::FsRead | Tool::FsEdit) {
         calllog::record(tool.name(), &args);
     }
     match tool {
@@ -168,6 +168,8 @@ mod dispatch_tests {
 
     #[test]
     fn run_returns_empty_for_tools_main_handles_before_pyjson_path() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let _cwd = crate::jail::CwdRestore::chdir(dir.path());
         match run(Tool::Okf, b"{}") {
             Ok(empty) => assert_eq!(empty, [] as [u8; 0]),
             Err(failure) => panic!("okf arm is a no-op inside run: {}", failure.0),
@@ -176,5 +178,7 @@ mod dispatch_tests {
             Ok(empty) => assert_eq!(empty, [] as [u8; 0]),
             Err(failure) => panic!("yaml-json arm is a no-op inside run: {}", failure.0),
         }
+        let entries = std::fs::read_dir(dir.path()).unwrap_or_else(|e| panic!("read dir: {e}"));
+        assert_eq!(entries.count(), 0, "no-op tools must leave no call logs");
     }
 }

@@ -45,6 +45,8 @@ pub struct ExecutorRequest {
     pub caller_grants: Vec<PathGrant>,
     pub workspace: PathBuf,
     pub tmpdir: PathBuf,
+    #[serde(default)]
+    pub check_scratch: Option<PathBuf>,
     pub home: PathBuf,
     #[serde(default)]
     pub executable: Option<PathBuf>,
@@ -210,9 +212,15 @@ impl ExecutorRequest {
         if self.variant != Some(Variant::Adapter) && self.adapter.is_some() {
             return Err(unenforceable("adapter record requires adapter variant"));
         }
+        if self.check_scratch.is_some()
+            && (self.variant == Some(Variant::Adapter) || self.lead.is_some())
+        {
+            return Err(unenforceable("check scratch requires a check profile"));
+        }
         for path in [&self.workspace, &self.tmpdir, &self.home]
             .into_iter()
             .chain(self.executable.iter())
+            .chain(self.check_scratch.iter())
             .chain(self.lookup_path.iter())
             .chain(self.read_roots.iter())
             .chain(self.home_reads.iter())
@@ -279,7 +287,10 @@ impl ExecutorRequest {
     }
 
     fn has_future_inputs(&self) -> bool {
-        !self.readonly_paths.is_empty() || self.adapter.is_some() || self.lead.is_some()
+        !self.readonly_paths.is_empty()
+            || self.adapter.is_some()
+            || self.lead.is_some()
+            || self.check_scratch.is_some()
     }
 }
 
@@ -750,6 +761,30 @@ fn socket_deny_rules() -> Vec<String> {
     rules
 }
 
+fn check_scratch_rules(request: &ExecutorRequest) -> Result<Vec<String>, Failure> {
+    let Some(path) = &request.check_scratch else {
+        return Ok(Vec::new());
+    };
+    let scratch = path
+        .canonicalize()
+        .map_err(|error| unenforceable(format!("check scratch: {error}")))?;
+    let workspace = crate::sbpl::resolve(&request.workspace)?;
+    if !scratch.is_dir()
+        || workspace.starts_with(&scratch)
+        || scratch.starts_with(&workspace)
+        || crate::sbpl::resolve(&request.home)?.starts_with(&scratch)
+    {
+        return Err(unenforceable("check scratch must be a separate directory"));
+    }
+    let scratch = crate::sbpl::quote(&scratch)?;
+    Ok(vec![
+        format!("(allow file-read* file-write* (subpath {scratch}))"),
+        "(deny network-bind (local unix-socket))".to_owned(),
+        format!("(allow network-bind (require-all (local unix-socket) (subpath {scratch})))"),
+        format!("(allow network-outbound (require-all (remote unix-socket) (subpath {scratch})))"),
+    ])
+}
+
 fn ssh_rules(request: &ExecutorRequest) -> Result<Vec<String>, Failure> {
     if request.version.is_some() {
         ssh_agent_deny::native_rules(&request.home, request.ssh_auth_sock.as_deref())
@@ -946,6 +981,7 @@ pub fn seatbelt_profile(request: &ExecutorRequest) -> Result<String, Failure> {
     let mut read_roots = vec![workspace.clone(), request.tmpdir.clone()];
     read_roots.extend(request.read_roots.iter().cloned());
     lines.extend(read_rules(request, &read_roots)?);
+    lines.extend(check_scratch_rules(request)?);
     if request
         .run_protection
         .as_ref()
@@ -983,6 +1019,55 @@ use typed::{caller_rules, toolchain_rules};
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn check_scratch_exception_follows_env_denies() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let (workspace, home, scratch) = (root.join("ws"), root.join("home"), root.join("check"));
+        let tmpdir = root.join("run-tmp");
+        std::fs::create_dir(&workspace)?;
+        std::fs::create_dir(&scratch)?;
+        std::fs::create_dir(&tmpdir)?;
+        let quoted = crate::sbpl::quote(&scratch).map_err(|error| error.message().to_owned())?;
+        let rules = [
+            format!("(allow file-read* file-write* (subpath {quoted}))"),
+            "(deny network-bind (local unix-socket))".to_owned(),
+            format!("(allow network-bind (require-all (local unix-socket) (subpath {quoted})))"),
+            format!(
+                "(allow network-outbound (require-all (remote unix-socket) (subpath {quoted})))"
+            ),
+        ];
+        for variant in ["native", "muse"] {
+            let mut request = serde_json::json!({
+                "version": 1, "variant": variant, "workspace": &workspace,
+                "tmpdir": &tmpdir, "home": &home
+            });
+            let render = |request| -> Result<String, Box<dyn std::error::Error>> {
+                Ok(seatbelt_profile(&serde_json::from_value(request)?)
+                    .map_err(|error| error.message().to_owned())?)
+            };
+            let agent = render(request.clone())?;
+            request["check_scratch"] = serde_json::to_value(&scratch)?;
+            let check = render(request)?;
+            for name in [r"/\.env$", r"/[^/]+\.env$"] {
+                let deny = format!(r#"(deny file-read* file-write* file-link (regex #"{name}"))"#);
+                let offset = check.rfind(&deny).ok_or("missing global env deny")?;
+                for rule in &rules {
+                    assert!(
+                        check[offset..].lines().any(|line| line == rule),
+                        "{variant}: {rule}"
+                    );
+                }
+            }
+            let remaining: Vec<_> = check
+                .lines()
+                .filter(|line| !rules.iter().any(|rule| rule == line))
+                .collect();
+            assert_eq!(remaining, agent.lines().collect::<Vec<_>>(), "{variant}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn versioned_protocol_is_strict() -> Result<(), serde_json::Error> {

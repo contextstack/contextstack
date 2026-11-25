@@ -400,10 +400,13 @@ def test_agent_probes():
 
         class FakeCs:
             HOME = home
+            KIT = CODE_ROOT
 
             @staticmethod
             def read_json(path, default):
                 reads.append(path)
+                if path == CODE_ROOT / "ops/bin/executor-templates.json":
+                    return json.loads(path.read_text())
                 return default
 
         init = module.Init.__new__(module.Init)
@@ -425,21 +428,74 @@ def test_agent_probes():
         init.args = SimpleNamespace(no_first_job=False, first_job=False, agent=None)
         init.marker_data = lambda: {}
         init.say = output.append
+        init.require_services = lambda: None
         agents = [{"name": name, "template": template, "path": str(binary), "signed_in": False}
                   for name, template in module.AGENTS.items()]
         rc = init.step_first_job("fixture", agents)
         init.prepare_welcome = lambda: fail("no-agent init must not create a welcome conversation")
         init.next_steps()
-        expect(rc == 1 and output[0] == "Almost ready: ContextStack needs a coding agent."
-               and output[-1] == "Then run: cs init" and len(output) == 6,
-               "no-agent ending names four agents and asks to rerun init")
+        expect(rc == 0 and output[0] == "Next: install a coding agent."
+               and output[-1] == "Then run: cs init" and len(output) == 5,
+               "no-agent ending names three agents and asks to rerun init")
         expect(all(module.LABELS[n] in output[i] and module.sign_in_command(n) in output[i]
-                   for i, n in enumerate(("claude", "codex", "cursor-agent", "gemini"), 1)),
+                   for i, n in enumerate(("claude", "codex", "cursor-agent"), 1)),
                "no-agent ending uses shared sign-in commands")
         expect(not any("ContextStack is ready" in line or "conversation" in line for line in output),
                "no-agent ending has no ready line or conversation link")
 
 
+
+
+def test_installer_setup_without_agents():
+    import contextlib
+    import io
+    from unittest.mock import patch
+    import cs_init
+
+    class ServiceFailure(Exception):
+        pass
+
+    with scratch_dir(prefix="cs-init-install-") as tmp:
+        home = Path(tmp)
+        current = home / "current"
+        current.symlink_to("releases/fixture")
+        cs = SimpleNamespace(ROOT=home, CONFIG=home, CURRENT=current, KIT=CODE_ROOT, Stop=ServiceFailure,
+                             read_json=lambda path, default: json.loads(path.read_text()),
+                             need_install=lambda: None, need_launchd=lambda: None)
+        init = cs_init.Init.__new__(cs_init.Init)
+        init.cs = cs
+        init.url = "http://fixture"
+        init.step_disk = init.step_toolchains = init.step_cli_pins = init.step_keys = lambda: None
+        init.step_agents = lambda: []
+        init.step_services = lambda: "fixture"
+        init.marker_data = lambda: {}
+        init.wait_up = lambda: (True, True)
+        for install_setup in (True, False):
+            args = SimpleNamespace(install_setup=install_setup, no_first_job=False, first_job=False, agent=None)
+            init.args = args
+            out = io.StringIO()
+            with patch.object(cs_init, "Init", return_value=init), contextlib.redirect_stdout(out), \
+                    patch.object(cs_init._install_setup, "init_setup_refusal", return_value=None):
+                rc = cs_init.main(cs, args)
+            expect(rc == 0 and "Next: install a coding agent." in out.getvalue(),
+                   "init without agents returns 0 when install_setup=%s" % install_setup)
+            expect(not any(label in out.getvalue() for label in ("Gemini", "Goose")),
+                   "unavailable agents are omitted when install_setup=%s" % install_setup)
+            expect(out.getvalue().splitlines().count("Services: Director at http://fixture, gateway, node fixture") == 1,
+                   "init reports services once when install_setup=%s" % install_setup)
+
+        init.wait_up = lambda: (False, True)
+        for install_setup in (True, False):
+            init.args = args = SimpleNamespace(install_setup=install_setup, no_first_job=False, first_job=False, agent=None)
+            with patch.object(cs_init, "Init", return_value=init), contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(cs_init._install_setup, "init_setup_refusal", return_value=None):
+                try:
+                    cs_init.main(cs, args)
+                except ServiceFailure as error:
+                    expect("the Director does not answer" in str(error),
+                           "init preserves service failures when install_setup=%s" % install_setup)
+                else:
+                    fail("init suppressed a service failure when install_setup=%s" % install_setup)
 
 
 def test_failed_first_job_ending():
@@ -701,6 +757,29 @@ def test_api_keys():
         expect(store.read_text() == "fake-api-key", "--api-key stores a key through the fake gateway")
         expect(restarts == [("kickstart", "-k", "gui/%d/fixture-gateway" % os.getuid())],
                "--api-key restarts the gateway")
+        # unset CSGATEWAY_CREDENTIALS is the gateway's file store (the default), never "no store"
+        gateway.write_text("#!%s\nimport os, pathlib, sys\n"
+                           "pathlib.Path(sys.argv[0]).with_name('seen').write_text(repr(os.environ.get('CSGATEWAY_CREDENTIALS')))\n"
+                           "input()\n" % sys.executable)
+        init.cs = SimpleNamespace(CURRENT=root, GATEWAY="fixture-gateway", Stop=Exception,
+                                  load_plist=lambda label: (None, {"EnvironmentVariables": {}}))
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"fake-api-key\n")
+        os.close(write_fd)
+        saved_stdin = os.dup(0)
+        refused = None
+        try:
+            os.dup2(read_fd, 0)
+            os.close(read_fd)
+            init.step_keys()
+        except Exception as error:
+            refused = error
+        finally:
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+        seen = root / "bin/seen"
+        expect(refused is None and seen.is_file() and seen.read_text() == "''",
+               "--api-key with CSGATEWAY_CREDENTIALS unset uses the default file store: %r" % refused)
 
 
 def test_browser_handoff():
@@ -842,6 +921,16 @@ def test_quiet_details():
             text = "\n".join(output)
             for detail in ("registration", "fixture-service", "launchd", "loaded"):
                 expect((detail in text) == verbose, detail + " only under verbose")
+        # activate drains active jobs for up to the drain bound: a shorter kill leaves a half-switched release
+        sys.path.insert(0, str(CODE_ROOT / "scripts"))
+        from _node_layout import DRAIN_DEFAULT_WAIT_S
+        timeouts = []
+        init.run = lambda argv, timeout=30, **kw: timeouts.append(timeout) or SimpleNamespace(
+            returncode=0, stdout=json.dumps({"ok": True}))
+        init.pending.write_text("fixture registration")
+        init.activate("fixture")
+        expect(timeouts and all(t is None or t > DRAIN_DEFAULT_WAIT_S for t in timeouts),
+               "activate is never killed inside the drain bound (%ss): %s" % (DRAIN_DEFAULT_WAIT_S, timeouts))
     output.clear()
     init.disk = lambda: (True, "FileVault", "FileVault is On.")
     init.step_disk()
@@ -991,6 +1080,7 @@ def main():
     test_progress_retry()
     test_agent_probes()
     test_login_and_fallback()
+    test_installer_setup_without_agents()
     test_failed_first_job_ending()
     test_machine_name_refusal()
     test_api_keys()

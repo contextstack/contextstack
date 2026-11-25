@@ -16,7 +16,8 @@ HERE = Path(__file__).resolve().parent
 CODE_ROOT = HERE.parent.parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
-from _estate_io import hardened_git_env, state_dir, append_jsonl, sha256_bytes
+from _estate_io import state_dir, append_jsonl, sha256_bytes
+from _harvest_git import host_git as git
 
 TS = re.compile(r"^(\d{8})-\d{6}")
 FAMILIES = ("corpus-*", "exp-*", "flowchart/director", "probes", "other")
@@ -39,10 +40,6 @@ def family_of(name):
 def run_date(name):
     match = TS.match(name)
     return match.group(1) if match else ""
-
-
-def git(cwd, *args):
-    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", str(cwd), *args], capture_output=True, text=True, env=hardened_git_env())
 
 
 def dir_size(path):
@@ -167,8 +164,7 @@ def reconstruct_evidence(run_dir, source_repo, base_sha):
 def reconstruct(source_repo, base_sha, diff_path):
     staging = Path(tempfile.mkdtemp(prefix="prune-rebuild-"))
     try:
-        cloned = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "clone", "--quiet", str(source_repo), str(staging / "ws")],
-                                capture_output=True, text=True, env=hardened_git_env())
+        cloned = git(staging, "clone", "--quiet", str(source_repo), str(staging / "ws"))
         if cloned.returncode:
             raise ValueError(cloned.stderr or "clone failed")
         clone = staging / "ws"

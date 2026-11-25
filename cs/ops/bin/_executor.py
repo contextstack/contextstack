@@ -14,16 +14,18 @@ import _lanes
 from functools import partial
 
 from _agent_stream import CursorAvailability, CursorEditRefusals, Events, Mapper, append as append_event, dialect, run_streaming, signals as stream_signals
+from _dispatch import executor_template
 from _provider_limits import detect_limit, enrich_allowance, limit_signal, record_limit
 from _cli_native import stage_copies, finish_copies, stage_claude_login, snapshot_login_files, stage as stage_native, terminal_stop, unstage as unstage_native, verify_login_files
 from _est import parse_usage
 import _run_record
 from _job_reason import persist_output, redact
-from _stuck import Monitor as StuckMonitor, parse_budget_stuck, write_report as write_stuck_report
+from _stuck import Monitor as StuckMonitor, agent_profile_writes, parse_budget_stuck, resolve_stuck_writes, write_report as write_stuck_report
 from _roots import NAMES as ROOT_ENV, task_label, transcript_id
 from _frozen_inputs import stage_frozen_inputs
 from _grant import covers_path, cover
-from _muse import Cancelled, run_process
+from _harvest_git import host_git
+from _muse import Cancelled, CleanupFailed, run_process
 from _setup_workspace import materialize
 
 HERE = Path(__file__).resolve().parent
@@ -92,6 +94,14 @@ def names_executor(spec, name):
     return spec.get("model") == name or name in spec_hypothesis(spec)
 
 
+def cli_args(template, workspace, turns, prompt, goal):
+    args = []
+    for part in template.get("args") or []:
+        part = part.replace("{{workspace}}", str(workspace)).replace("{{turns}}", turns)
+        args.append(part.replace("{{prompt}}", prompt).replace("{{goal}}", goal))
+    return args
+
+
 def allowlist_env(extra_drop, tmpdir, workspace=None):
     drop = {str(k) for k in (extra_drop or [])}
     from _toolchains import lane_path, toolchain_lane_env
@@ -113,6 +123,49 @@ def trusted_op_env(env):
 
 def research_prompt(repo_view, goal):
     return f"Research the question using the read-only repository snapshot at {repo_view}. Do not commit.\n\n{goal}"
+
+
+CODING_PREFIX = (
+    "Implement the task in the current working directory. "
+    "Do not leave this directory. Do not commit unless asked.\n\n"
+)
+
+
+def is_chat_spec(spec):
+    """Built-in chat (`id: chat`): conversational framing, not a coding lane."""
+    return isinstance(spec, dict) and str(spec.get("id") or "") == "chat"
+
+
+def spec_prompt_paths(spec):
+    """Prompt files the harness freezes into system.txt: `system`, then each `context` entry."""
+    if not isinstance(spec, dict):
+        return []
+    paths = []
+    system = spec.get("system")
+    if isinstance(system, str) and system.strip():
+        paths.append(system.strip())
+    context = spec.get("context")
+    if isinstance(context, list):
+        for item in context:
+            if isinstance(item, str) and item.strip():
+                paths.append(item.strip())
+    return paths
+
+
+def cli_prompt(*, chat, goal, stim_dir, repo_view=None, plan_path=None, approval_prefix=None):
+    """The string the CLI receives: chat uses frozen system.txt + goal; coding lanes keep the task framing."""
+    if chat:
+        system = (stim_dir / "system.txt").read_text(encoding="utf-8").strip()
+        prompt = f"{system}\n\n{goal}" if system else goal
+    elif repo_view is not None:
+        prompt = research_prompt(repo_view, goal)
+        if plan_path is not None:
+            prompt = f"Write the plan to {plan_path}.\n\n{prompt}"
+    else:
+        prompt = CODING_PREFIX + goal
+    if approval_prefix:
+        prompt = approval_prefix + "\n\n" + prompt
+    return prompt
 
 
 def collect_plan(source, destination):
@@ -138,7 +191,7 @@ def require_executor_sandbox():
 
 
 def sandbox_cmd(binary, args, ws, tmpdir, profile_path, protected=None, read_links=(), login_writes=None,
-                read_roots=(), home_reads=(), *, env=None, policy=None, caller=None):
+                read_roots=(), home_reads=(), *, env=None, policy=None, caller=None, check_scratch=None):
     from _estate_io import native_sandbox_request, render_native_sandbox
     require_executor_sandbox()
     if sys.platform != "darwin":
@@ -150,6 +203,8 @@ def sandbox_cmd(binary, args, ws, tmpdir, profile_path, protected=None, read_lin
     request = native_sandbox_request(binary, ws, tmpdir, HOME, protected=protected,
                                      read_links=read_links, login=login_writes,
                                      read_roots=read_roots, home_reads=home_reads, env=env, caller=caller)
+    if check_scratch is not None:
+        request["check_scratch"] = str(Path(check_scratch).resolve())
     profile_path.write_bytes(render_native_sandbox(CODE_ROOT, policy, request))
     return ["sandbox-exec", "-f", str(profile_path), binary, *args]
 
@@ -169,26 +224,7 @@ def claude_auth_refresh_cmd(binary, args):
 
 def changed_paths(ws, base, lane=None, *, env=None):
     lane_ctx = {"main": lane["main"], "lane": lane["lane"]} if lane else None
-    if lane_ctx:
-        return _lanes.workspace_changed_paths(ws, base, lane_ctx=lane_ctx, env=env)
-    names = []
-    for args in (
-        ("diff", "--name-only", "%s..HEAD" % base),
-        ("diff", "--cached", "--name-only"),
-        ("diff", "--name-only"),
-        ("ls-files", "--others", "--exclude-standard"),
-    ):
-        done = _lanes.workspace_git(ws, *args, lane_ctx=None, env=env)
-        if done.returncode != 0:
-            fail("git %s: %s" % (args[0], (done.stderr or done.stdout or "").strip()))
-        names.extend((done.stdout or "").splitlines())
-    seen, out = set(), []
-    for n in names:
-        n = n.strip()
-        if n and n not in seen:
-            seen.add(n)
-            out.append(n)
-    return out
+    return _lanes.workspace_changed_paths(ws, base, lane_ctx=lane_ctx, env=env)
 
 
 def changed_state(ws, base, paths=None):
@@ -245,8 +281,9 @@ def main(argv=None) -> int:
 
     threading.Thread(target=owner_lifetime, daemon=True).start()
     name = str(a.get("executor") or "").strip()
+    template_name = name.partition(":")[0]
     templates = json.loads(TEMPLATES.read_text())
-    tmpl = templates.get(name)
+    tmpl = executor_template(templates, name)
     if not tmpl:
         fail("unknown executor %s (templates: %s)" % (name, ", ".join(sorted(templates))))
     require_executor_sandbox()
@@ -322,6 +359,21 @@ def main(argv=None) -> int:
         stuck_config = parse_budget_stuck(spec.get("budget") if isinstance(spec, dict) else None)
     except ValueError as error:
         fail(str(error))
+    agent_name = str(a.get("agent") or "").strip()
+    order_writes = a.get("writes") if isinstance(a.get("writes"), bool) else None
+    check_text = ""
+    try:
+        check_text = (task / "check").read_text(encoding="utf-8")
+    except OSError:
+        pass
+    stuck_config["writes"] = resolve_stuck_writes(
+        writes=order_writes,
+        agent_writes=agent_profile_writes(CODE_ROOT / "agents", agent_name) if agent_name else None,
+        has_grant=bool(gid),
+        agent_named=bool(agent_name),
+        repo_read_only=isinstance(spec, dict) and spec.get("repo_read_only") is True,
+        read_only_check="is read-only (writes: false)" in check_text,
+    )
     trial = int(a["trial"]) if a.get("trial") not in (None, "") else 1
     if trial_limit is not None and trial > trial_limit:
         fail("trial %d exceeds spec trials %d" % (trial, trial_limit))
@@ -470,11 +522,12 @@ def main(argv=None) -> int:
             done = _lanes.workspace_git(ws, *args, env=child_env)
             if done.returncode != 0:
                 fail("git %s: %s" % (args[0], (done.stderr or done.stdout or "").strip()))
-        subprocess.run(
-            ["git", "-C", str(ws), *_lanes.LANE_GIT_HARDEN, "-c", "user.name=ContextStack", "-c", "user.email=cs@local",
-             "commit", "--allow-empty", "-q", "-m", "executor base"],
-            capture_output=True, env=child_env,
+        done = host_git(
+            ws, "commit", "--allow-empty", "-q", "-m", "executor base", env=child_env,
+            ident=("-c", "user.name=ContextStack", "-c", "user.email=cs@local"),
         )
+        if done.returncode:
+            fail("git commit: " + (done.stderr or done.stdout or "").strip())
 
     if lane:
         base = _lanes.lane_out(lane["main"], lane["lane"], ws, "rev-parse", "HEAD", env=child_env)
@@ -515,11 +568,14 @@ def main(argv=None) -> int:
         run({**globals(), **locals()})
         raise SystemExit(0)
 
+    chat = is_chat_spec(spec)
+    # Chat freezes the conversation system prompt and thread (as the harness does); coding jobs omit prompts.
     stim, stim_err = run_op(CODE_ROOT, "capture-stimulus", {
         "run_dir": str(run_dir), "run_id": run_id, "task": str(task),
         "spec": spec_rel, "spec_sha": spec_sha(spec_path) if spec_path else "",
         "trial": trial, "adapter": "executor", "workspace": str(ws),
         "grant": gid or "", "grant_known": True, "authority": "work order",
+        "prompts": spec_prompt_paths(spec) if chat else [],
         "executor_files": ["ops/bin/_executor.py", "ops/bin/_cli_budget.py"] if limits is not None else [],
     })
     if stim_err:
@@ -528,21 +584,17 @@ def main(argv=None) -> int:
     # The CLI is prompted from the frozen goal, never the live task.
     from _muse_adapter import goal_with_context
     goal = goal_with_context(stim_dir)
-    prompt = (
-        "Implement the task in the current working directory. "
-        "Do not leave this directory. Do not commit unless asked.\n\n" + goal
-    )
-    if repo_view:
-        prompt = research_prompt(repo_view, goal)
-        if planning_lane:
-            prompt = f"Write the plan to {cli_tmp / 'plan.md'}.\n\n{prompt}"
+    discovery = None
     if approval_prefix:
-        prompt = _lane_mcp.DISCOVERY + "\n\n" + prompt
+        import _lane_mcp
+        discovery = _lane_mcp.DISCOVERY
+    prompt = cli_prompt(
+        chat=chat, goal=goal, stim_dir=stim_dir,
+        repo_view=repo_view, plan_path=(cli_tmp / "plan.md") if planning_lane else None,
+        approval_prefix=discovery,
+    )
     turns = str(budget_turns(spec, job_budget))
-    args = []
-    for part in tmpl.get("args") or []:
-        part = part.replace("{{workspace}}", str(ws)).replace("{{turns}}", turns)
-        args.append(part.replace("{{prompt}}", prompt).replace("{{goal}}", goal))
+    args = cli_args(tmpl, ws, turns, prompt, goal)
 
     cost_class, unmetered = resolve_harness_cost(tmpl, args)
 
@@ -609,7 +661,7 @@ def main(argv=None) -> int:
             # Notify and pause only when the job reported a sign-in failure the trusted refresh did not fix.
             # A failed maintenance refresh after a successful job, or a quota error, is not a dead login.
             if expired and login_refresh_status not in ("written_back", "unchanged"):
-                notice(state_dir(CODE_ROOT), name, Path(binary).name, home=HOME)
+                notice(state_dir(CODE_ROOT), name.partition(":")[0], Path(binary).name, home=HOME)
 
 
     def cleanup():
@@ -889,6 +941,29 @@ def main(argv=None) -> int:
             except ValueError:
                 pass
             emit("fail", "timeout" if timed_out else "cancelled")
+        except RuntimeError as error:
+            # Job-process cleanup or tracking failed (seen live: 'job process cleanup deadline
+            # exceeded'). The CLI's work may be complete: keep its output and end with a
+            # retryable stop row instead of crashing before any row (a non-retryable no_row void).
+            note = "%s job process cleanup failed: %s" % (stage, error)
+            if mapper is not None:
+                close_turn(mapper, note)
+            row["seconds"] = time.time() - started
+            row["cli_exit"] = getattr(error, "returncode", None)
+            row["note"] = note[:480]
+            log = (
+                "stage=%s\ncleanup failed: %s\nstdout:\n%s\nstderr:\n%s\n"
+                % (stage, error, timeout_output(getattr(error, "stdout", "")),
+                   timeout_output(getattr(error, "stderr", "")))
+            )
+            persist_output(run_dir / "cli.log", log)
+            persist_output(run_dir / "transcript.md", log)
+            record_usage(log)
+            try:
+                verify_login_files(tmpl, HOME, login_snapshot)
+            except ValueError:
+                pass
+            emit("fail", "interrupted")
 
 
     row["cli_invoked"] = True
@@ -966,7 +1041,7 @@ def main(argv=None) -> int:
     if forced_meta and str(forced_meta.get("stop") or "") == "provider_limit":
         pl = forced_meta.get("provider_limit") if isinstance(forced_meta.get("provider_limit"), dict) else {}
         try:
-            record_limit(state_dir(CODE_ROOT), name, dict(pl, template=name))
+            record_limit(state_dir(CODE_ROOT), template_name, dict(pl, template=template_name))
         except OSError:
             pass
     if forced_meta and str(forced_meta.get("stop", "")).startswith("stuck:") and stuck_monitor is not None and not (run_dir / "stuck.md").is_file():
@@ -1016,12 +1091,12 @@ def main(argv=None) -> int:
                 native_stop = 'auth_expired' if AUTH_EXPIRED.search(auth_text) else 'native_terminal_error'
     # A run that succeeded wasn't limited, whatever its output says (the agent's work can quote a limit message).
     if not forced_meta and native_stop not in ("auth_expired", "provider_unavailable", "done"):
-        limit_hit = detect_limit(name, Path(binary).name, cli.stdout, cli.stderr, row.get("allowance"))
+        limit_hit = detect_limit(template_name, Path(binary).name, cli.stdout, cli.stderr, row.get("allowance"))
         if limit_hit:
             row["allowance"] = enrich_allowance(row.get("allowance"), limit_hit)
             row["reason"] = limit_hit["message"]
             try:
-                record_limit(state_dir(CODE_ROOT), name, limit_hit)
+                record_limit(state_dir(CODE_ROOT), template_name, limit_hit)
             except OSError:
                 pass
             if native_stop != "done" or row.get("allowance", {}).get("rejected"):
@@ -1033,10 +1108,10 @@ def main(argv=None) -> int:
         # Only CLIs whose login file is known: a re-login (file change) can then lift the pause.
         from _provider_limits import notice
         if login_refresh_status not in ("written_back", "unchanged"):
-            notice(state_dir(CODE_ROOT), name, Path(binary).name, home=HOME)
+            notice(state_dir(CODE_ROOT), template_name, Path(binary).name, home=HOME)
     elif native_stop == "done" and login_refresh_status in (None, "written_back", "unchanged"):
         from _provider_limits import clear_pause
-        clear_pause(state_dir(CODE_ROOT), name)
+        clear_pause(state_dir(CODE_ROOT), template_name)
     complete("task", native_stop)
 
 

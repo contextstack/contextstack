@@ -5,7 +5,7 @@
 //! | `state` | Meaning |
 //! | --- | --- |
 //! | `free` | no budget applied when it was created; its charge still counts once it settles |
-//! | `held` | `reserved_micros` is set aside and written into its spec; it is offered |
+//! | `held` | `reserved_micros` is set aside and written into its spec; it is offered, or waits (`jobs.state = 'waiting'`, `reason = 'executor_unavailable'`) until its node can run it |
 //! | `waiting` | nothing remained; the job is created and held (`jobs.state = 'waiting'`), with `reason` and `detail` |
 //! | `settled` | `charged_micros` is spent, the rest released: its runs reported, or it closed before they did |
 //!
@@ -369,32 +369,57 @@ pub fn release(store: &Store, db: &Connection) -> Res<usize> {
         .map_err(db_err)?;
     let mut offered = 0;
     for (job_id, scope, ceiling, trials, spec, reason, detail) in held {
-        match budget::place(ceiling, &rooms(db, &scope)?) {
-            Place::Wait(w) => {
-                if reason.as_deref() != Some(w.reason) || detail.as_ref() != Some(&w.detail) {
-                    db.execute(
-                        "UPDATE job_budgets SET reason = ?1, detail = ?2 WHERE job_id = ?3",
-                        params![w.reason, w.detail, job_id],
-                    )
-                    .map_err(db_err)?;
-                    touch(db, Record::Job, &job_id).map_err(db_err)?;
+        // One row that cannot be offered (its spec cannot carry a reservation, say) is logged and left waiting;
+        // it never stops the others, the sweep, a budget change or the Director starting.
+        let one = || -> Res<bool> {
+            match budget::place(ceiling, &rooms(db, &scope)?) {
+                Place::Wait(w) => {
+                    if reason.as_deref() != Some(w.reason) || detail.as_ref() != Some(&w.detail) {
+                        db.execute(
+                            "UPDATE job_budgets SET reason = ?1, detail = ?2 WHERE job_id = ?3",
+                            params![w.reason, w.detail, job_id],
+                        )
+                        .map_err(db_err)?;
+                        touch(db, Record::Job, &job_id).map_err(db_err)?;
+                    }
+                    Ok(false)
+                }
+                place => {
+                    let reserved = match place {
+                        Place::Reserve(m) => m,
+                        _ => 0,
+                    };
+                    let sent = offer_job(store, db, &job_id, &spec, trials, reserved)?;
+                    touch_scopes(db, &scope)?;
+                    Ok(sent)
                 }
             }
-            place => {
-                let reserved = match place {
-                    Place::Reserve(m) => m,
-                    _ => 0,
-                };
-                offer_job(store, db, &job_id, &spec, trials, reserved)?;
-                touch_scopes(db, &scope)?;
-                offered += 1;
-            }
+        };
+        match savepoint(db, "release_job", one) {
+            Ok(sent) => offered += usize::from(sent),
+            Err(e) => crate::logf!("job {job_id}: left waiting, it could not be offered: {e}"),
         }
     }
     Ok(offered)
 }
 
-/// A waiting job is offered: its spec carries the amount reserved (none when its budget was removed meanwhile).
+/// Run `f` under a named savepoint, rolling back only its own changes when it fails.
+pub(crate) fn savepoint<T>(db: &Connection, name: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    db.execute_batch(&format!("SAVEPOINT {name}"))
+        .map_err(db_err)?;
+    let done = f();
+    let end = if done.is_ok() {
+        format!("RELEASE {name}")
+    } else {
+        format!("ROLLBACK TO {name}; RELEASE {name}")
+    };
+    db.execute_batch(&end).map_err(db_err)?;
+    done
+}
+
+/// A waiting job's budget allows it: its spec carries the amount reserved (none when its budget was removed
+/// meanwhile). It is offered (`Ok(true)`) unless its node cannot run it; then it keeps the reservation, which
+/// still counts against its budgets, and waits for executor fit (`capabilities::offer_waiting`).
 pub fn offer_job(
     store: &Store,
     db: &Connection,
@@ -402,7 +427,7 @@ pub fn offer_job(
     spec: &str,
     trials: u32,
     reserved: Micros,
-) -> Res<()> {
+) -> Res<bool> {
     let mut files = crate::jobs::bundle_of_job(db, job_id).map_err(db_err)?;
     if reserved > 0 {
         rewrite(store, &mut files, spec, budget::per_run(reserved, trials))?;
@@ -418,23 +443,44 @@ pub fn offer_job(
         )
         .map_err(db_err)?;
     }
+    let (node_id, node_name): (i64, String) = db
+        .query_row(
+            "SELECT n.id, n.name FROM jobs j JOIN nodes n ON n.id = j.node_id WHERE j.job_id = ?1",
+            params![job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(db_err)?;
     let now = now_utc();
+    let state = if reserved > 0 { "held" } else { "free" };
+    let wait = crate::capabilities::capability_wait(store, db, node_id, &files, spec, &node_name);
     db.execute(
-        "UPDATE jobs SET state = 'offered', bundle_sha256 = ?1 WHERE job_id = ?2 AND state = 'waiting'",
-        params![bundle_sha(&files), job_id],
+        "UPDATE job_budgets SET state = ?1, reserved_micros = ?2, reserved_at = ?3, reason = ?4, detail = ?5
+         WHERE job_id = ?6",
+        params![state, reserved, now, wait.as_ref().map(|w| w.reason), wait.as_ref().map(|w| &w.detail), job_id],
     )
     .map_err(db_err)?;
-    db.execute(
-        "UPDATE job_budgets SET state = ?1, reserved_micros = ?2, reserved_at = ?3, reason = NULL, detail = NULL
-         WHERE job_id = ?4",
-        params![if reserved > 0 { "held" } else { "free" }, reserved, now, job_id],
-    )
-    .map_err(db_err)?;
+    if wait.is_none() {
+        db.execute(
+            "UPDATE jobs SET state = 'offered', bundle_sha256 = ?1, offered_at = ?3 WHERE job_id = ?2 AND state = 'waiting'",
+            params![bundle_sha(&files), job_id, now],
+        )
+        .map_err(db_err)?;
+    } else {
+        db.execute(
+            "UPDATE jobs SET bundle_sha256 = ?1 WHERE job_id = ?2",
+            params![bundle_sha(&files), job_id],
+        )
+        .map_err(db_err)?;
+    }
     touch(db, Record::Job, job_id).map_err(db_err)?;
-    crate::logf!(
-        "job {job_id}: offered after waiting for budget (reserved {reserved} micro-dollars)"
-    );
-    Ok(())
+    if wait.is_some() {
+        crate::logf!(
+            "job {job_id}: reserved {reserved} micro-dollars; waiting for {node_name} to run it"
+        );
+    } else {
+        crate::logf!("job {job_id}: offered after waiting (reserved {reserved} micro-dollars)");
+    }
+    Ok(wait.is_none())
 }
 
 /// Run `f` under a savepoint: a failure is logged and rolled back on its own, never failing the caller.
@@ -480,25 +526,24 @@ pub fn after_envelope(db: &Connection, job_terminal: bool, subject: &str) {
     });
 }
 
-/// A cancel of a job was applied on its node (`stopped` or `already_finished`): its reservation closes. A job the
-/// node never accepted and says it will never start is over: it ends `error` and costs $0.
+/// A cancel of a job was applied on its node (`stopped` or `already_finished`): its reservation closes. A job with
+/// no live run that the node stops (still `offered`, or `accepted` with no run / live events / report) is over: it
+/// ends `error` with terminal `cancelled` and costs $0. An accepted job with run evidence waits for `job_terminal`.
 pub fn after_cancel(db: &Connection, job_id: &str, outcome: &str) {
     guarded(db, job_id, || {
-        if outcome == "stopped" {
-            let never = db
-                .execute(
-                    "UPDATE jobs SET state = 'error', finished_at = ?1, terminal_row = ?2, error = ?3
-                     WHERE job_id = ?4 AND state = 'offered' AND accepted_at IS NULL",
-                    params![
-                        now_utc(),
-                        json!({"state": "cancelled", "detail": "cancelled before its node started it"})
-                            .to_string(),
-                        "cancelled before its node started it",
-                        job_id
-                    ],
-                )
-                .map_err(db_err)?
-                > 0;
+        // A node that finds nothing running answers `already_finished`; with no run evidence it ends the same way.
+        if outcome == "stopped" || outcome == "already_finished" {
+            let never = finish_cancel_without_run(
+                db,
+                job_id,
+                "offered",
+                "cancelled before its node started it",
+            )? || finish_cancel_without_run(
+                db,
+                job_id,
+                "accepted",
+                "cancelled: its node had nothing to stop",
+            )?;
             if never {
                 touch(db, Record::Job, job_id).map_err(db_err)?;
             }
@@ -506,6 +551,112 @@ pub fn after_cancel(db: &Connection, job_id: &str, outcome: &str) {
         settle(db, job_id, Some("cancel"))?;
         Ok(())
     });
+}
+
+/// The terminal path after a cancel is applied: end a no-run job when that applies, settle its reservation, offer
+/// waiting work. Shared by a newly applied control, a second `POST …/cancel`, and the startup orphan sweep.
+pub fn on_cancel_applied(store: &Store, db: &Connection, job_id: &str, outcome: &str) {
+    after_cancel(db, job_id, outcome);
+    crate::settle::after_envelope(store, db, true, job_id);
+    release_logged(store, db, job_id);
+}
+
+/// An applied cancel (`stopped`) on a still-open job with no run evidence: the outcome string, else `None`.
+fn orphan_applied_cancel_outcome(db: &Connection, job_id: &str) -> Res<Option<String>> {
+    db.query_row(
+        "SELECT k.outcome FROM jobs j
+         JOIN cancels c ON c.job_id = j.job_id
+         JOIN controls k ON k.control_id = c.control_id
+         WHERE j.job_id = ?1 AND j.state IN ('offered', 'accepted')
+           AND k.state = 'applied' AND k.outcome IN ('stopped', 'already_finished')
+           AND j.run_id IS NULL
+           AND NOT EXISTS (SELECT 1 FROM live_runs WHERE job_id = j.job_id)
+           AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = j.job_id)",
+        params![job_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// Finish a non-terminal job whose cancel is already applied and that has no run evidence (the live gap when a
+/// cancel was applied before the Director ended such jobs). Same terminal path as a newly applied cancel.
+/// Returns whether the job was ended.
+pub fn finish_orphan_applied_cancel(store: &Store, db: &Connection, job_id: &str) -> Res<bool> {
+    let Some(outcome) = orphan_applied_cancel_outcome(db, job_id)? else {
+        return Ok(false);
+    };
+    on_cancel_applied(store, db, job_id, &outcome);
+    let ended: bool = db
+        .query_row(
+            "SELECT state = 'error' FROM jobs WHERE job_id = ?1",
+            params![job_id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    Ok(ended)
+}
+
+/// At start: finish every non-terminal job with an applied cancel and no run evidence. Returns how many ended.
+pub fn sweep_orphan_applied_cancels(store: &Store) -> Res<usize> {
+    let mut db = store.db();
+    let mut stmt = db
+        .prepare(
+            "SELECT j.job_id FROM jobs j
+             JOIN cancels c ON c.job_id = j.job_id
+             JOIN controls k ON k.control_id = c.control_id
+             WHERE j.state IN ('offered', 'accepted')
+               AND k.state = 'applied' AND k.outcome IN ('stopped', 'already_finished')
+               AND j.run_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM live_runs WHERE job_id = j.job_id)
+               AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = j.job_id)",
+        )
+        .map_err(db_err)?;
+    let jobs: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    drop(stmt);
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+    let tx = crate::store::write_tx(&mut db).map_err(db_err)?;
+    let mut finished = 0;
+    for job_id in &jobs {
+        if finish_orphan_applied_cancel(store, &tx, job_id)? {
+            crate::logf!("job {job_id}: finished orphan applied cancel");
+            finished += 1;
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(finished)
+}
+
+/// End a job that a cancel stopped before any run existed (`offered`, or `accepted` with no named run,
+/// live events, or reported run). An accepted job that already has run evidence waits for `job_terminal`.
+fn finish_cancel_without_run(
+    db: &Connection,
+    job_id: &str,
+    state: &str,
+    detail: &str,
+) -> Res<bool> {
+    Ok(db
+        .execute(
+            "UPDATE jobs SET state = 'error', finished_at = ?1, terminal_row = ?2, error = ?3
+             WHERE job_id = ?4 AND state = ?5 AND run_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM live_runs WHERE job_id = ?4)
+               AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = ?4)",
+            params![
+                now_utc(),
+                json!({"state": "cancelled", "detail": detail}).to_string(),
+                detail,
+                job_id,
+                state
+            ],
+        )
+        .map_err(db_err)?
+        > 0)
 }
 
 /// The bounds after which a held reservation closes though its job has not ended (`serve
@@ -537,7 +688,8 @@ pub fn sweep(store: &Store, bounds: Bounds) -> Res<usize> {
             "SELECT b.job_id, CASE WHEN COALESCE(n.last_seen_at, '') <= ?1 AND b.reserved_at <= ?1 THEN 'node_stale'
                                    ELSE 'timeout' END
              FROM job_budgets b JOIN jobs j ON j.job_id = b.job_id JOIN nodes n ON n.id = j.node_id
-             WHERE b.state = 'held' AND ((COALESCE(n.last_seen_at, '') <= ?1 AND b.reserved_at <= ?1)
+             WHERE b.state = 'held' AND j.state <> 'waiting'
+               AND ((COALESCE(n.last_seen_at, '') <= ?1 AND b.reserved_at <= ?1)
                                          OR b.reserved_at <= ?2)",
         )
         .map_err(db_err)?;
@@ -695,6 +847,20 @@ mod tests {
         assert_eq!(state(&store, &b)?, ("waiting".into(), "waiting".into()));
         let view = job_view(&store.db(), &b)?;
         assert_eq!(view["reason"], "budget_reserved");
+        let offered_at = |j: &str| -> rusqlite::Result<Option<String>> {
+            store.db().query_row(
+                "SELECT offered_at FROM jobs WHERE job_id = ?1",
+                params![j],
+                |r| r.get(0),
+            )
+        };
+        assert!(offered_at(&a)?.is_some(), "offered at creation");
+        assert_eq!(offered_at(&b)?, None, "a waiting job has not been offered");
+        let held = crate::records::job_waiting(&store.db(), &b)?;
+        assert_eq!(
+            (held["reason"].as_str(), held["detail"].as_str()),
+            (Some("held"), Some("budget_reserved"))
+        );
         // The node sees only the offered job, and its spec carries the reservation.
         assert_eq!(crate::jobs::for_node(&store.db(), 1)?.len(), 1);
         let p = scope_view(&store.db(), "project", "p1")?;
@@ -705,6 +871,14 @@ mod tests {
         finish(&store, &a, 1.5)?;
         assert_eq!(state(&store, &a)?.1, "settled");
         assert_eq!(state(&store, &b)?, ("offered".into(), "held".into()));
+        assert!(
+            offered_at(&b)?.is_some(),
+            "offered when its budget allowed it"
+        );
+        assert!(
+            crate::records::job_waiting(&store.db(), &b)?.is_null(),
+            "within the grace"
+        );
         let vb = job_view(&store.db(), &b)?;
         assert_eq!(
             vb["reserved_usd"].as_f64(),
@@ -987,17 +1161,342 @@ mod tests {
             (v["charged_usd"].as_f64(), v["charge_basis"].as_str()),
             (Some(0.0), Some("no_run"))
         );
-        // Accepted, then stopped: the spend is unknown until the node's end and report arrive.
+        // Accepted with no run, then stopped: ends at once (nothing to stop), $0.
         let b = job(&store, 2.0)?;
         store.db().execute(
             "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE job_id = ?2",
             params![now_utc(), b],
         )?;
         after_cancel(&store.db(), &b, "stopped");
+        assert_eq!(state(&store, &b)?, ("error".into(), "settled".into()));
         let v = view(&store, &b)?;
+        assert_eq!(
+            (v["charged_usd"].as_f64(), v["charge_basis"].as_str()),
+            (Some(0.0), Some("no_run"))
+        );
+        assert_eq!(
+            v["settled_by"].as_str(),
+            Some("ended"),
+            "known end, not a presumed cancel hold"
+        );
+        let (term, err): (String, String) = store.db().query_row(
+            "SELECT terminal_row, error FROM jobs WHERE job_id = ?1",
+            params![b],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&term)?["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(err, "cancelled: its node had nothing to stop");
+        // Accepted with live run evidence: wait for the node's end; reservation presumed until then.
+        let c = job(&store, 2.0)?;
+        store.db().execute(
+            "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE job_id = ?2",
+            params![now_utc(), c],
+        )?;
+        store.db().execute(
+            "INSERT INTO live_runs (run_id, node_id, job_id, confirmed, first_at, last_at)
+             VALUES ('live-run', 1, ?1, 1, ?2, ?2)",
+            params![c, now_utc()],
+        )?;
+        after_cancel(&store.db(), &c, "stopped");
+        assert_eq!(state(&store, &c)?.0, "accepted");
+        let v = view(&store, &c)?;
         assert_eq!(
             (v["charge_basis"].as_str(), v["settled_by"].as_str()),
             (Some("presumed"), Some("cancel"))
+        );
+        Ok(())
+    }
+
+    /// Plant an applied cancel on a still-open job (the pre-fix orphan shape).
+    fn plant_orphan_applied_cancel(store: &Store, job_id: &str) -> R {
+        let now = now_utc();
+        store.db().execute(
+            "INSERT INTO controls (control_id, node_id, kind, body, state, outcome, detail, issued_at, settled_at)
+             VALUES (?1, 1, 'cancel', ?2, 'applied', 'stopped', 'stopped', ?3, ?3)",
+            params![
+                format!("ctl-{job_id}"),
+                json!({"job_id": job_id}).to_string(),
+                now
+            ],
+        )?;
+        store.db().execute(
+            "INSERT INTO cancels (cancel_id, job_id, state, requested_by, requested_at, control_id)
+             VALUES (?1, ?2, 'requested', 'cred', ?3, ?4)",
+            params![
+                format!("can-{job_id}"),
+                job_id,
+                now,
+                format!("ctl-{job_id}")
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_applied_cancel_finishes_on_sweep_and_leaves_run_evidence() -> R {
+        let tmp = tempfile::tempdir()?;
+        let store = setup(tmp.path())?;
+        set(
+            &store.db(),
+            "project",
+            "p1",
+            4_000_000,
+            Period::Total,
+            "cred",
+        )?;
+        // Accepted, no run, cancel already applied: startup sweep ends it.
+        let a = job(&store, 2.0)?;
+        store.db().execute(
+            "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE job_id = ?2",
+            params![now_utc(), a],
+        )?;
+        plant_orphan_applied_cancel(&store, &a)?;
+        assert_eq!(state(&store, &a)?.0, "accepted");
+        assert_eq!(sweep_orphan_applied_cancels(&store)?, 1);
+        assert_eq!(state(&store, &a)?, ("error".into(), "settled".into()));
+        let v = view(&store, &a)?;
+        assert_eq!(
+            (v["charged_usd"].as_f64(), v["charge_basis"].as_str()),
+            (Some(0.0), Some("no_run"))
+        );
+        assert_eq!(sweep_orphan_applied_cancels(&store)?, 0, "once");
+
+        // The node answered `already_finished` (it had nothing running) and never sent job_terminal.
+        let c = job(&store, 2.0)?;
+        store.db().execute(
+            "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE job_id = ?2",
+            params![now_utc(), c],
+        )?;
+        plant_orphan_applied_cancel(&store, &c)?;
+        store.db().execute(
+            "UPDATE controls SET outcome = 'already_finished', detail = 'already_finished' WHERE control_id = ?1",
+            params![format!("ctl-{c}")],
+        )?;
+        assert_eq!(sweep_orphan_applied_cancels(&store)?, 1);
+        assert_eq!(state(&store, &c)?, ("error".into(), "settled".into()));
+
+        // Accepted with live run evidence: sweep leaves it for job_terminal.
+        let b = job(&store, 2.0)?;
+        store.db().execute(
+            "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE job_id = ?2",
+            params![now_utc(), b],
+        )?;
+        plant_orphan_applied_cancel(&store, &b)?;
+        store.db().execute(
+            "INSERT INTO live_runs (run_id, node_id, job_id, confirmed, first_at, last_at)
+             VALUES ('live-orphan', 1, ?1, 1, ?2, ?2)",
+            params![b, now_utc()],
+        )?;
+        assert_eq!(sweep_orphan_applied_cancels(&store)?, 0);
+        assert_eq!(state(&store, &b)?.0, "accepted");
+        assert!(!finish_orphan_applied_cancel(&store, &store.db(), &b)?);
+        assert_eq!(state(&store, &b)?.0, "accepted");
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_applied_cancel_finishes_when_asked_again() -> R {
+        let tmp = tempfile::tempdir()?;
+        let store = setup(tmp.path())?;
+        set(
+            &store.db(),
+            "project",
+            "p1",
+            2_000_000,
+            Period::Total,
+            "cred",
+        )?;
+        let a = job(&store, 2.0)?;
+        store.db().execute(
+            "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE job_id = ?2",
+            params![now_utc(), a],
+        )?;
+        plant_orphan_applied_cancel(&store, &a)?;
+        assert!(finish_orphan_applied_cancel(&store, &store.db(), &a)?);
+        assert_eq!(state(&store, &a)?, ("error".into(), "settled".into()));
+        let err: String = store.db().query_row(
+            "SELECT error FROM jobs WHERE job_id = ?1",
+            params![a],
+            |r| r.get(0),
+        )?;
+        assert_eq!(err, "cancelled: its node had nothing to stop");
+        assert!(!finish_orphan_applied_cancel(&store, &store.db(), &a)?);
+        Ok(())
+    }
+
+    fn node_harness(store: &Store, harness: bool) -> R {
+        let status = json!({"agent_capabilities": {"templates": [], "harness": harness}});
+        store.db().execute(
+            "UPDATE nodes SET status = ?1 WHERE id = 1",
+            params![status.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn reason(store: &Store, job: &str) -> Result<Option<String>, rusqlite::Error> {
+        store.db().query_row(
+            "SELECT reason FROM job_budgets WHERE job_id = ?1",
+            params![job],
+            |r| r.get(0),
+        )
+    }
+
+    #[test]
+    fn a_capability_held_job_keeps_its_reservation_and_release_leaves_it() -> R {
+        let tmp = tempfile::tempdir()?;
+        let store = setup(tmp.path())?;
+        set(
+            &store.db(),
+            "project",
+            "p1",
+            5_000_000,
+            Period::Total,
+            "cred",
+        )?;
+        node_harness(&store, false)?;
+        let a = job(&store, 5.0)?;
+        assert_eq!(state(&store, &a)?.0, "waiting");
+        assert_eq!(reason(&store, &a)?.as_deref(), Some("executor_unavailable"));
+        // B2: what it holds still counts, so another job waits for budget.
+        let p = scope_view(&store.db(), "project", "p1")?;
+        assert_eq!(p["reserved_usd"].as_f64(), Some(5.0), "still reserved");
+        let b = job(&store, 1.0)?;
+        assert_eq!(state(&store, &b)?, ("waiting".into(), "waiting".into()));
+        // B1: release neither offers it to a node that cannot run it nor overwrites why it waits.
+        release(&store, &store.db())?;
+        assert_eq!(state(&store, &a)?.0, "waiting");
+        assert_eq!(reason(&store, &a)?.as_deref(), Some("executor_unavailable"));
+        // The sweep does not presume a charge for a job that never reached its node.
+        store.db().execute(
+            "UPDATE job_budgets SET reserved_at = '2000-01-01T00:00:00Z'",
+            [],
+        )?;
+        assert_eq!(sweep(&store, Bounds::default())?, 0);
+        // Once the node can run it, it is offered with its reservation; the other still waits for budget.
+        node_harness(&store, true)?;
+        assert_eq!(
+            crate::capabilities::offer_waiting(&store, &mut store.db(), 1, "node-a")?,
+            1
+        );
+        assert_eq!(state(&store, &a)?, ("offered".into(), "held".into()));
+        assert_eq!(
+            job_view(&store.db(), &a)?["reserved_usd"].as_f64(),
+            Some(5.0)
+        );
+        assert_eq!(state(&store, &b)?, ("waiting".into(), "waiting".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_budget_waiting_job_released_to_a_node_that_cannot_run_it_waits_for_capability() -> R {
+        let tmp = tempfile::tempdir()?;
+        let store = setup(tmp.path())?;
+        set(
+            &store.db(),
+            "project",
+            "p1",
+            1_000_000,
+            Period::Total,
+            "cred",
+        )?;
+        let a = job(&store, 1.0)?;
+        let b = job(&store, 1.0)?;
+        assert_eq!(state(&store, &b)?, ("waiting".into(), "waiting".into()));
+        node_harness(&store, false)?;
+        finish(&store, &a, 0.0)?;
+        assert_eq!(
+            state(&store, &b)?,
+            ("waiting".into(), "held".into()),
+            "reserved, not offered"
+        );
+        assert_eq!(reason(&store, &b)?.as_deref(), Some("executor_unavailable"));
+        node_harness(&store, true)?;
+        assert_eq!(
+            crate::capabilities::offer_waiting(&store, &mut store.db(), 1, "node-a")?,
+            1
+        );
+        assert_eq!(state(&store, &b)?, ("offered".into(), "held".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_waiting_job_whose_spec_cannot_be_edited_is_skipped_not_fatal() -> R {
+        let tmp = tempfile::tempdir()?;
+        let store = setup(tmp.path())?;
+        set(
+            &store.db(),
+            "project",
+            "p1",
+            1_000_000,
+            Period::Total,
+            "cred",
+        )?;
+        let a = job(&store, 1.0)?;
+        let bad = job(&store, 1.0)?;
+        let good = job(&store, 1.0)?;
+        // The bad one's spec is not stored, so it cannot carry a reservation.
+        store.db().execute(
+            "UPDATE job_files SET sha256 = ?1 WHERE job_id = ?2 AND path = 'spec.yaml'",
+            params![sha256_hex(b"missing"), bad],
+        )?;
+        store.db().execute(
+            "UPDATE job_budgets SET ceiling_micros = 1 WHERE job_id = ?1",
+            params![bad],
+        )?;
+        store.db().execute(
+            "UPDATE job_budgets SET ceiling_micros = 1 WHERE job_id = ?1",
+            params![good],
+        )?;
+        let db = store.db();
+        db.execute(
+            "UPDATE jobs SET state = 'done' WHERE job_id = ?1",
+            params![a],
+        )?;
+        drop(db);
+        // At start the bad row is skipped and logged; the rest goes on.
+        let (settled, offered) = reconcile(&store)?;
+        assert_eq!((settled, offered), (1, 1));
+        assert_eq!(state(&store, &bad)?, ("waiting".into(), "waiting".into()));
+        assert_eq!(state(&store, &good)?.0, "offered");
+        assert_eq!(release(&store, &store.db())?, 0);
+        assert!(sweep(&store, Bounds::default()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn offer_waiting_offers_each_job_on_its_own_and_reports_failures() -> R {
+        let tmp = tempfile::tempdir()?;
+        let store = setup(tmp.path())?;
+        set(
+            &store.db(),
+            "project",
+            "p1",
+            5_000_000,
+            Period::Total,
+            "cred",
+        )?;
+        node_harness(&store, false)?;
+        let bad = job(&store, 1.0)?;
+        let good = job(&store, 1.0)?;
+        store.db().execute(
+            "UPDATE job_files SET sha256 = ?1 WHERE job_id = ?2 AND path = 'spec.yaml'",
+            params![sha256_hex(b"missing"), bad],
+        )?;
+        node_harness(&store, true)?;
+        let done = crate::capabilities::offer_waiting(&store, &mut store.db(), 1, "node-a");
+        assert!(done.is_err(), "the failure is surfaced: {done:?}");
+        assert_eq!(state(&store, &good)?, ("offered".into(), "held".into()));
+        assert_eq!(
+            state(&store, &bad)?,
+            ("waiting".into(), "held".into()),
+            "untouched"
+        );
+        assert_eq!(
+            reason(&store, &bad)?.as_deref(),
+            Some("executor_unavailable")
         );
         Ok(())
     }

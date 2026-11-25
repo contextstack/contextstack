@@ -133,14 +133,14 @@ pub fn reason_for_job(
     intent_id: &str,
     meta: &Map<String, Value>,
     client: &Client,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<Value>, No> {
     let prior: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM jobs WHERE intent_id = ?1",
             params![intent_id],
             |r| r.get(0),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| No::internal(&e))?;
     if prior == 0 {
         return Ok(None);
     }
@@ -153,7 +153,16 @@ pub fn reason_for_job(
             .get("model")
             .and_then(Value::as_str)
             .or_else(|| meta.get("agent").and_then(Value::as_str));
-        if let Some(prior_model) = job_model(db, retry_of)? {
+        let Some(prior) = job_meta(db, retry_of).map_err(|e| No::internal(&e))? else {
+            return Err(No::invalid(&format!(
+                "meta.retry_of names no job: {retry_of}"
+            )));
+        };
+        if let Some(prior_model) = prior
+            .get("model")
+            .or(prior.get("agent"))
+            .and_then(Value::as_str)
+        {
             if new_model.is_some_and(|m| m != prior_model) {
                 return Ok(Some(json!({"kind": "fallback", "template": prior_model})));
             }
@@ -181,19 +190,17 @@ pub fn reason_for_job(
     }
 }
 
-fn job_model(db: &Connection, job_id: &str) -> Result<Option<String>, String> {
-    let meta: String = db
+/// The job's meta; `None` when no such job exists.
+fn job_meta(db: &Connection, job_id: &str) -> Result<Option<Value>, String> {
+    let meta: Option<String> = db
         .query_row(
             "SELECT meta FROM jobs WHERE job_id = ?1",
             params![job_id],
             |r| r.get(0),
         )
+        .optional()
         .map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&meta).unwrap_or(Value::Null);
-    Ok(v.get("model")
-        .or(v.get("agent"))
-        .and_then(Value::as_str)
-        .map(str::to_owned))
+    Ok(meta.map(|meta| serde_json::from_str(&meta).unwrap_or(Value::Null)))
 }
 
 /// Record needs-you when attention is raised on a conversation for one of its jobs.
@@ -686,7 +693,7 @@ pub fn stamp_job_reason(
     db: &Connection,
     intent_id: &str,
     client: &Client,
-) -> Result<(), String> {
+) -> Result<(), No> {
     if let Some(reason) = reason_for_job(db, intent_id, plan.meta(), client)? {
         plan.set_work_reason(Some(reason.to_string()));
     }
@@ -728,8 +735,11 @@ mod tests {
         };
         let mut meta = Map::new();
         meta.insert("retry_of".into(), "job-1".into());
-        let reason = reason_for_job(&db, "task-1", &meta, &client)?;
+        let reason = reason_for_job(&db, "task-1", &meta, &client).map_err(|e| e.2)?;
         assert_eq!(reason, Some(json!({"kind": "retry"})));
+        meta.insert("retry_of".into(), "job-missing".into());
+        let refused = reason_for_job(&db, "task-1", &meta, &client).err();
+        assert_eq!(refused.map(|e| (e.0, e.1)), Some((422, "invalid_request")));
         Ok(())
     }
 

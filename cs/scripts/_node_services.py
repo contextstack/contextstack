@@ -30,6 +30,8 @@ ALL_LABELS = (GATEWAY_LABEL, NODE_LABEL, LISTEN_LABEL) + LARAVEL_LABELS + (DIREC
 DIRECTOR_RS_DATA = ROOT / "state/director"
 DIRECTOR_RS_LISTEN = "127.0.0.1:8780"
 CLIENT_WEB, CLIENT_WEB_ENV = "client-web", CONFIG / "client-web/client-web.env"
+# Each open event stream holds a PHP server worker for the duration of the stream.
+CLIENT_WEB_WORKERS = "16"
 CLIENT_WEB_STATE = ROOT / "state/client-web"
 GATEWAY_BIN = {"go": "csgateway", "rust": "cs-gateway"}
 RUNNER_BIN = {"go": "cs-go", "rust": "cs-harness"}
@@ -145,8 +147,8 @@ def client_web_service(rec):
     php = rec["client_web_php"]
     args = [php, "-S", rec["serve_client_web"], "-t", str(app / "public"),
             str(app / "vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php")]
-    env = {"PATH": "%s:%s" % (os.path.dirname(php), SYSTEM_PATH), "LANG": "en_US.UTF-8", "PHP_CLI_SERVER_WORKERS": "4",
-           "DIRECTOR_ENV_FILE": str(CLIENT_WEB_ENV)}
+    env = {"PATH": "%s:%s" % (os.path.dirname(php), SYSTEM_PATH), "LANG": "en_US.UTF-8",
+           "PHP_CLI_SERVER_WORKERS": CLIENT_WEB_WORKERS, "DIRECTOR_ENV_FILE": str(CLIENT_WEB_ENV)}
     return Service(CLIENT_WEB_LABEL, args, env, str(app / "public"), "client-web", KeepAlive=True, RunAtLoad=True)
 
 

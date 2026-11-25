@@ -28,6 +28,9 @@ class Waiting extends DirectorScreen
 
     public ?string $selected = null;
 
+    /** Said when some project's backlog could not be read, while the rest of the list still shows. */
+    public string $backlogProblem = '';
+
     public bool $loaded = false;
 
     public function mount(): void
@@ -68,14 +71,17 @@ class Waiting extends DirectorScreen
                 if ($linked !== '' && isset($this->approvals[$linked])) {
                     continue; // shown as the approval itself
                 }
+                if (Json::string($conversation['conversation_id'] ?? null) === '') {
+                    continue;
+                }
                 $this->questions[] = [
-                    'id' => Json::string($conversation['id'] ?? null),
+                    'id' => Json::string($conversation['conversation_id'] ?? null),
                     'title' => Json::string($conversation['title'] ?? null, 'Conversation'),
                     'question' => Json::string($attention['question'] ?? null),
                 ];
             }
-            $this->backlog = $this->backlogWaitingOnYou($director);
             $this->loaded = true;
+            $this->backlog = $this->backlogWaitingOnYou($director);
         });
 
         if ($this->selected !== null && ! isset($this->approvals[$this->selected])) {
@@ -97,6 +103,7 @@ class Waiting extends DirectorScreen
     private function backlogWaitingOnYou(DirectorClient $director): array
     {
         $waiting = [];
+        $this->backlogProblem = '';
         foreach (Json::records($director->get('projects')['projects'] ?? null) as $project) {
             $projectId = Json::string($project['project_id'] ?? null);
             if ($projectId === '') {
@@ -105,10 +112,15 @@ class Waiting extends DirectorScreen
             try {
                 $items = Json::records($director->get('projects/'.rawurlencode($projectId).'/backlog/needs_you')['items'] ?? null);
             } catch (DirectorRefused $refused) {
-                if ($refused->status === 404) {
-                    continue;
+                if ($refused->status !== 404) {
+                    $this->backlogProblem = 'One project\'s backlog could not be read; the rest is shown.';
                 }
-                throw $refused;
+
+                continue;
+            } catch (DirectorUnavailable) {
+                $this->backlogProblem = 'One project\'s backlog could not be reached; the rest is shown.';
+
+                continue;
             }
             foreach ($items as $item) {
                 $waiting[] = [
@@ -141,8 +153,9 @@ class Waiting extends DirectorScreen
         }
 
         try {
-            $this->director()->write('action-approvals/'.rawurlencode($id).'/decide', ['decision' => $decision], DirectorClient::newKey());
+            $this->director()->write('action-approvals/'.rawurlencode($id).'/decide', ['decision' => $decision], $this->keyFor('decide:'.$id.':'.$decision));
         } catch (DirectorRefused $refused) {
+            $this->answered('decide:'.$id.':'.$decision);
             if ($refused->status === 409) {
                 $this->selected = null;
                 $this->refresh();
@@ -157,10 +170,12 @@ class Waiting extends DirectorScreen
 
             return;
         } catch (DirectorUnavailable) {
-            $this->problem = 'The Director could not be reached, so nothing was decided. Try again.';
+            $this->problem = 'The Director could not be reached, so the decision may not have arrived. Deciding again is safe.';
 
             return;
         }
+
+        $this->answered('decide:'.$id.':'.$decision);
 
         $this->selected = null;
         $this->refresh();

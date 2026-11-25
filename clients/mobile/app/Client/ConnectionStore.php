@@ -3,6 +3,7 @@
 namespace App\Client;
 
 use App\Client\Exceptions\NotConnected;
+use App\Client\Exceptions\TokenUnreadable;
 use JsonException;
 use Native\Mobile\Facades\SecureStorage;
 use RuntimeException;
@@ -39,7 +40,7 @@ class ConnectionStore
         $token = $this->token($saved);
 
         if ($token === null) {
-            throw new NotConnected('This device\'s token could not be read from the Keychain; pair again.');
+            throw new TokenUnreadable('This device\'s token could not be read from the Keychain just now. Try again in a moment; if it keeps happening, forget this Director in Settings and pair again.');
         }
 
         return new Connection(
@@ -51,15 +52,13 @@ class ConnectionStore
         );
     }
 
+    /**
+     * Whether this device is paired: a credential id is saved. A token the Keychain cannot give just now does not
+     * make the device unpaired (TokenUnreadable).
+     */
     public function isConnected(): bool
     {
-        try {
-            $this->resolve();
-
-            return true;
-        } catch (NotConnected) {
-            return false;
-        }
+        return Json::nullableString($this->saved()['credential_id'] ?? null) !== null;
     }
 
     /**
@@ -116,7 +115,7 @@ class ConnectionStore
     /**
      * @return array<string, mixed>
      */
-    private function saved(): array
+    public function saved(): array
     {
         if (! is_file($this->settingsPath)) {
             return [];

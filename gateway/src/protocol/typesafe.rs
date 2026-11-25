@@ -41,7 +41,7 @@ pub async fn post(
     http: &Http,
     base: &str,
     key: &str,
-    body: Bytes,
+    body: reqwest::Body,
     deadline: Instant,
 ) -> Result<Answer, CallError> {
     let url = format!("{}/systemone", base.trim_end_matches('/'));
@@ -122,7 +122,7 @@ mod response_limit_tests {
             &http,
             &base,
             "fake",
-            Bytes::new(),
+            Bytes::new().into(),
             Instant::now() + Duration::from_secs(2),
         )
         .await;

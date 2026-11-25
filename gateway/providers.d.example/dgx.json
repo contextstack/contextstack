@@ -27,6 +27,11 @@
     {
       "name": "local-reasoner",
       "provider": "vllm-spark2",
+      "picker": {
+        "provider": "vllm",
+        "provider_label": "vLLM",
+        "label": "Local reasoner (vLLM, configured model)"
+      },
       "tier": 2,
       "capability": "reasoning",
       "preferred": false,

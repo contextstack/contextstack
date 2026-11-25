@@ -1,4 +1,4 @@
-"""Host-owned harvest repository; never discover git metadata in a workspace."""
+"""Hardened host Git and host-owned harvest repositories."""
 import os
 import subprocess
 from pathlib import Path
@@ -7,7 +7,7 @@ from _estate_io import hardened_git_env
 
 HARDEN = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
           "-c", "commit.gpgsign=false", "-c", "gpg.program=false",
-          "-c", "core.attributesFile=/dev/null"]
+          "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null"]
 
 
 def repository(workspace):
@@ -30,9 +30,37 @@ def environment(source=None):
 
 def git(workspace, *args):
     ws = Path(workspace).resolve()
-    return subprocess.run(["git", "--git-dir=" + str(repository(ws)), "--work-tree=" + str(ws),
-                           *HARDEN, *args], cwd=ws.parent, capture_output=True, text=True,
-                          env=environment(), stdin=subprocess.DEVNULL)
+    return host_git(ws, *args, git_dir=repository(ws))
+
+
+def host_git(workspace, *args, git_dir=None, env=None, ident=(), index=None,
+             attributes=None, timeout=None, stdout=subprocess.PIPE):
+    """Run host Git with executable drivers disabled and only explicit Git overrides."""
+    ws = Path(workspace).resolve()
+    host_env = environment(env)
+    host_env.update(GIT_OPTIONAL_LOCKS="0", GIT_ATTR_NOSYSTEM="1",
+                    GIT_CEILING_DIRECTORIES=str(ws.parent))
+    if index is not None:
+        host_env["GIT_INDEX_FILE"] = str(index)
+    if attributes is not None:
+        host_env["GIT_ATTR_SOURCE"] = attributes
+    cmd = ["git", "-C", str(ws), "--no-pager", *HARDEN]
+    if git_dir is not None:
+        cmd += ["--git-dir=" + str(git_dir), "--work-tree=" + str(ws)]
+    options = dict(env=host_env, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                   timeout=timeout, text=True, errors="surrogateescape")
+    if args[0] != "init":
+        config = subprocess.run(
+            [*cmd, "config", "--null", "--name-only", "--get-regexp", r"^(filter|diff|merge)\."],
+            stdout=subprocess.PIPE, **options,
+        )
+        if config.returncode not in (0, 1):
+            return config
+        cmd += driver_overrides(config.stdout)
+    if args[0] == "diff":
+        args = ("diff", "--no-textconv", "--no-ext-diff", *args[1:])
+    return subprocess.run([*cmd, *ident, *args],
+                          stdout=stdout, **options)
 
 
 def initialize(workspace, setup=None, commit=None):
@@ -58,11 +86,14 @@ def initialize(workspace, setup=None, commit=None):
 def driver_overrides(config):
     """Disable every configured driver, including drivers activated by workspace attributes."""
     drivers = []
-    for key in config.splitlines():
+    filters = set()
+    for key in config.split("\0"):
         section, _, field = key.rpartition(".")
         if key.startswith("filter."):
-            for name, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")):
-                drivers += ["-c", section + "." + name + "=" + value]
+            filters.add(section)
         elif field in ("command", "textconv", "driver"):
             drivers += ["-c", key + "=false"]
+    for section in sorted(filters):
+        for name, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")):
+            drivers += ["-c", section + "." + name + "=" + value]
     return drivers

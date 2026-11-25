@@ -120,8 +120,10 @@ def harness_model_lane_offer(ctx):
     caps = {"templates": ["codex"], "harness_models": ["local-coder"]}
     capable.status([], agent_capabilities={**caps, "harness": True})
     cli_only.status([], agent_capabilities={**caps, "harness": False})
+    catalog = client.call("GET", "models")
+    model = next(row["name"] for row in catalog.json["models"] if row["name"] == "local-coder")
     lane = {"title": "Native coding", "goal": "Make the change", "agent": "coder",
-            "repo": "sample", "lane": "native", "model": "harness:local-coder"}
+            "repo": "sample", "lane": "native", "model": model}
 
     def submit(node):
         return client.call("POST", "intents", body={"node": node.name, "lane": lane}, key=new_key())
@@ -135,6 +137,7 @@ def harness_model_lane_offer(ctx):
     ctx.expect(job["state"] == "offered", "harness lane offered", job)
     rows = capable.call("GET", "jobs").json["jobs"]
     ctx.expect(len(rows) == 1 and rows[0]["job_id"] == job["job_id"], "capable node sees offer", rows)
+    ctx.expect(rows[0]["meta"]["model"] == "harness:local-coder", "stores the canonical model", rows[0])
     ctx.expect(cli_only.call("GET", "jobs").json["jobs"] == [], "CLI-only node sees no offers")
     spec = next(f for f in rows[0]["files"] if f["path"] == "spec.yaml")
     body = capable.call("GET", "objects/" + spec["sha256"]).body
@@ -144,7 +147,6 @@ def harness_model_lane_offer(ctx):
     ctx.expect(capable.call("GET", "jobs").json["jobs"] == [], "stale native offer is hidden")
     capable.status([], agent_capabilities={**caps, "harness": True})
     ctx.expect(len(capable.call("GET", "jobs").json["jobs"]) == 1, "native offer returns with capability")
-
 
 
 @case(C, "work", "unknown-harness-model-refused", RUST)
@@ -158,3 +160,55 @@ def unknown_harness_model_refused(ctx):
     )
     ctx.expect(refused.status == 422 and b"unknown harness model absent" in refused.body,
                "unknown gateway model refused", refused)
+    node.status([], agent_capabilities={"templates": [], "harness": True, "harness_models": ["absent"]})
+    bare = owner(ctx).call(
+        "POST",
+        "intents",
+        body={"node": node.name, "lane": {"title": "Unknown", "goal": "Run", "model": "absent"}},
+        key=new_key(),
+    )
+    ctx.expect(bare.status == 422 and b"unknown executor template absent" in bare.body,
+               "unknown bare model refused", bare)
+
+
+@case(C, "work", "model-harness-pair-lane", RUST)
+def model_harness_pair_lane(ctx):
+    node = ctx.node2()
+    node.status([], agent_capabilities={"templates": ["cursor-sol", "codex"], "harness": False})
+    client = owner(ctx)
+    lane = {"title": "Paired model", "goal": "Run the check", "harness": "cursor-agent", "model": "gpt-5.6-sol-high"}
+
+    def submit(**changes):
+        return client.call("POST", "intents", body={"node": node.name, "lane": {**lane, **changes}}, key=new_key())
+
+    refused = submit(harness="claude-code")
+    ctx.expect(refused.status == 422 and b"cannot run on harness" in refused.body, "mismatched pair refused", refused)
+    refused = submit(harness="contextstack", model="local-coder")
+    ctx.expect(refused.status == 422 and b"cannot run the native harness" in refused.body, "node cannot run native pair", refused)
+    accepted = submit()
+    ctx.expect(accepted.status == 201, "pair accepted", accepted)
+    jobs = node.call("GET", "jobs").json["jobs"]
+    spec = next(row for row in jobs[0]["files"] if row["path"] == "spec.yaml")
+    body = node.call("GET", "objects/" + spec["sha256"]).body
+    ctx.expect(b"\nmodel: cursor-sol\n" in body, "pair freezes the pinned executor template", body)
+
+    plain = client.call(
+        "POST", "intents",
+        body={"node": node.name, "lane": {"title": lane["title"], "goal": lane["goal"], "model": "cursor-sol"}},
+        key=new_key(),
+    )
+    ctx.expect(plain.status == 201, "pair value accepted as a plain model", plain)
+
+    accepted = submit(harness="codex", model="gpt-6.2-sol")
+    ctx.expect(accepted.status == 201, "selectable CLI pair accepted", accepted)
+    jobs = node.call("GET", "jobs").json["jobs"]
+    specs = [row for job in jobs for row in job["files"] if row["path"] == "spec.yaml"]
+    ctx.expect(any(b"\nmodel: codex:gpt-6.2-sol\n" in node.call("GET", "objects/" + spec["sha256"]).body
+                   for spec in specs), "selection freezes into a lane spec", specs)
+    refused = submit(harness="codex", model="codex:unknown")
+    ctx.expect(refused.status == 422, "undeclared CLI model refused", refused)
+
+    plain_job = plain.json["jobs"][0]["job_id"]
+    rows = node.call("GET", "jobs").json["jobs"]
+    ctx.expect(any(row["job_id"] == plain_job and row["meta"]["model"] == "cursor-sol" for row in rows),
+               "plain value retains its executor template", rows)

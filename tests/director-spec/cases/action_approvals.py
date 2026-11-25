@@ -2,7 +2,7 @@
 import json
 import time
 
-from cases.client import accept, device, lead, owner, refused, submitted
+from cases.client import accept, device, finish, lead, owner, refused, submitted
 from cases.conversations import created, post
 from harness.run import case
 
@@ -212,3 +212,50 @@ def change_events(ctx):
     finally:
         own_stream.close()
         foreign_stream.close()
+
+@case("client", "approvals", "approval.expires-when-job-ends")
+def expires_when_job_ends(ctx):
+    """Pending and needs_owner approvals expire when their job finishes; a live job is untouched."""
+    node, local = ctx.node2(), owner(ctx)
+    live_job = submitted(ctx, local, node)["jobs"][0]["job_id"]
+    accept(ctx, node, live_job)
+    ended = submitted(ctx, local, node)
+    ended_job = ended["jobs"][0]["job_id"]
+    accept(ctx, node, ended_job)
+
+    def request(job, tag, reason):
+        path = f"jobs/{job}/action-approvals"
+        body = {"run_id": f"{ctx.serial_tag()}-{tag}", "requesting_model": "requester",
+                "needs": ["network"], "argv": ["git", "push", "--force"], "reason": reason}
+        sent = node.call("POST", path, body=body)
+        ctx.expect(sent.status == 200 and sent.json["status"] == "pending", "approval created", sent)
+        route = "action-approvals/" + sent.json["id"]
+        until = time.monotonic() + 4
+        row = sent.json
+        while row["status"] == "pending" and time.monotonic() < until:
+            time.sleep(.025)
+            row = local.call("GET", route).json
+        ctx.expect(row["status"] == "needs_owner", "hard line escalates", row)
+        return sent.json["id"], route
+
+    ended_id, ended_route = request(ended_job, "ended", "publish ended work")
+    live_id, live_route = request(live_job, "live", "publish live work")
+    stream = device(ctx).stream()
+    try:
+        ctx.expect(stream.until(lambda name, _: name == "hello")[0] is not None, "stream ready")
+        finish(ctx, node, ended_job)
+        event, _ = stream.until(lambda name, d: name == "change" and d["kind"] == "action_approval"
+                                and d["id"] == ended_id)
+        ctx.expect(event is not None, "expiry publishes an approval change")
+        ended_row = local.call("GET", ended_route).json
+        ctx.expect(ended_row["status"] == "expired"
+                   and ended_row["outcome"] == {"status": "expired", "reason": "job ended"},
+                   "ended job approval expires", ended_row)
+        live_row = local.call("GET", live_route).json
+        ctx.expect(live_row["status"] == "needs_owner" and live_row["id"] == live_id,
+                   "running job approval stays open", live_row)
+        listed = local.call("GET", f"action-approvals?status=needs_owner&job={ended_job}")
+        ctx.expect(listed.json == {"action_approvals": []}, "expired approval leaves the queue", listed)
+    finally:
+        stream.close()
+
