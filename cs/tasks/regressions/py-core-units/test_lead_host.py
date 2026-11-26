@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent / '_lib'), str(HERE.parents[2] / 'ops/bin'),
                 str(HERE.parents[2] / 'scripts')]
 from hermetic_env import hermetic_env
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 import _lead_host as m
 import _lead_wake as wake
 import cs_lead
@@ -51,7 +51,7 @@ class FakeSession:
 
 class HostTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = scratch_dir(prefix='lead-host-units-', dir='/tmp')
+        self.scratch = scratch_dir(prefix='lead-host-units-', dir=short_tmp())
         self.root = Path(self.scratch.__enter__()).resolve()
         self.addCleanup(self.scratch.cleanup)
         self.state = self.root / 'state'

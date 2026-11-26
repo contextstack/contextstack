@@ -33,7 +33,7 @@ pub struct Run {
     pub report_dir: Option<PathBuf>,
     /// The launcher-provided read-only repo binding.
     pub repo_view: Option<RepoView>,
-    pub widening: Option<Widening>,
+    pub widening: Option<Box<Widening>>,
     /// The tool, an absolute path, a relative path or a bare name on `PATH`.
     pub tool: String,
     /// The tool's own arguments.
@@ -55,7 +55,9 @@ pub struct RepoView {
 pub struct Widening {
     pub network: bool,
     #[serde(default)]
-    pub loopback: bool,
+    pub loopback_ports: Vec<u16>,
+    #[serde(default)]
+    pub reserved_ports: Vec<u16>,
     pub delete: bool,
     pub write_paths: Vec<PathBuf>,
 }

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import re
 import tempfile
 from types import SimpleNamespace
@@ -230,10 +231,16 @@ def cases():
 def rust_report(binary_path, selected):
     """Materialize the identical fake filesystem only for the Rust subprocess.
 
-    Runtime temp prefixes are mapped back to the virtual owner after rendering;
-    Python golden bytes never undergo normalization. PATH and sockets stay fake.
+    Normalize the materialized owner paths and the two host-derived scratch paths.
+    PATH and sockets stay fake.
     """
     report = []
+    darwin_temp = Path(subprocess.check_output(
+        ['/usr/bin/getconf', 'DARWIN_USER_TEMP_DIR'], text=True).strip()).resolve(strict=True)
+    scratch_paths = (
+        (str(darwin_temp.parent), '/private/var/folders/xx/e2-baseline-owner'),
+        (f'/private/tmp/claude-{os.getuid()}', '/private/tmp/claude-501'),
+    )
     for case in selected:
         request, (files, dirs, links) = render(case['route'], case['template'], case['state'])
         with tempfile.TemporaryDirectory(prefix='e2-sbpl-', dir=ROOT / 'target') as scratch:
@@ -258,7 +265,10 @@ def rust_report(binary_path, selected):
             actual = estate_io.render_sandbox_request(
                 binary_path, ROOT / 'cs/policy/sandbox.json', mapped_request).decode()
             actual = actual.replace(re.escape(home), re.escape(str(V)))
-            actual = actual.replace(home, str(V)).encode()
+            actual = actual.replace(home, str(V))
+            for host, fixture in scratch_paths:
+                actual = actual.replace(f'(subpath "{host}")', f'(subpath "{fixture}")')
+            actual = actual.encode()
         hashes = json.loads((FIXTURES / 'profiles.sha256.json').read_text())
         representative = case['route'] == 'cli-adapter' or REPRESENTATIVES[case['route']] == case['template']
         reference = FIXTURES / (case['id'] + '.sb')

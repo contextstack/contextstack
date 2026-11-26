@@ -289,7 +289,7 @@ def test_happy(rep, fx):
                and "\n### turn 2\n\ndone\n" in text,
                "happy: the body was rendered from messages.jsonl (header, turns, tool block)", repr(text[:200]))
     check = json.loads((run_dir / "check.json").read_text(encoding="utf-8"))
-    rep.expect(check == {"verdict": "pass", "exit_code": 0, "output": "", "skipped": False, "window": 60,
+    rep.expect(check == {"verdict": "pass", "exit_code": 0, "output": "", "skipped": False, "window": 600,
                          "stimulus_sha": row["stimulus_sha"]}, "happy: check.json persisted", check)
     done = json.loads((run_dir / "finalized.json").read_text(encoding="utf-8"))
     rep.expect(row["row_version"] == 2 and "error" not in row and "call_errors" not in row
@@ -667,6 +667,23 @@ def test_env(rep, fx):
                "env: the check sees only the runner's child allowlist", sorted(names))
 
 
+def test_check_budget(rep, fx):
+    estate = fx.fresh("expired-job-check")
+    run_dir = run_dir_of(estate)
+    terminal = run_dir / "terminal.json"
+    row = json.loads(terminal.read_text())
+    row.update(started="2000-01-01T00:00:00Z", check_budget_seconds=1, check_window=30)
+    terminal.write_text(json.dumps(row))
+    (run_dir / "stimulus/check").write_text("#!/bin/sh\ntouch check-ran\n")
+    before = len(rows_of(estate))
+    rc, out, _ = finalize(estate)
+    check = json.loads((run_dir / "check.json").read_text())
+    rep.expect(rc == 0 and out.get("verdict") == "fail" and check["exit_code"] == -1
+               and check["window"] == 30 and not (run_dir / "workspace/check-ran").exists()
+               and len(rows_of(estate)) == before + 1 and (run_dir / "finalized.json").is_file(),
+               "expired job check: finalizes once without starting the check", (out, check))
+
+
 def test_tick(rep, fx, mode):
     """mode estate: the runner leaves no row (ESTATE missing refuses it). mode publish: the
     runner's own finalize-run fails at publish, so a ledger row IS present, finalized.json is
@@ -884,6 +901,7 @@ def main():
         test_stimulus_mismatch(rep, fx)
         test_refusals(rep, fx)
         test_env(rep, fx)
+        test_check_budget(rep, fx)
         test_receipt_handoff(rep, fx, binary)
         test_tick(rep, fx, "estate")
         test_tick(rep, fx, "publish")

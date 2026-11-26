@@ -10,6 +10,8 @@ import tempfile
 
 OPS = Path(__file__).resolve().parents[3] / "ops/bin"
 sys.path.insert(0, str(OPS))
+sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
+from scratch import short_tmp
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from hermetic_env import hermetic_env
 from _lead_mcp import HostMCPBridge
@@ -29,7 +31,7 @@ for scrub in (redact_text, redact_msg, redact_secrets):
 assert redact_msg({'content': [body]}) == {'content': [redact_text(body)]}
 
 
-with tempfile.TemporaryDirectory(prefix="lead-mcp-test-", dir="/tmp") as raw:
+with tempfile.TemporaryDirectory(prefix="lead-mcp-test-", dir=short_tmp()) as raw:
     root = Path(raw)
     cred = root / "host-only-credential"
     cred.write_text("decoy")

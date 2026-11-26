@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
 
 # Direct host calls share the isolated environment used by fixture children.
@@ -472,7 +472,7 @@ def test_report_lead_watch_unit() -> None:
 def test_socket_not_listening(mode="bound") -> None:
     # A bound UNIX socket exists before listen(), and an exited serve leaves the
     # same file behind. Wait for a real refused connection before becoming ready.
-    with scratch_dir(prefix="lead-socket-", dir="/tmp") as raw:
+    with scratch_dir(prefix="lead-socket-", dir=short_tmp()) as raw:
         path = Path(raw).resolve() / "host.sock"
         (path.parent / "token").write_text("fixture-auth")
         (path.parent / "token").chmod(0o600)

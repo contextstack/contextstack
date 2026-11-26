@@ -679,8 +679,11 @@ def ensure_lane(cfg, lane):
     if created:
         clone_lane_dependencies(main, path)
     dirty = bool(lane_out(main, lane, path, "status", "--porcelain"))
+    base = lane_out(main, lane, path, "rev-parse", "HEAD")
+    grader_base = base if base == head else out(main, "merge-base", head, base)
     return {"repo": cfg["name"], "lane": lane, "path": str(path.resolve()), "branch": branch,
-            "base": lane_out(main, lane, path, "rev-parse", "HEAD"), "main": str(main), "created": created,
+            "base": base, "grader_base_sha": grader_base,
+            "main": str(main), "created": created,
             "dirty_at_start": dirty}
 
 
@@ -856,6 +859,11 @@ def red_marker(message):
     return message.lstrip().lower().startswith("check-red:")
 
 
+def host_only_coverage(output):
+    prefix = "check: host-only covered: "
+    return sorted({line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)})
+
+
 def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
     from _process_group import stop_group
 
@@ -983,6 +991,9 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
                 result.update(status="red", stage="gate", failed=failed_lines(gate_out), output_tail=gate_out[-TAIL:])
                 return 1, result
 
+        if not hooks_cover and cfg["gate"]:
+            result["gate"]["host_only_covered"] = host_only_coverage(gate_out)
+
         if message is None:
             if len(subjects) == 1:
                 message = out(main, "log", "-1", "--format=%B", lane_tip)
@@ -1001,6 +1012,8 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
             restore()
             result.update(status="red", stage="commit", failed=failed_lines(text), output_tail=text[-TAIL:])
             return 1, result
+        if hooks_cover:
+            result["gate"]["host_only_covered"] = host_only_coverage(commit.stdout + commit.stderr)
         committed = True
     finally:
         for sig, handler in old_handlers.items():

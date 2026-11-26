@@ -21,6 +21,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+UNSET = object()
 ENDED = ("done", "error")
 NO_CHECK = "#!/bin/sh\n# no check: the lead gave none, so every run passes\nexit 0\n"  # client-web's Bundle::NoCheck
 
@@ -415,10 +416,13 @@ class Tools:
         return self.d.post(path, fields, key=key)
 
     def start_task(self, title, goal, node=None, model=None, check=None, repo=None, lane=None, budget=None,
-                   system=None, task_type=None, project_id=None, agent=None, dispatch_id=None, context=None, plan_with=None):
+                   system=None, task_type=None, project_id=None, agent=None, dispatch_id=None, context=None,
+                   plan_with=None, check_window=UNSET):
         if dispatch_id is not None and (not isinstance(dispatch_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", dispatch_id)):
             raise Refused("dispatch_id must be 1-128 characters of A-Z a-z 0-9 . _ : -")
+        if check_window is not UNSET and (type(check_window) is not int or not 1 <= check_window <= 3600):
+            raise Refused("check_window must be an integer from 1 to 3600")
         explicit_model = model is not None
         given = dict(model=model, check=check, repo=repo, budget=budget, system=system, task_type=task_type)
         profile = self._profile(agent) if agent else None
@@ -446,6 +450,8 @@ class Tools:
         form = dict(title=title, goal=goal, agent=agent, repo=repo, lane=lane)
         if explicit_model or not profile or model != prior:
             form["model"] = model
+        if check_window is not UNSET:
+            form["check_window"] = check_window
         for key, value in (("check", check), ("budget", budget), ("system", system),
                            ("task_type", task_type), ("context", context), ("plan_with", plan_with)):
             if value is not None:
@@ -918,6 +924,8 @@ TOOLS = [
                  "become the defaults (explicit arguments win)"),
       "model": S("string", "executor template (default cursor-sol), harness:<gateway-model>, or auto to route coder lanes by the languages named in a plan"),
       "check": S("string", "the check script run in the workspace after the agent; exit 0 = pass (default: no check)"),
+      "check_window": S("integer", "Maximum seconds for the final check, within the job's seconds budget (default 600).",
+                        minimum=1, maximum=3600),
       "repo": S("string", "repo name from config/repos.json. With lane, use its isolated copy. A read-only profile can give repo alone to read the configured main line"),
       "lane": S("string", "lane name ([a-z0-9._-]): branch lane/<lane>, worktree beside the repo's main line"),
       "budget": S("object", "{turns, tool_calls, usd, seconds}; 0 = unlimited. Default turns: 120 for harness coder "

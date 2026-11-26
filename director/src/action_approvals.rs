@@ -265,6 +265,16 @@ fn strings(value: &Value) -> Option<Vec<&str>> {
         .collect()
 }
 
+fn loopback_port(need: &str) -> Option<u16> {
+    let port = need.strip_prefix("network:loopback:")?;
+    if port.starts_with('0') || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    port.parse::<u16>()
+        .ok()
+        .filter(|port| !matches!(port, 0 | 8780 | 9200))
+}
+
 fn normalized(input: &Value) -> Option<Value> {
     let argv = strings(&input["argv"])?;
     let needs = strings(&input["needs"])?;
@@ -276,12 +286,9 @@ fn normalized(input: &Value) -> Option<Value> {
         || reason.is_empty()
         || model.is_empty()
         || needs.iter().any(|n| {
-            !matches!(
-                *n,
-                "network" | "network:loopback" | "write_paths" | "delete"
-            )
+            !matches!(*n, "network" | "write_paths" | "delete") && loopback_port(n).is_none()
         })
-        || (needs.contains(&"network") && needs.contains(&"network:loopback"))
+        || (needs.contains(&"network") && needs.iter().any(|need| loopback_port(need).is_some()))
         || needs.contains(&"write_paths") == paths.is_empty()
         || paths.iter().any(|p| !Path::new(p).is_absolute())
     {
@@ -811,7 +818,9 @@ fn finish_review(db: &Connection, id: &str, verdict: &Verdict) -> rusqlite::Resu
 
 fn submit(state: &Arc<State>, db: &Connection, body: &Value, job: &str, run: &str) -> Reply {
     let Some(request) = normalized(body) else {
-        return bad("valid argv, needs, write_paths, requesting_model and reason are required");
+        return bad(
+            "valid argv, needs, write_paths, requesting_model and reason are required; name each localhost port as network:loopback:<port> and exclude reserved ports",
+        );
     };
     let context = body["context"].clone();
     let id = match crate::util::ulid() {
@@ -1013,6 +1022,26 @@ mod tests {
         })
     }
 
+    #[test]
+    fn loopback_needs_name_unreserved_ports() {
+        let mut request = action();
+        request["needs"] = json!(["network:loopback:3000", "network:loopback:65535"]);
+        assert_eq!(normalized(&request).as_ref(), Some(&request));
+        for invalid in [
+            json!(["network:loopback"]),
+            json!(["network:loopback:0"]),
+            json!(["network:loopback:+3000"]),
+            json!(["network:loopback:03000"]),
+            json!(["network:loopback:65536"]),
+            json!(["network:loopback:8780"]),
+            json!(["network:loopback:9200"]),
+            json!(["network", "network:loopback:3000"]),
+        ] {
+            request["needs"] = invalid;
+            assert!(normalized(&request).is_none(), "{request}");
+        }
+    }
+
     fn lane() -> Value {
         json!({
             "home":"/workspace/agent-home","workspace":"/workspace/agent-home/lane",
@@ -1024,7 +1053,7 @@ mod tests {
     fn regression() -> Result<Value, String> {
         normalized(&json!({
             "argv": ["cs/tasks/regressions/trace-e2e/check"],
-            "needs": ["network:loopback", "write_paths"],
+            "needs": ["network:loopback:3000", "write_paths"],
             "write_paths": ["/workspace/agent-home/.contextstack/runs/run/tmp"],
             "requesting_model": "writer", "reason": "Verify the lane changes"
         }))

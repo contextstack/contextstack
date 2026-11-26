@@ -43,7 +43,7 @@ REPLY = "hello from ContextStack"
 
 
 def sign_in_command(name):
-    return {"claude": "claude, then /login", "gemini": "gemini, then sign in"}.get(name, name + " login")
+    return {"claude": "claude, then /login", "gemini": "gemini, then sign in", "pi": "pi"}.get(name, name + " login")
 
 
 class Init:
@@ -99,7 +99,7 @@ class Init:
         except EOFError:
             return False
 
-    def cancel_job(self, job):
+    def cancel_job(self, job, reason="cs init first job timed out"):
         import urllib.request
         import uuid
         try:
@@ -107,14 +107,14 @@ class Init:
         except OSError:
             raise self.cs.Stop("cs init: cannot read the owner credential to cancel job %s; check cs doctor" % job)
         request = urllib.request.Request(self.url + "/api/v1/client/jobs/" + job + "/cancel",
-            data=json.dumps({"reason": "cs init first job timed out"}).encode(),
+            data=json.dumps({"reason": reason}).encode(),
             headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                      "Idempotency-Key": str(uuid.uuid4())}, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 response.read()
         except OSError:
-            raise self.cs.Stop("cs init: could not cancel timed-out job %s; retry after checking cs jobs" % job)
+            raise self.cs.Stop("could not cancel job %s; retry after checking cs jobs" % job)
 
     def ask(self, question):
         if self.args.yes or not sys.stdin.isatty():
@@ -408,13 +408,21 @@ class Init:
         check.chmod(0o755)
 
     def job_row(self, job):
+        return self.read_job("SELECT state, run_id, terminal_row FROM jobs WHERE job_id = ?", job)
+
+    def job_hold(self, job):
+        return self.read_job(
+            "SELECT b.reason, b.detail FROM jobs j LEFT JOIN job_budgets b ON b.job_id = j.job_id "
+            "WHERE j.job_id = ? AND j.state IN ('waiting', 'held')", job)
+
+    def read_job(self, query, job):
         import sqlite3
         import urllib.parse
         db = self.data / "director.sqlite"
         try:
             conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(db)), uri=True, timeout=2)
             try:
-                row = conn.execute("SELECT state, run_id, terminal_row FROM jobs WHERE job_id = ?", (job,)).fetchone()
+                row = conn.execute(query, (job,)).fetchone()
             finally:
                 conn.close()
         except sqlite3.Error:

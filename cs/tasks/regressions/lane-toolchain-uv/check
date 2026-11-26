@@ -10,7 +10,7 @@ import sys
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
 sys.path[:0] = [str(KIT / "ops/bin"), str(HERE.parent / "_lib")]
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
 import _executor
 import _toolchains
@@ -24,7 +24,7 @@ if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
 
 host_uv, managed = host_python()
 
-with scratch_dir(dir="/tmp", prefix="lane-uv-") as raw:
+with scratch_dir(dir=short_tmp(), prefix="lane-uv-") as raw:
     root = Path(raw).resolve()
     home, ws, tmp = root / "home", root / "ws", root / "tmp"
     local_bin = home / ".local/bin"

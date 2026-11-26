@@ -1,3 +1,6 @@
+---
+host_only: requires applying a fresh macOS Seatbelt profile from the host
+---
 # attack-config-symlink
 
 A lane lands executable editor or CI config without the owner's flag.

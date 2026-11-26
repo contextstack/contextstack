@@ -9,12 +9,12 @@ from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "_lib"))
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
 sys.path.insert(0, str(HERE.parents[2] / "ops/bin"))
 import _lanes
 
-with scratch_dir(dir="/tmp", prefix="lane-vendor-clone-") as raw:
+with scratch_dir(dir=short_tmp(), prefix="lane-vendor-clone-") as raw:
     root = Path(raw).resolve()
     home = root / "home"
     home.mkdir()

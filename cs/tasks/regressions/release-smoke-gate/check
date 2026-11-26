@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
 sys.path.insert(0, str(HERE.parent / "_lib"))
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
 
 class Director(BaseHTTPRequestHandler):
@@ -34,7 +34,7 @@ class Director(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps({"turn_id": "smoke", "state": "error" if self.server.fail else "done", "reply": "2"}).encode())
 
-with scratch_dir(prefix="release-smoke-gate-", dir="/tmp") as tmp:
+with scratch_dir(prefix="release-smoke-gate-", dir=short_tmp()) as tmp:
     home = Path(tmp)
     root = home / ".contextstack"
     shims = home / "shims"

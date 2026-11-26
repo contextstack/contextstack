@@ -339,13 +339,21 @@ class ProviderLimitsStateTests(unittest.TestCase):
     def test_load_prunes_expired_limit_on_read(self):
         with scratch_dir(prefix="pl-exp-") as raw:
             state = Path(raw)
-            _provider_limits.record_limit(
-                state,
-                "cursor-sol",
-                {"message": "limited", "resets_at": "2000-01-01T00:00:00Z", "via": "test"},
-            )
-            _provider_limits.load(state)
-            self.assertEqual(_provider_limits.active_templates(state), [])
+            active = {"codex": {"resets_at": "2099-01-01T00:00:00Z"}}
+            expired = {"cursor-sol": {"resets_at": "2000-01-01T00:00:00Z"}}
+            path = _provider_limits.state_path(state)
+            _provider_limits.save(state, {"templates": {**active, **expired}})
+            self.assertEqual(_provider_limits.load(state)["templates"], active)
+            self.assertEqual(json.loads(path.read_text())["templates"], active)
+
+    def test_load_does_not_save_unchanged_limits(self):
+        with scratch_dir(prefix="pl-active-") as raw:
+            state = Path(raw)
+            data = {"templates": {"codex": {"resets_at": "2099-01-01T00:00:00Z"}}}
+            _provider_limits.save(state, data)
+            with patch.object(_provider_limits, "save") as save:
+                self.assertEqual(_provider_limits.load(state), data)
+                save.assert_not_called()
 
     def test_record_limit_round_trips_through_active_templates(self):
         with scratch_dir(prefix="pl-rec-") as raw:
@@ -509,6 +517,8 @@ class LoginRetryTests(unittest.TestCase):
                 self.assertIn("claude-code", _provider_limits.load(state)["templates"])
             login.write_text("decoy-new-login")
             self.assertNotIn("claude-code", _provider_limits.load(state)["templates"])
+            persisted = json.loads(_provider_limits.state_path(state).read_text())
+            self.assertNotIn("claude-code", persisted["templates"])
 
     def test_node_reports_ready_templates_and_init_preference(self):
         import _vitals

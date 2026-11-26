@@ -12,14 +12,14 @@ HERE = Path(__file__).resolve().parent
 OPS = HERE.parents[2] / 'ops/bin'
 sys.path[:0] = [str(HERE.parent / '_lib'), str(OPS)]
 from hermetic_env import hermetic_env
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 import _cli_native as m
 from sandbox_profile import render_profile
 
 
 class NativeTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = scratch_dir(prefix='native-units-', dir='/tmp')
+        self.scratch = scratch_dir(prefix='native-units-', dir=short_tmp())
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.__enter__()).resolve()
         self.home = self.root / 'owner'

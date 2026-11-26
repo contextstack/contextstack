@@ -1,3 +1,6 @@
+---
+host_only: requires applying a fresh macOS Seatbelt profile from the host
+---
 Protect owner login files while coding agents use private per-job copies.
 For every executor template copying Codex, Pi or Claude login data, stage
 marker JSON from a temporary HOME and exercise the real Darwin sandbox profile.

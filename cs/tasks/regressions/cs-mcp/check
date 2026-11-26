@@ -153,6 +153,13 @@ def model_injection_offline():
                 else:
                     expect(False, "invalid model was accepted: %r" % value)
             expect(module.validate_model("codex") == "codex", "known executor model accepted")
+            for value in (0, -1, 3601, True, 1.5, "30", None):
+                try:
+                    tools.start_task(title="x", goal="x", check_window=value)
+                except module.Refused as error:
+                    expect("check_window" in str(error), "invalid check window refused offline")
+                else:
+                    expect(False, "invalid check window accepted: %r" % value)
 
     class BuiltinDirector:
         def get(self, path):
@@ -160,6 +167,8 @@ def model_injection_offline():
 
         def post(self, path, body, key=None):
             expect(key == body.get("dispatch_id"), "dispatch ID passed as transport key", (key, body))
+            expect((body["lane"].get("check_window") == 30) if key == "offline:1"
+                   else "check_window" not in body["lane"], "only explicit check window sent", body)
             expect(path == "intents" and "lane" in body and "files" not in body,
                    "start_task sends built-in lane form without files", body)
             return {"intent": {"intent_id": "built-in", "task": "tasks/test"},
@@ -168,7 +177,7 @@ def model_injection_offline():
     with patch.object(module.agents, "kit_dir", return_value=KIT):
         module.Tools(BuiltinDirector(), "fixture-node").start_task(title="Test", goal="Do it", model="codex")
         tools = module.Tools(BuiltinDirector(), "fixture-node")
-        tools.start_task(title="Test", goal="Do it", model="codex", dispatch_id="offline:1")
+        tools.start_task(title="Test", goal="Do it", model="codex", dispatch_id="offline:1", check_window=30)
         for bad in ("", "has space", "x" * 129, 42):
             try:
                 tools.start_task(title="Test", goal="Do it", dispatch_id=bad)

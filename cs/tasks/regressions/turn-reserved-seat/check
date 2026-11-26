@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 
 from contextlib import ExitStack
 from functools import partial
@@ -34,7 +34,7 @@ class StillRunning(BaseException):
     """Suspend the stub executor after real tick has published its running row."""
 
 
-with scratch_dir(prefix='turn-reserved-seat-', dir='/tmp') as tmp:
+with scratch_dir(prefix='turn-reserved-seat-', dir=short_tmp()) as tmp:
     state = Path(tmp)
     os.environ['CS_STATE_ROOT'] = tmp
     (state / 'config').mkdir()

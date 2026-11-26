@@ -1,6 +1,9 @@
 //! `write_env`: a tool may write to the directory an environment variable names, when the host
 //! permits that variable and the directory lies under one of its allowed roots (the state root).
 
+use crate::cli_executor::PROTECTED_READS;
+use crate::failure::{Failure, unenforceable};
+use crate::policy::repo_root;
 use std::ffi::OsString;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
@@ -34,43 +37,94 @@ pub struct Bounds<'a> {
     pub workspace: &'a Path,
     /// The code root: never a `write_env` target.
     pub code_root: &'a Path,
+    /// The owner home directory.
+    pub home: &'a Path,
     /// The variable's allowed roots, expanded and absolute.
     pub roots: &'a [PathBuf],
 }
 
+#[derive(Debug)]
+pub enum GrantError {
+    Narrowed(String),
+    Unenforceable(Failure),
+}
+
+impl From<String> for GrantError {
+    fn from(reason: String) -> Self {
+        Self::Narrowed(reason)
+    }
+}
+
 impl Bounds<'_> {
-    fn check(&self, var: &str, path: &Path) -> Result<(), String> {
-        if path.starts_with(self.workspace) {
-            return Err(format!("{var} names a directory inside the workspace"));
-        }
-        if path.starts_with(canonical_prefix(self.code_root)) {
-            return Err(format!("{var} names a directory inside the code root"));
-        }
-        let under_a_root = self
-            .roots
-            .iter()
-            .any(|root| path.starts_with(canonical_prefix(root)));
-        if !under_a_root {
-            return Err(format!(
-                "{var} names {}, outside its allowed roots",
+    fn check(&self, var: &str, path: &Path) -> Result<(), GrantError> {
+        let refuse = |reason| {
+            GrantError::Unenforceable(unenforceable(format!(
+                "unenforceable write_env: {var} names {}: {reason}",
                 path.display()
-            ));
+            )))
+        };
+        let home = canonical_prefix(self.home);
+        for (root, label) in [(self.workspace, "workspace"), (self.code_root, "code root")] {
+            let root = canonical_prefix(root);
+            if root.starts_with(path) {
+                return Err(refuse(format!("directory equals or contains the {label}")));
+            }
+            if path.starts_with(&root) {
+                return Err(format!("{var} names a directory inside the {label}").into());
+            }
+        }
+        for (root, label) in [
+            (repo_root(self.code_root), "repo root"),
+            (home.clone(), "home directory"),
+            (home.join(".contextstack"), "state root"),
+        ] {
+            if root.starts_with(path) || canonical_prefix(&root).starts_with(path) {
+                return Err(refuse(format!("directory equals or contains the {label}")));
+            }
+        }
+        for relative in PROTECTED_READS {
+            let store = home.join(relative);
+            let resolved = canonical_prefix(&store);
+            if store.starts_with(path) || resolved.starts_with(path) || path.starts_with(&resolved)
+            {
+                return Err(refuse(format!(
+                    "directory overlaps protected path {}",
+                    store.display()
+                )));
+            }
+        }
+        let mut under_a_root = false;
+        for root in self.roots {
+            let root = canonical_prefix(root);
+            if path == root {
+                return Err(refuse("directory equals an allowed root".to_owned()));
+            }
+            under_a_root |= path.starts_with(root);
+        }
+        if !under_a_root {
+            return Err(
+                format!("{var} names {}, outside its allowed roots", path.display()).into(),
+            );
         }
         Ok(())
     }
 }
 
-/// The canonical directory `var` names, created (mkdir -p, 0700) when absent, or the narrowing
-/// reason. Checked before anything is created and again after canonicalising what was created,
+/// The canonical directory `var` names, created (mkdir -p, 0700) when absent.
+/// Checked before anything is created and again after canonicalising what was created,
 /// so a symlink under an allowed root that points elsewhere is refused.
-pub fn grant(var: &str, value: Option<OsString>, bounds: &Bounds<'_>) -> Result<PathBuf, String> {
+pub fn grant(
+    var: &str,
+    value: Option<OsString>,
+    bounds: &Bounds<'_>,
+) -> Result<PathBuf, GrantError> {
     let path = match value {
         Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => return Err(format!("{var} is unset")),
+        _ => return Err(format!("{var} is unset").into()),
     };
     let dotdot = path.components().any(|c| c == Component::ParentDir);
     if !path.is_absolute() || dotdot {
-        return Err(format!("{var} is not an absolute path without .."));
+        return Err(format!("{var} is not an absolute path without ..").into());
     }
     bounds.check(var, &canonical_prefix(&path))?;
     std::fs::DirBuilder::new()
@@ -92,6 +146,7 @@ mod tests {
     struct Layout {
         _dir: tempfile::TempDir,
         base: PathBuf,
+        home: PathBuf,
         workspace: PathBuf,
         code: PathBuf,
         roots: Vec<PathBuf>,
@@ -111,6 +166,7 @@ mod tests {
         }
         Ok(Layout {
             _dir: dir,
+            home: base.join("owner"),
             base,
             workspace,
             code,
@@ -122,9 +178,23 @@ mod tests {
         let bounds = Bounds {
             workspace: &fx.workspace,
             code_root: &fx.code,
+            home: &fx.home,
             roots: &fx.roots,
         };
-        grant("CS_X", value.map(|p| p.as_os_str().to_owned()), &bounds)
+        grant("CS_X", value.map(|p| p.as_os_str().to_owned()), &bounds).map_err(|error| match error
+        {
+            GrantError::Narrowed(reason) => reason,
+            GrantError::Unenforceable(failure) => {
+                format!("{}: {}", failure.code(), failure.message())
+            }
+        })
+    }
+
+    #[test]
+    fn the_allowed_root_itself_is_refused() -> Result<(), String> {
+        let fx = layout()?;
+        assert!(try_grant(&fx, Some(&fx.roots[0])).is_err());
+        Ok(())
     }
 
     #[test]
@@ -139,6 +209,69 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn protected_ancestors_and_allowed_root_are_refused() -> Result<(), String> {
+        let mut fx = layout()?;
+        let root = fx.roots[0].clone();
+        fx.workspace = root.join("projects/workspace");
+        fx.code = root.join("sources/repo/code");
+        fx.home = root.join("homes/owner");
+        let state = fx.home.join(".contextstack");
+        let alias = root.join("alias");
+        std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
+        std::os::unix::fs::symlink(&state, &alias).map_err(|e| e.to_string())?;
+        for (path, expected) in [
+            (root.join("projects"), "workspace"),
+            (fx.workspace.clone(), "workspace"),
+            (root.join("sources/repo"), "code root"),
+            (fx.code.clone(), "code root"),
+            (root.join("homes"), "home directory"),
+            (fx.home.clone(), "home directory"),
+            (state.clone(), "state root"),
+            (alias, "state root"),
+            (state.join("credentials"), "protected path"),
+            (fx.home.join(".ssh"), "protected path"),
+            (fx.home.join(".config"), "protected path"),
+            (fx.home.join("Library"), "protected path"),
+            (root.clone(), "workspace"),
+        ] {
+            let reason = try_grant(&fx, Some(&path))
+                .err()
+                .ok_or_else(|| format!("granted {}", path.display()))?;
+            assert!(
+                reason.starts_with("101:") && reason.contains(expected),
+                "{}: {reason}",
+                path.display()
+            );
+        }
+        // A symlinked code root can have a repo root outside its canonical ancestry.
+        let repo = root.join("separate-repo");
+        std::fs::create_dir(&repo).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&fx.code).map_err(|e| e.to_string())?;
+        std::os::unix::fs::symlink(&fx.code, repo.join("code")).map_err(|e| e.to_string())?;
+        fx.code = repo.join("code");
+        let reason = try_grant(&fx, Some(&repo))
+            .err()
+            .ok_or("granted repo root")?;
+        assert!(
+            reason.starts_with("101:") && reason.contains("repo root"),
+            "{reason}"
+        );
+
+        let extra_root = root.join("extra");
+        fx.roots.push(extra_root.clone());
+        let reason = try_grant(&fx, Some(&extra_root))
+            .err()
+            .ok_or("granted the allowed root")?;
+        assert!(
+            reason.starts_with("101:") && reason.contains("equals an allowed root"),
+            "{reason}"
+        );
+        let sibling = state.join("browser");
+        assert_eq!(try_grant(&fx, Some(&sibling)), Ok(sibling));
         Ok(())
     }
 
@@ -190,7 +323,9 @@ mod tests {
         assert!(!elsewhere.join("state").exists());
         let into_ws = fx.roots[0].join("ws-link");
         std::os::unix::fs::symlink(&fx.workspace, &into_ws).map_err(|error| error.to_string())?;
-        let reason = try_grant(&fx, Some(&into_ws)).err().unwrap_or_default();
+        let reason = try_grant(&fx, Some(&into_ws.join("state")))
+            .err()
+            .unwrap_or_default();
         assert!(reason.contains("inside the workspace"), "{reason}");
         Ok(())
     }

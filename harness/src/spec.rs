@@ -30,8 +30,8 @@ pub struct Spec {
     pub pre_tool: Vec<String>,
     #[serde(deserialize_with = "string_list")]
     pub env: Vec<String>,
-    #[serde(deserialize_with = "default_on_null")]
-    pub check_window: i64,
+    #[serde(deserialize_with = "check_window")]
+    pub check_window: Option<i64>,
     #[serde(deserialize_with = "default_on_null")]
     pub budget: Budget,
     #[serde(deserialize_with = "string_list")]
@@ -57,6 +57,17 @@ pub struct Budget {
     pub usd: f64,
     #[serde(deserialize_with = "default_on_null")]
     pub seconds: i64,
+}
+
+fn check_window<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+    let seconds = i64::deserialize(deserializer)?;
+    if (1..=3600).contains(&seconds) {
+        Ok(Some(seconds))
+    } else {
+        Err(serde::de::Error::custom(
+            "check_window must be an integer from 1 to 3600",
+        ))
+    }
 }
 
 // Go leaves concrete fields at their default when YAML or JSON contains null.
@@ -153,6 +164,20 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn final_check_window_requires_an_integer_in_range() -> Result<(), String> {
+        for invalid in ["0", "-1", "3601", "true", "1.5", "'30'", "null"] {
+            assert!(load_text(&format!("{VALID}check_window: {invalid}\n")).is_err());
+        }
+        for valid in [1, 30, 3600] {
+            assert_eq!(
+                load_text(&format!("{VALID}check_window: {valid}\n"))?.check_window,
+                Some(valid)
+            );
+        }
+        Ok(())
+    }
+
     const VALID: &str = "id: x\nmodel: fake\ntasks: [tasks/fx]\ntrials: 1\nbudget: {turns: 1}\nhypothesis: 'fixture parity'\n";
 
     fn load_text(text: &str) -> Result<Spec, String> {
@@ -234,13 +259,13 @@ budget: {turns: 1}
     #[test]
     fn null_fields_and_sequence_entries_match_go_defaults() -> Result<(), String> {
         let spec = load_text(&format!(
-            "{VALID}system: null\ncontext: null\ntools: [null, shell]\nmcp: null\npost_turn: null\npre_tool: null\nenv: null\ncheck_window: null\n"
+            "{VALID}system: null\ncontext: null\ntools: [null, shell]\nmcp: null\npost_turn: null\npre_tool: null\nenv: null\n"
         ))?;
         assert!(spec.system.is_empty() && spec.context.is_empty());
         assert_eq!(spec.tools, ["shell"]);
         assert!(spec.mcp.is_empty() && spec.post_turn.is_empty() && spec.pre_tool.is_empty());
         assert_eq!(spec.env, Vec::<String>::new());
-        assert_eq!(spec.check_window, 0);
+        assert_eq!(spec.check_window, None);
         let budget: Budget =
             serde_yaml::from_str("turns: null\ntool_calls: null\nusd: null\nseconds: null")
                 .map_err(|error| error.to_string())?;

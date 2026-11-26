@@ -17,8 +17,9 @@ from functools import partial
 from pathlib import Path
 
 import _lanes
+from _check_grader import GRADER_REPORT_KEYS, lane_grader
 import _run_record
-from _estate_io import run_op as estate_run_op, verify_frozen_stimulus, write_atomic
+from _estate_io import remaining_check_time, run_op as estate_run_op, verify_frozen_stimulus, write_atomic
 from _grant import covers_path
 from _roots import runs_dir, transcript_id, workspace_dir
 from _job_reason import redact
@@ -55,6 +56,9 @@ def result(CODE_ROOT, run_dir, row):
         out["preflight_reason"] = row["preflight_reason"]
     if "cli_exit" in row:
         out["cli_exit"] = row["cli_exit"]
+    for key in GRADER_REPORT_KEYS:
+        if key in row:
+            out[key] = row[key]
     if row.get("branch"):
         out["branch"] = row["branch"]
     if row.get("lane"):
@@ -96,18 +100,23 @@ def check_environment(env, scratch):
             yield dict(env, **git_env, TMPDIR=str(alias), TMP=str(alias), TEMP=str(alias))
 
 
-def sandboxed_check(run_dir, ws, child_env, window, memory_cap_mb, policy, caller, read_roots, protected):
+def sandboxed_check(run_dir, ws, child_env, window, memory_cap_mb, policy, caller, read_roots, protected,
+                    *, grader=None):
     from _executor import sandbox_cmd
 
     profile = run_dir / "check-sandbox.sb"
     stimulus = run_dir / "stimulus"
+    if grader:
+        read_roots = (*read_roots, grader.root)
+        child_env = grader.environment(child_env)
+        caller = dict(caller, deny_write_roots=[*caller.get("deny_write_roots", []), str(grader.root)])
     try:
         # A physical directory under /tmp stays short after canonicalization.
         with check_environment(child_env, "/tmp") as env:
             command = sandbox_cmd(str(stimulus / "check"), [], ws, run_dir / "tmp", profile, protected,
                                   read_roots=(stimulus, *read_roots), policy=policy, caller=caller,
                                   check_scratch=env["TMPDIR"])
-            return run_process(command, str(ws), env, window, memory_cap_mb=memory_cap_mb,
+            return run_process(command, str(grader.root if grader else ws), env, window, memory_cap_mb=memory_cap_mb,
                                on_evidence=lambda rows: record_process_evidence(run_dir, rows))
     finally:
         profile.unlink(missing_ok=True)
@@ -121,6 +130,7 @@ class Check:
     interruption: str = ""
     interruption_note: str = ""
     resource: dict | None = None
+    grader: dict | None = None
 
 
 def interrupted_check(error):
@@ -142,11 +152,14 @@ def record_check(run_dir, row, window, run, *, recover=False, hosted=False):
         if recover:
             check.stdout, check.stderr = redact(check.stdout), redact(check.stderr)
             write_atomic(path, json.dumps(asdict(check)).encode())
+    if check.grader:
+        row.update(check.grader)
     if check.resource:
         row.update(check.resource)
     if not (hosted and check.interruption):
         _run_record.check_json(run_dir, row["stimulus_sha"], window,
-                               -1 if check.interruption else check.returncode, check.stdout + check.stderr)
+                               -1 if check.interruption else check.returncode, check.stdout + check.stderr,
+                               grader=check.grader)
     return check
 
 
@@ -320,7 +333,7 @@ WORK_ORDER_ENV = (
 
 def execution_receipt(run_dir, ws, row, spec_id, task_ref, task_name, started, check_window,
                       mode, stop, verdict, extra, trace, lane, read_only, grant_paths,
-                      policy, caller, read_roots, protected, env_drop, memory_cap_mb, child_env, *, execution_id=None):
+                      policy, caller, read_roots, protected, env_drop, memory_cap_mb, child_env, *, execution_id=None, deadline=None):
     row.update(extra or {})
     usage = {key: row[key] for key in (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
@@ -334,7 +347,8 @@ def execution_receipt(run_dir, ws, row, spec_id, task_ref, task_name, started, c
         "stimulus": {"manifest": "stimulus/manifest.json", "sha256": row["stimulus_sha"]},
         "workspace": str(ws), "usage": usage, "row": row,
         "finish": {"mode": mode, "verdict": verdict, "lane": lane, "read_only": read_only,
-                   "grant_paths": grant_paths, "check_window": check_window, "memory_cap_mb": memory_cap_mb},
+                   "grant_paths": grant_paths, "check_window": check_window, "memory_cap_mb": memory_cap_mb,
+                   **({"deadline": deadline} if deadline is not None else {})},
         "sandbox": {"policy": "policy/sandbox.json",
                     "policy_sha256": sha256(policy) if policy.is_file() else None,
                     "caller": caller, "read_roots": [str(path) for path in read_roots],
@@ -428,15 +442,16 @@ def finish_receipt(code_root, run_dir, receipt):
                 row["seconds"] = time.time() - started
             raise Finished(verdict, stop, extra)
 
-        def profiled_check(timeout):
+        def profiled_check(timeout, *, grader=None):
             from _muse_adapter import check_command
 
             try:
-                with check_environment(env, "/tmp") as child_env:
+                with check_environment(grader.environment(env) if grader else env, "/tmp") as child_env:
                     command = check_command(run_dir / "stimulus/check", ws, Path.home(),
                                             sandbox["read_roots"], sandbox["caller"], env["TMPDIR"],
+                                            grader=grader.root if grader else None,
                                             check_scratch=child_env["TMPDIR"])
-                    done = run_process(command, str(ws), child_env, timeout, memory_cap_mb=settings["memory_cap_mb"],
+                    done = run_process(command, str(grader.root if grader else ws), child_env, timeout, memory_cap_mb=settings["memory_cap_mb"],
                                        on_evidence=lambda rows: record_process_evidence(run_dir, rows))
             except Cancelled:
                 raise
@@ -450,12 +465,30 @@ def finish_receipt(code_root, run_dir, receipt):
             return done
 
         def check():
-            if mode == "profiled":
-                run = partial(profiled_check, row.pop("profiled_timeout"))
-            else:
-                run = partial(sandboxed_check, run_dir, ws, env, window, settings["memory_cap_mb"],
-                              code_root / sandbox["policy"], sandbox["caller"], sandbox["read_roots"], protected)
-            return record_check(run_dir, row, window, run, recover=True, hosted=mode == "hosted")
+            limit = min(window, row.pop("profiled_timeout")) if mode == "profiled" else window
+
+            def run_with_grader():
+                try:
+                    with lane_grader(lane, ws, run_dir) as grader:
+                        timeout = remaining_check_time(limit, settings.get("deadline"))
+                        if timeout <= 0:
+                            chk = interrupted_check(subprocess.TimeoutExpired("check", 0))
+                        else:
+                            if mode == "profiled":
+                                run = partial(profiled_check, timeout)
+                            else:
+                                run = partial(sandboxed_check, run_dir, ws, env, timeout, settings["memory_cap_mb"],
+                                              code_root / sandbox["policy"], sandbox["caller"],
+                                              sandbox["read_roots"], protected)
+                            chk = collect_check(partial(run, grader=grader) if grader else run)
+                        if grader:
+                            chk.grader = grader.report(chk.stdout + "\n" + chk.stderr,
+                                                       -1 if chk.interruption else chk.returncode)
+                        return chk
+                except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                    return Check(1, "", redact(str(error)), "check_error")
+
+            return record_check(run_dir, row, window, run_with_grader, recover=True, hosted=mode == "hosted")
 
         lane = dict(settings["lane"]) if settings["lane"] else None
         paths = partial(changed_paths, ws, row["base_sha"], lane, env=env)

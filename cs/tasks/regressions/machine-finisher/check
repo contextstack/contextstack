@@ -94,6 +94,7 @@ sys.exit(_executor.main())
     )
     if sys.platform == "darwin":
         cases += (("read-only", 0, "done"), ("planning", 0, "done"))
+    cases += (("expired", 1, "check_timeout"),)
     for case, expected, expected_stop in cases:
         agent = "#!/bin/sh\nprintf 'research reply\n'\n" if case == "read-only" else cli_script
         if case == "planning":
@@ -123,6 +124,10 @@ exit %d
         if case == "planning":
             git_run("branch", "lane/planning-fixture", planned_base)
             spec += "planning_lane: planning-fixture\n"
+        if case in ("fail", "expired"):
+            spec += "check_window: 30\n"
+        if case == "expired":
+            spec += "budget: {seconds: 60}\n"
         if case == "hosted":
             spec = spec.replace("id: fixture", "id: hosted-lead")
             order.update(conversation_id="fixture", turn_id="fixture-turn")
@@ -156,6 +161,12 @@ exit %d
             snapshot, = path.glob("read-only-*/repo")
             assert (snapshot / "candidate.txt").read_text() == "candidate"
         matches_schema(SCHEMA, receipt)
+        assert receipt["finish"]["check_window"] == (30 if case in ("fail", "expired") else 600)
+        if case == "expired":
+            assert receipt["finish"]["deadline"] == receipt["started"] + 60
+            # Simulate recovery after the budget expired. Finishing must still publish a row.
+            receipt["finish"]["deadline"] = receipt["started"]
+            (path / "execution-receipt.json").write_text(json.dumps(receipt))
         path = state / "runs" / receipt["run_id"]
         assert not any((path / file).exists() for file in ("check.json", "terminal.json", "evidence"))
         assert not (state / "ledger.jsonl").exists()
@@ -194,7 +205,10 @@ exit %d
             assert not list(path.glob("read-only-*"))
             assert "branch" not in row
         check = load(path / "check.json")
+        assert check["window"] == receipt["finish"]["check_window"], (case, check)
         assert check["skipped"] == (case == "refused"), (case, check)
+        if case == "expired":
+            assert check["exit_code"] == -1 and "fixture check" not in check["output"], check
         evidence = load(path / "evidence/manifest.json")
         assert evidence["stimulus_sha"] == receipt["stimulus"]["sha256"], evidence
         again = run(finish, request)

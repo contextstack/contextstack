@@ -1,3 +1,6 @@
+---
+host_only: requires applying a fresh macOS Seatbelt profile from the host
+---
 # attack-ssh-agent
 
 An agent signs with the owner's ssh-agent.

@@ -4,11 +4,36 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 import stat
+
+DEFAULT_CHECK_WINDOW = 600
+
+
+def validate_check_window(value):
+    if type(value) is not int or not 1 <= value <= 3600:
+        raise ValueError("check_window must be an integer from 1 to 3600")
+    return value
+
+
+def remaining_check_time(window, deadline):
+    return min(window, deadline - time.time()) if deadline is not None else window
+
+
+def harness_check_time(window, row):
+    seconds = row.get("check_budget_seconds")
+    if seconds is not None and seconds > 0:
+        # The Rust harness writes nanoseconds; Python before 3.15 parses at most six fraction digits.
+        raw = re.sub(r"(\.\d{6})\d+", r"\1", row["started"].replace("Z", "+00:00"))
+        return remaining_check_time(window, datetime.fromisoformat(raw).timestamp() + seconds)
+    if row.get("harness_lane") or row.get("harness_trace", {}).get("identity", {}).get("job_id"):
+        return remaining_check_time(window, row.get("check_deadline"))
+    return window
+
 
 # Shared atomic write (the same code ships as cs/scripts/_atomic_write.py; a py-core-units test keeps them equal).
 

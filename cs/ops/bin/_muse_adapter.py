@@ -262,7 +262,7 @@ def execute(folder, ws, real_home, binary, env, protected, identity, prompt, tim
     return _muse.run_process(bounded, ws, env, timeout, on_started=on_started, memory_cap_mb=memory_cap_mb, on_evidence=on_evidence)
 
 
-def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None, *, check_scratch=None):
+def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None, *, grader=None, check_scratch=None):
     """Sandbox command for the frozen task check.
 
     Extra allows are emitted before the estate deny, so they do not keep a path
@@ -281,6 +281,9 @@ def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None,
             roots.append(tmp_path)
         grants.append(dict(path=str(tmp_path), access="read_write"))
     grants.append(dict(path=str(stim), access="read"))
+    if grader is not None:
+        roots.append(grader)
+        caller["deny_write_roots"] = [*caller.get("deny_write_roots", []), str(grader)]
     caller["caller_grants"] = grants
     return _muse.sandbox_command([os.path.abspath(str(check))], workspace, real_home, protected,
                                  extra=caller, read_roots=roots, check_scratch=check_scratch)
@@ -288,6 +291,9 @@ def check_command(check, workspace, real_home, protected=(), extra=(), tmp=None,
 
 def run(c):
     started_wall = time.time()
+    deadline = started_wall + c["timeout"]
+    check_budget = c.get("check_budget")
+    check_deadline = started_wall + check_budget if type(check_budget) in (int, float) and check_budget > 0 else None
     ws, run_dir, here = c["ws"].resolve(), c["run_dir"], c["HERE"]
     def process_evidence(rows):
         from _agent_stream import append
@@ -398,7 +404,7 @@ def run(c):
             c["check_window"], "profiled", stop, verdict, None, trace, lane, bool(repo_view),
             c["grant_paths"], c["CODE_ROOT"] / "policy/sandbox.json", sandbox_extra, protected if verdict is None else (),
             None, (c.get("tmpl") or {}).get("env_drop") or [], memory_cap_mb, c["child_env"],
-            execution_id=c["execution_id"],
+            execution_id=c["execution_id"], deadline=check_deadline,
         )
         c["send_receipt"](receipt)
 
@@ -427,7 +433,10 @@ def run(c):
             def probe(args):
                 row["native_probe_count"] += 1
                 command = _muse.sandbox_command([str(binary), *args], ws, real_home, protected, extra=sandbox_extra)
-                result = _muse.run_process(command, ws, env, min(c["timeout"], 15), memory_cap_mb=memory_cap_mb, on_evidence=process_evidence)
+                remaining = min(15, deadline - time.time())
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, 0)
+                result = _muse.run_process(command, ws, env, remaining, memory_cap_mb=memory_cap_mb, on_evidence=process_evidence)
                 _muse.require_resources(result)
                 if result.returncode:
                     raise ValueError("Muse identity/config probe failed: " + result.stderr)
@@ -467,7 +476,10 @@ def run(c):
         finish("fail" if stop in ("timeout", "cancelled") else "void", stop, stderr=str(error))
     try:
         call_started = time.monotonic()
-        cli = frozen.execute(folder, ws, real_home, binary, env, protected, identity, prompt, c["timeout"],
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(binary, c["timeout"])
+        cli = frozen.execute(folder, ws, real_home, binary, env, protected, identity, prompt, remaining,
                              on_started=lambda: row.update(cli_invoked=True), extra=sandbox_extra, memory_cap_mb=memory_cap_mb, on_evidence=process_evidence, trace=trace)
         row["per_call_latency_ms"] = (time.monotonic() - call_started) * 1000
         row["cli_exit"] = cli.returncode

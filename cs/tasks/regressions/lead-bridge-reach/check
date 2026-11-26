@@ -7,7 +7,7 @@ Host-only: --darwin-probe."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 
 import json, os, socket, subprocess, sys, tempfile, threading
 from pathlib import Path
@@ -38,8 +38,8 @@ def listener(path):
     return s
 
 
-own_dir = Path(tempfile.mkdtemp(prefix="lead-mcp-", dir="/tmp", suffix=".noindex"))
-other_dir = Path(tempfile.mkdtemp(prefix="lead-mcp-", dir="/tmp", suffix=".noindex"))
+own_dir = Path(tempfile.mkdtemp(prefix="lead-mcp-", dir=short_tmp(), suffix=".noindex"))
+other_dir = Path(tempfile.mkdtemp(prefix="lead-mcp-", dir=short_tmp(), suffix=".noindex"))
 own, other = own_dir / "mcp.sock", other_dir / "mcp.sock"
 servers = [listener(own), listener(other)]
 probe = ("import socket,sys\nfor p in sys.argv[1:]:\n s=socket.socket(socket.AF_UNIX)\n"

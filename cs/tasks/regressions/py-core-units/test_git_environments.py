@@ -1,9 +1,9 @@
 """Git callers discard inherited overrides without launching git."""
 import os
 import runpy
-import socket
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -40,9 +40,17 @@ class GitEnvironmentTests(unittest.TestCase):
             scratch = Path(root) / ("long-component-" * 8)
             scratch.mkdir()
             inherited = {"TMPDIR": str(scratch), "GIT_CONFIG_GLOBAL": "hostile-config"}
-            with check_environment(inherited, scratch) as env:
+            temporary_directory = tempfile.TemporaryDirectory
+
+            def fixture_directory(*, prefix, dir):
+                # Model the host's alias root inside the check's writable scratch.
+                return temporary_directory(prefix=prefix, dir=root if dir == "/tmp" else dir)
+
+            with patch("_machine_finish.tempfile.TemporaryDirectory", side_effect=fixture_directory), \
+                    check_environment(inherited, scratch) as env:
                 tmp = Path(env["TMPDIR"])
-                self.assertLess(len(os.fsencode(tmp)), 32)
+                self.assertEqual(tmp.parent.parent, Path(root))
+                self.assertLess(len(os.fsencode(tmp)), len(os.fsencode(tmp.resolve())))
                 self.assertEqual(tmp.resolve().parent, scratch.resolve())
                 self.assertEqual(env["TMP"], str(tmp))
                 self.assertEqual(env["TEMP"], str(tmp))
@@ -50,19 +58,25 @@ class GitEnvironmentTests(unittest.TestCase):
                 self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
                 self.assertEqual(env["GIT_AUTHOR_NAME"], "Fixture Author")
                 self.assertNotIn("GIT_COMMITTER_NAME", env)
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-                    listener.bind(str(tmp / "check.sock"))
+                subprocess.run(
+                    [sys.executable, "-c",
+                     "import socket; socket.socket(socket.AF_UNIX).bind('check.sock')"],
+                    cwd=tmp, check=True,
+                )
                 self.assertTrue((tmp.resolve() / "check.sock").is_socket())
             self.assertFalse(tmp.is_symlink())
             self.assertEqual(list(scratch.iterdir()), [])
             self.assertEqual(inherited["GIT_CONFIG_GLOBAL"], "hostile-config")
 
     def test_native_check_scratch_remains_short_when_resolved(self):
-        with patch.dict(os.environ, hermetic_env(), clear=True), check_environment({}, "/tmp") as env:
-            tmp = Path(env["TMPDIR"])
-            self.assertEqual(tmp.resolve().parent, Path("/tmp").resolve())
-            self.assertLess(len(os.fsencode(tmp.resolve())), 32)
-            self.assertFalse(tmp.is_symlink())
+        system_tmp = Path("/tmp")
+        target = system_tmp / "cs-fixture"
+        with patch("_machine_finish.tempfile.TemporaryDirectory") as directory:
+            directory.return_value.__enter__.return_value = str(target)
+            with check_environment({}, system_tmp) as env:
+                self.assertEqual(env["TMPDIR"], str(target.resolve()))
+                self.assertLess(len(os.fsencode(env["TMPDIR"])), 32)
+            directory.assert_called_once_with(prefix="cs-", dir=system_tmp)
 
     def test_publish_git_environment_and_private_index(self):
         publish = runpy.run_path(str(OPS / "publish-evidence"))

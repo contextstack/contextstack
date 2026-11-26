@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "node-install-layout"))
 import _bundle  # noqa: E402
 sys.path.insert(0, str(HERE.parent / "_lib"))
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
 
 CODE_ROOT = _bundle.CODE_ROOT
@@ -123,21 +123,22 @@ elif args[0] == "kickstart":
     start(open(os.path.join(emu, label + ".path")).read())
 '''
 
-# A signed-in Claude Code: auth status says so, a run answers in stream-json; every call is logged.
+# A signed-in Claude Code: auth status says so, and --print answers in stream-json.
 CLAUDE = r'''#!%s
-import json, os, sys
-open(os.path.join(os.environ.get("FAKE_CLAUDE_LOG_DIR", "%s"), "claude-calls.jsonl"), "a").write(json.dumps(sys.argv[1:]) + "\n")
+import json, sys
 if sys.argv[1:] == ["--version"]:
     print("9.9.9 (Claude Code)")
 elif sys.argv[1:3] == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty"}))
-else:
+elif "--print" in sys.argv[1:]:
     for line in ({"type": "system", "subtype": "init", "model": "claude-fake", "session_id": "s", "tools": []},
                  {"type": "assistant", "message": {"model": "claude-fake", "content": [{"type": "text", "text": "%s"}],
                                                    "usage": {"input_tokens": 3, "output_tokens": 5}}},
                  {"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "result": "%s",
                   "duration_ms": 10, "total_cost_usd": 0, "usage": {"input_tokens": 3, "output_tokens": 5}}):
         print(json.dumps(line), flush=True)
+else:
+    sys.exit("unexpected Claude Code arguments")
 '''
 
 
@@ -1099,7 +1100,7 @@ def main():
         return 1 if problems else 0
     before = _bundle.real_agents()
     # short: the gateway's socket under HOME/.contextstack/gateway must fit in sun_path (104 bytes on macOS)
-    created = tempfile.mkdtemp(prefix="csi-", dir="/tmp" if os.path.isdir("/tmp") else None, suffix=".noindex")
+    created = tempfile.mkdtemp(prefix="csi-", dir=short_tmp(), suffix=".noindex")
     tmp = Path(created).resolve()
     home, emu, shims = tmp / "home", tmp / "launchd", tmp / "shims"
     _fixture["prefixes"] = _usable_prefixes([tmp, created])
@@ -1115,7 +1116,7 @@ def main():
     try:
         (shims / "launchctl").write_text(LAUNCHCTL % sys.executable)
         (shims / "fdesetup").write_text("#!/bin/sh\necho 'FileVault is Off.'\n")
-        (home / ".local/bin/claude").write_text(CLAUDE % (sys.executable, tmp, REPLY, REPLY))
+        (home / ".local/bin/claude").write_text(CLAUDE % (sys.executable, REPLY, REPLY))
         for p in (shims / "launchctl", shims / "fdesetup", home / ".local/bin/claude"):
             p.chmod(0o755)
         _bundle.bundle(tmp / "bundle", uv, RID, {name: target / f for name, f in REAL.items()})
@@ -1173,8 +1174,6 @@ def main():
         done = jobs(db)
         expect(len(done) == 2 and any(j == first.get("job") and state == "done" for j, state in done),
                "the Director has the completed hello and welcome turn: %s" % done)
-        calls = [json.loads(l) for l in (tmp / "claude-calls.jsonl").read_text().splitlines()]
-        expect(any("--print" in c for c in calls), "the job ran the fake claude through the claude-code template")
         calls_before = (emu / "calls.log").read_text()
         snap = snapshot(root / "config", agents)
         r2 = subprocess.run(argv[:3] + argv[5:], env=env, cwd="/", capture_output=True, text=True, timeout=120)

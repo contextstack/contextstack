@@ -44,7 +44,32 @@ Effective policy: reads = `runtime_read` ∪ workspace ∪ tmp ∪ requested rea
 
 `sockets`: named unix sockets, the general form of `gateway`. A requested name is granted when the host lists it (name `[a-z0-9][a-z0-9-]*`, path absolute after expansion, else 101) and the path is a live socket now; otherwise it is narrowed (`capability: "socket"`, reported) and the tool fails on its own terms. The tool finds a granted path in `CS_SOCKET_<NAME>` (`browser-public` -> `CS_SOCKET_BROWSER_PUBLIC`); the report's `effective_policy.sockets` lists them. `net` is unchanged: Seatbelt adds `network-outbound` to each socket's literal and canonical path under every `net` mode (`all` opens IP networking only, never other unix sockets); bwrap `--ro-bind`s each canonical socket at the listed path and, under `none`, uses the `gateway` seccomp list (no socket but `AF_UNIX`; the network namespace holds no other endpoint). A socket the host lists but the descriptor did not request stays unreachable. The browser broker (`cs/ops/bin/browser-broker`) serves one socket per origin set this way.
 
-`write_env`: write targets named by variables are confined to the host's state root, `~/.contextstack`. A requested variable's directory (mkdir -p, 0700, canonical) is read- and writable only when the host lists the variable, it is set and absolute, and it lies under one of its roots and outside the workspace and the code root; otherwise the request is narrowed (reported) and the tool runs without it.
+`write_env`: write targets named by variables are confined to the host's state root, `~/.contextstack`. A requested variable's directory (mkdir -p, 0700, canonical) is read- and writable only when the host lists the variable, it is set and absolute, and it lies strictly inside an allowed root and outside the workspace and code root. A target that equals an allowed root, or equals or contains the workspace, code root, home, state root, or a credential store, causes exit 101. Other unavailable grants are narrowed and reported.
+
+On macOS, native agent profiles grant writes to the run's own TMPDIR and allow
+data writes to `/dev/null` and `/dev/tty`. Claude Code also gets
+`/private/tmp/claude-<uid>` for its Bash session files, and Cursor gets
+`/private/tmp/.cursor` for its workspace scratch. Each grant applies to that
+CLI's subtree. At render time, `getconf DARWIN_USER_TEMP_DIR` identifies the
+current user's Darwin temp directory. Its parent under
+`/private/var/folders/<xx>/<hash>` covers that user's `T`, `C`, and `0`
+directories.
+
+## Approved localhost actions
+
+List each port in `request_action.needs`. For example, `["network:loopback:3000", "network:loopback:3001"]`
+asks to open localhost ports 3000 and 3001 for one invocation. The approval displays these exact entries.
+The action runner passes the approved ports to `cs-sandbox` in `--action-widening` as `loopback_ports`.
+A request with a reserved port is refused in full. Ports 8780 (Director) and 9200 (gateway) are
+always reserved. The node also reserves ports from its configured Director listeners and receiver URL,
+its web client listener, and the gateway and Director environment settings. In `node.env`, set
+`CS_RESERVED_LOOPBACK_PORTS` to a comma-separated list of any additional ContextStack service ports.
+
+On macOS, Seatbelt allows connections to each listed host localhost port and lets the action bind and
+accept traffic on those ports. On Linux, bubblewrap creates a fresh network namespace per invocation
+with only its own loopback interface and no host routes. Every host TCP and UDP listener is unreachable,
+including a dev server started by another invocation on a listed port. A server and client started inside
+the same invocation can communicate on private loopback. Linux does not filter the private namespace by port.
 
 ## Named profiles
 
@@ -60,7 +85,7 @@ Seatbelt does not nest under a deny-default profile (`forbidden-sandbox-reinit`)
 
 ## Linux (phase 3b)
 
-`bwrap --unshare-user --disable-userns --unshare-ipc --unshare-pid --unshare-uts --unshare-cgroup-try [--unshare-net] --die-with-parent --new-session --cap-drop ALL --dev /dev --proc /proc --dir /tmp`, then the mount plan (`src/bwrap.rs`): every readable path outside the writable ones `--ro-bind` (canonical; an absent one is skipped and reported as a `read` narrowing), the workspace, tmp and granted `write_env` dirs `--bind`, parents before children, each symlink on the way to a runtime path (`/lib64`, `/bin`, Ubuntu's `/etc/resolv.conf`) recreated with `--symlink`, and the tool binary bound read-only when no read path covers it (`target/release/cs-tools`). Then `--remount-ro /`, so a write anywhere else is `EROFS`; `--chdir` the workspace; `--seccomp FD` and `--json-status-fd FD`, both inherited fds (a memfd and a pipe) set up with rustix, no `unsafe`. Net: `none` and `gateway` unshare the network; `gateway` also `--ro-bind`s the canonical `CS_GATEWAY_SOCKET` at the path the tool sees. An outside path is not denied but absent: a planted symlink dangles (`ENOENT`).
+`bwrap --unshare-user --disable-userns --unshare-ipc --unshare-pid --unshare-uts --unshare-cgroup-try [--unshare-net] --die-with-parent --new-session --cap-drop ALL --dev /dev --proc /proc --dir /tmp`, then the mount plan (`src/bwrap.rs`): every readable path outside the writable ones `--ro-bind` (canonical; an absent one is skipped and reported as a `read` narrowing), the workspace, tmp and granted `write_env` dirs `--bind`, parents before children, each symlink on the way to a runtime path (`/lib64`, `/bin`, Ubuntu's `/etc/resolv.conf`) recreated with `--symlink`, and the tool binary bound read-only when no read path covers it (`target/release/cs-tools`). Then `--remount-ro /`, so a write anywhere else is `EROFS`; `--chdir` the workspace; `--seccomp FD` and `--json-status-fd FD`, both inherited fds (a memfd and a pipe) set up with rustix, no `unsafe`. Net: `none`, `gateway` and `loopback` unshare the network; `gateway` also `--ro-bind`s the canonical `CS_GATEWAY_SOCKET` at the path the tool sees. An outside path is not denied but absent: a planted symlink dangles (`ENOENT`).
 
 The seccomp denylist (`src/seccomp.rs`, compiled with `seccompiler`, `EPERM` on match) is adapted from Codex: always `ptrace`, `process_vm_*`, `io_uring_*`; `none` adds connect, bind, listen, accept, send/recv*mmsg, sockopts and any socket but `AF_UNIX`; `gateway` refuses every socket but `AF_UNIX`; `all` refuses `AF_VSOCK`. Nested user namespaces are refused (`--disable-userns`; on Ubuntu AppArmor's `bwrap-userns-restrict` refuses them too), so a tool that runs its own bwrap (`exec`) skips it when its process already carries a seccomp filter and `no_new_privs` and cannot create a user namespace. bwrap is looked up at fixed paths only: Ubuntu's AppArmor profile that admits it is attached by path.
 

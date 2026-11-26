@@ -12,7 +12,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
 sys.path[:0] = [str(KIT / "ops/bin"), str(HERE.parent / "_lib")]
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
 import _executor
 import _toolchains
@@ -21,7 +21,7 @@ if "--darwin-probe" not in sys.argv or sys.platform != "darwin":
     print("lane-toolchain-php: SKIP (requires --darwin-probe on macOS)")
     raise SystemExit(0)
 
-with scratch_dir(dir="/tmp", prefix="lane-php-") as raw:
+with scratch_dir(dir=short_tmp(), prefix="lane-php-") as raw:
     root = Path(raw).resolve()
     home, ws, tmp = root / "home", root / "ws", root / "tmp"
     wrapper = home / "Library/Application Support/Herd/bin"

@@ -349,6 +349,9 @@ jobs:
         check('assets=(cs/scripts/install.sh ' in release['run'], 'installer asset on every release')
         check(release['run'].count('--notes-file docs/release/prerelease-notes.md') == 2,
               'tagged and rolling previews use the pre-release notes')
+        allowed = (REPO / 'scripts/public-export/allow.txt').read_text().split()
+        for notes in sorted(set(re.findall(r'--notes-file (\S+)', release['run']))):
+            check(notes in allowed, notes + ' is in the public export (the public CI reads it)')
         for endpoint in ('"repos/$GH_REPO/git/refs/tags/channel-latest"', '"repos/$GH_REPO/git/refs"'):
             check(endpoint in release['run'], 'channel tag API uses workflow repository')
         for command in ('gh release create "$GITHUB_REF_NAME" --verify-tag --latest=true',

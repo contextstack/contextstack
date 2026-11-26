@@ -17,7 +17,7 @@ with scratch_dir(prefix="executor-preflight-") as raw:
     ops, task, setup, ledger = (code_root / "ops/bin", code_root / "tasks/fixture",
                                 code_root / "tasks/fixture/setup", code_root / "ledger")
     for path in (ops, task, setup, ledger): path.mkdir(parents=True, exist_ok=True)
-    for name in ('_stuck.py', '_provider_limits.py', '_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_muse_adapter.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_process_group.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "capture-stimulus", "_est.py", "_grant.py",
+    for name in ('_stuck.py', '_provider_limits.py', '_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_muse_adapter.py", "_machine_finish.py", "_check_grader.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_process_group.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "capture-stimulus", "_est.py", "_grant.py",
                  "_workspace_setup.py", "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "publish-evidence",
                  "_run_record.py", "_env_policy.py", "_errors.py", "finalize-run"):
         shutil.copy2(ROOT / "ops/bin" / name, ops / name)

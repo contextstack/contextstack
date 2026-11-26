@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
-from scratch import scratch_dir
+from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
 
 OPS = Path(__file__).resolve().parents[3] / "ops/bin"
@@ -30,7 +30,7 @@ def executor_profile(home, ws, private, profile):
     return profile.read_text()
 
 
-with scratch_dir(prefix="sec-lead-mcp-bridge-", dir="/tmp") as raw:
+with scratch_dir(prefix="sec-lead-mcp-bridge-", dir=short_tmp()) as raw:
     root = Path(raw)
     home, ws, private = (root / n for n in ("home", "workspace", "private"))
     for path in (home, ws, private):
@@ -76,7 +76,7 @@ if capability.returncode != 0:
     print("sec-lead-mcp-bridge: PASS (offline); SKIP probe (nested sandbox refused)")
     raise SystemExit(0)
 
-with scratch_dir(prefix="sec-lead-mcp-probe-", dir="/tmp") as raw:
+with scratch_dir(prefix="sec-lead-mcp-probe-", dir=short_tmp()) as raw:
     root = Path(raw)
     home, ws, private = (root / n for n in ("home", "workspace", "private"))
     for path in (home, ws, private):

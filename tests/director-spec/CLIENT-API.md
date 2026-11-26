@@ -1275,7 +1275,10 @@ worker prompt is used. With `agent`, its model, prompt body, check, task type an
 budget supply defaults; explicit values override them and budget merges per key.
 Optional `system` overrides the prompt. Budget accepts nonnegative finite numbers
 for `usd` and nonnegative integers for `turns`, `tool_calls`, `seconds`; seconds
-cannot exceed 3600. Profile workspace requirements are enforced; a read-only
+cannot exceed 3600. Optional `check_window` must be an integer from 1 to 3600.
+It is copied to the spec and defaults to 600 seconds at execution. The final
+check also respects the time remaining in the job's seconds budget.
+Profile workspace requirements are enforced; a read-only
 profile's lane check also guards against worktree changes. The profile's SHA-256
 is recorded as `meta.agent_sha256`, with `agent`, `model`, `task_type`, `repo`,
 `lane` and `branch` where applicable.
@@ -1350,7 +1353,11 @@ this list and its model/fallback chain; `CS_AGENTS_DIR` does not affect MCP.
   access follows the job.
 - Show the exact `argv`, `needs`, absolute `write_paths`, requester model
   and reason, job and run, reviewer model, verdict and review reason. An
-  absent reviewer model means no model was selected or called.
+  absent reviewer model means no model was selected or called. Each
+  `network:loopback:<port>` entry names one requested localhost port, such
+  as `network:loopback:3000`. On macOS these entries open the named ports
+  on host localhost. On Linux the action receives a private localhost.
+  ContextStack service ports are reserved.
 - `POST action-approvals/ID/decide` with `{"decision":"approve"}` or
   `{"decision":"deny"}` requires a local or paired credential. Leads get 403 `owner_only`.
   Only `needs_owner` is decidable. The approval record includes the acting credential ID as `decided_by`

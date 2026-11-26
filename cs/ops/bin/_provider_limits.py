@@ -5,6 +5,7 @@ import calendar
 import math
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -276,22 +277,22 @@ def _login_changed(row):
     return [st.st_ino, st.st_mtime_ns, st.st_size] != row.get("login_signature")
 
 
-def load(state_root):
+def _read_active(state_root):
     path = state_path(state_root)
     if not path.is_file():
-        return {"templates": {}}
+        return {"templates": {}}, False
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"templates": {}}
+        return {"templates": {}}, False
     if not isinstance(data, dict):
-        return {"templates": {}}
+        return {"templates": {}}, False
     templates = data.setdefault("templates", {})
     if not isinstance(templates, dict):
         templates = {}
         data["templates"] = templates
     now = time.time()
-    active = {}
+    original_count = len(templates)
     for name, row in list(templates.items()):
         if not isinstance(row, dict):
             templates.pop(name, None)
@@ -317,10 +318,32 @@ def load(state_root):
             if ts is not None and ts <= now:
                 templates.pop(name, None)
                 continue
-        active[name] = row
-    if active != templates:
+    return data, len(templates) != original_count
+
+
+@contextmanager
+def _limits_lock(state_root):
+    import fcntl
+    Path(state_root).mkdir(parents=True, exist_ok=True)
+    with (Path(state_root) / "provider-limits.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _load_locked(state_root):
+    data, changed = _read_active(state_root)
+    if changed:
         save(state_root, data)
     return data
+
+
+def load(state_root):
+    data, changed = _read_active(state_root)
+    if not changed:
+        return data
+    # Re-read under the writer lock so cleanup cannot overwrite a concurrent update.
+    with _limits_lock(state_root):
+        return _load_locked(state_root)
 
 
 def save(state_root, data):
@@ -331,11 +354,8 @@ def save(state_root, data):
 
 
 def record_limit(state_root, template, hit, *, preserve_existing=False):
-    import fcntl
-    Path(state_root).mkdir(parents=True, exist_ok=True)
-    with (Path(state_root) / "provider-limits.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        data = load(state_root)
+    with _limits_lock(state_root):
+        data = _load_locked(state_root)
         templates = data.setdefault("templates", {})
         if preserve_existing and str(template) in templates:
             return
@@ -472,11 +492,8 @@ def notice(state, template, cli, home=None):
 
 
 def clear_pause(state, template):
-    import fcntl
-    Path(state).mkdir(parents=True, exist_ok=True)
-    with (Path(state) / "provider-limits.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        data = load(state)
+    with _limits_lock(state):
+        data = _load_locked(state)
         if data.get("templates", {}).get(template, {}).get("via") == "login":
             del data["templates"][template]
             save(state, data)

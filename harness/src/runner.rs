@@ -388,16 +388,11 @@ async fn hook(
     let check = cell.dir.join("stimulus/check");
     let mut env = vec![("CS_CHECK".into(), check.to_string_lossy().into_owned())];
     env.extend(tool.map(|name| ("CS_TOOL".into(), name.into())));
-    let capture = if name == "step-confirm" {
-        Capture::Foreground
-    } else {
-        Capture::Text
+    let capture = match name {
+        "step-confirm" => Capture::Foreground,
+        _ => Capture::Text,
     };
-    let kind = if tool.is_some() {
-        "pre_tool_hook"
-    } else {
-        "post_turn_hook"
-    };
+    let kind = tool.map_or("post_turn_hook", |_| "pre_tool_hook");
     let bin = cell.root.join("hooks/bin").join(name);
     let mut span = cell.trace.span(kind, name, parent);
     let result = process::command(
@@ -407,7 +402,7 @@ async fn hook(
         input,
         &env,
         Some(control),
-        Some(seconds(cell.spec.check_window.max(60))),
+        Some(seconds(cell.spec.check_window.unwrap_or(60))),
         capture,
     )
     .await;
@@ -487,7 +482,7 @@ async fn tool(
         .chain(entry.args.iter().map(String::as_str))
         .collect();
     let timeout_secs = if is_check {
-        cell.spec.check_window.max(60)
+        cell.spec.check_window.unwrap_or(60)
     } else {
         entry.timeout_seconds.max(60)
     };

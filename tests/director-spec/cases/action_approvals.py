@@ -113,7 +113,7 @@ def independent_review(ctx):
                 "review-model": ("openai", refusal("openai", "exhausted") if scenario == "refused" else answer),
             }
             request = {"run_id": f"{ctx.serial_tag()}-{scenario}", "context": context,
-                       "requesting_model": "local-coder", "needs": ["network:loopback", "write_paths"],
+                       "requesting_model": "local-coder", "needs": ["network:loopback:3000", "write_paths"],
                        "write_paths": [context["job_tmp"]],
                        "argv": ["cs/tasks/regressions/trace-e2e/check"],
                        "reason": "The regression needs a local server and scratch files."}

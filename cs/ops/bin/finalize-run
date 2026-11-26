@@ -78,7 +78,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from _estate_io import spec_intent, write_atomic
+from _estate_io import DEFAULT_CHECK_WINDOW, harness_check_time, spec_intent, write_atomic
 
 from _env_policy import load_policy
 from _errors import call_errors, classify_stop, sandbox_tools
@@ -198,27 +198,63 @@ def harness_workspace(run_dir, term):
 
 def run_check(run_dir, term):
     """Port of the runner's check(): frozen check, cwd workspace, combined output."""
-    window = int(term.get("check_window") or 60)
+    window = int(term.get("check_window") or DEFAULT_CHECK_WINDOW)
     workspace = harness_workspace(run_dir, term)
     env = child_env()
     toolchain = nullcontext({})
+    grader_context = nullcontext()
     if lane := term.get("harness_lane"):
+        from _check_grader import lane_grader
         from _lanes import assert_lane_git_pointer
         from _toolchains import harness_lane_env
         assert_lane_git_pointer(workspace, lane["main"], lane["lane"])
         toolchain = harness_lane_env(workspace, env.get("PATH", ""))
+        grader_context = lane_grader(lane, workspace, run_dir)
+    report = {}
     try:
-        with toolchain as extra_env:
-            done = subprocess.run([str(run_dir / "stimulus/check")], cwd=workspace,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  env=dict(env, **extra_env), timeout=window)
-        output, code = done.stdout, done.returncode
+        with toolchain as extra_env, grader_context as grader:
+            check_env = dict(env, **extra_env)
+            if grader:
+                check_env = grader.environment(check_env)
+            timeout = harness_check_time(window, term)
+            if timeout <= 0:
+                raise subprocess.TimeoutExpired("check", 0)
+            if grader and sys.platform == "darwin":
+                from _estate_io import native_caller
+                from _machine_finish import collect_check, sandboxed_check
+
+                scratch = run_dir / "tmp"
+                scratch.mkdir(exist_ok=True)
+                caller, reads = native_caller({}, Path.home(), run_dir, workspace, scratch, lane)
+                check = collect_check(lambda: sandboxed_check(
+                    run_dir, workspace, check_env, timeout, None,
+                    CODE_ROOT / "policy/sandbox.json", caller, reads, None, grader=grader,
+                ))
+                output = (check.stdout + "\n" + check.stderr).encode()
+                code = -1 if check.interruption else check.returncode
+            elif lane:
+                from _muse import run_process
+
+                done = run_process([str(run_dir / "stimulus/check")], str(grader.root if grader else workspace),
+                                   check_env, timeout)
+                output, code = (done.stdout + done.stderr).encode(), done.returncode
+            else:
+                done = subprocess.run([str(run_dir / "stimulus/check")],
+                                      cwd=grader.root if grader else workspace,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      env=check_env, timeout=timeout)
+                output, code = done.stdout, done.returncode
+            if grader:
+                report = grader.report(output.decode("utf-8", errors="replace"), code)
     except subprocess.TimeoutExpired as expired:
-        output, code = expired.stdout or b"", -1
-    except OSError:
-        output, code = b"", -1
+        output = expired.stdout or expired.stderr or b""
+        if isinstance(output, str):
+            output = ((expired.stdout or "") + (expired.stderr or "")).encode()
+        code = -1
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        output, code = str(error).encode(), -1
     return {"verdict": "pass" if code == 0 else "fail", "exit_code": code, "output": clip(output),
-            "skipped": False, "window": window, "stimulus_sha": term.get("stimulus_sha", "")}
+            "skipped": False, "window": window, "stimulus_sha": term.get("stimulus_sha", ""), **report}
 
 
 def step_check(run_dir, term, steps):
@@ -235,7 +271,7 @@ def step_check(run_dir, term, steps):
         raise Pending("CLI terminal requires the machine finisher’s check record")
     if term.get("verdict") == "void":
         write_json(path, {"verdict": "void", "exit_code": 0, "output": "", "skipped": True,
-                          "window": int(term.get("check_window") or 60),
+                          "window": int(term.get("check_window") or DEFAULT_CHECK_WINDOW),
                           "stimulus_sha": term.get("stimulus_sha", "")})
         steps["check"] = "skipped"
     else:
@@ -456,6 +492,7 @@ def step_row(run_dir, term, check, steps, result, by_tool=None):
     except (OSError, ValueError) as error:
         raise Pending("ledger row requires the local ESTATE identity: %s" % error)
     row = {key: term.get(key) for key in ROW_KEYS}
+    row.update(grader_report(check))
     if "provider_reported_usd" in term:
         row["provider_reported_usd"] = term["provider_reported_usd"]
     row.update(spec_intent(term))
@@ -649,6 +686,14 @@ def commit_harness_lane(run_dir, term, check, steps):
     steps["commit"] = "recorded"
 
 
+def grader_report(check):
+    if "check_summary" not in check:
+        return {}
+    from _check_grader import GRADER_REPORT_KEYS
+
+    return {key: check[key] for key in GRADER_REPORT_KEYS if key in check}
+
+
 def finalize(run_dir, term):
     steps, result = {}, {}
     check = step_check(run_dir, term, steps)
@@ -678,9 +723,12 @@ def finalize(run_dir, term):
     result.pop("sandbox_tools", None)
     verdict = term["verdict"] if "cli_row" in term else check["verdict"]
     result.update({"ts": now(), "steps": steps, "verdict": verdict, "stop": term["stop"]})
+    report = grader_report(check)
+    result.update(report)
     write_json(run_dir / "finalized.json", result)
     return {"ok": True, "state": "finalized", "verdict": verdict, "stop": term["stop"],
-            "row_appended": steps["row"] == "appended", "publish": steps["publish"]}
+            "row_appended": steps["row"] == "appended", "publish": steps["publish"],
+            **report}
 
 
 def emit(value, code):
@@ -731,7 +779,8 @@ def main():
         prior = json.loads(done.read_text(encoding="utf-8"))
         emit({"ok": True, "state": "finalized", "verdict": prior.get("verdict", ""),
               "stop": prior.get("stop", term.get("stop", "")), "row_appended": False,
-              "publish": (prior.get("steps") or {}).get("publish", "")}, 0)
+              "publish": (prior.get("steps") or {}).get("publish", ""),
+              **grader_report(prior)}, 0)
     try:
         emit(finalize(run_dir, term), 0)
     except Pending as error:

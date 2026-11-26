@@ -343,6 +343,9 @@
           "check_window": {
             "type": "integer"
           },
+          "deadline": {
+            "type": "number"
+          },
           "memory_cap_mb": {
             "type": [
               "integer",

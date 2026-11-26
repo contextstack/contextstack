@@ -13,6 +13,11 @@ from urllib.parse import quote
 
 
 SERVICE_WAIT_SECONDS = 60
+PAUSE_REASONS = {
+    "provider_unavailable": "provider unavailable",
+    "provider_limit": "provider limit reached",
+    "rate_limit": "rate limited",
+}
 
 
 class Skipped(RuntimeError):
@@ -41,6 +46,30 @@ def service_wait(init, seconds=SERVICE_WAIT_SECONDS):
     return " and ".join(missing) + " never came up within %ds" % seconds
 
 
+def sign_in_command(init, agent):
+    module = init.cs.load_script("cs_init", init.cs.KIT / "scripts/cs_init.py")
+    return module.sign_in_command(agent["name"])
+
+
+def report_hold(init, agent, job, hold):
+    reason, detail = hold
+    init.cancel_job(job, "cs smoke trial held: " + (reason or "waiting"))
+    if reason in (None, "executor_unavailable", "auth_expired", *PAUSE_REASONS):
+        from cs_agents import _limits_rows
+
+        limit = next((row for row in _limits_rows(state_root=init.cs.state_root())
+                      if row["template"] == agent["template"]), None)
+        if reason == "auth_expired" or (limit and limit.get("via") == "login"):
+            raise Skipped("sign-in expired; run `%s` to sign in again" % sign_in_command(init, agent))
+        if limit:
+            raise Skipped("provider limit reached" + (": " + limit["message"] if limit.get("message") else ""))
+        if reason == "executor_unavailable":
+            raise Skipped(detail or "executor unavailable for " + agent["template"])
+        if reason in PAUSE_REASONS:
+            raise Skipped(detail or PAUSE_REASONS[reason])
+    raise RuntimeError("held: " + (detail or reason or "waiting"))
+
+
 def agent_check(init, agent):
     deadline = time.monotonic() + 120
     with tempfile.TemporaryDirectory(prefix="cs-smoke-") as tmp:
@@ -54,19 +83,17 @@ def agent_check(init, agent):
         raise RuntimeError("could not create job: " + (result.stderr or result.stdout)[-300:])
     while time.monotonic() < deadline:
         row = init.job_row(job)
-        if row and row[0] not in ("offered", "waiting", "accepted", "running"):
+        if row and row[0] in ("waiting", "held"):
+            hold = init.job_hold(job)
+            if hold is not None:
+                report_hold(init, agent, job, hold)
+        elif row and row[0] not in ("offered", "accepted", "running"):
             terminal = json.loads(row[2] or "{}")
             stop = terminal.get("stop")
             if stop == "auth_expired":
-                module = init.cs.load_script("cs_init", init.cs.KIT / "scripts/cs_init.py")
-                raise Skipped("not signed in (%s)" % module.sign_in_command(agent["name"]))
-            reasons = {
-                "provider_unavailable": "provider unavailable",
-                "provider_limit": "provider limit reached",
-                "rate_limit": "rate limited",
-            }
-            if stop in reasons:
-                raise Skipped(reasons[stop])
+                raise Skipped("not signed in (%s)" % sign_in_command(init, agent))
+            if stop in PAUSE_REASONS:
+                raise Skipped(PAUSE_REASONS[stop])
             if row[0] != "done":
                 raise RuntimeError("job finished " + row[0])
             verdict = terminal.get("verdict")

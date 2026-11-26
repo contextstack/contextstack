@@ -15,7 +15,7 @@ import tempfile
 SOURCE = Path.cwd()
 VERSION = "Muse Code 1.0.3 (1.0.3-R2198.1)"
 NATIVE_SHA = "4c0f960028b603174af7df7bd5051d8c35d6c1aa372a37d18bc770926a0577a7"
-FILES = ("_executor.py", "_toolchains.py", "_harvest_git.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_vitals.py", "executor-templates.json", "_muse.py", "_muse_adapter.py", "_machine_finish.py",
+FILES = ("_executor.py", "_toolchains.py", "_harvest_git.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_vitals.py", "executor-templates.json", "_muse.py", "_muse_adapter.py", "_machine_finish.py", "_check_grader.py",
          "muse-profile.json", "capture-stimulus", "capture-stimulus.json",
          "_est.py", "_grant.py", "_workspace_setup.py", "_frozen_inputs.py",
          "publish-evidence", "harvest", "finalize-run")

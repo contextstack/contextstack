@@ -13,7 +13,7 @@ PATH, temp directories, and toolchain configuration are fake. No credentials or
 programs are executed. Lane git discovery and validation use fixed metadata.
 Template staging models resolved login sources.
 
-`profiles.sha256.json` preserves the frozen Python bytes from E2 steps 1–6.
+`profiles.sha256.json` records the expected profile bytes after host path normalization.
 The 48 retained `.sb` representatives cover every state for native-task/pi,
 frozen-check/goose, auth-refresh/pi, muse/pi, muse-check/pi, lead-host/antigravity,
 and both CLI adapters. No Python SBPL renderer remains.
@@ -22,7 +22,8 @@ Both baseline checks capture typed requests through the production Python
 builders, materialize the fake filesystem under target/, and render using
 `cs-sandbox --profile cli-executor --request -`. Every result must match its
 frozen SHA-256; representatives must also match their complete fixture bytes.
-Only Rust's temporary path prefix is mapped back to the virtual owner path.
+The renderer’s temporary owner path is mapped back to the virtual owner path.
+The Darwin user temp tree and Claude UID are mapped to fixed fixture values.
 Protected paths remain virtual so scratch ancestors cannot leak into rules.
 
 Drift saves `rendered.sb` and `representative.diff` beneath target/ and prints

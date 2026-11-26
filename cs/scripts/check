@@ -32,10 +32,22 @@ ops_cap_fail=0
 say() { echo "check: FAIL — $*"; fail=1; }
 
 bg_rule() {
-  local msg="$1" log
+  local msg="$1" log regression goal
   shift
+  regression=${1#tasks/regressions/}
+  goal="tasks/regressions/${regression%/check}/goal.md"
   log=$(mktemp)
-  ( "$@" >"$log.output" 2>&1 || printf '%s\n' "$msg" > "$log" ) &
+  (
+    if "$@" >"$log.output" 2>&1; then
+      if [ "$1" = "tasks/regressions/$regression" ] && [ "${regression##*/}" = check ] &&
+        awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } /^host_only: / { print; exit }' "$goal" 2>/dev/null | grep -q . &&
+        ! grep -qi 'skip' "$log.output"; then
+        printf '%s\n' "check: host-only covered: ${regression%/check}" > "$log.covered"
+      fi
+    else
+      printf '%s\n' "$msg" > "$log"
+    fi
+  ) &
   _bg_pids="${_bg_pids:-} $!"
   _bg_logs="${_bg_logs:-} $log"
 }
@@ -52,7 +64,12 @@ wait_rules() {
       kept="${TMPDIR:-/tmp}/check-failed-$(date +%Y%m%d-%H%M%S)-${log##*/}.log"
       cp "$log.output" "$kept" 2>/dev/null && echo "check: FAIL output kept: $kept"
     fi
-    rm -f "$log" "$log.output"
+    if [ -f "$log.covered" ]; then
+      cat "$log.covered"
+    else
+      grep -E '^[^:]+: skipped: needs host \(.*\)$' "$log.output" || true
+    fi
+    rm -f "$log" "$log.output" "$log.covered"
   done
   _bg_pids=""
   _bg_logs=""
@@ -288,7 +305,7 @@ bg_rule "the hosted lead bundle no longer satisfies conversation spec rules, cs 
 bg_rule "hosted lead setup duplicates conversations, fails recovery or welcome, or loses browser handoff" \
   tasks/regressions/cs-lead-create/check
 bg_rule "the hosted CLI reads the lead credential inside its sandbox, an unauthenticated socket launches host MCP, or proxy stdio/cleanup fails (#38)" \
-  tasks/regressions/lead-mcp-host/check
+  tasks/regressions/host-lead-mcp/check
 bg_rule "many hosted-lead conversations each get their own credential and session; legacy config migrates; missing owner refuses mint" \
   tasks/regressions/many-leads-host/check
 bg_rule "a lane can open the hosted lead's host-side MCP bridge socket, or the bridge spawns a thread per blind connect (#56)" \

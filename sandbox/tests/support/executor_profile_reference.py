@@ -94,7 +94,7 @@ def layout(case: str, root: Path):
 
     _, links = stage(tmpl, private, home)
     caller, read_roots = native_caller(tmpl, home, root / "run", ws, private, lane)
-    executable = home / ".local/bin/agent"
+    executable = home / ".local/bin" / Path(tmpl["binary"]).name
     executable.parent.mkdir(parents=True, exist_ok=True)
     if case == "codex":
         # Shebang scripts must remain readable by the interpreter by launcher path.

@@ -11,11 +11,13 @@ from unittest.mock import patch
 
 OPS = Path(__file__).resolve().parents[3] / "ops/bin"
 sys.path.insert(0, str(OPS))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
+from scratch import short_tmp  # noqa: E402
 
 import _lead_host as lead  # noqa: E402
 
 CONV = "reuse-sandbox-fixture"
-tmp = tempfile.mkdtemp(prefix="sec-serve-sandbox-", dir="/tmp", suffix=".noindex")
+tmp = tempfile.mkdtemp(prefix="sec-serve-sandbox-", dir=short_tmp(), suffix=".noindex")
 try:
     root = Path(tmp)
     state = root / "state"

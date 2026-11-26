@@ -20,7 +20,7 @@ class Limits(unittest.TestCase):
     def test_reads_either_yaml_style(self):
         # The Director edits budget.usd in place; a client may write the mapping as block lines.
         block='id: x\nbudget:\n  turns: 3   # limits\n  tool_calls: 7\n  usd: 0.25\n  seconds: 60\ntasks:\n- tasks/t\n'
-        self.assertEqual(declared(parsed(block)),(self.budget,60))
+        self.assertEqual(declared(parsed(block)),(self.budget,600))
         self.assertEqual(declared(parsed('budget: {turns: 3, tool_calls: 7, usd: 0, seconds: 60}\n'))[0]['usd'],0.0)
     def test_refuses_invalid_declarations(self):
         for raw in ['{}','{turns: 3}','~','{turns: 3, tool_calls: 7, usd: nan, seconds: 60}','{turns: 3, tool_calls: 7, usd: 1, seconds: "60"}',

@@ -1524,10 +1524,18 @@ def builtin_lane(ctx):
         form = dict(title="Bad", goal="No work", **over)
         a = c.call("POST", "intents", body={"node": n.name, "lane": form}, key=new_key())
         ctx.expect(a.status == 422, "invalid workspace slug refused", a)
-    a = c.call("POST", "intents", body={"node": n.name, "lane": {"title": "!! Hello WORLD !!", "goal": "x", "check": "echo yes"}}, key=new_key())
+    for invalid in (0, -1, 3601, True, 1.5, "30", None):
+        form = dict(title="Bad window", goal="No work", check_window=invalid)
+        a = c.call("POST", "intents", body={"node": n.name, "lane": form}, key=new_key())
+        ctx.expect(a.status == 422, "invalid check_window refused", a)
+    form = dict(title="!! Hello WORLD !!", goal="x", check="echo yes", check_window=30)
+    a = c.call("POST", "intents", body={"node": n.name, "lane": form}, key=new_key())
     ctx.expect(a.status == 201 and a.json["intent"]["task"] == "tasks/hello-world", "title slug for scratch lane", a)
     if a.status == 201:
-        check = c.call("GET", "jobs/%s/files/tasks/hello-world/check" % a.json["jobs"][0]["job_id"]).body
+        job = a.json["jobs"][0]["job_id"]
+        spec = c.call("GET", "jobs/%s/files/spec.yaml" % job).body
+        ctx.expect(b"check_window: 30\n" in spec, "check_window included in job spec", spec)
+        check = c.call("GET", "jobs/%s/files/tasks/hello-world/check" % job).body
         ctx.expect(check == b"#!/bin/sh\necho yes\n", "check body wrapped as executable script", check)
 
 

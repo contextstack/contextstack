@@ -135,7 +135,11 @@ fn ip_network_support_rules() -> Vec<String> {
     ]
 }
 
-fn network_rules(net: Net, gateway_socket: Option<&Path>) -> Result<Vec<String>, Failure> {
+fn network_rules(
+    net: Net,
+    loopback_ports: &[u16],
+    gateway_socket: Option<&Path>,
+) -> Result<Vec<String>, Failure> {
     match net {
         Net::None => Ok(vec!["(deny network*)".to_owned()]),
         Net::Gateway => {
@@ -145,14 +149,17 @@ fn network_rules(net: Net, gateway_socket: Option<&Path>) -> Result<Vec<String>,
             }
             Ok(rules)
         }
-        Net::Loopback => Ok([
-            "(deny network*)",
-            "(allow network-bind (local ip \"localhost:*\"))",
-            "(allow network-inbound (local ip \"localhost:*\"))",
-            "(allow network-outbound (remote ip \"localhost:*\"))",
-        ]
-        .map(str::to_owned)
-        .to_vec()),
+        Net::Loopback => {
+            let mut rules = vec!["(deny network*)".to_owned()];
+            for port in loopback_ports {
+                rules.extend([
+                    format!(r#"(allow network-bind (local ip "localhost:{port}"))"#),
+                    format!(r#"(allow network-inbound (local ip "localhost:{port}"))"#),
+                    format!(r#"(allow network-outbound (remote ip "localhost:{port}"))"#),
+                ]);
+            }
+            Ok(rules)
+        }
         Net::All => {
             let mut rules = vec![
                 "(deny network*)".to_owned(),
@@ -300,7 +307,11 @@ pub fn profile(effective: &Effective, gateway_socket: Option<&Path>) -> Result<S
     if let Some(profile) = effective.profile {
         lines.extend(profile.seatbelt_rules(&effective.tmp, quoted)?);
     }
-    lines.extend(network_rules(effective.net, gateway_socket)?);
+    lines.extend(network_rules(
+        effective.net,
+        &effective.loopback_ports,
+        gateway_socket,
+    )?);
     for socket in effective.sockets.values() {
         lines.extend(socket_rules(socket)?);
     }
@@ -336,6 +347,7 @@ mod tests {
                 PathBuf::from("/Users/me/.contextstack/state/browser-state"),
             ],
             net,
+            loopback_ports: Vec::new(),
             tmp: PathBuf::from("/private/var/folders/xy/T/cs-sandbox-7-8"),
             write_env: std::collections::BTreeMap::from([(
                 "CS_BROWSER_STATE".to_owned(),
@@ -497,6 +509,16 @@ mod tests {
         let text = profile(&effective(Net::All), None)?;
         assert_eq!(text, expected(GOLDEN_ALL)?);
         assert!(!text.contains("(allow network*)"));
+        Ok(())
+    }
+
+    #[test]
+    fn golden_profile_for_scoped_loopback() -> Result<(), Failure> {
+        let mut effective = effective(Net::Loopback);
+        effective.loopback_ports = vec![3000];
+        let frozen = include_str!("../tests/fixtures/action-loopback-network.sb");
+        let golden = GOLDEN_NONE.replace("(deny network*)\n", frozen);
+        assert_eq!(profile(&effective, None)?, expected(&golden)?);
         Ok(())
     }
 

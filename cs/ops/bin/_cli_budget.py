@@ -7,6 +7,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from _estate_io import DEFAULT_CHECK_WINDOW, validate_check_window
 from _stuck import parse_budget_stuck
 
 
@@ -44,12 +45,7 @@ def declared(spec):
     validate_budget_mapping(budget, label='CLI budget', min_turns=1, min_seconds=1)
     parse_budget_stuck(budget)  # validates budget.stuck when present
     limits = {key: float(budget[key]) if key == 'usd' else budget[key] for key in KEYS}
-    check_window = spec.get('check_window', 60)
-    if type(check_window) is not int:
-        raise ValueError('Malformed check window')
-    if check_window < 1:
-        raise ValueError('Invalid check window')
-    return limits, check_window
+    return limits, validate_check_window(spec.get('check_window', DEFAULT_CHECK_WINDOW))
 
 
 class Admission:

@@ -357,7 +357,7 @@ class CliBudgetValidationTests(unittest.TestCase):
     def test_declared_reads_turn_limits_and_default_check_window(self):
         budget = {"turns": 3, "tool_calls": 7, "usd": 0.25, "seconds": 60}
         spec = {"budget": budget}
-        self.assertEqual(_cli_budget.declared(spec), (budget, 60))
+        self.assertEqual(_cli_budget.declared(spec), (budget, 600))
 
     def test_declared_rejects_incomplete_or_non_finite_budgets(self):
         cases = (
@@ -638,8 +638,9 @@ class CliBudgetDepthTests(unittest.TestCase):
         limits, window = _cli_budget.declared(spec)
         self.assertEqual(window, 30)
         self.assertEqual(limits["turns"], 2)
-        with self.assertRaises(ValueError):
-            _cli_budget.declared({"budget": spec["budget"], "check_window": 0})
+        for invalid in (0, -1, 3601, True, 1.5, "30", None):
+            with self.subTest(check_window=invalid), self.assertRaises(ValueError):
+                _cli_budget.declared(dict(spec, check_window=invalid))
 
     def test_claude_args_skips_usd_cap_when_budget_usd_is_zero(self):
         budget = {"turns": 2, "tool_calls": 2, "usd": 0.0, "seconds": 60}

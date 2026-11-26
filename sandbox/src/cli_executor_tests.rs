@@ -12,6 +12,54 @@ fn request(home: &Path) -> Result<ExecutorRequest, String> {
     .map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn native_pi_lane_can_stat_secret_env_files_without_accessing_contents() -> Result<(), String> {
+    let io = |error: std::io::Error| error.to_string();
+    let temp = tempfile::tempdir().map_err(io)?;
+    let home = temp.path().canonicalize().map_err(io)?;
+    let mut req = request(&home)?;
+    fs::create_dir(&req.workspace).map_err(io)?;
+    fs::create_dir(&req.tmpdir).map_err(io)?;
+    req.executable = Some(home.join("bin/pi"));
+    req.lane = Some(Lane::default());
+    let profile = seatbelt_profile(&req).map_err(|error| error.message().to_owned())?;
+    let names = [
+        ".env",
+        ".env.install.example",
+        ".env_local",
+        ".env-local",
+        ".envrc.local",
+        "app.env",
+        "app.env.backup",
+    ];
+    for name in names {
+        fs::write(req.workspace.join(name), "fixture").map_err(io)?;
+    }
+    let output = std::process::Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", &profile, "/bin/sh", "-c"])
+        .arg(
+            r#"for name do
+                /usr/bin/stat "./$name" >/dev/null || exit 1
+                if /bin/cat "./$name" >/dev/null || (printf changed >"./$name"); then
+                    exit 2
+                fi
+            done"#,
+        )
+        .arg("env-probe")
+        .args(names)
+        .current_dir(&req.workspace)
+        .output()
+        .map_err(io)?;
+    assert!(
+        output.status.success(),
+        "{}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 #[test]
 fn native_interpreters_follow_child_path_and_do_not_grant_payloads() -> Result<(), String> {
     let temp = tempfile::tempdir().map_err(|e| e.to_string())?;

@@ -2,14 +2,17 @@
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from _director_client import Client, DirectorUnreachable, receiver_config
 from _harvest_git import host_git
+from _node_env import node_env
 from _roots import roots
 
 # Must fit inside request_action's 120 s tool budget after polling (about 22 s) and diffs.
@@ -109,14 +112,71 @@ def sandbox_prefix():
     return words
 
 
-def execute(record, request, prefix, env, repo_view, workspace):
+def loopback_ports(needs):
+    ports = set()
+    for need in needs:
+        if need in {"network", "write_paths", "delete"}:
+            continue
+        match = re.fullmatch(r"network:loopback:([1-9][0-9]{0,4})", need)
+        if not match or int(match[1]) > 65535:
+            raise ValueError("For localhost access, list each port as network:loopback:<port>.")
+        ports.add(int(match[1]))
+    if ports and "network" in needs:
+        raise ValueError("Request either network or specific localhost ports.")
+    return sorted(ports)
+
+
+def reserved_loopback_ports(root):
+    config = roots(root)["config"]
+    settings = node_env(config / "node.env")
+    reserved = {8780, 9200}
+    for key in ("CS_RESERVED_LOOPBACK_PORTS", "CSGATEWAY_PORT"):
+        for source in (settings, os.environ):
+            reserved.update(int(port) for port in source.get(key, "").split(",") if port.strip())
+
+    def read_config(path):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+
+    install = read_config(config / "install.json")
+    receiver = read_config(config / "policy/spool.json").get("receiver")
+    urls = [install.get("director"), *(source.get("DIRECTOR_GATEWAY") for source in (settings, os.environ))]
+    if isinstance(receiver, dict) and receiver.get("kind") == "director":
+        urls.append(receiver.get("url"))
+    listeners = [*(install.get("director_rs_listen") or []), install.get("serve_client_web")]
+    for source in (settings, os.environ):
+        listeners.extend(source.get("DIRECTOR_LISTEN", "").split(","))
+    urls.extend(f"http://{addr.strip()}" for addr in listeners if addr and addr.strip())
+    for url in filter(None, urls):
+        parts = urlsplit(url)
+        port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(parts.scheme)
+        if port is not None:
+            reserved.add(port)
+    if any(not 1 <= port <= 65535 for port in reserved):
+        raise ValueError("Invalid reserved localhost port in node configuration.")
+    return sorted(reserved)
+
+
+def checked_loopback_ports(root, needs):
+    ports = loopback_ports(needs)
+    reserved = reserved_loopback_ports(root) if ports else []
+    for port in ports:
+        if port in reserved:
+            raise ValueError(f"Localhost port {port} is reserved for ContextStack.")
+    return ports, reserved
+
+
+def execute(record, request, prefix, env, repo_view, workspace, root):
     from _process_group import stop_group
 
     timed_out = False
     cleanup_failed = False
     widening = {key: key in request["needs"] for key in ("network", "delete")}
-    if "network:loopback" in request["needs"]:
-        widening["loopback"] = True
+    ports, reserved = checked_loopback_ports(root, request["needs"])
+    if ports:
+        widening.update(loopback_ports=ports, reserved_ports=reserved)
     widening["write_paths"] = request["write_paths"]
     flags = ["--action-widening", json.dumps(widening)]
     if repo_view:
@@ -165,6 +225,7 @@ def request_action(root, run_dir, model, repo_view, request, *, job, workspace, 
         raise ValueError("Provide argv, needs, and reason. Provide absolute write_paths when requested.")
     if not argv[0] or any(not Path(path).is_absolute() for path in paths):
         raise ValueError("write_paths must be absolute.")
+    checked_loopback_ports(root, needs)
     env = {key: os.environ[key] for key in ("HOME", "LANG",
                                           "HOMEBREW_PREFIX", "HOMEBREW_CELLAR")
            if key in os.environ}
@@ -214,7 +275,7 @@ def request_action(root, run_dir, model, repo_view, request, *, job, workspace, 
     try:
         if any(record.get(key) != value for key, value in action.items()):
             raise ValueError("The execution claim differs from the requested action.")
-        code, content = execute(record, action, prefix, env, repo_view, workspace)
+        code, content = execute(record, action, prefix, env, repo_view, workspace, root)
         print(json.dumps(observation(record)), flush=True)
     finally:
         try:

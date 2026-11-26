@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from _env_policy import DEFAULT_ENV
-from _estate_io import verify_frozen_stimulus, write_atomic
+from _estate_io import DEFAULT_CHECK_WINDOW, verify_frozen_stimulus, write_atomic
 from _roots import runs_dir, transcript_id, workspace_dir
 
 
@@ -37,6 +37,7 @@ def finish_harness(code_root, run_dir, receipt, *, foreground=False):
                 receipt["native"]["stop"], receipt["stimulus"]["sha256"])):
         raise ValueError("harness receipt differs from its run identity")
 
+    window = row.get("check_window") or DEFAULT_CHECK_WINDOW
     # The harness holds this lock through process exit. Serialize promotion of
     # the receipt as well, so every caller uses the same terminal record.
     with (run_dir / "execution.lock").open("r+") as lock:
@@ -49,7 +50,7 @@ def finish_harness(code_root, run_dir, receipt, *, foreground=False):
                 raise ValueError("harness receipt has no frozen stimulus")
             trace = dict(receipt["trace"]["harness_trace"],
                          finalization_started=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
-            write_atomic(terminal, json.dumps(dict(row, harness_trace=trace)))
+            write_atomic(terminal, json.dumps(dict(row, harness_trace=trace, check_window=window)))
     pending = {"ok": False, "state": "pending", "verdict": row["verdict"], "stop": row["stop"]}
     if foreground and receipt["finish"]["defer"]:
         return pending
@@ -66,7 +67,7 @@ def finish_harness(code_root, run_dir, receipt, *, foreground=False):
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                           text=True, start_new_session=True) as child:
         try:
-            out, _ = child.communicate(json.dumps({"run_dir": str(run_dir)}), timeout=120)
+            out, _ = child.communicate(json.dumps({"run_dir": str(run_dir)}), timeout=120 + window)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(child.pid, signal.SIGKILL)

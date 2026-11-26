@@ -31,7 +31,7 @@ class ActionApprovalTests(unittest.TestCase):
         self.script.write_text("#!/bin/sh\nexit 0\n")
         self.request = {
             "argv": [str(self.script.relative_to(self.workspace))],
-            "needs": ["network:loopback", "write_paths"],
+            "needs": ["network:loopback:3000", "write_paths"],
             "write_paths": [str(self.run / "tmp")],
             "reason": "This check starts a loopback server and writes scratch files.",
         }
@@ -49,6 +49,7 @@ class ActionApprovalTests(unittest.TestCase):
 
         contexts.enter_context(patch.object(approval.subprocess, "Popen", side_effect=popen))
         contexts.enter_context(patch.object(Path, "home", return_value=self.home))
+        contexts.enter_context(patch.dict(approval.os.environ, {"CS_CONFIG_ROOT": str(self.home)}, clear=True))
         self.stdout = contexts.enter_context(contextlib.redirect_stdout(io.StringIO()))
 
     def request_action(self):
@@ -80,10 +81,35 @@ class ActionApprovalTests(unittest.TestCase):
         self.assertEqual(self.request_action(), 0)
         argv = self.execute.call_args.args[0]
         widening = json.loads(argv[argv.index("--action-widening") + 1])
-        self.assertEqual(widening, dict(network=False, loopback=True, delete=False,
+        self.assertEqual(widening, dict(network=False, loopback_ports=[3000], reserved_ports=[8780, 9200], delete=False,
                                         write_paths=self.request["write_paths"]))
         self.assertIn('"reviewer_model": "reviewer"', self.stdout.getvalue())
         self.assertEqual(self.client.call.call_count, 3)
+
+    def test_reserved_ports_are_refused_before_review(self):
+        (self.home / "install.json").write_text(json.dumps({
+            "director_rs_listen": ["127.0.0.1:8785", "[::1]:8786"],
+            "serve_client_web": "127.0.0.1:8787",
+        }))
+        (self.home / "policy").mkdir()
+        (self.home / "policy/spool.json").write_text(json.dumps({
+            "receiver": {"kind": "director", "url": "http://127.0.0.1:8788"},
+        }))
+        settings = {"CS_RESERVED_LOOPBACK_PORTS": "8789,8790", "DIRECTOR_LISTEN": "127.0.0.1:8791"}
+        with (patch.object(approval, "node_env", return_value=settings),
+              patch.dict(approval.os.environ, {"CSGATEWAY_PORT": "9201"})):
+            for port in [8780, 8785, 8786, 8787, 8788, 8789, 8790, 8791, 9200, 9201]:
+                with self.subTest(port=port), self.assertRaisesRegex(ValueError, f"port {port} is reserved"):
+                    self.request["needs"] = [f"network:loopback:{port}"]
+                    self.request_action()
+        self.client.call.assert_not_called()
+        self.execute.assert_not_called()
+
+    def test_unscoped_loopback_is_refused_before_review(self):
+        self.request["needs"] = ["network:loopback"]
+        with self.assertRaisesRegex(ValueError, "list each port"):
+            self.request_action()
+        self.client.call.assert_not_called()
 
     def test_hard_line_and_reviewer_timeout_wait_for_owner(self):
         regression_argv = self.request["argv"]

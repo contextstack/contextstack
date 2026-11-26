@@ -89,10 +89,19 @@ fn emitted_profile(policy: &Path, request: &Path) -> String {
 }
 
 #[test]
-fn emit_matches_sandbox_cmd_for_representative_templates() {
+fn emit_matches_sandbox_cmd_for_representative_templates() -> Result<(), Box<dyn std::error::Error>>
+{
     if !cfg!(target_os = "macos") {
-        return;
+        return Ok(());
     }
+    let darwin_temp = Command::new("/usr/bin/getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .output()?;
+    assert!(darwin_temp.status.success());
+    let darwin_temp = String::from_utf8(darwin_temp.stdout)?;
+    let darwin_temp = Path::new(darwin_temp.trim()).canonicalize()?;
+    let user_tree = darwin_temp.parent().ok_or("missing Darwin temp parent")?;
+    let claude = format!("/private/tmp/claude-{}", rustix::process::getuid().as_raw());
     let policy = workspace_root().join("cs/policy/sandbox.json");
     let scratch = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
     for case in CASES {
@@ -100,13 +109,48 @@ fn emit_matches_sandbox_cmd_for_representative_templates() {
         fs::create_dir_all(&case_root).unwrap_or_else(|error| panic!("mkdir: {error}"));
         let request_path = case_root.join("request.json");
         let (reference, request_body) = reference_bundle(case, &case_root);
-        fs::write(&request_path, request_body)
+        fs::write(&request_path, &request_body)
             .unwrap_or_else(|error| panic!("write request: {error}"));
         let emitted = emitted_profile(&policy, &request_path);
         assert!(emitted.contains(r#"(deny file-read* file-write* file-link (regex #"/\.env$"))"#));
+        let request: serde_json::Value = serde_json::from_str(&request_body)?;
+        let tmpdir = Path::new(
+            request["tmpdir"]
+                .as_str()
+                .ok_or("missing golden run tmpdir")?,
+        )
+        .canonicalize()?;
+        assert!(emitted.lines().any(|rule| {
+            rule == format!(r#"(allow file-write* (subpath "{}"))"#, tmpdir.display())
+        }));
+        for root in ["/tmp", "/private/tmp", "/private/var/folders", "/dev"] {
+            assert!(!emitted.contains(&format!(r#"(allow file-write* (subpath "{root}"))"#)));
+        }
+        assert!(
+            emitted
+                .contains(r#"(allow file-write-data (literal "/dev/null") (literal "/dev/tty"))"#)
+        );
+        assert!(emitted.contains(&format!(
+            r#"(allow file-write* (subpath "{}"))"#,
+            user_tree.display()
+        )));
+        for (path, expected) in [
+            (
+                claude.as_str(),
+                matches!(*case, "claude-code" | "repo-lane"),
+            ),
+            ("/private/tmp/.cursor", *case == "cursor-agent"),
+        ] {
+            assert_eq!(
+                emitted.contains(&format!(r#"(allow file-write* (subpath "{path}"))"#)),
+                expected,
+                "{case}: scratch grant for {path}"
+            );
+        }
         assert_eq!(
             emitted, reference,
             "cli-executor profile mismatch for {case}"
         );
     }
+    Ok(())
 }

@@ -36,7 +36,7 @@ def clip(text):
     return raw.decode("utf-8", "replace")
 
 
-def check_json(run_dir, stimulus_sha, window, exit_code=None, output="", verdict=None):
+def check_json(run_dir, stimulus_sha, window, exit_code=None, output="", verdict=None, *, grader=None):
     """check.json as finalize-run's run_check writes it; exit_code None is a check that did not run (skipped,
     with the run's verdict), so finalize-run never runs it afterwards. Written once."""
     path = Path(run_dir) / "check.json"
@@ -47,6 +47,7 @@ def check_json(run_dir, stimulus_sha, window, exit_code=None, output="", verdict
     else:
         value = {"verdict": "pass" if exit_code == 0 else "fail", "exit_code": exit_code,
                  "output": clip(redact(output)), "skipped": False}
+    value.update(grader or {})
     value.update(window=int(window), stimulus_sha=stimulus_sha or "")
     write_atomic(path, (json.dumps(value, sort_keys=True) + "\n").encode("utf-8"))
 
@@ -92,7 +93,7 @@ def terminal(run_dir, ws, row, run_id, spec_id, task, started, check_window, tra
         "terminal_state": state,
         "cancel_reason": "SIGTERM" if state == "cancelled" else None,  # the gateway's cancel is a TERM
         "started": stamp(started), "ended": stamp(ended), "seconds": round(ended - started, 6),
-        "check_window": max(int(check_window), 60),
+        "check_window": check_window,
     }
     value.update(spec_intent(row))
     if trace is not None:

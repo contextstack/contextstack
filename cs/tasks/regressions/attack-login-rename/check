@@ -34,11 +34,7 @@ for index, entry in enumerate(spec):
     payload = b'{"marker":"attacker"}\n'
     workspace = Path.cwd() / ('replacement-%s' % index)
     workspace.write_bytes(payload)
-    # TMPDIR is deliberately bypassed: exercise the system /tmp rename route.
-    fd, raw = tempfile.mkstemp(prefix='login-attack-', dir='/tmp')
-    os.write(fd, payload)
-    os.close(fd)
-    system_tmp = Path(raw)
+    system_tmp = Path(entry['system_tmp'])
     # This runs as the sandboxed job, whose cwd is its workspace under the system temp dir.
     job_workspace = Path.cwd()
     fd, raw = tempfile.mkstemp(prefix='.auth-', dir=job_workspace)
@@ -70,7 +66,7 @@ for index, entry in enumerate(spec):
         copied.write_bytes(payload)
         assert copied.read_bytes() == payload, 'private copy rewrite failed'
     finally:
-        for path in (workspace, system_tmp, atomic):
+        for path in (workspace, atomic):
             path.unlink(missing_ok=True)
 print(json.dumps(results))
 '''
@@ -96,7 +92,8 @@ def main():
                 if sources.intersection(tmpl.get('copies', {}).values())}
     assert selected, 'no copied-login templates exercised'
     assert sources == {src for tmpl in selected.values() for src in tmpl['copies'].values()}
-    with scratch_dir(prefix='attack-login-rename-') as raw:
+    with (scratch_dir(prefix='attack-login-rename-') as raw,
+          scratch_dir(prefix='login-attack-', dir='/tmp') as system_tmp):
         root = Path(raw).resolve()
         home = root / 'home'
         original = b'{"marker":"owner-decoy"}\n'
@@ -116,7 +113,15 @@ def main():
             assert len(records) == len(template['copies']), (name, 'missing staged copies')
             try:
                 spec = private / 'routes.json'
-                spec.write_text(json.dumps([dict(owner=str(r['real']), copy=str(r['copy'])) for r in records]))
+                routes = []
+                for index, record in enumerate(records):
+                    # Seed the /tmp source on the host. The job no longer has a
+                    # blanket write grant there, but can still attempt the rename.
+                    source = Path(system_tmp) / f'{name}-{index}'
+                    source.write_bytes(b'{"marker":"attacker"}\n')
+                    routes.append(dict(owner=str(record['real']), copy=str(record['copy']),
+                                       system_tmp=str(source)))
+                spec.write_text(json.dumps(routes))
                 probe = private / 'probe.py'
                 probe.write_text(PROBE)
                 profile = private / 'sandbox.sb'

@@ -9,6 +9,9 @@ import tempfile
 import time
 
 OPS = Path(__file__).resolve().parents[3] / 'ops/bin'
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '_lib'))
+from scratch import short_tmp
+
 CHILD = r'''
 import os, re, signal, sys
 from pathlib import Path
@@ -53,7 +56,7 @@ def wait_socket(proc, path):
         time.sleep(.01)
 
 
-with tempfile.TemporaryDirectory(prefix='lead-cleanup-check-', dir='/tmp') as tmp:
+with tempfile.TemporaryDirectory(prefix='lead-cleanup-check-', dir=short_tmp()) as tmp:
     root = Path(tmp).resolve()
     socket_dir = root / ('fixture-socket-%s-' % os.getuid() + 'a'*16)
     for mode, rc in [('normal', 0), ('error', 1), ('setup-error', 1)]:

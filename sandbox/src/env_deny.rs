@@ -131,17 +131,35 @@ fn walk_secret_env(
     Ok(())
 }
 
+const SEATBELT_PATTERNS: &[&str] = &[
+    r"/\.env$",
+    r"/\.env\.[^/]+$",
+    r"/\.env_[^/]+$",
+    r"/\.env-[^/]+$",
+    r"/\.envrc[^/]*$",
+    r"/[^/]+\.env$",
+    r"/[^/]+\.env\.[^/]+$",
+];
+
+/// Allow stat on secret env names inside an executor workspace.
+pub fn workspace_metadata_rules(workspace: &Path) -> Result<Vec<String>, Failure> {
+    let workspace = sbpl::quote(workspace)?;
+    Ok(SEATBELT_PATTERNS
+        .iter()
+        .map(|pattern| {
+            format!(
+                r#"(allow file-read-metadata (require-all (subpath {workspace}) (regex #"{pattern}")))"#
+            )
+        })
+        .collect())
+}
+
 /// Block secret env files; leave `.env.example` readable only under `read_roots`.
 pub fn seatbelt_rules(read_roots: &[impl AsRef<Path>]) -> Result<Vec<String>, Failure> {
-    let mut rules = vec![
-        r#"(deny file-read* file-write* file-link (regex #"/\.env$"))"#.to_owned(),
-        r#"(deny file-read* file-write* file-link (regex #"/\.env\.[^/]+$"))"#.to_owned(),
-        r#"(deny file-read* file-write* file-link (regex #"/\.env_[^/]+$"))"#.to_owned(),
-        r#"(deny file-read* file-write* file-link (regex #"/\.env-[^/]+$"))"#.to_owned(),
-        r#"(deny file-read* file-write* file-link (regex #"/\.envrc[^/]*$"))"#.to_owned(),
-        r#"(deny file-read* file-write* file-link (regex #"/[^/]+\.env$"))"#.to_owned(),
-        r#"(deny file-read* file-write* file-link (regex #"/[^/]+\.env\.[^/]+$"))"#.to_owned(),
-    ];
+    let mut rules: Vec<_> = SEATBELT_PATTERNS
+        .iter()
+        .map(|pattern| format!(r#"(deny file-read* file-write* file-link (regex #"{pattern}"))"#))
+        .collect();
     for root in read_roots {
         rules.push(format!(
             r#"(allow file-read* (require-all (subpath {}) (regex #"/\.env\.example$")))"#,

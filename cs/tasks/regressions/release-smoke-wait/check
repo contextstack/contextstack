@@ -14,7 +14,7 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
 sys.path.insert(0, str(HERE.parent / "_lib"))
-from scratch import scratch_dir  # noqa: E402
+from scratch import scratch_dir, short_tmp  # noqa: E402
 from hermetic_env import hermetic_env  # noqa: E402
 
 problems = []
@@ -164,7 +164,7 @@ def main():
     director_srv, _ = start_server(DirectorHandler)
     director_port = director_srv.server_address[1]
 
-    with scratch_dir(prefix="release-smoke-wait-", dir="/tmp") as tmp:
+    with scratch_dir(prefix="release-smoke-wait-", dir=short_tmp()) as tmp:
         home = Path(tmp)
         layout(home, director_port)
 

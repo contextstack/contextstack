@@ -296,6 +296,21 @@ fn spec_model_and_tools(
 }
 
 /// Resolve a lane request and build its files without writing objects.
+/// Writes the lane's optional check window (an integer from 1 to 3600 seconds) into the spec.
+fn write_check_window(
+    m: &serde_json::Map<String, Value>,
+    spec_text: &mut String,
+) -> Result<(), No> {
+    let Some(value) = m.get("check_window") else {
+        return Ok(());
+    };
+    let window = value
+        .as_u64()
+        .filter(|n| (1..=3600).contains(n))
+        .ok_or_else(|| No::invalid("lane.check_window must be an integer from 1 to 3600"))?;
+    writeln!(spec_text, "check_window: {window}").map_err(|e| No::internal(&e))
+}
+
 pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
     let m = input
         .as_object()
@@ -377,6 +392,7 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
         budget["seconds"],
         json!(title)
     );
+    write_check_window(m, &mut spec_text)?;
     if let Some(repo) = repo {
         writeln!(spec_text, "repo: {repo}").map_err(|e| No::internal(&e))?;
     }
@@ -386,12 +402,11 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
     if repo_view {
         spec_text.push_str("repo_read_only: true\n");
     }
-    let spec = spec_text;
     let fields = json!({"title":title.chars().take(200).collect::<String>(),"spec":"spec.yaml","task":task,"trials":1,"meta":meta}).as_object().cloned().ok_or_else(|| No::invalid("invalid lane"))?;
     Ok((
         fields,
         vec![
-            ("spec.yaml".into(), spec, 420),
+            ("spec.yaml".into(), spec_text, 420),
             ("prompts/system.md".into(), prompt, 420),
             (format!("{task}/goal.md"), goal.into(), 420),
             (format!("{task}/check"), check, 493),

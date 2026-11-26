@@ -3,7 +3,7 @@
 # Run a CLI against the frozen goal and return its execution receipt.
 # Dest merge is parked (operator_close).
 from _yaml import load as load_yaml
-from _estate_io import state_dir
+from _estate_io import DEFAULT_CHECK_WINDOW, remaining_check_time, state_dir, validate_check_window
 import atexit, hashlib, json, os, re, shutil, subprocess, sys, time, signal, threading, tempfile
 from pathlib import Path
 import stat
@@ -381,8 +381,15 @@ def main(argv=None) -> int:
     raw_budget = a.get("budget")
     spec_budget = spec.get("budget") if isinstance(spec, dict) else None
     job_budget = raw_budget if isinstance(raw_budget, dict) else (spec_budget if isinstance(spec_budget, dict) else None)
+    check_budget = (spec_budget or {}).get("seconds") if isinstance(spec_budget, dict) else None
+    if check_budget is None and job_budget:
+        check_budget = job_budget.get("seconds")
     limits = None
-    check_window = int(a.get("check_window") or 60)
+    try:
+        spec_window = validate_check_window(spec.get("check_window", DEFAULT_CHECK_WINDOW))
+        check_window = validate_check_window(a.get("check_window", spec_window))
+    except ValueError as error:
+        fail(str(error))
     budget_broker = None
     if spec_rel and Path(binary).name == "claude":
         from _cli_budget import declared, Broker, claude_args, native_result
@@ -399,13 +406,16 @@ def main(argv=None) -> int:
         if sys.platform != "darwin":
             fail("budget hook isolation requires macOS")
     else:
-        # Ordinary jobs may name only some fields; refuse non-finite or negative values without
-        # importing _cli_budget (frozen executor copies include it only for declared limits).
+        if "check_window" in spec and check_window != spec_window:
+            fail("work order check_window differs from the spec")
+        # Ordinary jobs may name only some fields; refuse non-finite or negative values.
         import math
         for key, value in (job_budget or {}).items() if isinstance(job_budget, dict) else ():
             if key in ("turns", "tool_calls", "usd", "seconds") and isinstance(value, (int, float)) \
                     and not isinstance(value, bool) and (not math.isfinite(value) or value < 0):
                 fail("work order budget %s must be a finite number >= 0" % key)
+        if type(check_budget) in (int, float) and check_budget > 0:
+            timeout = min(timeout, check_budget) if "timeout_s" in a else check_budget
         from _harness_usage import usd_budget_refusal
         refusal = usd_budget_refusal(tmpl, job_budget)
         if refusal:  # before any run dir or CLI: a missing dollar report is not $0
@@ -680,6 +690,8 @@ def main(argv=None) -> int:
 
     spec_id = str(spec.get("id") or "") or spec_rel
     started = time.time()
+    deadline = started + timeout
+    check_deadline = started + check_budget if type(check_budget) in (int, float) and check_budget > 0 else None
     if limits is not None:
         budget_broker = Broker(limits['tool_calls'])
         atexit.register(budget_broker.close)
@@ -720,7 +732,7 @@ def main(argv=None) -> int:
             run_dir, ws, row, spec_id, str(a.get("task") or ""), task.name, started,
             check_window, mode, stop, verdict, extra, trace, lane, bool(repo_view), grant_paths,
             sandbox_policy, sandbox_caller, sandbox_read_roots, protected, tmpl.get("env_drop") or [],
-            memory_cap_mb, child_env, execution_id=execution_id,
+            memory_cap_mb, child_env, execution_id=execution_id, deadline=check_deadline,
         )
         send_receipt(receipt)
 
@@ -745,9 +757,11 @@ def main(argv=None) -> int:
     preflight = task / "preflight"
     if preflight.is_file():
         try:
+            preflight_timeout = remaining_check_time(30, deadline)
+            if preflight_timeout <= 0:
+                raise subprocess.TimeoutExpired(preflight, 0)
             probe = subprocess.run([str(preflight)], cwd=str(ws), env=child_env,
-                                   capture_output=True, text=True,
-                                   timeout=min(timeout, 30))
+                                   capture_output=True, text=True, timeout=preflight_timeout)
         except subprocess.TimeoutExpired:
             row["seconds"] = time.time() - started
             emit("fail", "preflight_timeout")
@@ -901,9 +915,9 @@ def main(argv=None) -> int:
             call_started = time.monotonic()
             try:
                 if limits is not None:
-                    limit = min(limit, timeout - (time.time() - started))
-                    if limit <= 0:
-                        raise subprocess.TimeoutExpired(command, timeout)
+                    limit = remaining_check_time(limit, deadline)
+                if limit <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
                 if not task_call:
                     return run_process(command, str(working), run_env, limit, memory_cap_mb=memory_cap_mb, on_evidence=process_evidence)
                 done = run_streaming(command, str(working), run_env, limit,

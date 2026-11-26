@@ -9,9 +9,10 @@ from unittest.mock import patch
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parents[2] / "ops/bin"), str(HERE.parent / "_lib")]
 from hermetic_env import hermetic_env
+from scratch import short_tmp
 import _toolchains
 
-with tempfile.TemporaryDirectory(dir="/tmp", prefix="toolchain-discovery-") as raw:
+with tempfile.TemporaryDirectory(dir=short_tmp(), prefix="toolchain-discovery-") as raw:
     root = Path(raw).resolve()
     wrapper, real = root / "Application Support/bin", root / "runtime/bin"
     wrapper.mkdir(parents=True)

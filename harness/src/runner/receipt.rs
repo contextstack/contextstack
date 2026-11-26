@@ -49,7 +49,9 @@ impl Cell<'_> {
             "started": started.to_rfc3339_opts(SecondsFormat::Nanos, true),
             "ended": ended.0.to_rfc3339_opts(SecondsFormat::Nanos, true),
             "seconds": wire_float(ended.elapsed_from(clock)),
-            "check_window": sp.check_window.max(60)
+            "check_window": sp.check_window.unwrap_or(600),
+            "check_budget_seconds": (sp.repo.is_some() || self.trace.job.is_some())
+                .then_some(sp.budget.seconds)
         });
         if self.metrics.provider_reported_usd > 0.0 {
             let amount = json!(self.metrics.provider_reported_usd);
@@ -82,7 +84,7 @@ impl Cell<'_> {
                 "input_tokens": state["input_tokens"], "output_tokens": state["output_tokens"],
                 "cost_usd": state["cost_usd"], "est_usd": state["est_usd"], "est_basis": state["est_basis"],
             },
-            "finish": {"mode": "harness", "check_window": sp.check_window.max(60), "defer": trusted_hung},
+            "finish": {"mode": "harness", "check_window": state["check_window"], "defer": trusted_hung},
             "sandbox": null, "trace": {"harness_trace": trace_fields},
         })
     }

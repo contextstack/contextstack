@@ -22,7 +22,7 @@ with scratch_dir(prefix="executor-timeout-") as raw:
     fake = code_root / "fake"
     for path in (ops, task, ledger, fake):
         path.mkdir(parents=True, exist_ok=True)
-    for name in ('_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_machine_finish.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_est.py", "_grant.py", "_workspace_setup.py",
+    for name in ('_dispatch.py', '_lifecycle_evidence.py', '_estate_io.py', '_roots.py', "_executor.py", "_machine_finish.py", "_check_grader.py", "_toolchains.py", "_lanes.py", "_lane_policy.py", "_job_memory.py", "_job_identity.py", "_job_darwin.py", "_job_linux.py", "_vitals.py", "_muse.py", "_yaml.py", "_agent_stream.py", "_job_reason.py", "_cli_native.py", "_harness_usage.py", "_est.py", "_grant.py", "_workspace_setup.py",
                  "_frozen_inputs.py", "_harvest_git.py", "_setup_workspace.py", "capture-stimulus", "publish-evidence",
                  "harvest", "_run_record.py", "_env_policy.py", "_errors.py", "finalize-run"):
         shutil.copy2(ROOT / "ops/bin" / name, ops / name)

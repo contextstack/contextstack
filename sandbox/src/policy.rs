@@ -20,7 +20,7 @@ pub enum Net {
     None,
     /// One unix socket, the gateway's, and nothing else.
     Gateway,
-    /// IP traffic on loopback only.
+    /// Localhost traffic for an action, with ports recorded separately.
     Loopback,
     /// Unrestricted network.
     All,
@@ -214,6 +214,8 @@ pub struct Effective {
     pub write: Vec<PathBuf>,
     /// The network capability granted.
     pub net: Net,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub loopback_ports: Vec<u16>,
     /// The call's private tmp directory, outside the workspace, named by `TMPDIR`.
     pub tmp: PathBuf,
     /// Each granted `write_env` variable and its canonical directory (also in `read` and `write`).
@@ -669,7 +671,7 @@ pub fn runtime_links(
 /// when the host lists it, else `none`, recorded as a narrowing. Denial wins; nothing is widened.
 /// `tmp` is the call's canonical private tmp directory, already created by the caller. A requested
 /// `write_env` variable adds its directory to reads and writes when `write_env::grant` allows it
-/// (`var` reads the environment), else it is narrowed.
+/// (`var` reads the environment). Protected overlaps fail closed. Other unavailable grants are narrowed.
 pub fn intersect(
     host: &HostPolicy,
     request: &Request,
@@ -720,6 +722,7 @@ pub fn intersect(
         let bounds = write_env::Bounds {
             workspace,
             code_root,
+            home,
             roots: &roots,
         };
         match write_env::grant(name, var(name), &bounds) {
@@ -728,7 +731,10 @@ pub fn intersect(
                 write.insert(dir.clone());
                 env_writes.insert(name.clone(), dir);
             }
-            Err(reason) => narrowed.push(write_env_narrowing(name, reason)),
+            Err(write_env::GrantError::Narrowed(reason)) => {
+                narrowed.push(write_env_narrowing(name, reason));
+            }
+            Err(write_env::GrantError::Unenforceable(failure)) => return Err(failure),
         }
     }
     let sockets = grant_sockets(host, &request.sockets, code_root, home, &mut narrowed)?;
@@ -749,6 +755,7 @@ pub fn intersect(
         developer_dir,
         write: write.into_iter().collect(),
         net,
+        loopback_ports: Vec::new(),
         tmp: tmp.to_path_buf(),
         write_env: env_writes,
         profile,
@@ -1656,6 +1663,20 @@ mod tests {
         assert_eq!(narrowed[0].capability, "write_env");
         assert_eq!(narrowed[0].requested, "CS_UNLISTED");
         assert!(narrowed[0].reason.contains("does not list"));
+        let broad = |_: &str| Some(home.join(".contextstack").into_os_string());
+        let failure = intersect(
+            &policy,
+            &request,
+            &ws,
+            tmp,
+            Path::new("/code"),
+            &home,
+            &broad,
+        )
+        .err()
+        .ok_or("state root must be refused")?;
+        assert_eq!(failure.code(), 101);
+        assert!(failure.message().contains("unenforceable write_env"));
         let (unset, narrowed) = intersect(
             &policy,
             &request,

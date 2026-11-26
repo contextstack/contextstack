@@ -424,7 +424,7 @@ fn estate_read_rules(
 }
 
 /// Home-relative secret paths every agent profile denies (mirrors `_cli_native.HOSTED_PATHS`).
-const PROTECTED_READS: &[&str] = &[
+pub(crate) const PROTECTED_READS: &[&str] = &[
     ".contextstack/credentials",
     ".contextstack/state/director",
     ".contextstack/dev-state/director",
@@ -633,6 +633,15 @@ fn executable_home_rules(
 }
 
 /// Read isolation rules mirroring `_cli_native.read_rules`.
+/// Lane workspaces (any variant) may stat `.env`-style files (git status needs it); contents stay denied.
+fn lane_env_metadata_rules(request: &ExecutorRequest, v1: bool) -> Result<Vec<String>, Failure> {
+    if request.lane.is_some() {
+        env_deny::workspace_metadata_rules(&resolve(&request.workspace, v1)?)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn read_rules(request: &ExecutorRequest, read_roots: &[PathBuf]) -> Result<Vec<String>, Failure> {
     let v1 = request.version.is_some();
     let home = resolve(&request.home, v1)?;
@@ -682,6 +691,7 @@ fn read_rules(request: &ExecutorRequest, read_roots: &[PathBuf]) -> Result<Vec<S
         })
         .collect::<Result<Vec<_>, Failure>>()?;
     rules.extend(env_deny::seatbelt_rules(&env_roots)?);
+    rules.extend(lane_env_metadata_rules(request, v1)?);
     for rel in PROTECTED_READS.iter().chain(HOSTED_READS) {
         let path = home.join(rel);
         let mut targets = Vec::new();
@@ -946,6 +956,50 @@ fn protected_rules(protected: &Path, v1: bool) -> Result<Vec<String>, Failure> {
     Ok(rules)
 }
 
+/// Resolve the owner's Darwin temp tree independently of the run's TMPDIR.
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_tree() -> Option<PathBuf> {
+    let output = std::process::Command::new("/usr/bin/getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let temp = Path::new(std::str::from_utf8(&output.stdout).ok()?.trim())
+        .canonicalize()
+        .ok()?;
+    let tree = temp.parent()?;
+    let relative = tree.strip_prefix("/private/var/folders").ok()?;
+    (temp.ends_with("T") && relative.components().count() == 2).then(|| tree.to_path_buf())
+}
+
+fn native_scratch_rules(request: &ExecutorRequest) -> Result<Vec<String>, Failure> {
+    let mut rules =
+        vec![r#"(allow file-write-data (literal "/dev/null") (literal "/dev/tty"))"#.to_owned()];
+    // Match the launcher from the selected template before resolving its symlinks.
+    let launcher = request
+        .executable
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str);
+    match launcher {
+        Some("claude") => {
+            let root = format!("/private/tmp/claude-{}", rustix::process::getuid().as_raw());
+            rules.push(allow_write_subpath(Path::new(&root))?);
+        }
+        Some("cursor-agent") => {
+            rules.push(allow_write_subpath(Path::new("/private/tmp/.cursor"))?);
+        }
+        _ => {}
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(tree) = darwin_user_temp_tree() {
+        rules.push(allow_write_subpath(&tree)?);
+    }
+    Ok(rules)
+}
+
 /// The full Seatbelt text for one executor run.
 pub fn seatbelt_profile(request: &ExecutorRequest) -> Result<String, Failure> {
     request.validate()?;
@@ -966,17 +1020,16 @@ pub fn seatbelt_profile(request: &ExecutorRequest) -> Result<String, Failure> {
         "(deny file-write*)".to_owned(),
         allow_write_subpath(&workspace)?,
         allow_write_subpath(&tmpdir)?,
-        "(allow file-write* (subpath \"/private/tmp\"))".to_owned(),
-        "(allow file-write* (subpath \"/tmp\"))".to_owned(),
-        "(allow file-write* (subpath \"/dev\"))".to_owned(),
-        "(allow file-write* (subpath \"/private/var/folders\"))".to_owned(),
+    ];
+    lines.extend(native_scratch_rules(request)?);
+    lines.extend([
         deny_write_subpath(&request.home.join(".claude"))?,
         deny_write_subpath(&request.home.join(".codex"))?,
         deny_write_subpath(&request.home.join(".gemini"))?,
         deny_write_subpath(&request.home.join(".cursor"))?,
         deny_write_subpath(&request.home.join("Library/Keychains"))?,
         FCNTL_DENY.to_owned(),
-    ];
+    ]);
     // The run's private tmp (staged logins) stays readable under the estate deny.
     let mut read_roots = vec![workspace.clone(), request.tmpdir.clone()];
     read_roots.extend(request.read_roots.iter().cloned());

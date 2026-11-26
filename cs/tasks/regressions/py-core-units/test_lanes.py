@@ -95,6 +95,22 @@ class LanesTests(unittest.TestCase):
             lanes.repo_config('repo')
         self.assertEqual(lanes.land('missing', 'safe')[0], 2)
 
+    def test_grader_base_stays_on_main_when_reusing_lane(self):
+        base = self.g("rev-parse", "HEAD")
+        ws = self.lane()
+        (self.main / "main-only").write_text("new main content")
+        self.commit(self.main, "main advanced")
+        info = lanes.ensure_lane(self.cfg, "safe")
+        self.assertEqual(info["base"], self.g("rev-parse", "HEAD", cwd=ws))
+        self.assertEqual(info["grader_base_sha"], base)
+
+    def test_land_records_host_only_coverage_from_its_gate(self):
+        self.configure(gate="printf 'check: host-only covered: fixture\\n'")
+        self.lane()
+        rc, result = lanes.land("repo", "safe")
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(result["gate"]["host_only_covered"], ["fixture"])
+
     def test_worktree_creation_reuse_dirty_state_and_existing_branch(self):
         info = lanes.ensure_lane(self.cfg, 'safe')
         self.assertTrue(info['created'])

@@ -324,6 +324,7 @@ mod tests {
                 root.join("state"),
             ],
             net,
+            loopback_ports: Vec::new(),
             tmp: root.join("tmp/call"),
             write_env: BTreeMap::new(),
             profile: None,

@@ -14,21 +14,28 @@ pub fn apply(
     tool: &Path,
     args: &[String],
 ) -> Result<Vec<PathBuf>, Failure> {
-    if grant.network && grant.loopback {
+    let loopback = !grant.loopback_ports.is_empty();
+    for port in &grant.loopback_ports {
+        if matches!(port, 0 | 8780 | 9200) || grant.reserved_ports.contains(port) {
+            return Err(unenforceable(format!(
+                "loopback port {port} is reserved or invalid"
+            )));
+        }
+    }
+    if grant.network && loopback {
         return Err(unenforceable("conflicting action network widenings"));
     }
-    if grant.network || grant.loopback {
-        let net = if grant.loopback {
-            Net::Loopback
-        } else {
-            Net::All
-        };
+    if grant.network || loopback {
+        let net = if loopback { Net::Loopback } else { Net::All };
         if !host.allow_net.contains(&net) && !host.allow_net.contains(&Net::All) {
             return Err(unenforceable(
                 "host policy does not support a network widening",
             ));
         }
         effective.net = net;
+        effective.loopback_ports.clone_from(&grant.loopback_ports);
+        effective.loopback_ports.sort_unstable();
+        effective.loopback_ports.dedup();
     }
     let mut deny_unlink = Vec::new();
     for path in &grant.write_paths {
@@ -112,7 +119,8 @@ mod tests {
             &mut approved,
             &Widening {
                 network: true,
-                loopback: false,
+                loopback_ports: vec![],
+                reserved_ports: vec![],
                 delete: false,
                 write_paths: vec![write.clone()],
             },
@@ -124,13 +132,32 @@ mod tests {
         assert_eq!(approved.net, Net::All);
         assert!(approved.write.contains(&write));
         assert_eq!(deny_unlink, std::slice::from_ref(&write));
+        for port in [0, 8780, 9200, 9001] {
+            let error = apply(
+                &mut baseline()?,
+                &Widening {
+                    network: false,
+                    loopback_ports: vec![3000, port],
+                    reserved_ports: vec![9001],
+                    delete: false,
+                    write_paths: vec![],
+                },
+                &host,
+                Path::new("/bin/echo"),
+                &[],
+            )
+            .err()
+            .ok_or_else(|| format!("reserved or invalid localhost port {port} was granted"))?;
+            assert!(error.message().contains(&format!("port {port}")));
+        }
         let ordinary = baseline()?;
         let mut loopback = baseline()?;
         let scratch_unlinks = apply(
             &mut loopback,
             &Widening {
                 network: false,
-                loopback: true,
+                loopback_ports: vec![3000],
+                reserved_ports: vec![],
                 delete: false,
                 write_paths: vec![job_tmp.clone()],
             },
@@ -141,6 +168,16 @@ mod tests {
         .map_err(|e| e.message().to_owned())?;
         assert_eq!(scratch_unlinks, Vec::<PathBuf>::new());
         assert_eq!(loopback.net, Net::Loopback);
+        let profile =
+            crate::seatbelt::profile(&loopback, None).map_err(|e| e.message().to_owned())?;
+        assert!(profile.contains(r#"(allow network-outbound (remote ip "localhost:3000"))"#));
+        for denied in ["localhost:*", "localhost:8780", "localhost:9200"] {
+            assert!(
+                !profile
+                    .lines()
+                    .any(|line| line.contains("network-outbound") && line.contains(denied))
+            );
+        }
         assert!(loopback.write.contains(&job_tmp));
         assert_eq!(ordinary.net, Net::None);
         assert!(!ordinary.write.contains(&write));

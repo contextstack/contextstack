@@ -78,7 +78,7 @@ class NodeReview(unittest.TestCase):
             request = {"needs": ["network"], "write_paths": [], "argv": [
                 "/bin/sh", "-c", "trap '' TERM; (sleep 0.8; touch escaped) & wait"]}
             with patch.object(_action_approval, "ACTION_TIMEOUT_S", 0.25, create=True):
-                code, output = _action_approval.execute(record, request, ["/bin/sh", "-c", 'shift 2; exec "$@"', "sandbox", "--"], {}, None, path)
+                code, output = _action_approval.execute(record, request, ["/bin/sh", "-c", 'shift 2; exec "$@"', "sandbox", "--"], {}, None, path, path)
             self.assertEqual(code, 124, output)
             self.assertEqual(record["outcome"]["status"], "failed")
             time.sleep(0.4)
