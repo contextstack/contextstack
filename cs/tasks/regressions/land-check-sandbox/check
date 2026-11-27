@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Exercise the land-check Seatbelt profile against stand-in host files and sockets."""
+import ctypes
+import errno
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from contextlib import ExitStack
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CS = HERE.parents[2]
+sys.path.insert(0, str(HERE.parent / "_lib"))
+sys.path.insert(0, str(CS / "ops/bin"))
+from _estate_io import land_check_request, render_land_check_request
+from hermetic_env import hermetic_env
+
+SEATBELT = "/usr/bin/sandbox-exec"
+HOST_PROBE = "(version 1)(allow default)"
+DENIALS = {errno.EACCES, errno.EPERM}
+
+
+def denied(operation, *args):
+    try:
+        operation(*args)
+    except OSError as error:
+        if error.errno not in DENIALS:
+            raise
+    else:
+        raise AssertionError(f"sandbox allowed {operation.__name__} {args}")
+
+
+def listener(port):
+    server = socket.socket()
+    try:
+        server.bind(("127.0.0.1", port))
+        server.listen()
+        return server
+    except OSError:
+        server.close()
+        raise
+
+
+def exchange(server, client, address):
+    server.settimeout(2)
+    client.settimeout(2)
+    client.connect(address)
+    connection, _ = server.accept()
+    with connection:
+        client.sendall(b"ok")
+        connection.settimeout(2)
+        assert connection.recv(2) == b"ok"
+
+
+def hostile(root, darwin_temp, darwin_cache, ports):
+    for relative in ("home", "main", "main/target", "tools"):
+        denied((root / relative / "probe").write_text, "escape")
+    for relative in (
+            "home/private", "home/.ssh/key", "home/Library/Keychains/fixture", "home/.config/gh/hosts.yml",
+            "home/.aws/credentials", "home/.codex/auth.json", "home/.contextstack/config/node.env",
+            "main/clients/web/auth.json", "land/clients/web/auth.json"):
+        denied((root / relative).read_text)
+    for directory in ("land", "target", "run/cache", "run/tmp", "run/s"):
+        (root / directory / "probe").write_text("allowed")
+    assert (root / "tools/readable").read_text() == "fixture"
+    assert (root / "home/toolchains/readable").read_text() == "fixture"
+    denied((root / "home/toolchains/readable").write_text, "modified")
+    assert (root / "land/clients/web/vendor/autoload.php").read_text() == "fixture"
+    denied((root / "land/clients/web/vendor/autoload.php").write_text, "modified")
+    assert Path(os.environ["TMPDIR"]) == root / "run/tmp"
+    # Query the kernel's write decisions without opening files in the live
+    # user's cache, even if a broken profile grants writes there. Query only
+    # existing paths: sandbox_check reports a missing path as denied whatever
+    # the rules say.
+    sandbox_check = ctypes.CDLL(None).sandbox_check
+    sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    sandbox_check.restype = ctypes.c_int
+    for operation in (b"file-write-create", b"file-write-data"):
+        for path, expected in ((darwin_temp.parent, 1), (darwin_temp, 1), (darwin_cache, 1),
+                               (root / "run/s", 0), (root / "run/s/probe", 0)):
+            assert path.exists(), path
+            decision = sandbox_check(os.getpid(), operation, 1, ctypes.c_char_p(os.fsencode(path)))
+            assert decision == expected, (operation, path, decision)
+    for address in [("127.0.0.1", port) for port in ports] + [("192.0.2.1", 443)]:
+        with socket.socket() as client:
+            client.settimeout(2)
+            denied(client.connect, address)
+    with socket.socket(socket.AF_UNIX) as client:
+        denied(client.connect, str(root / "agent"))
+        denied(client.connect, str(root / "outside"))
+        denied(client.bind, str(root / "land/sock"))
+    with listener(0) as server, socket.socket() as client:
+        exchange(server, client, server.getsockname())
+    address = str(root / "run/s/socket")
+    with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as client:
+        server.bind(address)
+        server.listen()
+        exchange(server, client, address)
+
+
+def check(root, stack):
+    for directory in ("home", "main/target", "land", "target", "run/cache", "run/tmp", "run/s", "tools"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    for relative in (
+            "home/private", "home/toolchains/readable", "home/.ssh/key", "home/Library/Keychains/fixture", "home/.config/gh/hosts.yml",
+            "home/.aws/credentials", "home/.codex/auth.json", "home/.contextstack/config/node.env",
+            "main/clients/web/auth.json", "land/clients/web/auth.json", "tools/readable",
+            "land/clients/web/vendor/autoload.php"):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture")
+    for name in ("agent", "outside"):
+        server = stack.enter_context(socket.socket(socket.AF_UNIX))
+        server.bind(str(root / name))
+        server.listen()
+    ports = []
+    fallback = []
+    for port in (8780, 9200):
+        try:
+            server = listener(port)
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE:
+                raise
+            server = listener(0)
+            fallback.append(server.getsockname()[1])
+        stack.enter_context(server)
+        ports.append(server.getsockname()[1])
+    configured = stack.enter_context(listener(0)).getsockname()[1]
+    ports.append(configured)
+    env = hermetic_env()
+    env.update(HOME=str(root / "home"), TMPDIR=str(root / "run/tmp"),
+               SSH_AUTH_SOCK=str(root / "agent"))
+    darwin_temp = Path(subprocess.check_output(["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+                                             text=True).strip()).resolve()
+    darwin_cache = Path(subprocess.check_output(["/usr/bin/getconf", "DARWIN_USER_CACHE_DIR"],
+                                              text=True).strip()).resolve()
+    estate = root / "estate"
+    estate.mkdir()
+    (estate / "node.env").write_text(
+        "CS_RESERVED_LOOPBACK_PORTS=" + ",".join(map(str, [*fallback, configured])) + "\n")
+    request = land_check_request(
+        root=estate, home=env["HOME"], main_checkout=root / "main", worktree=root / "land",
+        cargo_target_dir=root / "target", run_tmp=root / "run", cache_dirs=[root / "run/cache"],
+        tmpdir=env["TMPDIR"], scratch=root / "run/s", darwin_user_temp=darwin_temp,
+        toolchain_roots=[root / "tools", root / "home/toolchains"],
+        readonly_dirs=[root / "land/clients/web/vendor"], ssh_auth_sock=env["SSH_AUTH_SOCK"], env=env)
+    binary = os.environ.get("CS_SANDBOX_BIN") or CS.parent / "target/release/cs-sandbox"
+    profile = render_land_check_request(binary, request)
+    policy = root / "land.sb"
+    policy.write_bytes(profile)
+    subprocess.run([SEATBELT, "-f", str(policy), sys.executable, __file__, "--hostile",
+                    str(root), str(darwin_temp), str(darwin_cache), *map(str, ports)],
+                   env=env, timeout=20, check=True)
+    npm = shutil.which("npm")
+    if npm:
+        land = root / "land"
+        (land / "package.json").write_text(json.dumps({"scripts": {
+            "postinstall": 'node -e "require(\'fs\').readFileSync(process.argv[1])" "$PROBE_SECRET"'
+        }}))
+        result = subprocess.run(
+            [SEATBELT, "-f", str(policy), npm, "run", "postinstall"], cwd=land,
+            env={**env, "PATH": os.environ["PATH"], "PROBE_SECRET": str(root / "home/private"),
+                 "npm_config_cache": str(root / "run/cache")},
+            capture_output=True, text=True, timeout=20)
+        assert result.returncode and "postinstall" in result.stdout, result
+        assert str(root / "home/private") in result.stderr and any(
+            error in result.stderr for error in ("EPERM", "EACCES")), result
+
+
+def main():
+    if sys.platform != "darwin":
+        print("land-check-sandbox: skipped: needs host (macOS Seatbelt)")
+        return
+    result = subprocess.run([SEATBELT, "-p", HOST_PROBE, "/usr/bin/true"],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode and "sandbox_apply: Operation not permitted" in result.stderr:
+        print("land-check-sandbox: skipped: needs host (nested Seatbelt is blocked)")
+        return
+    result.check_returncode()
+    # Keep the stand-in HOME and main checkout outside the protected Darwin user temp tree.
+    with tempfile.TemporaryDirectory(prefix="lc-", dir="/private/tmp") as directory, ExitStack() as stack:
+        check(Path(directory).resolve(), stack)
+    print("check: land-check-sandbox PASS")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--hostile"]:
+        hostile(*(Path(arg) for arg in sys.argv[2:5]), list(map(int, sys.argv[5:])))
+    else:
+        main()

@@ -40,7 +40,7 @@ def skip_or_run():
 def git_env():
     env = {key: value for key, value in hermetic_env().items()
            if not key.startswith(("GIT_", "CS_")) and key != "CS_LAND_COMMIT"}
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     return env
 
 
@@ -176,6 +176,9 @@ def main():
     failures = []
     with scratch_dir(prefix="attack-config-symlink-") as raw:
         root = Path(raw).resolve()
+        home = root / "home"
+        home.mkdir()
+        os.environ["HOME"] = str(home)
         main_repo = gwt(root / "gwt")
         if not str(main_repo.resolve()).startswith(str(root)):
             print("repo_escaped=true")
@@ -190,6 +193,7 @@ def main():
                 "gate": "cs/scripts/check",
                 "hook_gated": ["cs/"],
                 "land": "squash",
+                "land_check": "host",
             }
         }))
         os.environ["CS_REPOS_FILE"] = str(repos)
@@ -214,11 +218,15 @@ def main():
                 print("%s landed=false committed=false" % lane_name)
                 failures.append(lane_name)
                 continue
-            code, result = _lanes.land("demo", lane_name, allow_agent_config=False)
-            landed = code == 0 and result.get("status") == "landed" and result.get("ok") is True
-            print("%s landed=%s" % (lane_name, str(landed).lower()))
-            if landed:
-                failures.append(lane_name)
+            for mode in ("host", "sandbox"):
+                config = json.loads(repos.read_text())
+                config["demo"]["land_check"] = mode
+                repos.write_text(json.dumps(config))
+                code, result = _lanes.land("demo", lane_name, allow_agent_config=False, state=root / "state")
+                refused = code == 2 and "protected" in result.get("reason", "")
+                print("%s %s refused=%s" % (lane_name, mode, str(refused).lower()))
+                if not refused or (root / "state/land-check").exists():
+                    failures.append("%s/%s" % (lane_name, mode))
     if failures:
         for item in failures:
             print("FAIL " + item)

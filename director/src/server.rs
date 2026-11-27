@@ -179,18 +179,22 @@ async fn handle(
             .await
         {
             Ok(b) => {
-                let call = Call {
+                let mut call = Call {
                     method: method.clone(),
                     path: path.clone(),
                     query: parts.uri.query().unwrap_or("").to_string(),
                     headers: parts.headers,
                     body: b.to_bytes(),
                 };
-                let reply = if is_ui {
-                    crate::ui::handle(&state, &call, peer)
-                } else {
-                    route(&state, &call).await
-                };
+                if method == "POST"
+                    && matches!(
+                        path.as_str(),
+                        "/api/v1/client/invites" | "/api/v1/client/pairings"
+                    )
+                {
+                    set_invite_origin(&mut call, &parts.uri, peer);
+                }
+                let reply = route(&state, &call, peer, is_ui).await;
                 state.hub.publish(&state.store);
                 reply
             }
@@ -223,13 +227,43 @@ async fn handle(
     Ok(reply)
 }
 
-async fn route(state: &Arc<State>, call: &Call) -> Reply {
+fn set_invite_origin(call: &mut Call, uri: &hyper::Uri, peer: Peer) {
+    if peer.ip.to_canonical().is_loopback()
+        && call.headers.contains_key("x-contextstack-invite-origin")
+    {
+        return;
+    }
+    let authority = call
+        .header("host")
+        .and_then(|host| host.parse::<hyper::http::uri::Authority>().ok())
+        .or_else(|| uri.authority().cloned())
+        .filter(|host| !host.as_str().contains('@'));
+    let host = authority.map_or_else(|| peer.local.to_string(), |host| host.to_string());
+    let scheme = if peer.tls { "https" } else { "http" };
+    call.headers.remove("x-contextstack-invite-origin");
+    if let Ok(origin) = format!("{scheme}://{host}").parse() {
+        call.headers.insert("x-contextstack-invite-origin", origin);
+    }
+}
+
+async fn route(state: &Arc<State>, call: &Call, peer: Peer, ui: bool) -> Reply {
     if let Some(rest) = call.path.strip_prefix(crate::node_api::PREFIX) {
         return crate::node_api::handle(state, call, rest).await;
     }
     let state = Arc::clone(state);
     let call = call.clone();
-    match tokio::task::spawn_blocking(move || crate::client_api::handle(&state, &call)).await {
+    let handler = move || {
+        if ui {
+            crate::ui::handle(&state, &call, peer)
+        } else if call.method == "POST" && call.path == "/api/v1/pair" {
+            crate::client_api::pair_request(&state, &call, peer.ip)
+        } else if call.method == "POST" && call.path == "/api/v1/invites/accept" {
+            crate::members::accept(&state, &call, peer)
+        } else {
+            crate::client_api::handle(&state, &call)
+        }
+    };
+    match tokio::task::spawn_blocking(handler).await {
         Ok(reply) => reply,
         Err(e) => internal(&format!("request handler: {e}")),
     }
@@ -252,7 +286,7 @@ fn unauthenticated(state: &State, method: &str, path: &str, headers: &HeaderMap)
             Err(e) => Some(internal(&e)),
         };
     }
-    if method == "POST" && path == "/api/v1/pair" {
+    if method == "POST" && matches!(path, "/api/v1/pair" | "/api/v1/invites/accept") {
         return None;
     }
     if path.starts_with(crate::node_api::PREFIX) {
@@ -313,6 +347,17 @@ fn body_limit(method: &str, path: &str) -> usize {
         UI_BODY
     } else if object_upload(method, path) || envelope_post(method, path) {
         MAX_BODY
+    } else if method == "POST"
+        && path
+            .strip_prefix(crate::node_api::PREFIX)
+            .is_some_and(|rest| {
+                matches!(
+                    rest.split('/').collect::<Vec<_>>().as_slice(),
+                    ["jobs", _, "action-approvals"]
+                )
+            })
+    {
+        7 * 1024 * 1024
     } else {
         NORMAL_BODY
     }
@@ -511,4 +556,44 @@ where
     tokio::spawn(async move {
         let _ = conn.await;
     });
+}
+
+#[cfg(test)]
+mod enrollment_origin_tests {
+    use super::*;
+
+    #[test]
+    fn only_loopback_peers_can_override_the_host() -> Result<(), Box<dyn std::error::Error>> {
+        let mut call = Call {
+            method: "POST".into(),
+            path: "/api/v1/client/invites".into(),
+            query: String::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+        call.headers
+            .insert("host", "director.example:8780".parse()?);
+        call.headers.insert(
+            "x-contextstack-invite-origin",
+            "https://override.example".parse()?,
+        );
+        let uri = call.path.parse()?;
+        let mut peer = Peer {
+            ip: "::ffff:127.0.0.1".parse()?,
+            tls: true,
+            local: "127.0.0.1:8780".parse()?,
+        };
+        set_invite_origin(&mut call, &uri, peer);
+        assert_eq!(
+            call.header("x-contextstack-invite-origin"),
+            Some("https://override.example")
+        );
+        peer.ip = "198.51.100.2".parse()?;
+        set_invite_origin(&mut call, &uri, peer);
+        assert_eq!(
+            call.header("x-contextstack-invite-origin"),
+            Some("https://director.example:8780")
+        );
+        Ok(())
+    }
 }

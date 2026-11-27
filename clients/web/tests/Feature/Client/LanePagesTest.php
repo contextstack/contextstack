@@ -61,6 +61,7 @@ it('starts the Director\'s built-in coding lane with repo, lane and model, uploa
         director('repos') => Http::response(['repos' => [['name' => 'contextstack']], 'repos_file' => '/cfg/repos.json']),
         director('intents') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [laneJobRecord(['state' => 'offered'])], 'runs' => []], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lane-create')
         ->set('title', 'Fix the widget')
@@ -90,6 +91,7 @@ it('starts scratch work with neither repo nor lane name', function () {
         director('repos') => Http::response(['repos' => [['name' => 'contextstack']]]),
         director('intents') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [laneJobRecord(['state' => 'offered'])], 'runs' => []], 201),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lane-create')->set('title', 'Try an idea')->set('goal', 'Sketch it.')->set('scratch', true)
         ->call('submit')->assertHasNoErrors();
@@ -106,6 +108,7 @@ function fakeLaneCreate(): void
         director('repos') => Http::response(['repos' => [['name' => 'contextstack']]]),
         director('intents') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [laneJobRecord(['state' => 'offered'])], 'runs' => []], 201),
     ]);
+    fakeDirectorBackground();
 }
 
 it('defaults to Auto and sends model auto with no planner', function () {
@@ -211,6 +214,7 @@ it('lists lane jobs and shows the lane detail with live output and result', func
         'http://director.test/api/v1/client/runs/run_lane/files/evidence/candidate.diff' => Http::response($diff),
         'http://director.test/api/v1/client/runs/run_lane/files/transcript.md' => Http::response($transcript),
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('lanes.index'))->assertOk()->assertSee('Fix the widget');
 
@@ -240,6 +244,7 @@ it('approves a lane run and shows the land command', function () {
             'authorises' => [],
         ], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lane', ['job' => 'job_lane']);
     $key = $page->get('decisionKey');
@@ -261,6 +266,7 @@ it('requests cancel on a running lane', function () {
         director('cancels/can_1') => Http::response(['cancel_id' => 'can_1', 'state' => 'requested', 'revision' => 20]),
         director('runs/*/events*') => Http::response(['events' => [], 'confirmed' => 0]),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lane', ['job' => 'job_lane']);
     $key = $page->get('cancelKey');
@@ -305,6 +311,7 @@ it('withholds land commands for adversarial metadata', function (string $field, 
         ]),
         director('runs/run_lane/events*') => Http::response(['events' => [], 'confirmed' => 0]),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lane', ['job' => 'job_lane'])
         ->assertDontSee('data-test="land-command"', false);
@@ -336,6 +343,7 @@ function fakeLandedLane(?array $land): void
         director('runs/run_lane/events*') => Http::response(['events' => [], 'confirmed' => 0]),
         director('runs/run_lane') => Http::response($run),
     ]);
+    fakeDirectorBackground();
 }
 
 /**
@@ -425,6 +433,7 @@ function retriedLaneAnswer(): array
 
 it('lists a retried lane once, as its newest attempt', function () {
     Http::fake([director('intents?*') => Http::response(retriedLaneAnswer())]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lanes');
 
@@ -443,6 +452,7 @@ it('counts lanes, not retry jobs, when deciding whether there is more to show', 
         $answer['jobs'][] = laneJobRecord(['job_id' => "job_{$n}_retry", 'intent_id' => "int_{$n}", 'created_at' => sprintf('2026-11-12T11:%02d:00Z', $n)]);
     }
     Http::fake([director('intents?*') => Http::response($answer)]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lanes');
 
@@ -456,6 +466,7 @@ it('links every attempt of a retried lane from each attempt\'s page', function (
         director('jobs/job_lane') => Http::response($answer['jobs'][1]),
         director('intents/int_lane') => Http::response(['intent' => laneIntentRecord(), 'jobs' => $answer['jobs'], 'runs' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lane', ['job' => 'job_lane'])
         ->assertSee('data-test="lane-attempts"', false)
@@ -473,6 +484,7 @@ it('shows the model the router chose for the coding job, and why', function () {
         director('jobs/job_lane') => Http::response($job),
         director('intents/int_lane') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [$job], 'runs' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lane', ['job' => 'job_lane'])
         ->assertSeeText('harness:local-coder')
@@ -485,6 +497,7 @@ it('shows the intent\'s model and no routing line when the job was not routed', 
         director('jobs/job_lane') => Http::response(laneJobRecord()),
         director('intents/int_lane') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [laneJobRecord()], 'runs' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lane', ['job' => 'job_lane'])->assertDontSeeText('Model routing');
 });
@@ -494,6 +507,7 @@ it('shows no attempts line on a lane that was never retried', function () {
         director('jobs/job_lane') => Http::response(laneJobRecord()),
         director('intents/int_lane') => Http::response(['intent' => laneIntentRecord(), 'jobs' => [laneJobRecord()], 'runs' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lane', ['job' => 'job_lane'])
         ->assertDontSee('data-test="lane-attempts"', false)
@@ -502,6 +516,7 @@ it('shows no attempts line on a lane that was never retried', function () {
 
 it('suggests a lane name from the title, keeping every letter', function () {
     Http::fake([director('*') => Http::response(['nodes' => [], 'models' => [], 'repos' => []])]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lane-create')->set('title', 'Add Dark Mode')->assertSet('lane', 'add-dark-mode');
 });
@@ -519,6 +534,7 @@ it('does not take a refused transcript or diff for the run\'s evidence, and read
             ->push("--- a/x\n+++ b/x\n+hi\n")
             ->push("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Done.\"}]}}\n"),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lane', ['job' => 'job_lane'])
         ->assertSet('diff', null)
@@ -546,6 +562,7 @@ it('reads the diff, last message and decision again when another run becomes the
         'http://director.test/api/v1/client/runs/run_b/files/evidence/candidate.diff' => Http::response("--- a/b.txt\n+++ b/b.txt\n+b\n+b\n"),
         'http://director.test/api/v1/client/runs/run_b/files/transcript.md' => Http::response($transcript('Run B done.')),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.lane', ['job' => 'job_lane'])
         ->assertSet('lastMessage', 'Run A done.')
@@ -572,6 +589,7 @@ it('lets the Director decide which tasks are lanes, by its lane flag', function 
         'intents' => [laneIntentRecord(), laneIntentRecord(['intent_id' => 'int_other', 'title' => 'Not a lane by the Director', 'lane' => false])],
         'jobs' => [$job, laneJobRecord(['job_id' => 'job_other', 'intent_id' => 'int_other'])],
     ])]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lanes')->assertSee('Fix the widget')->assertDontSee('Not a lane by the Director');
 });

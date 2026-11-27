@@ -119,7 +119,9 @@ new #[Layout('layouts::client')] #[Title('Task lanes')] class extends DirectorPa
         </div>
         <div class="flex items-center gap-3">
             <x-client.stream-dot />
+            @capable('start_work')
             <flux:button variant="primary" icon="plus" :href="route('lanes.create')" wire:navigate>{{ __('New task lane') }}</flux:button>
+            @endcapable
         </div>
     </header>
 

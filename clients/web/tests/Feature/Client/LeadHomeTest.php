@@ -20,6 +20,7 @@ it('opens on what needs you while the chief of staff is off, and hides it from t
         homeConversation(['conversation_id' => 'con_asks', 'lead' => false, 'created_at' => '2026-11-12T00:00:00Z',
             'attention' => ['question' => 'Which branch?', 'set_at' => '2026-11-14T03:00:00Z']]),
     ]])]);
+    fakeDirectorBackground();
 
     $this->get(route('home'))->assertRedirect(route('conversations.show', 'con_asks'));
     Http::assertSent(fn ($request) => $request->url() === director('conversations?limit=100'));
@@ -28,6 +29,7 @@ it('opens on what needs you while the chief of staff is off, and hides it from t
 
 it('opens a new conversation when there are none', function () {
     Http::fake([director('conversations?*') => Http::response(['conversations' => []])]);
+    fakeDirectorBackground();
 
     $this->get(route('home'))->assertRedirect(route('conversations.create'));
 });
@@ -39,6 +41,7 @@ it('marks the lead on the conversation list and puts it first', function () {
             homeConversation(['conversation_id' => 'con_lead', 'title' => 'Hosted lead', 'lead' => true, 'created_at' => '2026-11-12T00:51:25Z']),
         ]]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversations')
         ->assertSee('data-test="lead-badge"', false)
@@ -54,6 +57,7 @@ it('lists conversations under Recents: those waiting on you first, then those th
                 'attention' => ['question' => 'Which repo?', 'set_at' => '2026-11-13T12:00:00Z', 'set_by' => 'cred_lead']]),
         ]]),
     ]);
+    fakeDirectorBackground();
 
     $rail = Livewire::withoutLazyLoading()->test('client.thread-rail')
         ->assertSeeTextInOrder(['New chat', 'Recents', 'asks you', 'Hosted lead', 'newer chat'])
@@ -70,6 +74,7 @@ it('groups chats by project under Projects, named by the Director, a few at a ti
         director('conversations?*') => Http::response(['conversations' => [...$chats, homeConversation(['conversation_id' => 'con_loose', 'title' => 'loose chat'])]]),
         director('projects') => Http::response(['projects' => [['project_id' => 'prj_site', 'name' => 'site rebuild']]]),
     ]);
+    fakeDirectorBackground();
 
     $rail = Livewire::withoutLazyLoading()->test('client.thread-rail')
         ->assertSeeTextInOrder(['Projects', 'site rebuild', 'site chat 6', 'Recents', 'loose chat'])
@@ -99,6 +104,7 @@ function threadLanesAnswer(): array
 
 it('shows only the lanes this lead started, with their state and land state', function () {
     Http::fake([director('intents*') => Http::response(threadLanesAnswer())]);
+    fakeDirectorBackground();
 
     Livewire::test('client.thread-lanes', ['conversationId' => 'con_lead'])
         ->assertSeeText('Fix the widget')
@@ -114,6 +120,7 @@ it('shows a lane the lead retried once, as its newest attempt with the earlier o
     $answer['jobs'][0] = [...$answer['jobs'][0], 'state' => 'error', 'land' => null];
     $answer['jobs'][] = ['job_id' => 'job_mine_retry', 'intent_id' => 'int_mine', 'state' => 'done', 'created_at' => '2026-11-13T11:00:00Z', 'cancel' => null, 'revision' => 7];
     Http::fake([director('intents*') => Http::response($answer)]);
+    fakeDirectorBackground();
 
     $pane = Livewire::test('client.thread-lanes', ['conversationId' => 'con_lead']);
 
@@ -132,6 +139,7 @@ it('shows no lanes from a Director that does not yet link lanes to conversations
         return $intent;
     }, $answer['intents']);
     Http::fake([director('intents*') => Http::response($answer)]);
+    fakeDirectorBackground();
 
     Livewire::test('client.thread-lanes', ['conversationId' => 'con_lead'])
         ->assertSee('data-test="no-thread-lanes"', false)
@@ -146,6 +154,7 @@ it('shows the lanes pane on a lead conversation and tells it when one of its lan
         director('conversations/con_lead/thread') => Http::response(['conversation' => $conversation, 'turns' => [], 'summaries' => []]),
         director('intents*') => Http::response(['intents' => [], 'jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation', ['conversation' => 'con_lead'])
         ->assertSee('data-test="lanes-pane"', false)
@@ -163,6 +172,7 @@ it('shows no lanes pane on an ordinary conversation', function () {
         director('models') => Http::response(['models' => [], 'default_model' => null]),
         director('conversations/con_chat/thread') => Http::response(['conversation' => $conversation, 'turns' => [], 'summaries' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation', ['conversation' => 'con_chat'])
         ->assertDontSee('data-test="lanes-pane"', false);
@@ -192,6 +202,7 @@ function fakeLeadCreate(int $status = 201, array $answer = [], ?array $catalog =
         director('conversations') => Http::response($answer ?: ['conversation' => homeConversation(['conversation_id' => 'con_new', 'lead' => true])], $status),
         director('conversations/con_new/turns') => Http::response(['turn' => ['turn_id' => 'trn_1', 'state' => 'queued']], 201),
     ]);
+    fakeDirectorBackground();
 }
 
 it('starts a lead by default: no bundle, the hosted-lead spec, a Claude Code model, then the first message', function () {
@@ -246,6 +257,7 @@ it('treats a conversation marked as a lead as one, and shows its lanes pane', fu
         director('conversations/con_marked/thread') => Http::response(['conversation' => $conversation, 'turns' => [], 'summaries' => []]),
         director('intents*') => Http::response(['intents' => [], 'jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation', ['conversation' => 'con_marked'])
         ->assertSee('data-test="lanes-pane"', false);
@@ -280,10 +292,11 @@ it('shows a model the Director lists more than once only once', function () {
 });
 
 it('refuses an empty or overlong chief-of-staff name, asking the Director nothing', function (string $name) {
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => true]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => true]),
         director('lead-node') => Http::response(['error' => 'Not Found', 'code' => 'not_found'], 404),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.connect')
         ->set('chiefOfStaff', true)
@@ -295,11 +308,12 @@ it('refuses an empty or overlong chief-of-staff name, asking the Director nothin
 })->with(['empty' => [''], 'too long' => [str_repeat('a', 41)]]);
 
 it('keeps the chief of staff as it was and says why when the Director refuses, as it does for a paired device', function () {
+    meOnDirector(['credential_id' => 'cred_phone', 'owner' => false]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_phone', 'owner' => false]),
         director('lead-node') => Http::response(['error' => 'Not Found', 'code' => 'not_found'], 404),
         director('chief-of-staff') => Http::response(['error' => 'Forbidden', 'code' => 'owner_only', 'detail' => 'only the owner can change the chief of staff'], 403),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.connect')->set('chiefOfStaff', true)->call('saveChiefOfStaff')
         ->assertNoRedirect()->assertSee('data-test="chief-of-staff-problem"', false);
@@ -307,6 +321,7 @@ it('keeps the chief of staff as it was and says why when the Director refuses, a
 
 it('opens the conversation list, not an error page, when the Director cannot answer', function (int $status) {
     Http::fake([director('conversations?*') => Http::response(['error' => 'Bad Gateway', 'code' => 'unavailable'], $status)]);
+    fakeDirectorBackground();
 
     $this->get(route('home'))->assertRedirect(route('conversations.index'));
 })->with([502, 503]);
@@ -318,6 +333,7 @@ it('keeps a long-lived lead on the sidebar however many newer conversations ther
         ]]),
         director('conversations?*') => Http::response(['conversations' => [homeConversation(['conversation_id' => 'con_new', 'title' => 'newer chat'])]]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::withoutLazyLoading()->test('client.thread-rail')->assertSeeTextInOrder(['Old lead', 'newer chat']);
     Http::assertSent(fn ($request) => $request->url() === director('conversations?limit=100'));
@@ -327,6 +343,7 @@ it('lists a page of conversations at a time, with "Show more" while there are ol
     $conversations = array_map(fn (int $n): array => homeConversation(['conversation_id' => "con_{$n}", 'title' => "chat {$n}",
         'created_at' => sprintf('2026-11-%02dT00:00:00Z', 30 - intdiv($n, 3))]), range(1, 51));
     Http::fake(fn ($request) => Http::response(['conversations' => array_slice($conversations, 0, (int) $request->data()['limit'])]));
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversations')->assertSee('data-test="show-more"', false);
     expect($page->instance()->conversations())->toHaveCount(50);
@@ -338,11 +355,12 @@ it('lists a page of conversations at a time, with "Show more" while there are ol
 
 it('reads and saves the chief of staff on the Director, so every client shows the same', function () {
     chiefOfStaffOnDirector(['enabled' => false, 'name' => 'Ada', 'conversation_id' => 'con_chief']);
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => true]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => true]),
         director('lead-node') => Http::response(['node' => 'workstation', 'source' => 'set']),
         director('chief-of-staff') => Http::response(['chief_of_staff' => ['enabled' => true, 'name' => 'Ada', 'conversation_id' => 'con_chief', 'revision' => 2]]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.connect')
         ->assertSet('chiefOfStaff', false)->assertSet('chiefOfStaffName', 'Ada')
@@ -365,6 +383,7 @@ it('opens on, pins and protects the chief of staff the Director names', function
         director('models') => Http::response(['models' => []]),
         director('intents*') => Http::response(['intents' => [], 'jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('home'))->assertRedirect(route('conversations.show', 'con_chief'));
     $rail = Livewire::withoutLazyLoading()->test('client.thread-rail')->assertSee('data-test="rail-chief-of-staff"', false);

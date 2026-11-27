@@ -1,9 +1,10 @@
 //! Whether a node's reported status fits a job's spec `model` (executor template or harness).
 
 use crate::jobs::BundleFile;
+use crate::store::ScopedConnection;
 use crate::store::{Record, Store, touch};
 use crate::util;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -73,10 +74,10 @@ pub fn model_in_spec(store: &Store, files: &[BundleFile], spec_path: &str) -> Op
         .map(str::to_owned)
 }
 
-pub(crate) fn node_status(db: &Connection, node_id: i64) -> Option<Value> {
+pub(crate) fn node_status(db: &ScopedConnection, node_id: i64) -> Option<Value> {
     let raw: Option<String> = db
         .query_row(
-            "SELECT status FROM nodes WHERE id = ?1",
+            "SELECT status FROM nodes WHERE +org_id = :org_id AND id = ?1",
             params![node_id],
             |r| r.get(0),
         )
@@ -115,7 +116,7 @@ fn harness_ready(status: &Value) -> bool {
 }
 
 pub fn validate_harness_model(model: &str, status: &Value, node: &str) -> Res<()> {
-    if is_cli_template(model) {
+    if model == "gate" || is_cli_template(model) {
         return Err(format!(
             "gateway model {model} conflicts with an executor template"
         ));
@@ -144,7 +145,9 @@ pub fn can_run(model: &str, status: &Value) -> bool {
     if !caps.is_object() {
         return false;
     }
-    if is_cli_template(model) {
+    if model == "gate" {
+        caps["gate"] == true
+    } else if is_cli_template(model) {
         template_ready(base_template(model), status)
     } else {
         harness_ready(status)
@@ -158,10 +161,10 @@ fn capability_known(status: &Value) -> bool {
 }
 
 /// Refuse client submission when the named node's status already rules the model out.
-pub fn refuse_dispatch(db: &Connection, node: &str, model: &str, harness: bool) -> Res<()> {
+pub fn refuse_dispatch(db: &ScopedConnection, node: &str, model: &str, harness: bool) -> Res<()> {
     let node_id: i64 = db
         .query_row(
-            "SELECT id FROM nodes WHERE name = ?1 AND revoked_at IS NULL",
+            "SELECT id FROM nodes WHERE +org_id = :org_id AND name = ?1 AND revoked_at IS NULL",
             params![node],
             |r| r.get(0),
         )
@@ -184,7 +187,7 @@ pub fn refuse_dispatch(db: &Connection, node: &str, model: &str, harness: bool) 
     if can_run(model, &status) {
         return Ok(());
     }
-    if is_cli_template(model) {
+    if model == "gate" || is_cli_template(model) {
         Err(format!("node {node} cannot run executor template {model}"))
     } else {
         Err(format!(
@@ -195,7 +198,7 @@ pub fn refuse_dispatch(db: &Connection, node: &str, model: &str, harness: bool) 
 
 pub fn capability_wait(
     store: &Store,
-    db: &Connection,
+    db: &ScopedConnection,
     node_id: i64,
     files: &[BundleFile],
     spec_path: &str,
@@ -206,7 +209,7 @@ pub fn capability_wait(
     if !capability_known(&status) || can_run(&model, &status) {
         return None;
     }
-    let detail = if is_cli_template(&model) {
+    let detail = if model == "gate" || is_cli_template(&model) {
         format!("no node can run executor template {model}; {node_name} does not report it")
     } else {
         format!(
@@ -222,14 +225,18 @@ pub fn capability_wait(
 /// A new job its node cannot run waits for executor fit. Its budget row keeps its state (`held` or `free`): what it
 /// reserved still counts against its budgets, and `reservations::release` (which offers only `waiting` rows) leaves
 /// it alone.
-pub fn hold_capability(tx: &Connection, job_id: &str, wait: &CapabilityWait) -> Result<(), String> {
+pub fn hold_capability(
+    tx: &ScopedConnection,
+    job_id: &str,
+    wait: &CapabilityWait,
+) -> Result<(), String> {
     tx.execute(
-        "UPDATE jobs SET state = 'waiting', offered_at = NULL WHERE job_id = ?1",
+        "UPDATE jobs SET state = 'waiting', offered_at = NULL WHERE +org_id = :org_id AND (job_id = ?1)",
         params![job_id],
     )
     .map_err(|e| e.to_string())?;
     tx.execute(
-        "UPDATE job_budgets SET reason = ?1, detail = ?2 WHERE job_id = ?3",
+        "UPDATE job_budgets SET reason = ?1, detail = ?2 WHERE +org_id = :org_id AND (job_id = ?3)",
         params![wait.reason, wait.detail, job_id],
     )
     .map_err(|e| e.to_string())?;
@@ -242,7 +249,7 @@ pub fn hold_capability(tx: &Connection, job_id: &str, wait: &CapabilityWait) -> 
 /// that fails is rolled back on its own and its error returned once the rest are done.
 pub fn offer_waiting(
     store: &Store,
-    db: &mut Connection,
+    db: &mut ScopedConnection,
     node_id: i64,
     node_name: &str,
 ) -> Res<usize> {
@@ -255,7 +262,7 @@ pub fn offer_waiting(
     let mut stmt = db
         .prepare_cached(
             "SELECT j.job_id, j.spec, b.trials, b.reserved_micros
-             FROM jobs j JOIN job_budgets b ON b.job_id = j.job_id
+             FROM (SELECT rowid AS rowid, * FROM jobs WHERE +org_id = :org_id) j JOIN (SELECT rowid AS rowid, * FROM job_budgets WHERE +org_id = :org_id) b ON b.job_id = j.job_id
              WHERE j.node_id = ?1 AND j.state = 'waiting' AND b.state IN ('held', 'free')
                AND b.reason = 'executor_unavailable' ORDER BY j.rowid",
         )
@@ -276,7 +283,7 @@ pub fn offer_waiting(
             // Still waiting for executor fit, now the transaction holds the lock.
             let still = tx
                 .query_row(
-                    "SELECT 1 FROM jobs j JOIN job_budgets b ON b.job_id = j.job_id
+                    "SELECT 1 FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j JOIN (SELECT * FROM job_budgets WHERE +org_id = :org_id) b ON b.job_id = j.job_id
                      WHERE j.job_id = ?1 AND j.state = 'waiting' AND b.state IN ('held', 'free')
                        AND b.reason = 'executor_unavailable'",
                     params![job_id],
@@ -319,6 +326,15 @@ mod tests {
         let status = json!({"agent_capabilities": {"templates": ["codex"], "harness": false}});
         assert!(can_run("codex", &status));
         assert!(!can_run("claude-code", &status));
+    }
+
+    #[test]
+    fn gate_needs_its_own_capability() {
+        let gate = json!({"agent_capabilities": {"templates": [], "harness": false, "gate": true}});
+        assert!(can_run("gate", &gate));
+        assert!(!is_cli_template("gate"));
+        let agents = json!({"agent_capabilities": {"templates": ["codex"], "harness": true}});
+        assert!(!can_run("gate", &agents));
     }
 
     #[test]

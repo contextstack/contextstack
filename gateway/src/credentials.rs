@@ -390,17 +390,38 @@ fn private(path: &Path, meta: &fs::Metadata, dir: bool) -> Result<(), StoreError
             "credential path {shown} has the wrong type; refused"
         )));
     }
-    let perm = meta.permissions().mode() & 0o777;
+    check_mode(
+        path,
+        meta.permissions().mode() & 0o7777,
+        dir,
+        cfg!(target_os = "linux"),
+    )?;
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(StoreError::Refused(format!(
+            "credential path {shown} is owned by another user; refused"
+        )));
+    }
+    Ok(())
+}
+
+fn check_mode(path: &Path, mode: u32, dir: bool, linux: bool) -> Result<(), StoreError> {
+    let shown = path.display();
+    let perm = mode & 0o777;
     if perm & 0o077 != 0 {
         return Err(StoreError::Refused(format!(
             "credential path {shown} is group/world-accessible (mode {perm:04o}); refused, chmod {}",
             if dir { "700" } else { "600" }
         )));
     }
-    if meta.uid() != rustix::process::getuid().as_raw() {
-        return Err(StoreError::Refused(format!(
-            "credential path {shown} is owned by another user; refused"
-        )));
+    if linux {
+        let want = if dir { 0o700 } else { 0o600 };
+        let mode = mode & 0o7777;
+        let required = if dir { 0o500 } else { 0o400 };
+        if mode & 0o7000 != 0 || mode & required != required {
+            return Err(StoreError::Refused(format!(
+                "credential path {shown} has mode {mode:04o}; refused, chmod {want:03o}"
+            )));
+        }
     }
     Ok(())
 }
@@ -631,6 +652,34 @@ impl<R: BufRead> TakeLine for R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_credential_modes() {
+        let path = Path::new("fixture");
+        for (dir, accepted, refused) in [
+            (
+                true,
+                [0o700, 0o500],
+                &[0o750, 0o300, 0o600, 0o4700, 0o2700, 0o1700][..],
+            ),
+            (
+                false,
+                [0o600, 0o400],
+                &[0o640, 0o604, 0o644, 0o200, 0o4600, 0o2600, 0o1600][..],
+            ),
+        ] {
+            for mode in accepted {
+                assert!(check_mode(path, mode, dir, true).is_ok(), "mode {mode:04o}");
+            }
+            let fix = if dir { "chmod 700" } else { "chmod 600" };
+            for &mode in refused {
+                assert!(
+                    matches!(check_mode(path, mode, dir, true), Err(StoreError::Refused(message)) if message.contains(fix)),
+                    "mode {mode:04o}"
+                );
+            }
+        }
+    }
 
     /// A fake `security` that counts its runs: each provider's lookup runs once (found or missing),
     /// concurrent first callers share it, and only `forget` reads again.

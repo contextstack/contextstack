@@ -15,9 +15,16 @@ never real `~/.contextstack` or `~/.config/systemd`):
 2. Units contain no secrets (node token, APP_KEY).
 3. Install calls `systemctl --user daemon-reload` and `enable --now`;
    uninstall and purge call `disable --now`. Output notes
-   `loginctl enable-linger` and does not run it.
-4. A host with no `systemctl` is refused clearly.
-5. Unquoted `WorkingDirectory=`, `User=` and log paths are validated (refused, not quoted). An `ExecStart` word containing `%` or a space is quoted. A bad value is a clear `Refused`, not a traceback.
+   `loginctl enable-linger` when the `loginctl show-user` recorder reports
+   lingering is off. Only the owner can enable lingering.
+4. Missing `systemctl` and an unreachable user manager are reported clearly.
+5. Unquoted `WorkingDirectory=` and `User=` are validated. An `ExecStart`
+   word containing `%` or a space is quoted. Invalid values report a clear refusal.
+6. CLI start, stop, restart and status use the user manager. Logs use the
+   user journal, and the backup schedule enables a user timer.
+7. `cs init` activates the units with a headless service PATH. Init and
+   doctor check sandbox prerequisites with a fake bwrap, report Landlock
+   availability, and enforce the Linux file credential modes.
 
 Runs on macOS: pure rendering plus a fake systemctl.
 `env -u CS_STATE_ROOT -u CSGATEWAY_ENDPOINT`.

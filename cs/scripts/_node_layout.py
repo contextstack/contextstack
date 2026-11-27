@@ -19,7 +19,8 @@ from pathlib import Path
 from _atomic_write import write_atomic as _write_atomic_bytes  # noqa: E402
 
 from _node_services import (CLIENT_WEB, CLIENT_WEB_ENV, CLIENT_WEB_STATE, CONFIG, CURRENT, DIRECTOR_RS_DATA,
-                            DIRECTOR_RS_LISTEN, GATEWAY_BIN, HOME, MODELS, Refused, ROOT, release_bin)
+                            DIRECTOR_RS_LISTEN, GATEWAY_BIN, HOME, MODELS, Refused, ROOT, host_platform,
+                            linux_login_path, release_bin)
 
 RELEASES, RECORD = ROOT / "releases", CONFIG / "install.json"
 DIRECTOR_ENV = CONFIG / "director/director.env"
@@ -64,6 +65,7 @@ class DrainRefused(Exception):
 
 INSTALL_LOCK = RELEASES / "install.lock"
 INSTALL_LOCK_FD = "NODE_INSTALL_LOCK_FD"
+RESTART_INTAKE_FD = "CS_HOSTED_RESTART_INTAKE_FD"
 
 
 @contextmanager
@@ -134,6 +136,8 @@ def user_path():
     probe = os.environ.get("NODE_INSTALL_USER_PATH")
     if probe is not None:
         return probe
+    if host_platform() == "linux":
+        return linux_login_path()
     try:
         out = subprocess.run([os.environ.get("SHELL") or "/bin/zsh", "-lic", 'printf "\\n%s" "$PATH"'],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15).stdout
@@ -158,9 +162,10 @@ def shell_profiles():
 def setup_path(link_dir, yes=False):
     if link_dir != HOME / ".local/bin" or str(link_dir) in user_path().split(":"):
         return
-    shell = Path(os.environ.get("SHELL", "/bin/zsh")).name
+    linux = host_platform() == "linux"
+    shell = Path(os.environ.get("SHELL", "/bin/sh" if linux else "/bin/zsh")).name
     profiles = dict(zip(("zsh", "bash", "fish"), shell_profiles()))
-    profile = profiles.get(shell, profiles["zsh"])
+    profile = profiles.get(shell, HOME / ".profile" if linux else profiles["zsh"])
     line = ('fish_add_path --prepend "$HOME/.local/bin"' if shell == "fish"
             else 'export PATH="$HOME/.local/bin:$PATH"') + "  " + PATH_MARKER
     try:
@@ -372,6 +377,30 @@ def seed_config(rid, rec):
     for rel in SEEDED:
         if not (CONFIG / rel).exists():
             shutil.copy2(RELEASES / rid / kit(rid) / rel, CONFIG / rel)
+    template = RELEASES / rid / kit(rid) / "policy/land-host-probes.json"
+    if template.is_file():  # Older releases can still be activated.
+        probe_root = Path(os.environ.get("CS_STATE_ROOT") or ROOT)
+        if not probe_root.is_absolute():
+            raise Refused("CS_STATE_ROOT must be an absolute path")
+        destination = probe_root / "config/land-host-probes.json"
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            ops = str(Path(__file__).resolve().parents[1] / "ops/bin")
+            if ops not in sys.path:
+                sys.path.insert(0, ops)
+            from _land_host_probes import policy_drift, policy_repair
+
+            try:
+                drift = policy_drift(destination, template)
+            except ValueError as error:
+                drift = str(error)
+            if drift:
+                print(f"land host probes: {drift}. {policy_repair(template)}.", file=sys.stderr)
+        else:
+            with os.fdopen(fd, "wb") as output:
+                output.write(template.read_bytes())
     have = estate.read_text(encoding="utf-8").strip() if estate.is_file() else None
     if want and not have:
         write_atomic(estate, (want + "\n").encode())
@@ -417,6 +446,7 @@ DIRECTOR_DB = DIRECTOR_RS_DATA / "director.sqlite"
 DIRECTOR_DB_SNAP_PREFIX = "director.sqlite.pre-"
 # Beside the Director's data, not in it: the data directory is what an uninstall --purge keeps.
 DIRECTOR_DB_SNAPS = DIRECTOR_RS_DATA.parent / "director-snapshots"
+DIRECTOR_DB_BACKUPS = DIRECTOR_RS_DATA.parent / "director-backups"
 
 
 def director_db_snapshot_path(rid):
@@ -424,10 +454,11 @@ def director_db_snapshot_path(rid):
 
 
 def prune_director_db_snapshots(keep=2):
-    snaps = sorted(DIRECTOR_DB_SNAPS.glob(DIRECTOR_DB_SNAP_PREFIX + "*"),
-                    key=lambda path: path.stat().st_mtime, reverse=True)
-    for stale in snaps[keep:]:
-        stale.unlink(missing_ok=True)
+    for directory, prefix in ((DIRECTOR_DB_SNAPS, DIRECTOR_DB_SNAP_PREFIX),
+                              (DIRECTOR_DB_BACKUPS, "backup-")):
+        copies = sorted(directory.glob(prefix + "*"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for stale in copies[keep:]:
+            stale.unlink(missing_ok=True)
 
 
 def director_db_schema(path=DIRECTOR_DB):
@@ -468,7 +499,7 @@ def check_director_schema(rid):
             raise Refused(f"release {rid} supports Director schema {supported}, but the live database is schema {live}")
 
 
-def snapshot_director_db(rid):
+def snapshot_director_db(rid, *, checked=False):
     """Consistent copy of director.sqlite before a release that will restart the Director."""
     if not DIRECTOR_DB.is_file():
         return None
@@ -476,6 +507,16 @@ def snapshot_director_db(rid):
     DIRECTOR_DB_SNAPS.mkdir(mode=0o700, parents=True, exist_ok=True)
     with closing(sqlite3.connect(DIRECTOR_DB)) as src, closing(sqlite3.connect(dest)) as dst:
         src.backup(dst)
+        if checked:
+            if dst.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                raise Refused("pre-upgrade database copy failed the integrity check")
+            if dst.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise Refused("pre-upgrade database copy failed the foreign-key check")
+            DIRECTOR_DB_BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+            backup = DIRECTOR_DB_BACKUPS / ("backup-" + dest.name)
+            with closing(sqlite3.connect(backup)) as saved:
+                dst.backup(saved)
+            backup.chmod(0o600)
     os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR)
     prune_director_db_snapshots()
     return dest
@@ -585,6 +626,14 @@ def drain_before_restart(load, opts):
     return {"waited_s": waited, "active": []}
 
 
+def restart_lock(lock, opts):
+    try:
+        flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if opts.get("bounded") else 0)
+        fcntl.flock(lock, flags)
+    except BlockingIOError:
+        raise DrainRefused({"code": "busy", "detail": "restart lock is busy", "active": active_jobs()})
+
+
 @contextmanager
 def restart_window(load, opts):
     if not load:
@@ -594,13 +643,20 @@ def restart_window(load, opts):
     ensure_private_root(state)
     # Stop job pulls while letting already queued jobs run and drain.
     with (state / "restart-intake.lock").open("a") as intake:
-        fcntl.flock(intake, fcntl.LOCK_EX)
+        inherited = os.environ.get(RESTART_INTAKE_FD) if opts.get("bounded") else None
+        if inherited is None:
+            restart_lock(intake, opts)
+        elif not os.path.samestat(os.fstat(int(inherited)), os.fstat(intake.fileno())):
+            raise Refused("invalid hosted restart intake lock")
         drain = drain_before_restart(load, opts)
         # Tick holds this lock while recording admission. Keep it through the
         # service restart and check the shelf again once admission is frozen.
         with (state / "dispatch.lock").open("a") as admission:
-            fcntl.flock(admission, fcntl.LOCK_EX)
-            if not opts.get("force") and active_jobs():
+            restart_lock(admission, opts)
+            jobs = [] if opts.get("force") else active_jobs()
+            if jobs:
+                if opts.get("no_wait"):
+                    raise DrainRefused({"code": "active_jobs", "detail": "jobs arrived before restart", "active": jobs})
                 raise Refused("jobs arrived during drain; retry the release switch")
             yield drain
 

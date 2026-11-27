@@ -172,4 +172,4 @@ with subprocess.Popen([server["command"], *server["args"]], stdin=subprocess.PIP
     proxy.stdin.close()
     assert proxy.wait(timeout=3) == 0
 """.replace("ACTION_LITERAL", repr(ACTION)).replace("EXPECTED_LITERAL", repr(
-        ("approved command output", "single execution claim") if go else ("waiting on the owner",) * 2))
+        ("approved command output", "single execution claim") if go else ("waiting for a human decision",) * 2))

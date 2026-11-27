@@ -19,6 +19,7 @@ Exit 0 when every selected case passes.
 import argparse
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -87,6 +88,8 @@ def main():
     try:
         director_cases = [c for c in selected if c.side == "director"]
         client_cases = [c for c in selected if c.side == "client"]
+        if client_cases:
+            runpy.run_path(str(SPEC / "check-policy.py"))["check"]()
         if client_cases and a.impl != "rust":
             raise SystemExit("director-spec: the client cases target the Rust Director only (--impl rust)")
         if director_cases or client_cases:

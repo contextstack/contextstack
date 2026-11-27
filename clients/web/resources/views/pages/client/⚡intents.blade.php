@@ -96,8 +96,12 @@ new #[Layout('layouts::client')] #[Title('Tasks')] class extends DirectorPage
         <div class="flex items-center gap-3">
             <x-client.stream-dot />
             <div class="flex gap-2">
+            @capable('start_work')
             <flux:button variant="filled" icon="code-bracket" :href="route('lanes.create')" wire:navigate>{{ __('New task lane') }}</flux:button>
+            @endcapable
+            @capable('start_work')
             <flux:button variant="primary" icon="plus" :href="route('intents.create')" wire:navigate>{{ __('New task') }}</flux:button>
+            @endcapable
         </div>
         </div>
     </header>

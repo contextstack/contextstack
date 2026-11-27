@@ -2,10 +2,13 @@
 
 namespace App\Livewire;
 
+use App\Client\BrowserApproval;
 use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Exceptions\NotConnected;
+use App\Client\ReleaseApproval;
+use Flux\Flux;
 use Livewire\Attributes\Locked;
 
 /**
@@ -60,6 +63,89 @@ abstract class ApprovalsPage extends DirectorPage
             $this->problem = $refused->status === 409
                 ? __('This request was already decided, or it no longer waits on you. It shows its latest state below.')
                 : $refused->explain();
+            if ($refused->status !== 409) {
+                // 401: nothing stays on screen. 403/404: the role or assignment changed; ask again and refresh.
+                $this->refused($refused);
+            }
+        } catch (DirectorUnavailable|NotConnected $failure) {
+            $this->problem = $failure->getMessage();
+        }
+
+        $this->loadApproval($id);
+        $this->explainBrowserExpiry($id);
+    }
+
+    /**
+     * A browser action decided or answered after `expires_at` gets a 409: the Director expires it in the same
+     * transaction. The page has read it again by now; when it reads `expired`, say so instead of the generic conflict.
+     */
+    private function explainBrowserExpiry(string $id): void
+    {
+        $approval = $this->approvals[$id] ?? null;
+        if ($this->problem !== '' && BrowserApproval::is($approval) && ($approval['status'] ?? null) === 'expired') {
+            $this->problem = __('The window to decide this browser action ended before your decision reached the Director. It expired, and nothing was sent.');
+        }
+    }
+
+    /**
+     * Clear a stuck release request (CLIENT-API.md "Hosted release approvals"; owner-only `POST
+     * action-approvals/{id}/clear`). Clearing revokes the claim at the Director; a node worker already inside the
+     * installer may still finish, so the page asks the owner to check the live release before retrying.
+     */
+    public function clearApproval(string $id): void
+    {
+        if (! ReleaseApproval::is($this->approvals[$id] ?? null)) {
+            return;
+        }
+
+        Flux::modal('clear-release-'.$id)->close();
+        $this->releaseWrite($id, 'clear', [], __('This request already ended or changed. It shows its latest state below.'));
+    }
+
+    /**
+     * Acknowledge a failed install whose rollback still waits on running jobs (`answer` with `acknowledge`). Intake
+     * stays frozen until the previous release is restored.
+     */
+    public function acknowledgeRelease(string $id): void
+    {
+        if (! ReleaseApproval::is($this->approvals[$id] ?? null)) {
+            return;
+        }
+
+        $this->releaseWrite($id, 'answer', ['choice' => 'acknowledge'], __('This was already acknowledged, or the rollback finished. It shows its latest state below.'));
+    }
+
+    /**
+     * Answer a browser action approval as a needs-you item (`answer` with `go` or `no_go`), only when its record says
+     * `actions.answer`. A decision is not its execution: an approved proposal's follow-up job reports separately.
+     */
+    public function answerBrowserApproval(string $id, string $choice): void
+    {
+        $approval = $this->approvals[$id] ?? null;
+        if (! BrowserApproval::is($approval) || ! in_array($choice, ['go', 'no_go'], true) || ! BrowserApproval::answerable($approval)) {
+            return;
+        }
+
+        $this->releaseWrite($id, 'answer', ['choice' => $choice], __('This request was already decided, or it no longer waits on you. It shows its latest state below.'));
+        $this->explainBrowserExpiry($id);
+    }
+
+    /**
+     * @param  array<string, string>  $body
+     */
+    private function releaseWrite(string $id, string $operation, array $body, string $conflict): void
+    {
+        try {
+            $answer = $this->director()->write('action-approvals/'.rawurlencode($id).'/'.$operation, $body, DirectorClient::newKey());
+            $this->problem = '';
+            if (is_string($answer->body['id'] ?? null) && $answer->body['id'] === $id) {
+                $this->approvals[$id] = $answer->body;
+            }
+        } catch (DirectorRefused $refused) {
+            $this->problem = $refused->status === 409 ? $conflict : $refused->explain();
+            if ($refused->status !== 409) {
+                $this->refused($refused);
+            }
         } catch (DirectorUnavailable|NotConnected $failure) {
             $this->problem = $failure->getMessage();
         }
@@ -138,5 +224,11 @@ abstract class ApprovalsPage extends DirectorPage
         }
 
         return null;
+    }
+
+    protected function signOut(): void
+    {
+        $this->approvals = [];
+        parent::signOut();
     }
 }

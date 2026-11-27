@@ -3,10 +3,11 @@
 
 use crate::jobs::{BundleFile, Plan};
 use crate::server::State;
+use crate::store::ScopedConnection;
 use crate::store::{Record, Store, touch, write_tx};
 use crate::util::{now_utc, sha256_hex, utc_in};
 use crate::work::No;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -116,11 +117,16 @@ struct Request {
 
 fn request(m: &Map<String, Value>) -> Result<Option<Request>, No> {
     let lane = m.get("lane").unwrap_or(&Value::Null);
+    if lane["agent"] == "gate" && (!lane["plan_with"].is_null() || auto_requested(lane)) {
+        return Err(No::invalid("gate jobs do not use planning models"));
+    }
     let model = match lane.get("plan_with") {
         None | Some(Value::Null) if auto_requested(lane) => CODEX_MODEL,
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(model))
-            if crate::lane::model_name(model) && crate::capabilities::is_cli_template(model) =>
+            if model != "gate"
+                && crate::lane::model_name(model)
+                && crate::capabilities::is_cli_template(model) =>
         {
             model
         }
@@ -141,13 +147,13 @@ fn request(m: &Map<String, Value>) -> Result<Option<Request>, No> {
 }
 
 fn pick_node(
-    db: &Connection,
+    db: &ScopedConnection,
     executor: &str,
     model: &str,
     repo: &str,
 ) -> Result<Option<String>, String> {
     let mut stmt = db.prepare(
-        "SELECT name, status FROM nodes WHERE revoked_at IS NULL ORDER BY name != ?1, last_seen_at DESC, name",
+        "SELECT name, status FROM nodes WHERE +org_id = :org_id AND revoked_at IS NULL ORDER BY name != ?1, last_seen_at DESC, name",
     ).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([executor], |r| {
@@ -182,7 +188,7 @@ fn pick_node(
 
 fn prepare(
     state: &State,
-    db: &Connection,
+    db: &ScopedConnection,
     want: &Value,
     request: &Request,
     intent: &str,
@@ -245,6 +251,7 @@ fn prepare(
     .under(crate::reservations::JobScope {
         project: want["project_id"].as_str().map(str::to_owned),
         conversation: None,
+        schedule: None,
     });
     planner
         .stamp(&state.store, intent, None)
@@ -255,7 +262,7 @@ fn prepare(
 
 pub fn prepare_if_requested(
     state: &State,
-    db: &Connection,
+    db: &ScopedConnection,
     want: &Value,
     submitted: &Map<String, Value>,
     intent: &str,
@@ -342,7 +349,7 @@ fn fallback(executor: &mut Plan, detail: &str) -> Result<(), String> {
 
 pub fn insert(
     store: &Store,
-    db: &Connection,
+    db: &ScopedConnection,
     intent: &str,
     planner: &Plan,
     executor: &Plan,
@@ -350,7 +357,7 @@ pub fn insert(
     let job = planner.insert(store, db, Some(intent))?;
     let executor = serde_json::to_string(executor).map_err(|e| e.to_string())?;
     db.execute(
-        "INSERT INTO planning_jobs (job_id, executor, deadline) VALUES (?1, ?2, ?3)",
+        "INSERT INTO planning_jobs (org_id, job_id, executor, deadline) VALUES (:org_id, ?1, ?2, ?3)",
         params![job, executor, utc_in(900)],
     )
     .map_err(|e| e.to_string())?;
@@ -361,13 +368,13 @@ pub fn insert(
 /// the `## Files` section a long plan ends with.
 fn markdown(
     store: &Store,
-    db: &Connection,
+    db: &ScopedConnection,
     job: &str,
     run: Option<&str>,
 ) -> Result<Option<String>, String> {
     let sha: Option<String> = db.query_row(
-        "SELECT f.sha256 FROM run_files f JOIN runs r ON r.run_id = f.run_id
-         JOIN jobs j ON j.job_id = ?1 AND j.node_id = r.node_id
+        "SELECT f.sha256 FROM (SELECT * FROM run_files WHERE +org_id = :org_id) f JOIN (SELECT * FROM runs WHERE +org_id = :org_id) r ON r.run_id = f.run_id
+         JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = ?1 AND j.node_id = r.node_id
          WHERE r.run_id = ?2 AND (r.job_id IS NULL OR r.job_id = j.job_id) AND f.path = 'plan.md' AND f.bytes BETWEEN 1 AND ?3",
         params![job, run, MAX_PLAN_READ],
         |r| r.get(0),
@@ -395,29 +402,34 @@ fn frozen(plan: &str) -> std::borrow::Cow<'_, str> {
 /// Settle a planner job: offer its coding job, planned or as a fallback. A failure while planning falls back to
 /// the default executor with the error as its reason; a row that cannot be settled at all is logged and left for
 /// the sweep. Neither refuses the caller (an envelope ack or the sweep's other rows).
-pub fn advance(store: &Store, db: &Connection, job: &str, expired: bool) -> Result<(), String> {
-    db.execute_batch("SAVEPOINT planning_advance")
+pub fn advance(
+    store: &Store,
+    db: &ScopedConnection,
+    job: &str,
+    expired: bool,
+) -> Result<(), String> {
+    db.savepoint_sql("SAVEPOINT planning_advance")
         .map_err(|e| e.to_string())?;
     let mut outcome = settle(store, db, job, expired, None);
     if let Err(detail) = &outcome {
-        db.execute_batch("ROLLBACK TO planning_advance")
+        db.savepoint_sql("ROLLBACK TO planning_advance")
             .map_err(|e| e.to_string())?;
         let detail = format!("planning failed: {detail}");
         outcome = settle(store, db, job, expired, Some(&detail));
         if let Err(error) = &outcome {
-            db.execute_batch("ROLLBACK TO planning_advance")
+            db.savepoint_sql("ROLLBACK TO planning_advance")
                 .map_err(|e| e.to_string())?;
             eprintln!("director: planning job {job} not settled: {detail}; fallback: {error}");
         }
     }
-    db.execute_batch("RELEASE planning_advance")
+    db.savepoint_sql("RELEASE planning_advance")
         .map_err(|e| e.to_string())
 }
 
 /// `failed` forces the fallback with that reason.
 fn settle(
     store: &Store,
-    db: &Connection,
+    db: &ScopedConnection,
     job: &str,
     expired: bool,
     failed: Option<&str>,
@@ -425,12 +437,12 @@ fn settle(
     let row = db
         .query_row(
             "SELECT p.executor, j.intent_id, j.state, j.run_id,
-                EXISTS(SELECT 1 FROM cancels c LEFT JOIN controls k ON k.control_id = c.control_id
+                EXISTS(SELECT 1 FROM (SELECT * FROM cancels WHERE +org_id = :org_id) c LEFT JOIN (SELECT * FROM controls WHERE +org_id = :org_id) k ON k.control_id = c.control_id
                        WHERE c.job_id = j.job_id AND COALESCE(k.state, c.state) != 'refused'
                          AND COALESCE(k.outcome, '') != 'already_finished'),
-                EXISTS(SELECT 1 FROM runs r WHERE r.run_id = j.run_id AND r.node_id = j.node_id),
+                EXISTS(SELECT 1 FROM runs r WHERE +org_id = :org_id AND r.run_id = j.run_id AND r.node_id = j.node_id),
                 j.node_id
-         FROM planning_jobs p JOIN jobs j ON j.job_id = p.job_id WHERE p.job_id = ?1",
+         FROM (SELECT * FROM planning_jobs WHERE +org_id = :org_id) p JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = p.job_id WHERE p.job_id = ?1",
             [job],
             |r| {
                 Ok((
@@ -483,18 +495,21 @@ fn settle(
         }
         executor.insert(store, db, Some(&intent))?;
     }
-    db.execute("DELETE FROM planning_jobs WHERE job_id = ?1", [job])
-        .map_err(|e| e.to_string())?;
+    db.execute(
+        "DELETE FROM planning_jobs WHERE +org_id = :org_id AND (job_id = ?1)",
+        [job],
+    )
+    .map_err(|e| e.to_string())?;
     touch(db, Record::Intent, &intent)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
-pub fn after_run(store: &Store, db: &Connection, run: &str) -> Result<(), String> {
+pub fn after_run(store: &Store, db: &ScopedConnection, run: &str) -> Result<(), String> {
     let job: Option<String> = db
         .query_row(
-            "SELECT j.job_id FROM planning_jobs p JOIN jobs j ON j.job_id = p.job_id
-         JOIN runs r ON r.run_id = j.run_id AND r.node_id = j.node_id
+            "SELECT j.job_id FROM (SELECT * FROM planning_jobs WHERE +org_id = :org_id) p JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = p.job_id
+         JOIN (SELECT * FROM runs WHERE +org_id = :org_id) r ON r.run_id = j.run_id AND r.node_id = j.node_id
          WHERE j.run_id = ?1 AND j.state = 'done'",
             [run],
             |r| r.get(0),
@@ -511,7 +526,7 @@ pub fn sweep(store: &Store) -> Result<(), String> {
     let mut db = store.db();
     let jobs: Vec<String> = db
         .prepare(
-            "SELECT p.job_id FROM planning_jobs p JOIN jobs j ON j.job_id = p.job_id
+            "SELECT p.job_id FROM (SELECT * FROM planning_jobs WHERE +org_id = :org_id) p JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = p.job_id
          WHERE p.deadline <= ?1 OR j.state = 'error' ORDER BY p.job_id",
         )
         .and_then(|mut stmt| stmt.query_map([now_utc()], |r| r.get(0))?.collect())
@@ -572,7 +587,7 @@ mod tests {
 
     fn executor(
         store: &Store,
-        db: &Connection,
+        db: &ScopedConnection,
         goal_stored: bool,
         auto: bool,
     ) -> Result<Plan, String> {
@@ -596,33 +611,39 @@ mod tests {
     }
 
     /// An intent on `lead` with a planner job on `lead` in `state`, deferring `executor`.
-    fn planning(db: &Connection, intent: &str, job: &str, state: &str, executor: &str) -> Res {
+    fn planning(
+        db: &ScopedConnection,
+        intent: &str,
+        job: &str,
+        state: &str,
+        executor: &str,
+    ) -> Res {
         db.execute(
-            "INSERT INTO intents (intent_id, node, spec, task, trials, meta, bundle_sha256, created_by, created_at)
-             VALUES (?1, 'lead', 'spec.yaml', 'tasks/t', 1, '{}', 'x', 'cred', ?2)",
+            "INSERT INTO intents (org_id, intent_id, node, spec, task, trials, meta, bundle_sha256, created_by, created_at)
+             VALUES (:org_id, ?1, 'lead', 'spec.yaml', 'tasks/t', 1, '{}', 'x', 'cred', ?2)",
             params![intent, now_utc()],
         )?;
         db.execute(
-            "INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
-             VALUES (?1, 1, 'spec.yaml', 'tasks/t', 1, 'x', '{\"phase\":\"planning\"}', ?2, ?3, ?4)",
+            "INSERT INTO jobs (org_id, job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
+             VALUES (:org_id, ?1, 1, 'spec.yaml', 'tasks/t', 1, 'x', '{\"phase\":\"planning\"}', ?2, ?3, ?4)",
             params![job, state, now_utc(), intent],
         )?;
         db.execute(
-            "INSERT INTO planning_jobs (job_id, executor, deadline) VALUES (?1, ?2, ?3)",
+            "INSERT INTO planning_jobs (org_id, job_id, executor, deadline) VALUES (:org_id, ?1, ?2, ?3)",
             params![job, executor, utc_in(900)],
         )?;
         Ok(())
     }
 
     /// Give a done planner job a run with `plan.md`.
-    fn planned(store: &Store, db: &Connection, job: &str, run: &str, plan: &str) -> Res {
+    fn planned(store: &Store, db: &ScopedConnection, job: &str, run: &str, plan: &str) -> Res {
         store.put_object(plan.as_bytes())?;
         db.execute(
-            "INSERT INTO runs (run_id, node_id, usage, received_at, job_id) VALUES (?1, 1, '{}', ?2, ?3)",
+            "INSERT INTO runs (org_id, run_id, node_id, usage, received_at, job_id) VALUES (:org_id, ?1, 1, '{}', ?2, ?3)",
             params![run, now_utc(), job],
         )?;
         db.execute(
-            "INSERT INTO run_files (run_id, path, sha256, bytes) VALUES (?1, 'plan.md', ?2, ?3)",
+            "INSERT INTO run_files (org_id, run_id, path, sha256, bytes) VALUES (:org_id, ?1, 'plan.md', ?2, ?3)",
             params![run, sha256_hex(plan.as_bytes()), i64::try_from(plan.len())?],
         )?;
         db.execute(
@@ -632,7 +653,10 @@ mod tests {
         Ok(())
     }
 
-    fn coding(db: &Connection, intent: &str) -> Result<(String, Value, Value), rusqlite::Error> {
+    fn coding(
+        db: &ScopedConnection,
+        intent: &str,
+    ) -> Result<(String, Value, Value), rusqlite::Error> {
         db.query_row(
             "SELECT n.name, j.meta, j.work_reason FROM jobs j JOIN nodes n ON n.id = j.node_id
              WHERE j.intent_id = ?1 AND j.meta LIKE '%\"coding\"%'",
@@ -667,7 +691,7 @@ mod tests {
         assert_eq!(node, "lead", "the coding job stays on the intent's node");
         let node: String = db.query_row(
             "SELECT node FROM intents WHERE intent_id = 'intent-1'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert_eq!(node, "lead", "intents.node is unchanged");
@@ -714,7 +738,7 @@ mod tests {
         assert_eq!(meta["route"]["model"], CODEX_MODEL, "{meta}");
         let (sha, bytes): (String, i64) = db.query_row(
             "SELECT sha256, bytes FROM job_files WHERE path = 'tasks/t/context/plan.md'",
-            [],
+            params![],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let kept = String::from_utf8(store.read_object(&sha).ok_or("frozen plan missing")?)?;

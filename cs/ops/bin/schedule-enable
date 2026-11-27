@@ -118,22 +118,30 @@ def stage_row(value,new_grants):
 
 def enable_one(args):
     kind=actor(args,{'schedule_id','grant','grant_digest','actor_id','actor_kind','request_key','expected_digest'})
-    templates=json.loads(Path(__file__).with_suffix('.json').read_text())['templates']
+    definitions=json.loads(Path(__file__).with_suffix('.json').read_text())
+    templates=definitions['templates']
     sid=args.get('schedule_id')
-    if sid not in templates:
+    watch=isinstance(sid,str) and sid.startswith('price-watch-')
+    if not watch and sid not in templates:
         raise ValueError('schedule outside enabled definitions')
-    row={**templates[sid],'id':sid,'grant':args.get('grant'),'enabled':True}
+    template=definitions['price_watch_template'] if watch else templates[sid]
+    row={**template,'id':sid,'grant':args.get('grant'),'enabled':True}
     error=schedule_error(row)
     if error:
         raise ValueError(error)
-    ok,error,_=cover(args['grant'],repo=str(CODE_ROOT),paths=[row['spec'],row['task']])
+    paths=['ops/bin/_price_watch.py','tools/bin/browser_session'] if watch else [row['spec'],row['task']]
+    ok,error,_=cover(args['grant'],repo=str(CODE_ROOT),paths=paths)
     if not ok:
         raise ValueError(error)
     if hashlib.sha256(grant_path(args['grant']).read_bytes()).hexdigest()!=args.get('grant_digest'):
         raise ValueError('grant digest changed')
-    spec=CODE_ROOT/row['spec']
-    if not spec.is_file() or re.search(r'^verdict:',spec.read_text(),re.M):
-        raise ValueError('schedule needs a runnable spec, not an archival verdict')
+    if watch:
+        from _watch_config import PREFIX,load_watch
+        row['watch_origin']=load_watch(sid.removeprefix(PREFIX))['origin']
+    else:
+        spec=CODE_ROOT/row['spec']
+        if not spec.is_file() or re.search(r'^verdict:',spec.read_text(),re.M):
+            raise ValueError('schedule needs a runnable spec, not an archival verdict')
     shelves=state_dir(CODE_ROOT);shelves.mkdir(exist_ok=True)
     with (shelves/'schedule.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)

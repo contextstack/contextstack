@@ -1,12 +1,12 @@
 //! Command line: `--policy FILE [--cwd DIR] [--report-dir DIR] [--repo-view JSON] [--action-widening JSON] -- TOOL [ARGS...]`,
-//! `--probe --policy FILE`, or `--policy FILE --profile cli-executor --request FILE|-`.
+//! `--probe --policy FILE`, or profile rendering from a JSON request.
 
 use std::path::PathBuf;
 
 use crate::failure::{Failure, usage};
 
 /// The usage line printed with every argument error.
-pub const USAGE_LINE: &str = "usage: cs-sandbox --policy FILE [--cwd DIR] [--report-dir DIR] [--repo-view JSON] [--action-widening JSON] -- TOOL [ARGS...] | cs-sandbox --probe --policy FILE | cs-sandbox --policy FILE --profile cli-executor --request FILE|-";
+pub const USAGE_LINE: &str = "usage: cs-sandbox --policy FILE [--cwd DIR] [--report-dir DIR] [--repo-view JSON] [--action-widening JSON] -- TOOL [ARGS...] | cs-sandbox --probe --policy FILE | cs-sandbox --policy FILE --profile cli-executor --request FILE|- | cs-sandbox --profile land-check --request FILE|- | cs-sandbox --policy FILE --profile cli-executor|lane-check-run --request-json JSON -- CLI [ARGS...]";
 
 /// A parsed command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -18,6 +18,14 @@ pub enum Command {
     },
     /// Print a coding-agent Seatbelt profile (macOS).
     EmitCliExecutor { policy: PathBuf, request: PathBuf },
+    /// Run a CLI command under an executor or lane-check profile.
+    RunCliExecutor {
+        policy: PathBuf,
+        request: String,
+        command: Vec<String>,
+    },
+    /// Print the host land-check Seatbelt profile.
+    EmitLandCheck { request: PathBuf },
     /// Run one tool under the policy.
     Run(Run),
 }
@@ -77,6 +85,51 @@ fn json_arg<T: serde::de::DeserializeOwned>(
         .map_err(|error| usage(format!("invalid {flag}: {error}; {USAGE_LINE}")))
 }
 
+fn emit_profile(
+    name: &str,
+    policy: Option<PathBuf>,
+    request: Option<PathBuf>,
+) -> Result<Command, Failure> {
+    let request = request.ok_or_else(|| {
+        usage(format!(
+            "--profile {name} needs --request FILE|-; {USAGE_LINE}"
+        ))
+    })?;
+    match (name, policy) {
+        ("land-check", None) => Ok(Command::EmitLandCheck { request }),
+        ("land-check", Some(_)) => Err(usage(format!(
+            "--profile land-check takes only --request; {USAGE_LINE}"
+        ))),
+        ("cli-executor", Some(policy)) => Ok(Command::EmitCliExecutor { policy, request }),
+        ("cli-executor", None) => Err(usage(format!("--policy FILE is required; {USAGE_LINE}"))),
+        _ => Err(usage(format!("unknown profile {name}; {USAGE_LINE}"))),
+    }
+}
+
+fn executor_profile(
+    name: &str,
+    policy: Option<PathBuf>,
+    request: Option<PathBuf>,
+    request_json: Option<String>,
+    tool_argv: Option<Vec<String>>,
+) -> Result<Command, Failure> {
+    match (name, policy, request, request_json, tool_argv) {
+        (name, policy, request, None, None) => emit_profile(name, policy, request),
+        ("cli-executor" | "lane-check-run", Some(policy), None, Some(request), Some(command))
+            if !command.is_empty() =>
+        {
+            Ok(Command::RunCliExecutor {
+                policy,
+                request,
+                command,
+            })
+        }
+        _ => Err(usage(format!(
+            "invalid arguments for --profile {name}; {USAGE_LINE}"
+        ))),
+    }
+}
+
 /// Parse the arguments after the program name.
 pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
     let mut policy = None;
@@ -87,6 +140,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
     let mut probe = false;
     let mut profile = None;
     let mut request = None;
+    let mut request_json = None;
     let mut tool_argv: Option<Vec<String>> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -104,6 +158,12 @@ pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
                         .ok_or_else(|| usage(format!("--profile needs a value; {USAGE_LINE}")))?,
                 );
             }
+            "--request-json" => {
+                request_json = Some(
+                    iter.next()
+                        .ok_or_else(|| usage("--request-json needs a value"))?,
+                );
+            }
             "--request" => request = Some(value(&mut iter, "--request")?),
             "--probe" => probe = true,
             "--" => {
@@ -113,47 +173,30 @@ pub fn parse(args: Vec<String>) -> Result<Command, Failure> {
             other => return Err(usage(format!("unknown argument {other}; {USAGE_LINE}"))),
         }
     }
+    let run_options = tool_argv.is_some()
+        || cwd.is_some()
+        || report_dir.is_some()
+        || repo_view.is_some()
+        || widening.is_some();
+    if let Some(name) = profile.as_deref().filter(|_| !probe) {
+        if cwd.is_some() || report_dir.is_some() || repo_view.is_some() || widening.is_some() {
+            return Err(usage(format!(
+                "--profile {name} does not take tool options; {USAGE_LINE}"
+            )));
+        }
+        return executor_profile(name, policy, request, request_json, tool_argv);
+    }
     let Some(policy) = policy else {
         return Err(usage(format!("--policy FILE is required; {USAGE_LINE}")));
     };
     if probe {
-        if tool_argv.is_some()
-            || cwd.is_some()
-            || report_dir.is_some()
-            || repo_view.is_some()
-            || widening.is_some()
-            || profile.is_some()
-            || request.is_some()
-        {
+        if run_options || profile.is_some() || request.is_some() || request_json.is_some() {
             return Err(usage(format!("--probe takes only --policy; {USAGE_LINE}")));
         }
         return Ok(Command::Probe { policy });
     }
-    if let Some(name) = profile {
-        if name != "cli-executor" {
-            return Err(usage(format!("unknown profile {name}; {USAGE_LINE}")));
-        }
-        let Some(request) = request else {
-            return Err(usage(format!(
-                "--profile cli-executor needs --request FILE|-; {USAGE_LINE}"
-            )));
-        };
-        if tool_argv.is_some()
-            || cwd.is_some()
-            || report_dir.is_some()
-            || repo_view.is_some()
-            || widening.is_some()
-        {
-            return Err(usage(format!(
-                "--profile cli-executor takes only --policy and --request; {USAGE_LINE}"
-            )));
-        }
-        return Ok(Command::EmitCliExecutor { policy, request });
-    }
-    if request.is_some() {
-        return Err(usage(format!(
-            "--request requires --profile cli-executor; {USAGE_LINE}"
-        )));
+    if request.is_some() || request_json.is_some() {
+        return Err(usage(format!("--request requires --profile; {USAGE_LINE}")));
     }
     let Some(mut rest) = tool_argv else {
         return Err(usage(format!(

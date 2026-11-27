@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 import _muse
@@ -107,8 +109,16 @@ def command(profile, binary, ws, home, real_home, protected, args, extra=()):
                   localhost_port=str(profile['network_port']) if profile.get('network_port') else None,
                   project_config_paths=[str(ws / p) for p in
                       ('.grok', '.opencode', '.pi', '.claude', '.cursor', 'opencode.json', 'opencode.jsonc')])
+    loopback_ports = ()
+    if sys.platform == "linux" and record["localhost_port"] == "*":
+        providers = profile["files"]["opencode.json"]["provider"]
+        endpoints = [urlsplit(provider["options"]["baseURL"]) for provider in providers.values()]
+        if not endpoints or any(url.hostname not in ("localhost", "127.0.0.1") or not url.port
+                                for url in endpoints):
+            raise ValueError("Linux adapter requires explicit IPv4 loopback provider ports")
+        loopback_ports = tuple(sorted({url.port for url in endpoints}))
     return _muse.sandbox_command([str(binary), *profile.get('prefix', []), *args], ws, real_home,
-                                 protected, extra=extra, adapter=record)
+                                 protected, extra=extra, adapter=record, loopback_ports=loopback_ports)
 
 
 def prepare(c):

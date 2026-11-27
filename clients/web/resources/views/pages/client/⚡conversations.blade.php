@@ -106,7 +106,9 @@ new #[Layout('layouts::client')] #[Title('Conversations')] class extends Directo
         </div>
         <div class="flex items-center gap-3">
             <x-client.stream-dot />
+            @capable('start_work')
             <flux:button variant="primary" icon="plus" :href="route('conversations.create')" wire:navigate>{{ __('New conversation') }}</flux:button>
+            @endcapable
         </div>
     </header>
 

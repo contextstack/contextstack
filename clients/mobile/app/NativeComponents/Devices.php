@@ -7,16 +7,18 @@ use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Json;
 use App\Native\DirectorScreen;
+use App\Native\InviteQr;
 use Illuminate\View\View;
 use Native\Mobile\Attributes\On;
 use Native\Mobile\Events\Biometric\Completed;
 use Native\Mobile\Facades\Biometrics;
 
 /**
- * Devices paired with the Director: list them, pair another one, revoke one. Pairing and revoking first ask for this
+ * This member's devices on the Director (`GET credentials` with `member_id`, teams step 2): list them, pair another one, revoke one. Pairing and revoking first ask for this
  * device's own unlock (iOS device-owner authentication: Face ID, Touch ID or the passcode, whichever the owner set
  * up), so a lost but unlocked-once phone cannot hand out access by itself. This device cannot revoke itself here;
- * Settings forgets it instead.
+ * Settings forgets it instead. An owner's or admin's inventory also lists other members' devices; managing those stays
+ * in Members, so they are counted here, not listed. A Director from before teams lists every device, as before.
  */
 class Devices extends DirectorScreen
 {
@@ -27,10 +29,17 @@ class Devices extends DirectorScreen
 
     public string $name = '';
 
-    /** @var array{code: string, name: string, expires_at: string}|array{} */
+    /**
+     * A just-issued pairing code, and the Director's `contextstack://pair` link for it when it sends one ('' before).
+     *
+     * @var array{code: string, name: string, expires_at: string, link: string}|array{}
+     */
     public array $issued = [];
 
     public bool $allowed = true;
+
+    /** Other members' devices in the inventory, managed from Members. */
+    public int $others = 0;
 
     public bool $loaded = false;
 
@@ -46,7 +55,12 @@ class Devices extends DirectorScreen
         try {
             $credentials = Json::records($this->director()->get('credentials')['credentials'] ?? null);
         } catch (DirectorRefused $refused) {
-            $this->allowed = ! $refused->is('owner_only');
+            if ($refused->status === 401) {
+                $this->refused($refused);
+
+                return;
+            }
+            $this->allowed = ! $refused->is('owner_only') && ! $refused->is('forbidden');
             $this->problem = $this->allowed ? $refused->explain() : '';
             $this->loaded = true;
 
@@ -59,7 +73,11 @@ class Devices extends DirectorScreen
 
         $this->allowed = true;
         $this->problem = '';
-        $this->devices = array_values(array_filter($credentials, fn (array $credential): bool => ($credential['kind'] ?? null) === 'device'));
+        $devices = array_values(array_filter($credentials, fn (array $credential): bool => ($credential['kind'] ?? null) === 'device'));
+        $me = $this->identity()?->memberId;
+        $this->devices = $me === null ? $devices : array_values(array_filter($devices,
+            fn (array $device): bool => Json::nullableString($device['member_id'] ?? null) === null || $device['member_id'] === $me));
+        $this->others = count($devices) - count($this->devices);
         usort($this->devices, fn (array $a, array $b): int => strcmp(Json::string($b['created_at'] ?? null), Json::string($a['created_at'] ?? null)));
         $this->loaded = true;
     }
@@ -74,6 +92,21 @@ class Devices extends DirectorScreen
         }
         $this->name = $name;
         Biometrics::prompt()->id('pair')->prompt();
+    }
+
+    /**
+     * Whose device it is, in words: this member's (with the role), or the member's name before teams said otherwise.
+     *
+     * @param  array<string, mixed>  $device
+     */
+    public function owner(array $device): string
+    {
+        $identity = $this->identity();
+        if ($identity === null || $identity->memberId === null) {
+            return '';
+        }
+
+        return trim('Yours · '.$identity->roleWords(), ' ·');
     }
 
     public function revoke(string $id): void
@@ -111,7 +144,10 @@ class Devices extends DirectorScreen
 
     public function render(): View
     {
-        return view('native.devices', ['address' => app(ConnectionStore::class)->url()]);
+        return view('native.devices', [
+            'address' => app(ConnectionStore::class)->url(),
+            'issuedQr' => ($this->issued['link'] ?? '') !== '' ? InviteQr::dataUri($this->issued['link']) : '',
+        ]);
     }
 
     private function issue(): void
@@ -136,6 +172,7 @@ class Devices extends DirectorScreen
             'code' => Json::string($answer->body['code'] ?? null),
             'name' => Json::string($answer->body['name'] ?? null, $this->name),
             'expires_at' => Json::string($answer->body['expires_at'] ?? null),
+            'link' => Json::string($answer->body['link'] ?? null),
         ];
         $this->name = '';
     }

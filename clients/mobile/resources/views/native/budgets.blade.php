@@ -10,13 +10,17 @@
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
+            @include('native.partials.signed-out')
+            @if (! $this->can('manage_source_budgets'))
+                <native:text class="text-sm text-theme-on-surface-variant">Only an owner changes source budgets; your role can read them.</native:text>
+            @endif
 
             @if ($loaded)
                 <native:list-item native:key="source-shared"
                     headline="Shared budget"
                     supporting="{{ $shared !== '' ? $shared.' · covers every source without its own' : 'None' }}"
                     leadingIcon="tray.full"
-                    trailingIcon="chevron.right"
+                    trailingIcon="{{ $this->can('manage_source_budgets') ? 'chevron.right' : '' }}"
                     @press="edit('*')" />
 
                 @foreach ($sources as $source)
@@ -24,7 +28,7 @@
                         headline="{{ $source['source'] }}"
                         supporting="{{ $source['state'] === 'active' ? 'active' : ($source['state'] === 'exhausted' ? 'budget used up' : 'off') }} · {{ $source['budget'] }} · {{ $source['spent'] }}"
                         leadingIcon="{{ $source['state'] === 'active' ? 'checkmark.circle' : ($source['state'] === 'exhausted' ? 'exclamationmark.circle' : 'circle') }}"
-                        trailingIcon="chevron.right"
+                        trailingIcon="{{ $this->can('manage_source_budgets') ? 'chevron.right' : '' }}"
                         @press="edit('{{ $source['source'] }}')" />
                 @endforeach
             @endif

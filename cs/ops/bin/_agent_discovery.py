@@ -5,6 +5,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -79,6 +80,9 @@ def probe_agent(name, path, home, run, read_json, *, strict=False):
 def discover_node_agents():
     home = Path.home()
     path = os.environ.get("CS_AGENT_PATH")
+    if path is None and sys.platform == "linux":
+        # The systemd node and gateway units share the configured tool PATH.
+        path = os.pathsep.join((str(home / ".local/bin"), os.environ.get("PATH", os.defpath)))
     if path is None:
         plist = home / "Library/LaunchAgents/com.contextstack.csgateway-socket.plist"
         try:

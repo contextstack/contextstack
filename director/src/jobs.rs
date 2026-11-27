@@ -3,9 +3,10 @@
 //! as it is, so it names its own `intent:` (or is a legacy `EXP-` spec) or the runner refuses it. A job made from an
 //! intent has that intent's id written into its spec (`stamp.rs`).
 
+use crate::store::ScopedConnection;
 use crate::store::{Record, Store, touch};
 use crate::util::{self, now_utc, sha256_hex};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use std::fmt::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -201,9 +202,12 @@ pub fn bundle_of_objects(store: &Store, listed: &Value) -> Result<Vec<BundleFile
 }
 
 /// An earlier job's bundle, to offer again.
-pub fn bundle_of_job(db: &Connection, job_id: &str) -> Result<Vec<BundleFile>, rusqlite::Error> {
+pub fn bundle_of_job(
+    db: &ScopedConnection,
+    job_id: &str,
+) -> Result<Vec<BundleFile>, rusqlite::Error> {
     let mut stmt = db.prepare(
-        "SELECT path, sha256, bytes, mode FROM job_files WHERE job_id = ?1 ORDER BY path",
+        "SELECT path, sha256, bytes, mode FROM job_files WHERE +org_id = :org_id AND job_id = ?1 ORDER BY path",
     )?;
     stmt.query_map(params![job_id], |r| {
         Ok(BundleFile {
@@ -261,7 +265,7 @@ impl Plan {
     /// Check a job against its node and bundle.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        db: &Connection,
+        db: &ScopedConnection,
         node: &str,
         spec: &str,
         task: &str,
@@ -272,7 +276,7 @@ impl Plan {
     ) -> Result<Self, String> {
         let node_id: i64 = db
             .query_row(
-                "SELECT id FROM nodes WHERE name = ?1 AND revoked_at IS NULL",
+                "SELECT id FROM nodes WHERE +org_id = :org_id AND name = ?1 AND revoked_at IS NULL",
                 params![node],
                 |r| r.get(0),
             )
@@ -370,9 +374,9 @@ impl Plan {
         self.auto_spec.is_some()
     }
 
-    pub fn node_name(&self, db: &Connection) -> Result<String, String> {
+    pub fn node_name(&self, db: &ScopedConnection) -> Result<String, String> {
         db.query_row(
-            "SELECT name FROM nodes WHERE id = ?1",
+            "SELECT name FROM nodes WHERE +org_id = :org_id AND id = ?1",
             [self.node_id],
             |r| r.get(0),
         )
@@ -437,7 +441,7 @@ impl Plan {
     pub fn refuse_if_node_lacks_capability(
         &self,
         store: &Store,
-        db: &Connection,
+        db: &ScopedConnection,
         node: &str,
     ) -> Result<(), String> {
         if let Some(model) = crate::capabilities::model_in_spec(store, &self.files, &self.spec) {
@@ -460,20 +464,25 @@ impl Plan {
     pub fn insert(
         &self,
         store: &Store,
-        tx: &Connection,
+        tx: &ScopedConnection,
         intent: Option<&str>,
     ) -> Result<String, String> {
         let job_id = util::ulid()?;
         let mut files = self.files.clone();
-        let placed = crate::reservations::place_new(
-            store,
-            tx,
-            &self.scope,
-            &self.spec,
-            self.trials,
-            &mut files,
-        )?;
         let node_name = self.node_name(tx)?;
+        let mut scope = self.scope.clone();
+        scope.schedule = self
+            .meta
+            .get("schedule_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("{node_name}/{id}"));
+        if let Some(schedule) = &scope.schedule
+            && !crate::sponsorship::schedule_can_fire(tx, schedule).map_err(|e| e.to_string())?
+        {
+            return Err("the schedule's responsible member cannot sponsor new work".into());
+        }
+        let placed =
+            crate::reservations::place_new(store, tx, &scope, &self.spec, self.trials, &mut files)?;
         // Retries use the intent's coding model. Route details belong to this job. The intent keeps its node, so
         // the lead that started it still sees it.
         if let (Some(intent), Some(model)) = (
@@ -484,19 +493,24 @@ impl Plan {
         ) {
             tx.execute(
                 "UPDATE intents SET meta = json_set(json_remove(meta, '$.route'), '$.model', ?1)
-                 WHERE intent_id = ?2",
+                 WHERE +org_id = :org_id AND (intent_id = ?2)",
                 params![model, intent],
             )
             .map_err(|e| e.to_string())?;
         }
         let state = if placed.waits() { "waiting" } else { "offered" };
         tx.execute(
-            "INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, grant_id, grant_sha256, meta, state,
-                               created_at, intent_id, work_reason, offered_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, CASE WHEN ?10 = 'offered' THEN ?11 END)",
+            "INSERT INTO jobs (org_id, job_id, node_id, spec, task, trials, bundle_sha256, grant_id, grant_sha256, meta, state,
+                               created_at, intent_id, work_reason, offered_at, responsible_member_id)
+             VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, CASE WHEN ?10 = 'offered' THEN ?11 END,
+                     COALESCE(
+                         (SELECT responsible_member_id FROM intents WHERE +org_id = :org_id AND intent_id = ?12),
+                         (SELECT responsible_member_id FROM conversations WHERE +org_id = :org_id AND conversation_id = ?14),
+                         (SELECT responsible_member_id FROM schedules WHERE +org_id = :org_id AND schedule_key = ?15),
+                         :member_id))",
             params![job_id, self.node_id, self.spec, self.task, self.trials, bundle_sha(&files), self.grant,
                     self.grant_sha, Value::Object(self.meta.clone()).to_string(), state, now_utc(), intent,
-                    self.work_reason.as_deref()],
+                    self.work_reason.as_deref(), scope.conversation, scope.schedule],
         )
         .map_err(|e| e.to_string())?;
         record_files(tx, &job_id, &files).map_err(|e| e.to_string())?;
@@ -520,13 +534,13 @@ impl Plan {
 
 /// Record a job's bundle files.
 fn record_files(
-    tx: &Connection,
+    tx: &ScopedConnection,
     job_id: &str,
     files: &[BundleFile],
 ) -> Result<(), rusqlite::Error> {
     for f in files {
         tx.execute(
-            "INSERT INTO job_files (job_id, path, sha256, bytes, mode) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO job_files (org_id, job_id, path, sha256, bytes, mode) VALUES (:org_id, ?1, ?2, ?3, ?4, ?5)",
             params![
                 job_id,
                 f.path,
@@ -540,9 +554,9 @@ fn record_files(
 }
 
 /// A job's bundle files in `GET jobs` form, sorted by path.
-pub fn files(db: &Connection, job_id: &str) -> Result<Vec<Value>, rusqlite::Error> {
+pub fn files(db: &ScopedConnection, job_id: &str) -> Result<Vec<Value>, rusqlite::Error> {
     let mut stmt = db.prepare(
-        "SELECT path, sha256, bytes, mode FROM job_files WHERE job_id = ?1 ORDER BY path",
+        "SELECT path, sha256, bytes, mode FROM job_files WHERE +org_id = :org_id AND job_id = ?1 ORDER BY path",
     )?;
     stmt.query_map(params![job_id], |r| {
         Ok(
@@ -554,10 +568,10 @@ pub fn files(db: &Connection, job_id: &str) -> Result<Vec<Value>, rusqlite::Erro
 }
 
 /// This node's offered and accepted jobs, oldest first, with Director-owned turn identity.
-pub fn for_node(db: &Connection, node_id: i64) -> Result<Vec<Value>, rusqlite::Error> {
+pub fn for_node(db: &ScopedConnection, node_id: i64) -> Result<Vec<Value>, rusqlite::Error> {
     let mut stmt = db.prepare(
         "SELECT job_id, spec, task, trials, bundle_sha256, grant_id, grant_sha256, meta, state FROM jobs
-         WHERE node_id = ?1 AND state IN ('offered', 'accepted') ORDER BY rowid",
+         WHERE +org_id = :org_id AND node_id = ?1 AND state IN ('offered', 'accepted') ORDER BY rowid",
     )?;
     let rows: Vec<(String, Value, bool)> = stmt
         .query_map(params![node_id], |r| {
@@ -590,7 +604,7 @@ pub fn for_node(db: &Connection, node_id: i64) -> Result<Vec<Value>, rusqlite::E
             // Intent metadata is caller-controlled; only the turns table grants turn identity.
             let turn: Option<(String, String)> = db
                 .query_row(
-                    "SELECT conversation_id, turn_id FROM turns WHERE job_id = ?1",
+                    "SELECT conversation_id, turn_id FROM turns WHERE +org_id = :org_id AND job_id = ?1",
                     params![id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -618,14 +632,14 @@ pub enum Accept {
 
 /// Accept a job: offered → accepted the first time the node names its bundle; a repeat changes nothing.
 pub fn accept(
-    db: &Connection,
+    db: &ScopedConnection,
     node_id: i64,
     job_id: &str,
     body: &[u8],
 ) -> Result<Accept, rusqlite::Error> {
     let job: Option<(String, String)> = db
         .query_row(
-            "SELECT bundle_sha256, state FROM jobs WHERE job_id = ?1 AND node_id = ?2",
+            "SELECT bundle_sha256, state FROM jobs WHERE +org_id = :org_id AND job_id = ?1 AND node_id = ?2",
             params![job_id, node_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -643,7 +657,7 @@ pub fn accept(
     }
     if state == "offered" {
         db.execute(
-            "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE job_id = ?2 AND state = 'offered'",
+            "UPDATE jobs SET state = 'accepted', accepted_at = ?1 WHERE +org_id = :org_id AND (job_id = ?2 AND state = 'offered')",
             params![now_utc(), job_id],
         )?;
         touch(db, Record::Job, job_id)?;
@@ -653,10 +667,14 @@ pub fn accept(
 }
 
 /// Whether an object is a file of one of this node's job bundles, in any state (§6).
-pub fn node_may_read(db: &Connection, node_id: i64, sha: &str) -> Result<bool, rusqlite::Error> {
+pub fn node_may_read(
+    db: &ScopedConnection,
+    node_id: i64,
+    sha: &str,
+) -> Result<bool, rusqlite::Error> {
     Ok(db
         .query_row(
-            "SELECT 1 FROM job_files f JOIN jobs j ON j.job_id = f.job_id WHERE f.sha256 = ?1 AND j.node_id = ?2 LIMIT 1",
+            "SELECT 1 FROM (SELECT * FROM job_files WHERE +org_id = :org_id) f JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = f.job_id WHERE f.sha256 = ?1 AND j.node_id = ?2 LIMIT 1",
             params![sha, node_id],
             |_| Ok(()),
         )
@@ -762,14 +780,14 @@ mod tests {
         assert!(forged[0].get("conversation_id").is_none());
         assert!(forged[0].get("turn_id").is_none());
         db.execute(
-            "INSERT INTO conversations (conversation_id, node, spec, spec_version, model, instructions_tokens,
+            "INSERT INTO conversations (org_id, conversation_id, node, spec, spec_version, model, instructions_tokens,
                                         tools, created_by, created_at)
-             VALUES ('conversation-real', 'node-a', 'spec.yaml', 'v1', 'local-coder', 0, 0, 'cred', ?1)",
+             VALUES (:org_id, 'conversation-real', 'node-a', 'spec.yaml', 'v1', 'local-coder', 0, 0, 'cred', ?1)",
             params![now_utc()],
         )?;
         db.execute(
-            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at, job_id)
-             VALUES ('turn-real', 'conversation-real', 1, 'hello', 'running', 'cred', ?1, ?2)",
+            "INSERT INTO turns (org_id, turn_id, conversation_id, seq, message, state, posted_by, posted_at, job_id)
+             VALUES (:org_id, 'turn-real', 'conversation-real', 1, 'hello', 'running', 'cred', ?1, ?2)",
             params![now_utc(), job_id],
         )?;
         let real = for_node(&db, 1)?;

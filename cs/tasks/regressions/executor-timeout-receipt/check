@@ -13,6 +13,10 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "scripts"))
+from check_timeout import timeout as check_timeout
+
+TASK_TIMEOUT_S = 3  # 1 s raced Python startup under the full check
 subprocess.run([sys.executable, str(Path(__file__).with_name("verify_retry.py"))], check=True, env={**hermetic_env()})
 with scratch_dir(prefix="executor-timeout-") as raw:
     code_root = Path(raw) / "code_root"
@@ -38,7 +42,7 @@ with scratch_dir(prefix="executor-timeout-") as raw:
     claude.write_text("""#!/usr/bin/env python3
 import os
 import sys
-import time
+from threading import Event
 from pathlib import Path
 if "Reply with exactly: AUTH_OK" in sys.argv:
     print("AUTH_OK")
@@ -48,7 +52,7 @@ if not marker.exists():
     marker.write_text("seen")
     print("OAuth access token has expired", file=sys.stderr)
     raise SystemExit(1)
-time.sleep(5)
+Event().wait()  # the executor must terminate the retry
 """, encoding="utf-8")
     claude.chmod(0o755)
     template = {
@@ -83,12 +87,13 @@ time.sleep(5)
             "task": "tasks/fixture",
             "exp": "task-fixture",
             "trial": 1,
-            "timeout_s": 3,  # 1 s raced Python startup under the full check
+            "timeout_s": TASK_TIMEOUT_S,
         }),
         cwd=code_root,
         text=True,
         capture_output=True,
-        timeout=15,
+        # Allow for executor startup, auth refresh, and receipt finalization.
+        timeout=check_timeout(20 * TASK_TIMEOUT_S),
         env={**{k: v for k, v in hermetic_env().items() if k not in ("CS_STATE_ROOT", "CSGATEWAY_ENDPOINT")}, "HOME": str(home), "PATH": str(fake) + os.pathsep + os.environ["PATH"], "ANTHROPIC_API_KEY": "must-not-leak"},
     )
     assert result.returncode != 0

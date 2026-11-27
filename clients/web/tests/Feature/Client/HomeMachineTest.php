@@ -16,8 +16,8 @@ beforeEach(fn () => connectClientWeb());
  */
 function fakeHomeMachine(?array $leadNode, bool $owner = true, array $over = []): void
 {
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => $owner]);
     Http::fake([...[
-        director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => $owner]),
         director('lead-node') => $leadNode === null
             ? Http::response(['error' => 'Not Found', 'code' => 'not_found', 'detail' => 'no route'], 404)
             : Http::response($leadNode),

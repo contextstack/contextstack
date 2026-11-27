@@ -1,0 +1,6 @@
+{
+  "model_free": true,
+  "cost_class": "free_local",
+  "cost_usd": 0,
+  "auth": "none"
+}

@@ -2,6 +2,7 @@
 
 namespace App\Http\Middleware;
 
+use App\Client\Json;
 use App\Native\AppLock;
 use Closure;
 use Illuminate\Http\Request;
@@ -21,7 +22,8 @@ class RequireUnlock
     public function handle(Request $request, Closure $next): Response
     {
         if ($this->lock->locked()) {
-            $this->lock->stoppedAt($request->getPathInfo());
+            // The path goes back through the redirect; the query (a link's code) stays in memory, out of any URL.
+            $this->lock->stoppedAt($request->getPathInfo(), Json::record($request->query()));
 
             return redirect('/locked');
         }

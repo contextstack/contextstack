@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "home": "/Users/check-owner",
+  "main_checkout": "/Users/check-owner/main",
+  "worktree": "/Users/check-owner/land",
+  "run_tmp": "/private/tmp/land-run",
+  "cargo_target_dir": "/private/tmp/land-run/target",
+  "cache_dirs": ["/private/tmp/land-run/cache"],
+  "tmpdir": "/private/tmp/land-run/tmp",
+  "scratch": "/private/tmp/land-run/scratch",
+  "darwin_user_temp": "/private/var/folders/zz/land/T",
+  "toolchain_roots": ["/Users/check-owner/.rustup"],
+  "reserved_ports": [53210],
+  "ssh_auth_sock": "/private/tmp/agent.sock"
+}

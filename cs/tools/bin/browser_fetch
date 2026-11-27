@@ -1,88 +1,22 @@
 #!/usr/bin/env python3
-"""Render one public HTTPS page through the existing gstack CDP browser."""
-import atexit
-import fcntl
+"""Render one public HTTPS URL using the separate-profile broker."""
 import hashlib
+import ipaddress
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import _calllog
-from _browser_auth import cookie_import_for, isolated_state_dir, state_partition_for
+from _broker_client import ask
 from _web import append_manifest, atomic_json, fail, normalize_url, public_address, safe_directory
 
-MAX_TEXT = 5 * 1024 * 1024
 MAX_ARCHIVE = 20 * 1024 * 1024
-MAX_LINK_BYTES = 5 * 1024 * 1024
-STATUS = re.compile(r"\((\d{3})\)\s*$")
-PLAYWRIGHT_REVISION = "1208"
-
-
-def estate_runtime():
-    configured = os.environ.get("CS_ESTATE_RUNTIME")
-    if configured:
-        return Path(configured).expanduser()
-    return Path(__file__).resolve().parents[2].parent / ".estate/runtime"
-
-
-def browse_binary():
-    configured = os.environ.get("CS_BROWSE")
-    if configured:
-        path = Path(configured).expanduser()
-    else:
-        tagged = estate_runtime() / "browse"
-        path = tagged if tagged.is_file() else Path.home() / ".claude/skills/gstack/browse/dist/browse"
-    if not path.is_file() or not os.access(path, os.X_OK):
-        fail("gstack browse is unavailable; set CS_BROWSE to its executable")
-    return str(path)
-
-
-def playwright_chromium():
-    cache = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-    if not cache:
-        tagged = estate_runtime() / "ms-playwright"
-        cache = str(tagged) if tagged.is_dir() else None
-    if not cache:
-        return None
-    root = Path(cache).expanduser() / ("chromium_headless_shell-" + PLAYWRIGHT_REVISION)
-    choices = sorted(path for path in root.rglob("*")
-                     if path.is_file() and os.access(path, os.X_OK)
-                     and path.name in {"chrome-headless-shell", "headless_shell"})
-    if not choices:
-        fail("Playwright chromium_headless_shell-%s is unavailable" % PLAYWRIGHT_REVISION)
-    return choices[0]
-
-
-def run(binary, args, env, timeout=60, sensitive=False):
-    result = subprocess.run([binary, *args], cwd=Path.cwd(), env=env, text=True,
-                            capture_output=True, timeout=timeout)
-    if result.returncode:
-        detail = "" if sensitive else ": " + (result.stderr or result.stdout).strip()
-        fail("browser %s failed%s" % (args[0], detail))
-    return result.stdout.strip()
-
-
-def stop_browser(binary, env, headed):
-    """Best-effort teardown; wait briefly for the daemon state to drain."""
-    state_file = Path(env["BROWSE_STATE_FILE"])
-    if not state_file.is_file():
-        return
-    args = ["--headed", "stop"] if headed else ["stop"]
-    try:
-        subprocess.run([binary, *args], cwd=Path.cwd(), env=env, text=True,
-                       capture_output=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    deadline = time.monotonic() + 5
-    while state_file.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
+MAX_FETCH_REPLY = 40 * 1024 * 1024
 
 
 def store_bytes(relative_dir, digest, suffix, raw):
@@ -94,175 +28,103 @@ def store_bytes(relative_dir, digest, suffix, raw):
         if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
             fail("browser evidence digest collision")
     else:
-        handle = tempfile.NamedTemporaryFile(prefix="browser-", dir=directory, delete=False)
-        handle.write(raw); handle.flush(); os.fsync(handle.fileno()); handle.close()
-        Path(handle.name).replace(destination)
+        with tempfile.NamedTemporaryFile(prefix="browser-", dir=directory, delete=False) as handle:
+            temp = Path(handle.name)
+            try:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp.replace(destination)
+            finally:
+                temp.unlink(missing_ok=True)
     return str(destination.relative_to(Path.cwd()))
 
 
-cleanup = None
+
 try:
     args = json.load(sys.stdin)
     _calllog.record("browser_fetch", args)
+    if not isinstance(args, dict) or set(args) - {"url", "archive", "links"}:
+        fail("args must be {url, archive?, links?}")
     requested = normalize_url(args.get("url"))
-    public_address(urlsplit(requested).hostname)
-    want_archive = bool(args.get("archive", False))
-    want_links = bool(args.get("links", False))
+    hostname = urlsplit(requested).hostname
+    if hostname == "tasks.google.com":
+        fail("Google Tasks requires the scheduled reader and native host")
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        public_address(hostname)
+    want_archive = args.get("archive", False)
+    want_links = args.get("links", False)
+    if not isinstance(want_archive, bool) or not isinstance(want_links, bool):
+        fail("archive and links must be booleans")
+    reply = ask("public", {"verb": "open", "url": requested, "archive": want_archive,
+                           "links": want_links}, MAX_FETCH_REPLY)
+    if reply.get("ok") is not True:
+        fail("browser broker refused: %s" % reply.get("error"))
+    status = reply.get("status")
+    if not isinstance(status, (int, float)) or not 200 <= status < 300:
+        fail("browser returned HTTP status %s" % status)
+    text = reply.get("text")
+    if not isinstance(text, str) or not text.strip():
+        fail("browser rendered no visible text")
+    raw = text.encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != reply.get("sha256"):
+        fail("page text does not match the broker's sha256")
     evidence = safe_directory("_evidence")
-    safe_directory("_evidence/.tmp")
-    code_root = Path(__file__).resolve().parents[2]
-    state_root = isolated_state_dir(
-        os.environ.get("CS_BROWSER_STATE", "/tmp/contextstack-corpus-browser"),
-        Path.cwd(), code_root,
-    )
-    state_dir = state_root / state_partition_for(requested)
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    requested_auth = cookie_import_for(requested, requested)
-    engine = os.environ.get("CS_BROWSER_ENGINE", "auto")
-    if engine not in {"auto", "chrome", "chromium"}:
-        fail("CS_BROWSER_ENGINE must be auto, chrome, or chromium")
-    visibility = os.environ.get("CS_BROWSER_VISIBILITY", "auto")
-    if visibility not in {"auto", "headless", "headed"}:
-        fail("CS_BROWSER_VISIBILITY must be auto, headless, or headed")
-    headed = visibility == "headed" or (visibility == "auto" and bool(requested_auth))
-    use_real_chrome = engine == "chrome" or (engine == "auto" and bool(requested_auth))
-    keep_open = os.environ.get("CS_BROWSER_KEEP_OPEN") == "1"
-    env = {**os.environ, "CS_BROWSER_STATE": str(state_dir),
-           "BROWSE_STATE_FILE": str(state_dir / "state.json"),
-           "CHROMIUM_PROFILE": str(state_dir / "chromium-profile"),
-           "BROWSE_PARENT_PID": "0" if keep_open else str(os.getpid()),
-           "BROWSE_IDLE_TIMEOUT": "300000",
-           "GSTACK_TELEMETRY_OFF": "1"}
-    if use_real_chrome:
-        chrome = Path(os.environ.get(
-            "CS_REAL_CHROME",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        ))
-        if not chrome.is_file() or not os.access(chrome, os.X_OK):
-            fail("installed real Chrome is unavailable")
-        env["GSTACK_CHROMIUM_PATH"] = str(chrome)
-    elif chromium := playwright_chromium():
-        env["GSTACK_CHROMIUM_PATH"] = str(chromium)
-        # Keep Playwright itself off the host cache when we resolved a tagged runtime.
-        env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(chromium.parents[1]))
-    def browser_args(*parts):
-        return (["--headed", *parts] if headed else list(parts))
-    lock_path = state_dir / "browser.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        binary = browse_binary()
-        if not keep_open:
-            atexit.register(stop_browser, binary, env, headed)
-            cleanup = (binary, env, headed)
-        navigation = run(binary, browser_args("goto", requested), env)
-        match = STATUS.search(navigation)
-        status = int(match.group(1)) if match else 200
-        run(binary, browser_args("wait", "--load"), env)
-        initial_url = normalize_url(run(binary, browser_args("url"), env).splitlines()[-1])
-        auth_rule = cookie_import_for(requested, initial_url)
-        auth_mode = None
-        if auth_rule:
-            browser, cookie_domain, profile = auth_rule
-            run(binary, browser_args("cookie-import-browser", browser, "--domain", cookie_domain,
-                                     "--profile", profile), env, sensitive=True)
-            navigation = run(binary, browser_args("goto", requested), env)
-            match = STATUS.search(navigation)
-            status = int(match.group(1)) if match else 200
-            if status < 200 or status >= 300:
-                fail("browser returned HTTP status %d after local cookie import" % status)
-            run(binary, browser_args("wait", "--load"), env)
-            auth_mode = "local_browser_cookie_import"
-        elif status < 200 or status >= 300:
-            fail("browser returned HTTP status %d" % status)
-        final_url = normalize_url(run(binary, browser_args("url"), env).splitlines()[-1])
-        public_address(urlsplit(final_url).hostname)
-        # Scratch files go in TMPDIR: browse refuses --out outside its temp dirs and cwd, and under
-        # cs-sandbox TMPDIR is the call's private tmp.
-        text_handle = tempfile.NamedTemporaryFile(prefix="rendered-", suffix=".txt",
-                                                  delete=False)
-        text_tmp = Path(text_handle.name); text_handle.close()
-        run(binary, browser_args("js", "document.body ? document.body.innerText : ''",
-                                 "--out", str(text_tmp), "--raw"), env)
-        raw = text_tmp.read_bytes(); text_tmp.unlink(missing_ok=True)
-        if not raw.strip():
-            fail("browser rendered no visible text")
-        if len(raw) > MAX_TEXT:
-            fail("rendered text exceeded %d bytes" % MAX_TEXT)
-        digest = hashlib.sha256(raw).hexdigest()
-        body_path = store_bytes("_evidence/bodies", digest, ".txt", raw)
-        link_fields = {}
-        if want_links:
-            link_handle = tempfile.NamedTemporaryFile(prefix="rendered-links-", suffix=".json",
-                                                       delete=False)
-            link_tmp = Path(link_handle.name); link_handle.close()
-            expression = """JSON.stringify(Array.from(document.querySelectorAll('a[href]')).map(a => ({text: (a.innerText || a.getAttribute('aria-label') || '').trim(), href: a.href})))"""
-            run(binary, browser_args("js", expression, "--out", str(link_tmp), "--raw"), env)
-            link_raw = link_tmp.read_bytes(); link_tmp.unlink(missing_ok=True)
-            if not link_raw or len(link_raw) > MAX_LINK_BYTES:
-                fail("rendered link map is empty or exceeds %d bytes" % MAX_LINK_BYTES)
-            parsed_links = json.loads(link_raw.decode("utf-8"))
-            if not isinstance(parsed_links, list) or len(parsed_links) > 20000:
-                fail("rendered link map is not a bounded array")
-            links, seen_links = [], set()
-            for item in parsed_links:
-                if not isinstance(item, dict):
-                    continue
-                text = str(item.get("text") or "").strip()[:500]
-                href = str(item.get("href") or "").strip()
-                if not href.startswith(("https://", "http://")):
-                    continue
-                key = (text, href)
-                if key in seen_links:
-                    continue
-                seen_links.add(key)
-                links.append({"text": text, "href": href})
-            canonical_links = (json.dumps(links, ensure_ascii=False, sort_keys=True,
-                                          separators=(",", ":")) + "\n").encode("utf-8")
-            links_sha = hashlib.sha256(canonical_links).hexdigest()
-            link_fields = {"links_path": store_bytes("_evidence/links", links_sha, ".json",
-                                                       canonical_links),
-                           "links_sha256": links_sha, "link_count": len(links)}
-        archive_fields = {}
-        if want_archive and not auth_mode:
-            archive_handle = tempfile.NamedTemporaryFile(prefix="archive-", suffix=".mhtml",
-                                                         delete=False)
-            archive_tmp = Path(archive_handle.name); archive_handle.close()
-            try:
-                run(binary, browser_args("archive", str(archive_tmp)), env, timeout=90)
-                archive_raw = archive_tmp.read_bytes()
-                if not archive_raw or len(archive_raw) > MAX_ARCHIVE:
-                    archive_fields = {"archive_omitted": "empty_or_exceeds_limit"}
-                else:
-                    archive_sha = hashlib.sha256(archive_raw).hexdigest()
-                    archive_fields = {"archive_path": store_bytes("_evidence/archives", archive_sha,
-                                                                    ".mhtml", archive_raw),
-                                      "archive_sha256": archive_sha, "archive_bytes": len(archive_raw)}
-            except (RuntimeError, subprocess.TimeoutExpired):
-                archive_fields = {"archive_omitted": "capture_failed"}
-            finally:
-                archive_tmp.unlink(missing_ok=True)
-        retrieved = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        record = {"schema_version": "0.1", "kind": "browser", "renderer": "gstack-browse-cdp",
-                  "requested_url": requested, "final_url": final_url, "status": status,
-                  "content_type": "text/plain; charset=utf-8", "retrieved_at": retrieved,
-                  "bytes": len(raw), "sha256": digest, "body_path": body_path,
-                  "redirects": [], **link_fields, **archive_fields}
-        if auth_mode:
-            record["auth"] = auth_mode
-            if want_archive:
-                record["archive_omitted"] = "authenticated_session"
-        record_id = hashlib.sha256(("browser\0" + requested + "\0" + digest).encode()).hexdigest()
-        record_path = Path("_evidence/fetches") / (record_id + ".json")
-        safe_directory("_evidence/fetches")
-        atomic_json(record_path, record)
-        append_manifest(evidence / "manifest.jsonl", record)
-        if cleanup:
-            stop_browser(*cleanup)
-            atexit.unregister(stop_browser)
-            cleanup = None
+    body_path = store_bytes("_evidence/bodies", digest, ".txt", raw)
+    link_fields = {}
+    if want_links:
+        links_from_broker = reply.get("links")
+        if not isinstance(links_from_broker, list) or len(links_from_broker) > 20000:
+            fail("rendered link map is not a bounded array")
+        links, seen_links = [], set()
+        for item in links_from_broker:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("text") or "").strip()[:500]
+            href = str(item.get("href") or "").strip()
+            if not href.startswith(("https://", "http://")):
+                continue
+            key = (label, href)
+            if key in seen_links:
+                continue
+            seen_links.add(key)
+            links.append({"text": label, "href": href})
+        canonical_links = (json.dumps(links, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":")) + "\n").encode("utf-8")
+        links_sha = hashlib.sha256(canonical_links).hexdigest()
+        link_fields = {"links_path": store_bytes("_evidence/links", links_sha, ".json",
+                                                   canonical_links),
+                       "links_sha256": links_sha, "link_count": len(links)}
+    archive_fields = {}
+    if want_archive:
+        archive = reply.get("archive")
+        archive_raw = archive.encode("utf-8") if isinstance(archive, str) else b""
+        if 0 < len(archive_raw) <= MAX_ARCHIVE:
+            archive_sha = hashlib.sha256(archive_raw).hexdigest()
+            archive_fields = {"archive_path": store_bytes("_evidence/archives", archive_sha,
+                                                            ".mhtml", archive_raw),
+                              "archive_sha256": archive_sha, "archive_bytes": len(archive_raw)}
+        else:
+            archive_fields = {"archive_omitted": reply.get("archive_omitted", "empty_or_exceeds_limit")}
+    retrieved = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    record = {"schema_version": "0.1", "kind": "browser", "renderer": "chrome-cdp-broker",
+              "requested_url": requested, "final_url": normalize_url(reply["final_url"]),
+              "status": status, "content_type": "text/plain; charset=utf-8",
+              "retrieved_at": retrieved, "bytes": len(raw), "sha256": digest,
+              "body_path": body_path, "redirects": reply.get("navigations") or [],
+              **link_fields, **archive_fields}
+    record_id = hashlib.sha256(("browser\0" + requested + "\0" + digest).encode()).hexdigest()
+    safe_directory("_evidence/fetches")
+    record_path = Path("_evidence/fetches") / (record_id + ".json")
+    atomic_json(record_path, record)
+    append_manifest(evidence / "manifest.jsonl", record)
     print(json.dumps({"ok": True, "evidence": str(record_path), **record,
                       "preview": raw[:4000].decode("utf-8", errors="replace")}, sort_keys=True))
-except (KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.TimeoutExpired,
-        json.JSONDecodeError) as error:
+except (KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
     print("browser_fetch: " + str(error), file=sys.stderr)
     sys.exit(1)

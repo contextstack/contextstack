@@ -1,30 +1,31 @@
-//! Director-owned chief-of-staff slot, stored atomically with its conversation in meta.
+//! Director-owned chief-of-staff slot, stored atomically with its conversation in `org_settings`.
 use crate::access::Client;
 use crate::server::{Call, Reply, State, internal, json};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::util::{now_utc, ulid};
 use crate::work::{No, body, content, key, remember, scoped_prior};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-pub fn read(db: &Connection) -> rusqlite::Result<Value> {
+pub fn read(db: &ScopedConnection) -> rusqlite::Result<Value> {
     let raw: Option<String> = db
         .query_row(
-            "SELECT value FROM meta WHERE key = 'chief_of_staff'",
-            [],
+            "SELECT value FROM org_settings WHERE +org_id = :org_id AND key = 'chief_of_staff'",
+            params![],
             |r| r.get(0),
         )
         .optional()?;
     Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!({"enabled": false, "name": "Chief of staff", "conversation_id": null, "revision": 0})))
 }
 
-fn save(db: &Connection, slot: &mut Value) -> rusqlite::Result<()> {
+fn save(db: &ScopedConnection, slot: &mut Value) -> rusqlite::Result<()> {
     db.execute(
-        "INSERT INTO changes (kind, record_id, at) VALUES ('chief_of_staff', 'chief_of_staff', ?1)",
+        "INSERT INTO changes (org_id, kind, record_id, at) VALUES (:org_id, 'chief_of_staff', 'chief_of_staff', ?1)",
         [now_utc()],
     )?;
     slot["revision"] = json!(db.last_insert_rowid());
-    db.execute("INSERT INTO meta (key, value) VALUES ('chief_of_staff', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [slot.to_string()])?;
+    db.execute("INSERT INTO org_settings (org_id, key, value) VALUES (:org_id, 'chief_of_staff', ?1) ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value WHERE +org_settings.org_id = :org_id", [slot.to_string()])?;
     Ok(())
 }
 
@@ -35,7 +36,7 @@ pub fn get(state: &State) -> Reply {
     }
 }
 
-pub fn protect(db: &Connection, id: &str) -> Result<(), No> {
+pub fn protect(db: &ScopedConnection, id: &str) -> Result<(), No> {
     let slot = read(db).map_err(|e| No::internal(&e))?;
     if slot["enabled"] == true && slot["conversation_id"].as_str() == Some(id) {
         return Err(No(
@@ -56,21 +57,9 @@ fn title(value: &Value) -> Result<&str, No> {
         .ok_or_else(|| No::invalid("title or name must contain 1 to 200 characters, trimmed"))
 }
 
-fn owner(client: &Client) -> Result<(), No> {
-    if !client.is_owner() {
-        return Err(No(
-            403,
-            "owner_only",
-            "only the owner may do this".into(),
-            Value::Null,
-        ));
-    }
-    Ok(())
-}
-
 fn create(
     state: &State,
-    db: &Connection,
+    db: &ScopedConnection,
     client: &Client,
     name: &str,
 ) -> Result<(String, bool), No> {
@@ -79,7 +68,7 @@ fn create(
         .ok_or_else(|| No::invalid("register a node before enabling the chief of staff"))?;
     let status: Option<String> = db
         .query_row(
-            "SELECT status FROM nodes WHERE name = ?1 AND revoked_at IS NULL",
+            "SELECT status FROM nodes WHERE +org_id = :org_id AND name = ?1 AND revoked_at IS NULL",
             [&node],
             |r| r.get(0),
         )
@@ -110,20 +99,20 @@ fn create(
         "con_{}",
         ulid().map_err(|e| No::internal(&e))?.to_lowercase()
     );
-    db.execute("INSERT INTO conversations (conversation_id, title, node, spec, spec_version, model, instructions_tokens, tools, created_by, created_at, lead) VALUES (?1, ?2, ?3, 'spec.yaml', ?4, ?5, ?6, ?7, ?8, ?9, 1)", params![id, name, node, crate::jobs::bundle_sha(&files), facts.model, instructions, facts.tools, client.id, now_utc()]).map_err(|e| No::internal(&e))?;
+    db.execute("INSERT INTO conversations (org_id, conversation_id, title, node, spec, spec_version, model, instructions_tokens, tools, created_by, created_at, lead, responsible_member_id, sponsor_member_id) VALUES (:org_id, ?1, ?2, ?3, 'spec.yaml', ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)", params![id, name, node, crate::jobs::bundle_sha(&files), facts.model, instructions, facts.tools, client.id, now_utc(), client.member_id()]).map_err(|e| No::internal(&e))?;
     for f in files {
-        db.execute("INSERT INTO conversation_files (conversation_id, path, sha256, bytes, mode) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, f.path, f.sha256, i64::try_from(f.bytes).unwrap_or(i64::MAX), f.mode]).map_err(|e| No::internal(&e))?;
+        db.execute("INSERT INTO conversation_files (org_id, conversation_id, path, sha256, bytes, mode) VALUES (:org_id, ?1, ?2, ?3, ?4, ?5)", params![id, f.path, f.sha256, i64::try_from(f.bytes).unwrap_or(i64::MAX), f.mode]).map_err(|e| No::internal(&e))?;
     }
     touch(db, Record::Conversation, &id).map_err(|e| No::internal(&e))?;
     Ok((id, available.is_none()))
 }
 
-fn put_answer(db: &Connection, slot: &Value) -> Result<Value, No> {
+fn put_answer(db: &ScopedConnection, slot: &Value) -> Result<Value, No> {
     let mut answer = json!({"chief_of_staff": slot});
     let note: Option<String> = db
         .query_row(
-            "SELECT value FROM meta WHERE key = 'chief_of_staff_model_note'",
-            [],
+            "SELECT value FROM org_settings WHERE +org_id = :org_id AND key = 'chief_of_staff_model_note'",
+            params![],
             |r| r.get(0),
         )
         .optional()
@@ -137,10 +126,10 @@ fn put_answer(db: &Connection, slot: &Value) -> Result<Value, No> {
 }
 
 /// Whether `id` names an existing hosted-lead conversation.
-fn is_lead_conversation(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, No> {
+fn is_lead_conversation(tx: &crate::store::ScopedTransaction<'_>, id: &str) -> Result<bool, No> {
     let lead: Option<i64> = tx
         .query_row(
-            "SELECT lead FROM conversations WHERE conversation_id = ?1",
+            "SELECT lead FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
             [id],
             |r| r.get(0),
         )
@@ -149,9 +138,9 @@ fn is_lead_conversation(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool
     Ok(lead == Some(1))
 }
 
-fn conversation_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool, No> {
+fn conversation_exists(tx: &crate::store::ScopedTransaction<'_>, id: &str) -> Result<bool, No> {
     tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1)",
         [id],
         |r| r.get::<_, bool>(0),
     )
@@ -160,7 +149,6 @@ fn conversation_exists(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<bool,
 
 pub fn put(state: &State, call: &Call, client: &Client) -> Reply {
     let result = (|| -> Result<Value, No> {
-        owner(client)?;
         let key = key(call)?;
         let m = body(call)?;
         if m.get("enabled").is_some_and(|v| !v.is_boolean()) {
@@ -210,19 +198,19 @@ pub fn put(state: &State, call: &Call, client: &Client) -> Reply {
             )?;
             slot["conversation_id"] = json!(id);
             tx.execute(
-                "DELETE FROM meta WHERE key = 'chief_of_staff_model_note'",
-                [],
+                "DELETE FROM org_settings WHERE +org_id = :org_id AND key = 'chief_of_staff_model_note'",
+                params![],
             )
             .map_err(|e| No::internal(&e))?;
             if limited {
-                tx.execute("INSERT INTO meta (key, value) VALUES ('chief_of_staff_model_note', ?1)",
+                tx.execute("INSERT INTO org_settings (org_id, key, value) VALUES (:org_id, 'chief_of_staff_model_note', ?1)",
                     ["all lead models were usage-limited at creation; selected the first lead model"])
                     .map_err(|e| No::internal(&e))?;
             }
         } else if exists {
             let id = id.as_deref().unwrap_or_default();
             let at = (slot["enabled"] != true).then(now_utc);
-            let changed = tx.execute("UPDATE conversations SET title = ?2, archived_at = ?3 WHERE conversation_id = ?1 AND (title IS NOT ?2 OR (archived_at IS NULL) != (?3 IS NULL))", params![id, slot["name"].as_str(), at]).map_err(|e| No::internal(&e))?;
+            let changed = tx.execute("UPDATE conversations SET title = ?2, archived_at = ?3 WHERE +org_id = :org_id AND (conversation_id = ?1 AND (title IS NOT ?2 OR (archived_at IS NULL) != (?3 IS NULL)))", params![id, slot["name"].as_str(), at]).map_err(|e| No::internal(&e))?;
             if changed > 0 {
                 touch(&tx, Record::Conversation, id).map_err(|e| No::internal(&e))?;
             }
@@ -251,7 +239,6 @@ pub fn put(state: &State, call: &Call, client: &Client) -> Reply {
 
 pub fn rename(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
     let result = (|| -> Result<Value, No> {
-        owner(client)?;
         let key = key(call)?;
         let m = body(call)?;
         let name = title(&m.get("title").cloned().unwrap_or_default())?.to_string();
@@ -261,7 +248,7 @@ pub fn rename(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         if scoped_prior(&tx, &key, &sha, client)?.is_none() {
             if tx
                 .execute(
-                    "UPDATE conversations SET title = ?2 WHERE conversation_id = ?1",
+                    "UPDATE conversations SET title = ?2 WHERE +org_id = :org_id AND (conversation_id = ?1)",
                     params![id, name],
                 )
                 .map_err(|e| No::internal(&e))?

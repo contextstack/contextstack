@@ -517,7 +517,8 @@ def run_spec(rel, schedule_id=None, job_id="", external_effects=None, completion
     sid = spec_value(text, "id")
     # a director job runs the task materialised beside its frozen spec, never a checkout path
     tasks = [job_task] if job_task else (spec_tasks(text) or [None])
-    use_executor = executor_template(TEMPLATES, spec_value(text, "model")) is not None
+    model = spec_value(text, "model")
+    use_executor = model == "gate" or executor_template(TEMPLATES, model) is not None
     final_row = {}
     failure = None
     try:  # the node's roots (_roots), then the spec's env: request against policy/env.json; a refusal is a config void, nothing launches
@@ -832,6 +833,7 @@ def main(turn_only=False):
             rc, trial_row = 1, {"verdict": "void", "stop": "error: dispatch crashed: %s" % detail,
                                 "error": error_object("unclassified", "dispatch_exception", "launcher", False, detail)}
         done = lockf(True)
+        terminal = None
         try:
             if first_terminal(Q, jid) is None:
                 terminal = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -859,6 +861,14 @@ def main(turn_only=False):
         finally:
             fcntl.flock(done.fileno(), fcntl.LOCK_UN)
             done.close()
+        if terminal is not None and terminal["state"] != "cancelled" and job.get("schedule_id"):
+            from _schedule_delivery import deliver_job
+
+            try:
+                deliver_job(terminal, trial_row, RUNS)
+            except (OSError, ValueError, RuntimeError) as error:
+                append_job_log(job_log_path(STATE, job.get("director_job") or jid),
+                               "scheduled result delivery failed: %s\n" % error)
         if NODE and not cancelled(job.get("director_job")):  # deliver this job's envelope and terminal row now
             spool_pass()  # (a cancelled job's: node-listen, after it reports the outcome)
         emit({"ok": rc == 0, "id": jid, "spec": job["spec"], "code": rc}, swept)

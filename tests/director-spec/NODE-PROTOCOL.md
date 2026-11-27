@@ -517,7 +517,7 @@ recorded.
  "body": {"schedule_id": "nightly-eval", "expect_revision": 4, "set": {"enabled": false}}}
 ```
 
-`set` holds one or both of `enabled` (boolean) and `missed` (`skip` | `catch_up`). The node applies it only when the
+`set` holds one or more of `enabled` (boolean), `missed` (`skip` | `catch_up`), `cron` or `timezone`. The node applies it only when the
 schedule's current revision is `expect_revision`: it makes the change, raises the revision, reports `applied` with
 `result: {"revision": <new>}` and sends a `POST schedules` report. A schedule at another revision is `refused` with
 outcome `revision_mismatch` (so an older, delayed change never overwrites a newer one); an unknown schedule is
@@ -525,6 +525,13 @@ outcome `revision_mismatch` (so an older, delayed change never overwrites a newe
 
 
 
+
+For creation the body additionally carries `kind: "create"` and the target `node`. It uses `expect_revision: 0`
+and sets the initial definition, including `name`, `enabled`, `cron`, `timezone`, `missed`, `task`, and
+one of `spec` or `agent`. The node appends revision 1 only if the ID has no ledger rows.
+For deletion the body carries `kind: "delete"` and `set: {"enabled": false}`. The node appends a disabled
+tombstone and continues reporting its revision with `definition.deleted: true`. The control ID in the ledger
+makes reapplication of either operation return the revision already written.
 
 ### 9.7 `POST conversations/{conversation_id}/lead-credential`
 
@@ -586,3 +593,75 @@ the exact argv, then `/outcome` with `run_id` and `exit_code`. A repeated
 claim returns 409 even if its response was lost. A repeated matching
 outcome is accepted. The Director records an unknown outcome until the
 node confirms it. Request, claim and outcome are bound to the owning node.
+
+Before capturing a browser proposal, the node sends `url`, `origin_set`, `action`,
+`target`, and `run_id` to `POST jobs/JOB/action-approvals/capture` to check the
+job's declared action. Submit to the usual request route with `kind: "browser_action"`,
+`run_id`, the native host's `capture` and `capture_proof`, and the host's JPEG
+bytes in lowercase hex as `image`. The Director verifies the HMAC, job and run
+binding, capture time, and screenshot hash. The response starts at `needs_owner`.
+To claim, supply `run_id`, `origin`, `action`, `target`, and the digest of the
+current field values. The approved binding must match exactly and the owner
+decision must be within five minutes.
+Only the successful browser claim response includes `claim_proof`, the
+native host's authentication tag. The host checks the tag, consumes it once,
+and compares the extension's live form digest before authorizing submission.
+
+Every proposal's frozen job spec must declare the origin and form under
+`browser.actions[action]`. By default, proposals remain open for up to 24 hours when
+the proposing job ends. Owner approval records
+`followup_job_id` and queues the follow-up for the same node.
+
+`GET browser-action-jobs` returns `{jobs:[...]}` for that node. Use the
+follow-up job ID in both the claim route and the body’s `run_id`, and use
+the same follow-up route for the outcome. A consumed claim never requeues,
+including when the node loses the native host’s response.
+
+### Hosted land requests (protocol 2)
+
+`GET land-requests` returns `{land_requests: [...]}` with up to 100 pending or
+approved, unclaimed land approvals assigned to the authenticated node. Use
+`POST land-requests/ID/OP` with the following operations. A successful operation
+returns the updated approval. A request assigned to another node returns 404,
+and an invalid state transition returns 409.
+
+| Operation | Body and effect |
+| --- | --- |
+| `inspect` | `{commit, base, protected, tracing}` pins the lane and main commit IDs and reports the path flags. The Director either approves the pin automatically or sends it to the owner. |
+| `unavailable` | `{}` ends a pending request when the node cannot pin it. The client may request a fresh inspection. |
+| `claim` | `{}` acquires the approved pin for execution and records an unknown outcome. Execute only after a successful claim. |
+| `outcome` | `{status, attempts}` records `succeeded`, `failed` or `interrupted` with the associated land attempts. For preflight lock contention, send `{status: "busy", claim_revision}` using the revision from the claim response. This releases that claim for retry and creates no run land record. |
+
+Automatic approval reads the newest gate job's run and its `gate.json` artifact
+for the inspected commit. The artifact must report `verdict: "pass"`,
+`complete: true` and `uncovered: []`. The newest independent reviewer verdict
+for that commit must also approve it.
+
+### Hosted release switches (protocol 2)
+
+`GET release-requests` returns `{release_requests: [...]}` for the
+authenticated node. It includes pending inspections and approved requests
+without a final receipt. Use `POST release-requests/ID/OP` as follows.
+
+| Operation | Body and effect |
+| --- | --- |
+| `inspect` | `{commit, target_hash, schema_current, schema_target, release_notes_diff}` locks the target and creates an owner decision. The commit and hash are full hex IDs. For main the pin is the commit. For a staged bundle it is a SHA-256 over the bundle tree. |
+| `unavailable` | `{}` closes a pending request the node could not inspect. |
+| `claim` | `{target_hash}` requires the approved hash and a human decision. It records the unknown outcome before execution. A replay with the same pin can recover a lost claim response. |
+| `outcome` | `{target_hash, status, release}` settles the claim and enqueues a post-install wake in the same transaction. A matching replay is accepted. |
+
+Terminal statuses are `installed`, `rolled_back`, `rollback_failed`,
+`restored` and `failed`. `restored` denotes a separately approved
+rollback. Conflicting pins or transitions return `409`. Another node
+gets `404`. The Director constructs the visible failure summary from
+the status. Installer stdout, stderr and smoke transcripts stay off the
+approval and turn.
+
+The node stores execution receipts under persistent
+`state/node/release-requests`. The node installer serializes activation
+with its install lock, retries when active jobs prevent a switch, and
+keeps the prior image for automatic rollback. A local Director upgrade
+uses a pre-migration SQLite copy, integrity and foreign-key checks, and
+a separate local backup. If rollback crosses a schema boundary, the
+installer restores the pre-migration copy. An independent service worker
+can complete activation while the listener restarts.

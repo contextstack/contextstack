@@ -34,6 +34,7 @@ it('escapes raw image HTML and unsafe alt content', function () {
 
 it('restricts image sources on client web pages', function () {
     connectClientWeb();
+    fakeDirectorBackground();
 
     $this->get(route('connect'))->assertOk()
         ->assertHeader('Content-Security-Policy', "img-src 'self' data:");

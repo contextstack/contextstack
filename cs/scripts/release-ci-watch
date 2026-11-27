@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Wait for an exact GitHub Actions push run using read-only gh commands."""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+
+
+def gh_json(args, repo, deadline):
+    try:
+        result = subprocess.run(
+            ["gh", "run", *args, "--repo", repo],
+            capture_output=True, text=True, check=True,
+            timeout=min(30, max(0.001, deadline - time.monotonic())),
+        )
+        return json.loads(result.stdout)
+    except FileNotFoundError:
+        raise ValueError("gh is required to read Actions runs") from None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        raise ValueError("could not read Actions data with gh") from None
+
+
+def watch(args):
+    deadline = time.monotonic() + args.timeout
+    run_id = None
+    ref = args.tag or args.branch
+    while time.monotonic() < deadline:
+        if run_id is None:
+            filters = ["--branch", args.branch] if args.branch else []
+            rows = gh_json([
+                "list", "--workflow", args.workflow, "--event", "push",
+                *filters, "--commit", args.commit,
+                "--json", "databaseId,headSha,headBranch,event",
+            ], args.repo, deadline)
+            for row in rows:
+                if (row["headSha"], row["headBranch"], row["event"]) == (args.commit, ref, "push"):
+                    run_id = row["databaseId"]
+                    if type(run_id) is not int or run_id <= 0:
+                        raise ValueError("invalid Actions run ID")
+                    break
+        if run_id is not None:
+            run = gh_json([
+                "view", str(run_id), "--json",
+                "databaseId,headSha,headBranch,event,status,conclusion,url,jobs",
+            ], args.repo, deadline)
+            if (run["databaseId"], run["headSha"], run["headBranch"], run["event"]) != (
+                run_id, args.commit, ref, "push"
+            ):
+                raise ValueError("Actions run identity changed")
+            if run["status"] == "completed":
+                print(json.dumps({
+                    "status": "pass" if run["conclusion"] == "success" else "fail",
+                    "commit": args.commit, "ref": ref, "run_id": run_id, "url": run["url"],
+                    "conclusion": run["conclusion"],
+                    "failing_jobs": [
+                        job["name"] for job in run["jobs"]
+                        if job["conclusion"] not in {"success", "skipped", "neutral"}
+                    ],
+                }))
+                return 0 if run["conclusion"] == "success" else 1
+        time.sleep(max(0, min(args.interval, deadline - time.monotonic())))
+    raise ValueError(
+        f"timed out waiting for Actions run {run_id}" if run_id is not None
+        else "timed out waiting for a matching Actions push run"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True, help="GitHub OWNER/REPO")
+    parser.add_argument("--workflow", default="release-bundles.yml")
+    parser.add_argument("--commit", required=True, help="full commit SHA")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--tag")
+    target.add_argument("--branch")
+    parser.add_argument("--timeout", type=int, default=900, help="seconds to wait")
+    parser.add_argument("--interval", type=int, default=15, help="seconds between reads")
+    args = parser.parse_args()
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo, re.ASCII):
+        parser.error("--repo must be OWNER/REPO")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
+        parser.error("--commit must be a full lowercase GitHub commit SHA")
+    if args.timeout < 1 or args.interval < 1:
+        parser.error("--timeout and --interval must be positive")
+    try:
+        return watch(args)
+    except (KeyError, TypeError):
+        print("release-ci-watch: malformed Actions data", file=sys.stderr)
+    except ValueError as error:
+        print(f"release-ci-watch: {error}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

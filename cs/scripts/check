@@ -32,9 +32,12 @@ ops_cap_fail=0
 say() { echo "check: FAIL — $*"; fail=1; }
 
 bg_rule() {
-  local msg="$1" log regression goal
+  local msg="$1" log regression goal arg
   shift
-  regression=${1#tasks/regressions/}
+  regression=""
+  for arg in "$@"; do
+    case "$arg" in tasks/regressions/*) regression=${arg#tasks/regressions/}; break ;; esac
+  done
   goal="tasks/regressions/${regression%/check}/goal.md"
   log=$(mktemp)
   (
@@ -46,6 +49,15 @@ bg_rule() {
       fi
     else
       printf '%s\n' "$msg" > "$log"
+    fi
+    if [ "${CS_SANDBOXED_LAND_CHECK:-}" = 1 ] && [ -n "$regression" ] &&
+      grep -Eiq '(skip(ped)?.*(host|macOS|darwin|seatbelt|nested sandbox|sandbox_apply)|nested (sandbox|seatbelt).*(unavailable|refused))' "$log.output"; then
+      local name=${regression%/check}
+      printf '%s\n' "check: host-only uncovered: $name" > "$log.uncovered"
+      rm -f "$log.covered"
+    elif [ -n "$regression" ] && grep -Eiq 'skip.*(nested (sandbox|seatbelt)|sandbox_apply)' "$log.output" &&
+      ! grep -Eq '^[^:]+: skipped: needs host \(.*\)$' "$log.output"; then
+      printf '%s\n' "${regression%/check}: skipped: needs host (nested Seatbelt)" > "$log.uncovered"
     fi
   ) &
   _bg_pids="${_bg_pids:-} $!"
@@ -66,10 +78,11 @@ wait_rules() {
     fi
     if [ -f "$log.covered" ]; then
       cat "$log.covered"
-    else
+    elif [ "${CS_SANDBOXED_LAND_CHECK:-}" != 1 ] || [ ! -f "$log.uncovered" ]; then
       grep -E '^[^:]+: skipped: needs host \(.*\)$' "$log.output" || true
     fi
-    rm -f "$log" "$log.output" "$log.covered"
+    [ ! -f "$log.uncovered" ] || cat "$log.uncovered"
+    rm -f "$log" "$log.output" "$log.covered" "$log.uncovered"
   done
   _bg_pids=""
   _bg_logs=""
@@ -109,13 +122,13 @@ PYENV
 if command -v cargo >/dev/null 2>&1; then
   # A successful build means cargo found every binary current; mark them so (a Cargo.lock change for another crate
   # leaves cs-harness untouched, and the runner freshness rule compares mtimes against Cargo.lock).
-  (cd .. && cargo build --release --locked -q -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director \
-    && touch target/release/cs-harness) || say "cs-tools, cs-harness, cs-sandbox, cs-gateway or cs-director does not build (cargo build --release -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director at the repo root)"
+  (cd .. && cargo build --release --locked -q -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -p browser-host \
+    && touch target/release/cs-harness) && runner_built=1 || say "cs-tools, cs-harness, cs-sandbox, cs-gateway, cs-director or browser-host does not build (cargo build --release -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -p browser-host at the repo root)"
   # Regressions copy ops/bin into partial estates with no release bin/: render profiles with this build.
   export CS_SANDBOX_BIN="${CS_SANDBOX_BIN:-$(cd .. && pwd)/target/release/cs-sandbox}"
   # The public repository's CI runs `cargo fmt --all --check` first; keep the same bar here.
   (cd .. && cargo fmt --all --check >/dev/null) || say "Rust code is not rustfmt-formatted (run cargo fmt --all at the repo root)"
-  (cd .. && cargo clippy --release --locked --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -- -D warnings) || say "cs-director, cs-gateway, cs-harness, cs-sandbox or cs-tools has Clippy warnings (cargo clippy --release --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -- -D warnings at the repo root)"
+  (cd .. && cargo clippy --release --locked --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -p browser-host -p cs-http-client -p cs-child-signals -p cs-landlock -- -D warnings) || say "a Rust workspace crate has Clippy warnings (cargo clippy --release --all-targets -p cs-tools -p cs-harness -p cs-sandbox -p cs-gateway -p cs-director -p browser-host -p cs-http-client -p cs-child-signals -p cs-landlock -- -D warnings at the repo root)"
 else
   echo "check: skip cs-tools build: no cargo on PATH; tools whose descriptor names target/release/cs-tools cannot run, and the gateway contract suite is skipped" >&2
 fi
@@ -150,8 +163,12 @@ tasks/regressions/transcript-redaction/check || say "a transcript, event, or tas
 # (each path is briefly missing), so in the batch it raced the rules that exec them: "cs-tools ... is not built",
 # a gateway case that could not spawn (2026-11-11). Serial, before the batch; no batch rule may run cargo.
 tasks/regressions/node-install/check || say "the node image no longer installs offline from a bundle, or a manifest tool needs more than the pinned interpreter"
+# node-install's cargo build re-copies target/release/cs-harness from deps/ with the artifact's old mtime; when the
+# build above succeeded, restore its verdict so rule 6 does not call a current runner stale after a Cargo.lock-only change.
+[ "${runner_built:-}" = 1 ] && touch ../target/release/cs-harness
 bg_rule "a regression has no full-check entry or documented exclusion" python3 scripts/check-regression-coverage.py
 bg_rule "landing loses owner changes, lane exclusivity, or gate cleanup" tasks/regressions/cs-land/check
+bg_rule "a model-free gate job bypasses the lane sandbox or loses its evidence" tasks/regressions/gate-job/check
 bg_rule "release activation failure does not restore the previous release" tasks/regressions/node-release-load-rollback/check
 bg_rule "release rollback does not restore the Director database" tasks/regressions/node-release-db-rollback/check
 bg_rule "landing confuses lane policy with unrelated changes on main" tasks/regressions/lane-policy/check
@@ -250,6 +267,8 @@ bg_rule "the hosted lead cannot reach its own MCP bridge under its profile, or c
   tasks/regressions/lead-bridge-reach/check --darwin-probe
 bg_rule "an agent can connect to the owner's ssh-agent: launchd Listeners, ~/.ssh sockets or SSH_AUTH_SOCK (independent attack test, 7th pass #58)" \
   tasks/regressions/attack-ssh-agent/check --darwin-probe
+bg_rule "land-check Seatbelt grants let a check escape or prevent permitted build activity" \
+  tasks/regressions/land-check-sandbox/check
 bg_rule "trusted login refresh, owner/identity guards or proactive re-login pauses regressed" \
   tasks/regressions/trusted-login-refresh/check --darwin-probe
 bg_rule "an agent mutates an owner login or task login copies write back (attack-login-rename)" \
@@ -341,6 +360,10 @@ fi
 if command -v cargo >/dev/null 2>&1; then
   bg_rule "the Rust sandbox profiles drift from the Python ones or cs-sandbox fails its tests (cd .. && cargo test --locked -p cs-sandbox)" \
     sh -c 'cd .. && cargo test --locked -q -p cs-sandbox'
+  bg_rule "browser-host fails its tests (cd .. && cargo test --locked -p browser-host)" \
+    sh -c 'cd .. && cargo test --locked -q -p browser-host'
+  bg_rule "cs-tools, cs-director, cs-http-client, cs-child-signals or cs-landlock fails its tests (cd .. && cargo test --locked -p cs-tools -p cs-director -p cs-http-client -p cs-child-signals -p cs-landlock)" \
+    sh -c 'cd .. && cargo test --locked -q -p cs-tools -p cs-director -p cs-http-client -p cs-child-signals -p cs-landlock'
 fi
 bg_rule "HOME read allowlists or centralized Seatbelt read rules regressed" \
   tasks/regressions/home-read-allowlist/check
@@ -378,7 +401,9 @@ else
 fi
 # Confined form of the demand: with the wrapper built, no shipped tool may escape
 # the workspace. Without a built wrapper, check fails unless CS_CHECK_SKIP_ESCAPE_SUITE=1.
-if [ -x ../target/release/cs-sandbox ]; then
+if [ "${CS_SANDBOXED_LAND_CHECK:-}" = 1 ]; then
+  echo "check: host-only uncovered: tool-escapes-workspace"
+elif [ -x ../target/release/cs-sandbox ]; then
   bg_rule "a shipped tool escapes the workspace under cs-sandbox (tool-escapes-workspace, confined)" \
     env CS_TOOL_PREFIX="$(cd .. && pwd)/target/release/cs-sandbox --policy $(pwd)/policy/sandbox.json --" \
     tasks/regressions/tool-escapes-workspace/check
@@ -405,6 +430,7 @@ bg_rule "est_usd no longer prefers the CLI meter or omits cache-creation tokens"
   tasks/regressions/est-meter-1400x/check
 bg_rule "a coding-agent run drops the tokens, real model, estimate label or allowance its agent reported" \
   tasks/regressions/agent-usage/check
+bg_rule "provider limit signals lose their stop, allowance, node state or fallback routing" \
   tasks/regressions/provider-limits/check
 bg_rule "a failed, limited, timed-out or cancelled profiled-template run (opencode, pi) is not finalized and sent like any other run" \
   tasks/regressions/profiled-finalization/check
@@ -444,6 +470,8 @@ bg_rule "an outage, dependency wait, or config-void can consume or silently lose
   tasks/regressions/tick-terminal-seat-release/check
 bg_rule "an outage, dependency wait, or config-void can consume or silently lose a due schedule" \
   tasks/regressions/schedule-config-void-hold/check
+bg_rule "Director schedule controls cannot create, edit or tombstone a node schedule at its expected revision" \
+  tasks/regressions/schedule-director-control/check
 bg_rule "a schedule firing starts before its identity is recorded, re-fires after a crash, or runs a missed slot under missed: skip" \
   tasks/regressions/schedule-firing-identity/check
 bg_rule "schedule failures isolate dependencies, hold repeat failures and surface silent cron slots" \
@@ -452,6 +480,8 @@ bg_rule "enqueue accepts a schedule slot that shadow audit cannot parse" \
   tasks/regressions/dispatch-slot-validation/check
 bg_rule "browser cookies can enter a run, setup tree, evidence, spill, or harvest" \
   tasks/regressions/browser-cookie-isolation/check
+bg_rule "scheduled Google Tasks reads leave the extension path, give the page reader tools, keep logged-in pages, or loop on a logged-out session" \
+  tasks/regressions/google-tasks-reader/check
 bg_rule "a clean first-task preflight suppresses later tasks in the same spec" \
   tasks/regressions/tick-multitask-preflight-continuation/check
 bg_rule "inline quoted task lists lose task identity or a zero-evidence void does not stop the batch" \

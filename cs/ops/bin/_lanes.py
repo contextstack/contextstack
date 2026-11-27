@@ -9,9 +9,11 @@ A job's spec names `repo:` and `lane:` (both or neither). The repo name resolves
                     "hooks_path": "scripts/git-hooks",            core.hooksPath for the landing commit
                                                                   (relative to the checkout; absent: the repo's own)
                     "gate": "cs/scripts/check",              run in the checkout before the landing commit
+                    "gate_steps": [{"name": "...", "command": ["..."], "host_only": false}],
                     "hook_gated": ["cs/"],                   paths whose change makes the hooks run the gate
                                                                   themselves: then the explicit gate is skipped
                     "gate_timeout_s": 3600,
+                    "land_check": "host",                         owner kill switch for the default sandboxed land check
                     "land": "squash"},                            squash (one commit) or merge (--no-ff)
    "ai-usage-ledger": "/Users/me/sites/ai-usage-ledger"}          short form: the path, every default
 
@@ -29,7 +31,7 @@ hook accepts rules-tier commits. land() merges the lane into main, runs the gate
 or a conflict main is reset to where it was. It never pushes.
 """
 import fcntl
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
 import fnmatch
 import json
@@ -40,14 +42,15 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _lane_policy import lane_changed_names, refuse_agent_configs
 from _harvest_git import environment as git_environment, host_git
 
 LANE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
-DEFAULTS = {"branch": "main", "hooks_path": None, "gate": None, "hook_gated": [], "gate_timeout_s": 3600,
-            "land": "squash", "tracked_secret_allowlist": []}
+DEFAULTS = {"branch": "main", "hooks_path": None, "gate": None, "gate_steps": None, "hook_gated": [],
+            "gate_timeout_s": 3600, "land": "squash", "land_check": "sandbox", "tracked_secret_allowlist": []}
 TAIL = 4000
 
 
@@ -256,13 +259,20 @@ class LandGit:
             common = self.output(main, "rev-parse", "--path-format=absolute", "--git-common-dir")
             self.hooks = str(Path(common) / "hooks")
 
-    def environment(self, extra=None):
-        host_env = clean_env(extra)
+    def environment(self, extra=None, *, sandbox_commit=False):
+        if sandbox_commit:
+            names = ("LANG", "LC_ALL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE")
+            host_env = {name: os.environ[name] for name in names if name in os.environ}
+            host_env.update(PATH="/usr/bin:/bin", **(extra or {}))
+        else:
+            host_env = clean_env(extra)
         host_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_ATTR_NOSYSTEM="1")
         if self.attributes:
             host_env["GIT_ATTR_SOURCE"] = self.attributes
         # Gates and hooks may themselves invoke git. Inherit the same overrides.
-        config = ["core.hooksPath=" + self.hooks, "core.attributesFile=/dev/null", *self.options[1::2]]
+        hooks = "/dev/null" if sandbox_commit else self.hooks
+        config = ["core.hooksPath=" + hooks, "core.attributesFile=/dev/null", *self.options[1::2]]
         host_env["GIT_CONFIG_COUNT"] = str(len(config))
         for n, entry in enumerate(config):
             key, value = entry.split("=", 1)
@@ -270,10 +280,13 @@ class LandGit:
             host_env["GIT_CONFIG_VALUE_%d" % n] = value
         return host_env
 
-    def run(self, cwd, *args, env=None, input=None):
-        host_env = self.environment(env)
-        command = ["git", "-C", str(cwd), "-c", "core.hooksPath=" + self.hooks,
+    def run(self, cwd, *args, env=None, input=None, sandbox_commit=False):
+        host_env = self.environment(env, sandbox_commit=sandbox_commit)
+        hooks = "/dev/null" if sandbox_commit else self.hooks
+        command = ["git", "-C", str(cwd), "-c", "core.hooksPath=" + hooks,
                    "-c", "core.attributesFile=/dev/null", *self.options, *args]
+        if sandbox_commit:
+            command[3:3] = ["-c", "commit.gpgSign=false", "-c", "core.fsmonitor=false"]
         return subprocess.run(command, capture_output=True, text=True, env=host_env,
                               **({"input": input} if input is not None else {"stdin": subprocess.DEVNULL}))
 
@@ -298,8 +311,7 @@ def out(cwd, *args):
     return done.stdout.strip()
 
 
-def repo_config(name):
-    """The repos file's entry for `name`, with defaults filled and `path` a resolved Path."""
+def read_repos():
     path = repos_file()
     try:
         repos = json.loads(path.read_text(encoding="utf-8"))
@@ -307,7 +319,16 @@ def repo_config(name):
         raise LaneError("no repos file at %s (it maps repo names to main checkouts)" % path)
     except (OSError, ValueError) as error:
         raise LaneError("repos file %s: %s" % (path, error))
-    if not isinstance(repos, dict) or name not in repos:
+    if not isinstance(repos, dict):
+        raise LaneError("repos file %s must contain an object" % path)
+    return repos
+
+
+def repo_config(name, *, repos=None):
+    """The repos file's entry for `name`, with defaults filled and `path` a resolved Path."""
+    path = repos_file()
+    repos = read_repos() if repos is None else repos
+    if name not in repos:
         raise LaneError("repo %r is not in %s" % (name, path))
     entry = repos[name]
     entry = {"path": entry} if isinstance(entry, str) else entry
@@ -320,6 +341,8 @@ def repo_config(name):
     cfg["path"] = Path(os.path.expanduser(str(entry["path"]))).resolve()
     if cfg["land"] not in ("squash", "merge"):
         raise LaneError("repo %r: land must be squash or merge" % name)
+    if cfg["land_check"] not in ("host", "sandbox"):
+        raise LaneError("repo %r: land_check must be host or sandbox" % name)
     if not isinstance(cfg["hook_gated"], list):
         raise LaneError("repo %r: hook_gated must be a list of path prefixes" % name)
     validate_secret_allowlist(cfg)
@@ -751,7 +774,8 @@ def failed_lines(text):
 
 
 # After land() decides, `cs land` reports the outcome to the Director (ops/bin/_land_record.py)
-def land(name, lane, message=None, *, allow_agent_config=False):
+def land(name, lane, message=None, *, allow_agent_config=False, state=None, expected=None, owner_approved=False,
+         host_probes=False, yes_host_probes=False):
     """Land lane/<lane> on the repo's main branch. Returns (exit code, result): 0 landed, 1 red or conflict (main
     reset to where it was), 2 refused before anything changed."""
     result = {"ok": False, "repo": name, "lane": lane, "branch": "lane/%s" % lane}
@@ -765,6 +789,10 @@ def land(name, lane, message=None, *, allow_agent_config=False):
         check_lane(cfg, lane)
     except LaneError as error:
         return refused(str(error))
+    if yes_host_probes and not host_probes:
+        return refused("--yes-host-probes requires --host-probes")
+    if host_probes and cfg["land_check"] != "sandbox":
+        return refused("--host-probes requires sandboxed land")
     main = cfg["path"]
     result["main"] = str(main)
     try:
@@ -775,6 +803,7 @@ def land(name, lane, message=None, *, allow_agent_config=False):
     # A kernel lock on a file that is never removed: it dies with its process, so a killed
     # land leaves no stale lock, and no second land can lock a fresh inode after an unlink.
     fd = None
+    entered_land = False
     try:
         lock_path = git_common_dir(main) / "cs-land.lock"
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -790,7 +819,9 @@ def land(name, lane, message=None, *, allow_agent_config=False):
                 os.lseek(fd, 0, os.SEEK_SET)
                 os.write(fd, ("%d\n" % os.getpid()).encode())
                 try:
-                    return _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock)
+                    entered_land = True
+                    return _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock, state,
+                                 expected, owner_approved, host_probes, yes_host_probes)
                 finally:
                     os.ftruncate(fd, 0)
         except LaneBusy as error:
@@ -798,7 +829,9 @@ def land(name, lane, message=None, *, allow_agent_config=False):
         except LaneError as error:
             return refused(str(error))
     except OSError as error:
-        return refused("cannot hold the landing lock in %s: %s" % (main, error), busy=True)
+        if not entered_land:
+            return refused("cannot hold the landing lock in %s: %s" % (main, error), busy=True)
+        return refused("landing in %s encountered an I/O error: %s" % (main, error))
     finally:
         _LAND_GIT.reset(token)
         if fd is not None:
@@ -864,15 +897,29 @@ def host_only_coverage(output):
     return sorted({line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)})
 
 
-def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
+def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock, state,
+          expected, owner_approved, host_probes, yes_host_probes):
     from _process_group import stop_group
 
     main, branch = cfg["path"], result["branch"]
+    sandboxed = cfg["land_check"] == "sandbox"
     if message is not None and red_marker(message):
         return refused("a landing message may not start with check-red: (landing refuses on red)")
     current = git(main, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
     if current != cfg["branch"]:
         return refused("%s is on %s, not %s" % (main, current or "a detached HEAD", cfg["branch"]))
+    if sandboxed:
+        from _land_check import clean_stale_land, land_scratch, validate_land_scratch
+
+        common = git_common_dir(main)
+        estate = Path.home() / ".contextstack"
+        scratch_root = land_scratch(state or estate / "state", common)
+        try:
+            validate_land_scratch(scratch_root, main, common, (estate / "current/bin/cs-sandbox").resolve())
+            clean_stale_land(main, common, scratch_root, git, out)
+        except (OSError, RuntimeError, LaneError) as error:
+            return refused("land-check cleanup failed: " + str(error), stage="sandbox-readiness",
+                           main_unchanged=True)
     _recover_leftover_squash(main, dead_lock)
     dirty = out(main, "status", "--porcelain")
     if dirty:
@@ -881,6 +928,10 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
         return refused("main has a merge in progress")
     if git(main, "rev-parse", "-q", "--verify", "refs/heads/" + branch).returncode != 0:
         return refused("no branch %s" % branch)
+    lane_tip = out(main, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}")
+    before = out(main, "rev-parse", "HEAD")
+    if expected and expected != (lane_tip, before):
+        return refused("the approved lane commit or main base changed")
     path = lane_path(cfg, lane)
     registered = str(path.resolve()) in worktrees(main)
     if registered and path.is_dir():
@@ -889,24 +940,35 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
         if untracked:
             return refused("the lane has untracked files; commit, ignore or remove them before landing",
                            paths=untracked[:100])
-        lane_commit = commit_tracked_lane_changes(path, "land %s: tracked changes before landing" % branch, main=main,
-                                                  lane=lane)
-        if lane_commit:
-            result["lane_commit"] = lane_commit
+        if expected and lane_out(main, lane, path, "status", "--porcelain", "--untracked-files=no"):
+            return refused("the approved lane has uncommitted tracked changes")
+        if not expected:
+            lane_commit = commit_tracked_lane_changes(path, "land %s: tracked changes before landing" % branch,
+                                                      main=main, lane=lane)
+            if lane_commit:
+                result["lane_commit"] = lane_commit
     # Preserve tracked work on the lane before enforcing the owner-only landing policy.
     if not allow_agent_config:
-        refuse_agent_configs(main, lane_changed_names(out, main, branch),
-                             out, LaneError, repos_file(), branch=branch,
+        policy_tip = lane_tip if expected else branch
+        refuse_agent_configs(main, lane_changed_names(out, main, policy_tip),
+                             out, LaneError, repos_file(), branch=policy_tip,
                              hooks_paths=(_LAND_GIT.get().original_hooks,))
     assert_lane_refs(main, lane, expected_lane_gitdir(main, lane))
     lane_tip = out(main, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}")
     before = out(main, "rev-parse", "HEAD")
+    if expected and expected != (lane_tip, before):
+        return refused("the approved lane commit or main base changed")
     result["before"] = before
     subjects = out(main, "log", "--reverse", "--format=%s", "%s..%s" % (before, lane_tip)).splitlines()
     if not subjects:
         return refused("nothing to land: %s has no commits that %s lacks" % (branch, cfg["branch"]))
 
+    if expected and not owner_approved and any(
+            p.casefold().split("/", 1)[0] == "tracing" for p in lane_changed_names(out, main, lane_tip)):
+        return refused("tracing/ changes require an owner decision")
+
     introduced = []  # paths the merge added; restore removes these and nothing else untracked
+    existing_dirs = set()
 
     def restore():
         if not introduced:
@@ -922,9 +984,11 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
             if rel not in tracked and (target.is_file() or target.is_symlink()):
                 target.unlink()
             parent = target.parent
-            while parent != main and parent.is_dir() and not any(parent.iterdir()):
+            while parent != main and parent not in existing_dirs and parent.is_dir() and not any(parent.iterdir()):
                 parent.rmdir()
                 parent = parent.parent
+        for directory in existing_dirs:
+            directory.mkdir(parents=True, exist_ok=True)
         result["main_unchanged"] = out(main, "rev-parse", "HEAD") == before and not out(main, "status", "--porcelain",
                                                                                          "--untracked-files=no")
 
@@ -932,7 +996,13 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
     committed = False
     interrupted = False
     gate_proc = None
+    managed_gate = False
     old_handlers = {}
+    sandbox_deadline = None
+    memory_cap_mb = None
+    main_updated = False
+    receipt = None
+    land_worktree = ExitStack()
 
     class GateInterrupted(Exception):
         pass
@@ -941,47 +1011,167 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
         nonlocal interrupted
         if not interrupted:
             interrupted = True
+            if managed_gate:
+                raise KeyboardInterrupt
             if gate_proc is not None:
                 raise GateInterrupted
+
+    def run_gate(argv, cwd, env):
+        nonlocal gate_proc, managed_gate
+        if interrupted:
+            raise GateInterrupted
+        if sandboxed:
+            from _muse import Cancelled, run_process
+
+            remaining = sandbox_deadline - time.monotonic()
+            if remaining <= 0:
+                return 124, "FAIL: sandboxed land check exceeded its total time limit"
+            managed_gate = True
+            try:
+                done = run_process(argv, str(cwd), env, remaining, memory_cap_mb=memory_cap_mb)
+            except (Cancelled, KeyboardInterrupt):
+                raise GateInterrupted from None
+            except subprocess.TimeoutExpired as error:
+                return 124, ((error.stdout or "") + (error.stderr or "")
+                             + "\nFAIL: sandboxed land check exceeded its total time limit")
+            finally:
+                managed_gate = False
+            output = done.stdout + done.stderr
+            if getattr(done, "forced_stop", None) == "memory_cap":
+                return 1, output + "\nFAIL: land check exceeded its job memory cap\n"
+            return done.returncode, output
+        gate_proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, env=env, stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            if interrupted:
+                raise GateInterrupted
+            output, _ = gate_proc.communicate(timeout=int(cfg["gate_timeout_s"]))
+            rc = gate_proc.returncode
+        except subprocess.TimeoutExpired:
+            stop_group(gate_proc)
+            output, _ = gate_proc.communicate()
+            rc = 124
+        except GateInterrupted:
+            stop_group(gate_proc)
+            gate_proc.wait()
+            gate_proc.stdout.close()
+            gate_proc = None
+            raise
+        gate_proc = None
+        return rc, output or ""
 
     try:
         for sig in (signal.SIGTERM, signal.SIGINT):
             old_handlers[sig] = signal.signal(sig, _on_land_signal)
-        done = git(main, *merge, lane_tip)
-        if done.returncode != 0:
-            conflicts = git(main, "diff", "--name-only", "--diff-filter=U").stdout.split()
-            restore()
-            result.update(status="conflict", files=conflicts, reason="the lane does not merge cleanly",
-                          output_tail=(done.stdout + done.stderr)[-TAIL:])
-            return 1, result
-        files = out(main, "diff", "--cached", "--name-only", before).splitlines()
+        if sandboxed:
+            done = git(main, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", before, lane_tip)
+            tree, *conflicts = done.stdout.rstrip("\0").split("\0")
+            if done.returncode == 1:
+                result.update(status="conflict", files=conflicts, reason="the lane does not merge cleanly",
+                              main_unchanged=True, output_tail=done.stderr[-TAIL:])
+                return 1, result
+            if done.returncode:
+                return refused("git merge-tree: " + done.stderr.strip())
+            files = out(main, "diff", "--no-renames", "--name-only", "-z", before, tree).split("\0")
+            files = list(filter(None, files))
+        else:
+            changed = out(main, "diff", "--name-only", "-z", before + "..." + lane_tip)
+            for relative in filter(None, changed.split("\0")):
+                directory = main
+                for part in Path(relative).parts[:-1]:
+                    directory /= part
+                    if directory.is_symlink() or not directory.is_dir():
+                        break
+                    existing_dirs.add(directory)
+            main_updated = True
+            done = git(main, *merge, "--no-overwrite-ignore", lane_tip)
+            if done.returncode != 0:
+                conflicts = git(main, "diff", "--name-only", "--diff-filter=U").stdout.split()
+                restore()
+                result.update(status="conflict", files=conflicts, reason="the lane does not merge cleanly",
+                              output_tail=(done.stdout + done.stderr)[-TAIL:])
+                return 1, result
+            files = out(main, "diff", "--cached", "--name-only", before).splitlines()
         result["files"] = files
         if not files:
-            restore()
             return refused("nothing to land: main already has the lane's changes")
 
         if interrupted:
             return refused("land interrupted")
         hooks_cover = bool(cfg["hooks_path"]) and any(f.startswith(tuple(cfg["hook_gated"])) for f in files)
         result["gate"] = {"hooks": cfg["hooks_path"] or "repo default", "command": None}
-        if cfg["gate"] and not hooks_cover:
+        if sandboxed:
+            from _job_memory import job_memory_cap_bytes
+            from _land_check import KILL_SWITCH, sandbox_gate, sandbox_readiness, uncovered, verify_worktree
+            from _land_host_probes import config_path, confirm, load_policy, policy_repair, report, run_probes, touched_paths
+
+            dispatcher = _LAND_GIT.get().hooks == str(main / "scripts/git-hooks")
+            cs_changed = any(f.startswith("cs/") for f in files)
+            command = cfg["gate"] or ("cs/scripts/check" if hooks_cover or (dispatcher and cs_changed) else "true")
+            if dispatcher and any(f == "clients/web/package.json" or f.startswith("clients/web/resources/js/")
+                                  for f in files):
+                command = "(\n%s\n) && (cd clients/web && node --test 'resources/js/**/*.test.js')" % command
+            result["gate"].update(mode="sandbox", command=command, prefetch=[])
+            gate = result["gate"]
+            kill_switch = KILL_SWITCH % repos_file()
+            try:
+                try:
+                    probes, triggers = load_policy(config_path(estate), main, path)
+                except ValueError as error:
+                    return refused("%s. %s." % (error, policy_repair()),
+                                   stage="host-probes", main_unchanged=True)
+                report(gate, probes)
+                touched = touched_paths(files, triggers)
+                if touched and not host_probes:
+                    return refused("needs owner host probes: use cs land --host-probes",
+                                   stage="host-probes", trigger_paths=touched, main_unchanged=True)
+                # Only the shipped dispatcher understands the receipt and skips its host gate.
+                hooks = _LAND_GIT.get().hooks
+                if hooks and not dispatcher and os.access(Path(hooks) / "pre-commit", os.X_OK):
+                    return refused("sandboxed land cannot run this pre-commit hook on the host. Configure the "
+                                   "check as the repo's gate in %s and remove the hook from its landing configuration"
+                                   % repos_file(),
+                                   stage="sandbox-readiness", main_unchanged=True)
+                if host_probes:
+                    confirm(yes_host_probes)
+                ready, detail = sandbox_readiness(estate)
+                if not ready:
+                    return refused("sandboxed land check is not ready: %s. Repair the installed backend or rerun "
+                                   "cs init. Owner-only fallback: %s."
+                                   % (detail, kill_switch),
+                                   stage="sandbox-readiness", main_unchanged=True)
+                cap = job_memory_cap_bytes()
+                memory_cap_mb = cap // (1024 * 1024) if cap else None
+                sandbox_deadline = time.monotonic() + int(cfg["gate_timeout_s"])
+                worktree, argv, env, host_only, pointer = land_worktree.enter_context(
+                    sandbox_gate(main, common, before, tree, scratch_root, estate, git, out,
+                                 run_gate, result["gate"]["prefetch"]))
+                expected_probes = set(probes) | host_only
+                report(gate, expected_probes)
+                gate_rc, gate_out = run_gate([*argv, command], worktree, env)
+                report(gate, uncovered(expected_probes, gate_out))
+                verify_worktree(main, worktree, tree, pointer, git, out)
+                if not gate_rc and host_probes:
+                    failures = run_probes(main, before, tree, scratch_root, probes, run_gate, gate, git, out)
+                    if failures:
+                        result.update(status="red", stage="host-probes", failed=failed_lines("\n".join(failures)),
+                                      output_tail="\n".join(failures)[-TAIL:], main_unchanged=True)
+                        return 1, result
+                    if gate["uncovered"]:
+                        return refused("needs owner host probes: some probes remain uncovered",
+                                       stage="host-probes", main_unchanged=True)
+            except GateInterrupted:
+                return refused("land interrupted", main_unchanged=True)
+            except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
+                return refused(str(error), main_unchanged=True)
+            if gate_rc:
+                result.update(status="red", stage="gate", failed=failed_lines(gate_out),
+                              output_tail=gate_out[-TAIL:], main_unchanged=True)
+                return 1, result
+        elif cfg["gate"] and not hooks_cover:
             result["gate"]["command"] = cfg["gate"]
             try:
-                gate_proc = subprocess.Popen(["/bin/sh", "-c", cfg["gate"]], cwd=str(main), stdout=subprocess.PIPE,
-                                             stderr=subprocess.STDOUT, text=True,
-                                             env=_LAND_GIT.get().environment(), stdin=subprocess.DEVNULL, start_new_session=True)
-                try:
-                    if interrupted:
-                        raise GateInterrupted
-                    gate_out, _ = gate_proc.communicate(timeout=int(cfg["gate_timeout_s"]))
-                except subprocess.TimeoutExpired:
-                    stop_group(gate_proc)
-                    gate_out, _ = gate_proc.communicate()
-                    gate_rc = 124
-                else:
-                    gate_rc = gate_proc.returncode
-                gate_proc = None
-                gate_out = gate_out or ""
+                gate_rc, gate_out = run_gate(["/bin/sh", "-c", cfg["gate"]], main, _LAND_GIT.get().environment())
             except GateInterrupted:
                 return refused("land interrupted")
             except OSError as error:
@@ -991,7 +1181,7 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
                 result.update(status="red", stage="gate", failed=failed_lines(gate_out), output_tail=gate_out[-TAIL:])
                 return 1, result
 
-        if not hooks_cover and cfg["gate"]:
+        if not sandboxed and not hooks_cover and cfg["gate"]:
             result["gate"]["host_only_covered"] = host_only_coverage(gate_out)
 
         if message is None:
@@ -1000,19 +1190,46 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
             else:
                 message = "Land %s\n\n%s\n" % (branch, "\n".join("- " + s for s in subjects))
             if red_marker(message):
-                restore()
                 return refused("the lane's commit message starts with check-red:; land it with -m")
         if interrupted:  # a signal after the gate (gate_proc gone, so the handler only set the flag)
             return refused("land interrupted")
-        commit = _LAND_GIT.get().run(main, "commit", "-q", "-F", "-", input=message,
-                                    env={"CS_LAND_COMMIT": "1"})
+        commit_env = {"CS_LAND_COMMIT": "1", "CS_LAND_CHECK_RECEIPT": ""}
+        if sandboxed:
+            head = out(main, "rev-parse", "HEAD")
+            checkout_branch = git(main, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
+            merging = git(main, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
+            dirty = out(main, "status", "--porcelain")
+            if head != before or checkout_branch != cfg["branch"] or merging or dirty:
+                return refused("main changed while the land check ran; rerun after restoring a clean landing branch",
+                               actual_head=head, actual_branch=checkout_branch, merge_in_progress=merging,
+                               dirty_paths=dirty.splitlines()[:10])
+            nonce = secrets.token_hex(16)
+            receipt = common / ("cs-land-check-" + nonce)
+            with receipt.open("x", encoding="ascii") as handle:
+                handle.write(tree + "\n")
+            commit_env["CS_LAND_CHECK_RECEIPT"] = nonce
+            out(main, "read-tree", "-m", "-u", before, tree)
+            main_updated = True
+            if out(main, "write-tree") != tree:
+                return refused("main index differs from the checked merge tree")
+            if cfg["land"] == "merge":
+                for name, content in (("MERGE_HEAD", lane_tip + "\n"), ("MERGE_MODE", "no-ff")):
+                    file = out(main, "rev-parse", "--path-format=absolute", "--git-path", name)
+                    Path(file).write_text(content)
+        if sandboxed:
+            result["gate"]["commit_hooks_skipped"] = "sandboxed gate checked the exact index tree; commit hooks can invoke candidate code"
+        commit = _LAND_GIT.get().run(main, "commit", "-q", "-F", "-", input=message, env=commit_env,
+                                    sandbox_commit=sandboxed)
         after = out(main, "rev-parse", "HEAD")
-        if commit.returncode != 0 or after == before:
+        wrong_tree = sandboxed and out(main, "rev-parse", "HEAD^{tree}") != tree
+        if commit.returncode != 0 or after == before or wrong_tree:
             text = commit.stdout + commit.stderr
+            if wrong_tree and after != before:
+                text += "\nFAIL: committed tree differs from the checked merge tree"
             restore()
             result.update(status="red", stage="commit", failed=failed_lines(text), output_tail=text[-TAIL:])
             return 1, result
-        if hooks_cover:
+        if hooks_cover and not sandboxed:
             result["gate"]["host_only_covered"] = host_only_coverage(commit.stdout + commit.stderr)
         committed = True
     finally:
@@ -1024,8 +1241,18 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
                 gate_proc.wait()
                 gate_proc.stdout.close()
         finally:
-            if not committed:
-                restore()
+            try:
+                if not committed and main_updated:
+                    restore()
+            finally:
+                try:
+                    if receipt is not None:
+                        receipt.unlink(missing_ok=True)
+                finally:
+                    try:
+                        land_worktree.close()
+                    except (OSError, RuntimeError) as error:
+                        result["land_check_cleanup"] = str(error)
 
     result.update(ok=True, status="landed", commit=after, removed={"worktree": None, "branch": None})
     if registered:
@@ -1035,6 +1262,6 @@ def _land(cfg, lane, message, result, refused, allow_agent_config, dead_lock):
         else:
             result["cleanup"] = "worktree not removed: " + (removal.stderr or removal.stdout).strip()
     if not result.get("cleanup"):
-        if git(main, "branch", "-D", branch).returncode == 0:
+        if git(main, "update-ref", "-d", "refs/heads/" + branch, lane_tip).returncode == 0:
             result["removed"]["branch"] = branch
     return 0, result

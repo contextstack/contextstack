@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+from functools import cache
 from pathlib import Path
 
 from _atomic_write import write_atomic
@@ -44,7 +45,8 @@ def release_bin(current, new):
     return path
 
 
-SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+LINUX_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SYSTEM_PATH = "/opt/homebrew/bin:" + LINUX_SYSTEM_PATH
 MODELS = ROOT / "gateway/models.json"
 ROOTS_ENV = {"LANG": "en_US.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "CS_CONFIG_ROOT": str(CONFIG),
              "CS_STATE_ROOT": str(ROOT / "state"), "CS_WORKSPACES_ROOT": str(ROOT / "workspaces")}
@@ -54,9 +56,7 @@ _SAFE = re.compile(r"^[A-Za-z0-9_./:@+=-]+$")
 # WorkingDirectory=, User= and Standard{Output,Error}= paths are not unquoted by their parsers.
 # A space, quote or backslash would be a literal path character or a line continuation.
 _SCALAR = re.compile(r"^[A-Za-z0-9_./:@+=$%~-]+$")
-_SYSTEM_SYSTEMCTL = ("/usr/bin/systemctl", "/bin/systemctl", "/usr/sbin/systemctl", "/sbin/systemctl")
-LINGER_NOTE = ("systemd user units stop at logout unless linger is on: loginctl enable-linger "
-               "(the installer does not run it)")
+_SYSTEM_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 
 class Refused(Exception):
@@ -82,22 +82,35 @@ def host_platform():
     return {"darwin": "macos", "linux": "linux"}.get(sys.platform, sys.platform)
 
 
-def agents_dir():
-    if host_platform() == "linux":
-        return HOME / ".config/systemd/user"
-    return HOME / "Library/LaunchAgents"
-
-
-def agent_suffix():
-    return ".service" if host_platform() == "linux" else ".plist"
-
-
 def agent_path(label):
-    return agents_dir() / (label + agent_suffix())
+    return service_backend().path(label)
 
 
 def unit_name(label):
     return label + ".service"
+
+
+@cache
+def linux_login_path():
+    inherited = os.environ.get("PATH", os.defpath)
+    shell = os.environ.get("SHELL")
+    for candidate in dict.fromkeys(filter(None, (shell, "/bin/sh"))):
+        try:
+            result = subprocess.run([candidate, "-lc", 'printf "\\n%s\\n" "$PATH"'],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    errors="replace", timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().splitlines()[-1]
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return inherited
+
+
+def linux_user_path():
+    paths = [str(HOME / ".local/bin"), str(HOME / ".cargo/bin"),
+             *linux_login_path().split(":"), *os.environ.get("PATH", "").split(":"),
+             *LINUX_SYSTEM_PATH.split(":")]
+    return ":".join(dict.fromkeys(path for path in paths if path.startswith("/")))
 
 
 def gateway_service(rec, code):
@@ -106,6 +119,8 @@ def gateway_service(rec, code):
            "CSAGENT_MODELS_CONFIG": str(MODELS), "CSGATEWAY_PROVIDERS_DIR": str(CONFIG / "gateway/providers.d"),
            "PATH": "%s:%s:%s" % (CURRENT / code / ".venv/bin", HOME / ".local/bin", SYSTEM_PATH),
            **ROOTS_ENV}
+    if host_platform() == "linux":
+        env["PATH"] = "%s:%s" % (CURRENT / code / ".venv/bin", linux_user_path())
     env["CSGATEWAY_CREDENTIALS"] = CREDENTIALS[rec["credentials"]]
     return Service(GATEWAY_LABEL, [str(binary)], env, str(ROOT / "gateway"), "csgateway",
                    KeepAlive=True, RunAtLoad=True)
@@ -118,6 +133,8 @@ def node_args_env(rec, code, op):
     env = {"PATH": "%s:%s" % (venv, SYSTEM_PATH), **ROOTS_ENV,
            "CS_RUNNER_BIN": str(runner),
            "CSGATEWAY_ENDPOINT": "http://127.0.0.1:9200/v1/agent/model.call"}
+    if host_platform() == "linux":
+        env["PATH"] = "%s:%s" % (venv, linux_user_path())
     args = [str(venv / "python3"), str(CURRENT / code / "ops/bin" / op)]
     return args, env
 
@@ -138,7 +155,7 @@ def director_rs_service(rec):
     for addr in rec["director_rs_listen"]:
         args += ["--listen", addr]
     args += ["--gateway-owner-token", str(CONFIG / "gateway/owner-token")]
-    env = {"PATH": SYSTEM_PATH, "LANG": "en_US.UTF-8"}
+    env = {"PATH": LINUX_SYSTEM_PATH if host_platform() == "linux" else SYSTEM_PATH, "LANG": "en_US.UTF-8"}
     return Service(DIRECTOR_RS_LABEL, args, env, str(DIRECTOR_RS_DATA), "director-rs", KeepAlive=True, RunAtLoad=True)
 
 
@@ -147,7 +164,8 @@ def client_web_service(rec):
     php = rec["client_web_php"]
     args = [php, "-S", rec["serve_client_web"], "-t", str(app / "public"),
             str(app / "vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php")]
-    env = {"PATH": "%s:%s" % (os.path.dirname(php), SYSTEM_PATH), "LANG": "en_US.UTF-8",
+    system_path = LINUX_SYSTEM_PATH if host_platform() == "linux" else SYSTEM_PATH
+    env = {"PATH": "%s:%s" % (os.path.dirname(php), system_path), "LANG": "en_US.UTF-8",
            "PHP_CLI_SERVER_WORKERS": CLIENT_WEB_WORKERS, "DIRECTOR_ENV_FILE": str(CLIENT_WEB_ENV)}
     return Service(CLIENT_WEB_LABEL, args, env, str(app / "public"), "client-web", KeepAlive=True, RunAtLoad=True)
 
@@ -189,7 +207,7 @@ def systemd_quote(value, field="unit value"):
 
 
 def systemd_scalar(value, field):
-    """A setting whose parser does not unquote (WorkingDirectory=, User=, append: paths).
+    """A setting whose parser does not unquote (WorkingDirectory=, User=).
 
     Specifiers still apply, so a literal `%` is written `%%`. Anything the line reader or the
     setting would treat specially is refused, not written raw.
@@ -204,8 +222,6 @@ def systemd_scalar(value, field):
         raise Refused("systemd WorkingDirectory must be an absolute path, not %r" % raw)
     if field == "User" and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9._%-]*|[0-9]+", raw):
         raise Refused("systemd User must be a user name, not %r" % raw)
-    if field in ("StandardOutput", "StandardError") and not raw.startswith("/"):
-        raise Refused("systemd %s path must be absolute, not %r" % (field, raw))
     return raw.replace("%", "%%")
 
 
@@ -232,10 +248,7 @@ def render_unit(svc):
     args = [":" + str(svc.args[0]), *svc.args[1:]]
     lines.append("ExecStart=" + " ".join(systemd_quote(a, "ExecStart") for a in args))
     lines.append("Type=oneshot" if svc.label == BACKUP_LABEL else "Restart=on-failure")
-    lines.append("StandardOutput=append:%s" % systemd_scalar(
-        ROOT / "logs" / (svc.logs + ".out.log"), "StandardOutput"))
-    lines.append("StandardError=append:%s" % systemd_scalar(
-        ROOT / "logs" / (svc.logs + ".err.log"), "StandardError"))
+    lines.extend(("StandardOutput=journal", "StandardError=journal"))
     if svc.label != BACKUP_LABEL:
         lines.extend(("", "[Install]", "WantedBy=default.target"))
     lines.append("")
@@ -243,7 +256,7 @@ def render_unit(svc):
 
 
 def render_agent(svc):
-    return render_unit(svc) if host_platform() == "linux" else render_plist(svc)
+    return service_backend().render(svc)
 
 
 def our_agent(path):
@@ -288,97 +301,279 @@ def _fake_home():
     return os.path.realpath(str(HOME)) != _account_home()
 
 
-def launchctl(*args):
+def launchctl(*args, timeout=None):
     """launchctl from PATH. The system one only for this account's own HOME: plists under a fake HOME (a test, a
     dry run) must never reach the real gui domain, where they would bootstrap or restart real jobs."""
     found = shutil.which("launchctl") or "launchctl"
     if os.path.realpath(found) == "/bin/launchctl" and _fake_home():
         raise Refused("HOME %s is not this account's home: refusing the real launchctl (pass --no-load, or put a "
                       "launchctl shim first on PATH)" % HOME)
-    return subprocess.run([found, *args], capture_output=True, text=True)
+    if timeout is None:
+        return subprocess.run([found, *args], capture_output=True, text=True)
+    try:
+        return subprocess.run([found, *args], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(args, 127, "", str(error))
+
+
+def system_tool(name):
+    found = shutil.which(name)
+    if found and os.path.dirname(os.path.realpath(found)) in _SYSTEM_DIRS and _fake_home():
+        raise Refused("HOME %s is not this account's home: refusing the real %s (pass --no-load, or put a "
+                      "%s shim first on PATH)" % (HOME, name, name))
+    return found
 
 
 def systemctl(*args):
     """systemctl --user from PATH. The system one only for this account's own HOME (a fake HOME's units must
     never reach the real user instance). Always passes --user; never embeds secrets on the command line."""
-    found = shutil.which("systemctl")
+    found = system_tool("systemctl")
     if not found:
         raise Refused("systemctl --user is not available on this host (Linux installs systemd user units; pass "
                       "--no-load to write them without loading)")
-    if os.path.realpath(found) in _SYSTEM_SYSTEMCTL and _fake_home():
-        raise Refused("HOME %s is not this account's home: refusing the real systemctl (pass --no-load, or put a "
-                      "systemctl shim first on PATH)" % HOME)
-    return subprocess.run([found, "--user", *args], capture_output=True, text=True)
+    try:
+        return subprocess.run([found, "--user", *args], capture_output=True, text=True, timeout=90,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(args, 127, "", str(error))
 
 
-def need_systemctl():
-    """Refuse before load when systemctl --user cannot be used. Does not run loginctl."""
-    found = shutil.which("systemctl")
-    if not found:
-        raise Refused("systemctl --user is not available on this host (Linux installs systemd user units; pass "
-                      "--no-load to write them without loading)")
-    if os.path.realpath(found) in _SYSTEM_SYSTEMCTL and _fake_home():
-        raise Refused("HOME %s is not this account's home: refusing the real systemctl (pass --no-load, or put a "
-                      "systemctl shim first on PATH)" % HOME)
+class LaunchdBackend:
+    missing = "no plist"
+
+    def check(self):
+        pass
+
+    def linger_warning(self):
+        return None
+
+    def reload(self):
+        pass
+
+    def path(self, label):
+        return HOME / "Library/LaunchAgents" / (label + ".plist")
+
+    def render(self, service):
+        return render_plist(service)
+
+    def read(self, path):
+        try:
+            return plistlib.loads(path.read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return None
+
+    def load(self, label, path, changed, restart):
+        domain = "gui/%d" % os.getuid()
+        loaded = launchctl("print", "%s/%s" % (domain, label)).returncode == 0
+        if changed or not loaded:
+            if loaded:
+                self.unload(label)
+            for _ in range(10):
+                r = launchctl("bootstrap", domain, str(path))
+                if r.returncode == 0:
+                    return "bootstrapped"
+                time.sleep(1)
+            raise Refused("launchctl bootstrap %s failed: %s (the files are written; rerun to load)"
+                          % (path, (r.stderr or r.stdout).strip()))
+        if restart:
+            self.restart(label)
+            return "restarted"
+        return "loaded"
+
+    def unload(self, label, *, require_stopped=False):
+        target = "gui/%d/%s" % (os.getuid(), label)
+        launchctl("bootout", target)
+        for _ in range(20):
+            if launchctl("print", target).returncode != 0:
+                return
+            time.sleep(0.5)
+        if require_stopped:
+            raise Refused(f"could not stop {label}")
+
+    def restart(self, label):
+        launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), label))
+
+    def control(self, action, label, path):
+        if action == "stop":
+            self.unload(label)
+            return "booted out"
+        launchctl("enable", "gui/%d/%s" % (os.getuid(), label), timeout=10)
+        return self.load(label, path, False, action == "restart")
+
+    def status(self, label, view, data, problems):
+        r = launchctl("print", "gui/%d/%s" % (os.getuid(), label), timeout=10)
+        if r.returncode == 0:
+            view["loaded"] = True
+            for line in r.stdout.splitlines():
+                if line.startswith("\t") and not line.startswith("\t\t"):
+                    key, sep, value = line.strip().partition(" = ")
+                    if sep and key in ("state", "pid", "last exit code"):
+                        view[{"last exit code": "last_exit"}.get(key, key)] = value.strip()
+        view["pid"] = int(view["pid"]) if str(view["pid"] or "").isdigit() else None
+        if label == NODE_LABEL:  # a 60 s tick can be healthy while it waits
+            view["up"] = view["loaded"] and str(view["last_exit"] or "0").split(":")[0] in ("0", "(never exited)")
+        else:
+            view["up"] = view["state"] == "running"
+        if not view["loaded"]:
+            view["reason"] = "not loaded"
+        elif not view["up"]:
+            view["reason"] = "%s, last exit %s" % (view["state"] or "not running", view["last_exit"] or "?")
+        view["reason"] = "; ".join(x for x in [view["reason"]] + problems(data) if x)
+        return view
+
+    def logs(self, labels, n, follow, file_logs):
+        return file_logs()
+
+
+class SystemdBackend:
+    missing = "no unit"
+
+    def path(self, label):
+        return HOME / ".config/systemd/user" / unit_name(label)
+
+    def render(self, service):
+        return render_unit(service)
+
+    def read(self, path):
+        """Read the metadata from a ContextStack-generated unit."""
+        try:
+            lines = path.read_text(encoding="utf-8").split("\n")
+        except (OSError, UnicodeError):
+            return None
+        data = {"EnvironmentVariables": {}}
+        for line in lines:
+            key, _, value = line.partition("=")
+            if key == "WorkingDirectory":
+                data[key] = value.replace("%%", "%")
+            elif key in ("Environment", "ExecStart"):
+                # Invert systemd_quote's word format, including literal specifiers.
+                words = re.findall(r'"(?:[^"\\]|\\.)*"|[^\s"]+', value)
+                words = [re.sub(r'\\(.)', lambda m: "\t" if m[1] == "t" else m[1], word[1:-1])
+                         .replace("%%", "%") if word.startswith('"') else word for word in words]
+                if key == "ExecStart" and words:
+                    words[0] = words[0].removeprefix(":")
+                    data["ProgramArguments"] = words
+                elif key == "Environment":
+                    data["EnvironmentVariables"].update(word.split("=", 1) for word in words if "=" in word)
+        return data
+
+    def check(self):
+        r = systemctl("show", "--property=Version", "--value")
+        if r.returncode:
+            raise Refused("systemd user manager is unreachable (systemctl --user): %s. "
+                          "Run from a login session with a running systemd user manager, or run loginctl enable-linger."
+                          % (r.stderr or r.stdout).strip())
+
+    def linger_warning(self):
+        try:
+            found = system_tool("loginctl")
+            if not found:
+                return None
+            r = subprocess.run([found, "show-user", str(os.getuid()), "--property=Linger", "--value"],
+                               capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        except (Refused, OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode == 0 and r.stdout.strip() in ("no", "Linger=no"):
+            return ("systemd user lingering is off. User services stop at logout. "
+                    "To keep them running, the account owner can run: loginctl enable-linger")
+
+    def reload(self):
+        self.command("daemon-reload")
+
+    def command(self, *args):
+        r = systemctl(*args)
+        if r.returncode:
+            raise Refused("systemctl --user %s failed: %s" % (" ".join(args), (r.stderr or r.stdout).strip()))
+        return r
+
+    def load(self, label, path, changed, restart):
+        unit = label + ".timer" if label == BACKUP_LABEL else unit_name(label)
+        if changed and not restart:
+            self.command("try-restart", unit)
+        self.command("enable", "--now", unit)
+        if restart:
+            self.restart(label)
+        return "restarted" if restart else "enabled"
+
+    def unload(self, label, *, require_stopped=False):
+        unit = label + ".timer" if label == BACKUP_LABEL else unit_name(label)
+        command = self.command if require_stopped else systemctl
+        command("disable", "--now", unit)
+        if label == BACKUP_LABEL:
+            command("stop", unit_name(label))
+
+    def restart(self, label):
+        self.command("restart", unit_name(label))
+
+    def control(self, action, label, path):
+        self.command(action, unit_name(label))
+        return {"start": "started", "stop": "stopped", "restart": "restarted"}[action]
+
+    def status(self, label, view, data, problems):
+        r = systemctl("show", "--property=LoadState,ActiveState,MainPID,ExecMainStatus",
+                      unit_name(label))
+        fields = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        load, active = fields.get("LoadState"), fields.get("ActiveState")
+        view["loaded"] = load == "loaded"
+        view["state"] = active
+        pid = fields.get("MainPID", "")
+        view["pid"] = int(pid) if pid.isdigit() and int(pid) > 0 else None
+        view["last_exit"] = fields.get("ExecMainStatus")
+        view["up"] = view["loaded"] and active == "active"
+        if r.returncode and not load:
+            view["reason"] = "systemctl --user show failed: %s" % (r.stderr or r.stdout).strip()
+        elif not view["loaded"]:
+            view["reason"] = load or "not loaded"
+        elif not view["up"]:
+            view["reason"] = "%s, last exit %s" % (active or "not running", view["last_exit"] or "?")
+        return view
+
+    def logs(self, labels, n, follow, file_logs):
+        argv = self.journal_command(labels, n)
+        if follow:
+            argv.append("-f")
+        try:
+            with subprocess.Popen(argv, stdout=subprocess.PIPE, text=True, errors="replace",
+                                  stdin=subprocess.DEVNULL) as process:
+                try:
+                    for line in process.stdout:
+                        print(line, end="", flush=follow)
+                    return process.wait()
+                except KeyboardInterrupt:
+                    process.terminate()
+                    return 0
+        except OSError as error:
+            raise Refused("journalctl --user: %s" % error) from error
+
+    def journal_command(self, labels, n):
+        found = system_tool("journalctl")
+        if not found:
+            raise Refused("journalctl --user is not available on this host")
+        argv = [found, "--user"]
+        for label in labels:
+            argv += ["-u", unit_name(label)]
+        return argv + ["--no-pager", "-n", str(n)]
+
+
+def service_backend(platform=None):
+    return SystemdBackend() if (platform or host_platform()) == "linux" else LaunchdBackend()
 
 
 def load_agent(label, path, changed, restart):
-    if host_platform() == "linux":
-        unit = label + ".timer" if label == BACKUP_LABEL else unit_name(label)
-        r = systemctl("enable", "--now", unit)
-        if r.returncode != 0:
-            raise Refused("systemctl --user enable --now %s failed: %s (the files are written; rerun to load)"
-                          % (unit, (r.stderr or r.stdout).strip()))
-        if restart:
-            systemctl("restart", unit_name(label))
-            return "restarted"
-        return "enabled"
-    domain = "gui/%d" % os.getuid()
-    loaded = launchctl("print", "%s/%s" % (domain, label)).returncode == 0
-    if changed or not loaded:
-        if loaded:
-            unload_agent(label)
-        for _ in range(10):
-            r = launchctl("bootstrap", domain, str(path))
-            if r.returncode == 0:
-                return "bootstrapped"
-            time.sleep(1)
-        raise Refused("launchctl bootstrap %s failed: %s (the files are written; rerun to load)"
-                      % (path, (r.stderr or r.stdout).strip()))
-    if restart:
-        launchctl("kickstart", "-k", "%s/%s" % (domain, label))
-        return "restarted"
-    return "loaded"
+    return service_backend().load(label, path, changed, restart)
 
 
 def unload_agent(label, *, require_stopped=False):
-    if host_platform() == "linux":
-        unit = label + ".timer" if label == BACKUP_LABEL else unit_name(label)
-        stopped = systemctl("disable", "--now", unit)
-        if require_stopped and stopped.returncode != 0:
-            raise Refused(f"could not stop {label}: {(stopped.stderr or stopped.stdout).strip()}")
-        if label == BACKUP_LABEL:
-            systemctl("stop", unit_name(label))
-        return
-    target = "gui/%d/%s" % (os.getuid(), label)
-    launchctl("bootout", target)
-    for _ in range(20):
-        if launchctl("print", target).returncode != 0:
-            return
-        time.sleep(0.5)
-    if require_stopped:
-        raise Refused(f"could not stop {label}")
+    return service_backend().unload(label, require_stopped=require_stopped)
 
 
 def reload_units():
-    """systemctl --user daemon-reload after writing or removing units."""
-    r = systemctl("daemon-reload")
-    if r.returncode != 0:
-        raise Refused("systemctl --user daemon-reload failed: %s" % (r.stderr or r.stdout).strip())
+    service_backend().reload()
 
 
 def backup_timer_path():
-    return agents_dir() / (BACKUP_LABEL + ".timer")
+    return SystemdBackend().path(BACKUP_LABEL).with_suffix(".timer")
 
 
 def backup_timer():
@@ -393,8 +588,12 @@ def install_backup_schedule(no_load):
     timer = backup_timer_path() if linux else None
     if timer and timer.exists() and timer.read_bytes() != backup_timer():
         raise Refused("refusing to replace an existing backup timer")
-    if linux and not no_load:
-        need_systemctl()
+    backend = service_backend()
+    if not no_load:
+        backend.check()
+        warning = backend.linger_warning()
+        if warning:
+            print(warning, file=sys.stderr)
     kit = CURRENT / "cs"
     svc = Service(BACKUP_LABEL, [str(kit / ".venv/bin/python3"), "-I", str(kit / "scripts/cs"), "backup", "run"],
                   {"PATH": SYSTEM_PATH, **ROOTS_ENV}, str(ROOT), "backup",
@@ -408,6 +607,5 @@ def install_backup_schedule(no_load):
     if timer and not timer.exists():
         write_atomic(timer, backup_timer(), mode=0o644)
     if not no_load:
-        if linux:
-            reload_units()
-        load_agent(BACKUP_LABEL, path, changed, False)
+        backend.reload()
+        backend.load(BACKUP_LABEL, path, changed, False)

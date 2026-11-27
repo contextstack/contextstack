@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from hermetic_env import hermetic_env
+from scratch import short_tmp
 
 HERE = Path(__file__).resolve().parent
 CODE_ROOT = HERE.parents[2]
@@ -181,8 +182,9 @@ def broker_contract(root, cfg, log):
     expect(not r.get("ok") and "left set public" in r.get("error", "") and "text" not in r,
            "open: a final URL off the set returns no text", r)
     r = ask(pub, {"verb": "open", "url": "https://example.com/popup"})
-    closed = [e["params"]["targetId"] for e in fake_log(log) if e.get("method") == "Target.closeTarget"]
-    expect(r.get("ok") and "POPUP" in closed, "open: a window the page opened is closed with the tab", closed)
+    methods = [e.get("method") for e in fake_log(log)]
+    expect(r.get("ok") and "Target.disposeBrowserContext" in methods[-4:],
+           "open: the isolated context and all its pages are discarded", methods[-5:])
     for payload, needle, what in ((b'{"verb": "evaluate", "expression": "document.cookie"}\n', "unknown verb", "a verb other than open"),
                                   (b"x" * 70000 + b"\n", "exceeds", "an oversized request"),
                                   (b"not json\n", "bad request", "a malformed request"),
@@ -274,6 +276,12 @@ def confinement(root, cfg, log):
         out = json.loads(r.stdout) if r.returncode == 0 else {}
         expect(out.get("ok") and out.get("renderer") == "chrome-cdp-broker" and (ws / out.get("body_path", "x")).is_file(),
                "wrapped browser_session reaches its set's socket and writes evidence", (r.stdout, r.stderr))
+        r = wrapped(policy, ws, [TOOL.with_name("browser_fetch")],
+                    '{"url":"https://example.com","archive":true,"links":true}')
+        out = json.loads(r.stdout) if r.returncode == 0 else {}
+        expect(out.get("ok") and out.get("link_count") == 1
+               and (ws / out.get("archive_path", "missing")).is_file(),
+               "wrapped browser_fetch renders and archives through the public broker", (r.stdout, r.stderr))
         # A set is a symlink browser_<set> -> browser_session with its own descriptor (the wrapper reads <name>.json).
         for sub_dir, socket_name in (("granted", "browser-other"), ("sneaky", "browser-public")):
             (ws / sub_dir).mkdir()
@@ -300,6 +308,14 @@ def confinement(root, cfg, log):
         expect(run("probe", "env") == '["CS_SOCKET_BROWSER_PUBLIC"]', "only the granted socket is named to the tool",
                run("probe", "env"))
         expect(run("probe", "granted") == "granted Example fixture page.", "the probe speaks to the granted socket")
+        private = root / "native-sockets"
+        private.mkdir()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as native_host:
+            native_path = private / "public.sock"
+            native_host.bind(str(native_path))
+            native_host.listen()
+            expect(run("probe", "unix", native_path).startswith("refused"),
+                   "the owner Chrome native host's live socket is unreachable even with browser-public")
         expect(run("probe", "unix", root / "sockets/other.sock").startswith("refused"),
                "another set's socket the host lists is unreachable")
         expect(run("probe", "unix", Path.home() / ".contextstack/gateway/csgateway.sock").startswith("refused"),
@@ -343,9 +359,10 @@ def main():
     hold = sys.argv[1:] == ["--hold"]
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, on_signal)
-    state = Path.home() / ".contextstack/tmp"
-    state.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="bbr-", dir=state, suffix=".noindex")).resolve()
+    home = Path(tempfile.mkdtemp(prefix="bbr-", dir=short_tmp(), suffix=".noindex")).resolve()
+    os.environ["HOME"] = str(home)
+    root = home / ".contextstack"
+    root.mkdir(mode=0o700)
     left = []
     try:
         cfg = root / "browser.json"
@@ -362,7 +379,7 @@ def main():
             confinement(broker, cfg, root / "chrome.log")
     finally:
         left = reap(root)
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
     if hold:
         return 0
     expect(not left, "no broker or Chrome outlives the run", left)

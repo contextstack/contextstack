@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import sys
+
+request = json.load(sys.stdin)
+assert request["verb"] == "open"
+text = "Rendered fact: fixture browser evidence.\n"
+reply = {"ok": True, "final_url": request["url"], "status": 200, "text": text,
+         "sha256": hashlib.sha256(text.encode()).hexdigest()}
+if request["archive"]:
+    reply["archive"] = "fixture mhtml archive"
+if request["links"]:
+    reply["links"] = [{"text": "Fixture detail", "href": "https://93.184.216.34/detail"}]
+print(json.dumps(reply))

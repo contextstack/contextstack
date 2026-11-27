@@ -1,7 +1,9 @@
 @use('App\NativeComponents\Conversations')
 
 <native:top-bar title="Conversations">
-    <native:top-bar-action id="new" label="New conversation" icon="plus" @tap="newConversation" />
+    @if ($this->can('start_work'))
+        <native:top-bar-action id="new" label="New conversation" icon="plus" @tap="newConversation" />
+    @endif
     <native:top-bar-action id="refresh" label="Refresh" icon="refresh" @tap="refresh" />
 </native:top-bar>
 
@@ -13,6 +15,7 @@
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
+            @include('native.partials.signed-out')
 
             @if ($loaded && $conversations === [])
                 <native:text class="text-base text-theme-on-surface-variant">No conversations yet. Tap + to start one.</native:text>

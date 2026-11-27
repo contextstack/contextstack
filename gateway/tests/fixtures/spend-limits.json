@@ -1,0 +1,20 @@
+[
+  ["missing", null, {}],
+  ["empty", "{}", {}],
+  ["per-source", "{\"sources\": {\"OpenAI\": {\"period\": \"day\", \"usd\": 0.2}, \"anthropic\": {\"period\": \"month\", \"usd\": 5}}}", {"openai": {"period": "day", "usd": 0.2}, "anthropic": {"period": "month", "usd": 5}}],
+  ["legacy", "{\"api_usd_per_day\": 2.5}", {"*": {"period": "day", "usd": 2.5}}],
+  ["legacy with named budget", "{\"api_usd_per_day\": 2.5, \"sources\": {\"openai\": {\"period\": \"month\", \"usd\": 5}}}", {"*": {"period": "day", "usd": 2.5}, "openai": {"period": "month", "usd": 5}}],
+  ["both shared budgets", "{\"api_usd_per_day\": 2.5, \"sources\": {\"*\": {\"period\": \"day\", \"usd\": 1}}}", null],
+  ["null legacy", "{\"api_usd_per_day\": null, \"sources\": {\"*\": {\"period\": \"month\", \"usd\": 1}}}", {"*": {"period": "month", "usd": 1}}],
+  ["positional budget", "{\"sources\": {\"a\": [1, {\"day\": null}]}}", {"a": {"period": "day", "usd": 1}}],
+  ["bad period", "{\"sources\": {\"openai\": {\"period\": \"week\", \"usd\": 1}}}", null],
+  ["negative", "{\"sources\": {\"openai\": {\"period\": \"day\", \"usd\": -1}}}", null],
+  ["NaN", "{\"api_usd_per_day\": NaN}", null],
+  ["overflow", "{\"api_usd_per_day\": 1e400}", null],
+  ["boolean", "{\"api_usd_per_day\": true}", null],
+  ["unknown root key", "{\"other\": 1}", null],
+  ["unknown budget key", "{\"sources\": {\"a\": {\"period\": \"day\", \"usd\": 1, \"other\": 1}}}", null],
+  ["case collision", "{\"sources\": {\"a\": {\"period\": \"day\", \"usd\": 1}, \"A\": {\"period\": \"month\", \"usd\": 1}}}", null],
+  ["null sources", "{\"sources\": null}", null],
+  ["malformed", "{bad", null]
+]

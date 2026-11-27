@@ -3,9 +3,10 @@
 //!
 //! Evidence is hashed and verified before the database lock; settlement runs in one `write_tx`.
 
+use crate::store::ScopedTransaction;
 use crate::store::{Record, Store, touch, write_tx};
 use crate::util::{self, is_sha256, now_utc, plain_path, sha256_hex};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -164,7 +165,7 @@ fn rejected(error: &str) -> Value {
 fn earlier_ack(store: &Store, event_id: &str) -> Result<Option<(i64, String, String)>, String> {
     let db = store.db();
     db.query_row(
-        "SELECT node_id, envelope_sha256, ack FROM envelopes WHERE event_id = ?1",
+        "SELECT node_id, envelope_sha256, ack FROM envelopes WHERE +org_id = :org_id AND event_id = ?1",
         params![event_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
@@ -423,7 +424,7 @@ fn prepare_run(store: &Store, p: &Parsed) -> Result<Option<Map<String, Value>>, 
 
 fn settle(
     store: &Store,
-    tx: &Transaction,
+    tx: &ScopedTransaction,
     node_id: i64,
     prep: Prepared<'_>,
 ) -> Result<Value, String> {
@@ -446,7 +447,7 @@ fn settle(
     let db = |e: rusqlite::Error| format!("database: {e}");
     let earlier: Option<(i64, String, String)> = tx
         .query_row(
-            "SELECT node_id, envelope_sha256, ack FROM envelopes WHERE event_id = ?1",
+            "SELECT node_id, envelope_sha256, ack FROM envelopes WHERE +org_id = :org_id AND event_id = ?1",
             params![event_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -483,7 +484,7 @@ fn settle(
     let ack = json!({"event_id": event_id, "envelope_sha256": envelope_sha256,
                      "verified_at": now_utc(), "restored": true});
     tx.execute(
-        "INSERT INTO envelopes (event_id, node_id, envelope_sha256, ack, received_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO envelopes (org_id, event_id, node_id, envelope_sha256, ack, received_at) VALUES (:org_id, ?1, ?2, ?3, ?4, ?5)",
         params![event_id, node_id, envelope_sha256, ack.to_string(), now_utc()],
     )
     .map_err(db)?;
@@ -512,7 +513,7 @@ fn restorable<'p>(p: &'p Parsed) -> Result<BTreeMap<&'p str, &'p str>, String> {
 
 /// §7.2 step 5: record the run once objects are already verified.
 fn record_run(
-    tx: &Transaction,
+    tx: &ScopedTransaction,
     node_id: i64,
     p: &Parsed,
     verified: &VerifiedRun,
@@ -520,7 +521,7 @@ fn record_run(
     let db = |e: rusqlite::Error| format!("database: {e}");
     let listed = restorable(p)?;
     let mut stmt = tx
-        .prepare("SELECT path, sha256 FROM run_files WHERE run_id = ?1")
+        .prepare("SELECT path, sha256 FROM run_files WHERE +org_id = :org_id AND run_id = ?1")
         .map_err(db)?;
     let before: Vec<(String, String)> = stmt
         .query_map(params![p.subject], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -545,7 +546,7 @@ fn record_run(
     let duplicate_row = match transcript {
         Some(t) => tx
             .query_row(
-                "SELECT 1 FROM runs WHERE transcript = ?1",
+                "SELECT 1 FROM runs WHERE +org_id = :org_id AND transcript = ?1",
                 params![t],
                 |_| Ok(()),
             )
@@ -561,9 +562,9 @@ fn record_run(
         .and_then(Value::as_str);
     let job = named_job(tx, node_id, p.job).map_err(db)?;
     tx.execute(
-        "INSERT INTO runs (run_id, node_id, usage, row_line, transcript, verdict, received_at, job_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(run_id) DO UPDATE SET usage = excluded.usage, job_id = COALESCE(runs.job_id, excluded.job_id)",
+        "INSERT INTO runs (org_id, run_id, node_id, usage, row_line, transcript, verdict, received_at, job_id)
+         VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(run_id) DO UPDATE SET usage = excluded.usage, job_id = COALESCE(runs.job_id, excluded.job_id) WHERE +runs.org_id = :org_id",
         params![
             p.subject,
             node_id,
@@ -585,10 +586,10 @@ fn record_run(
 }
 
 /// A run's evidence files, once each.
-fn record_files(tx: &Transaction, p: &Parsed) -> rusqlite::Result<()> {
+fn record_files(tx: &ScopedTransaction, p: &Parsed) -> rusqlite::Result<()> {
     for f in &p.files {
         tx.execute(
-            "INSERT OR IGNORE INTO run_files (run_id, path, sha256, bytes) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO run_files (org_id, run_id, path, sha256, bytes) VALUES (:org_id, ?1, ?2, ?3, ?4)",
             params![
                 p.subject,
                 f.path,
@@ -603,7 +604,7 @@ fn record_files(tx: &Transaction, p: &Parsed) -> rusqlite::Result<()> {
 /// The job a run's report names, when it is one of this node's jobs: it links the run to that job (each trial's
 /// run). A node's own dispatch id names no Director job and links nothing.
 fn named_job(
-    tx: &Transaction,
+    tx: &ScopedTransaction,
     node_id: i64,
     job: Option<&str>,
 ) -> rusqlite::Result<Option<String>> {
@@ -611,7 +612,7 @@ fn named_job(
         return Ok(None);
     };
     tx.query_row(
-        "SELECT job_id FROM jobs WHERE job_id = ?1 AND node_id = ?2",
+        "SELECT job_id FROM jobs WHERE +org_id = :org_id AND job_id = ?1 AND node_id = ?2",
         params![job, node_id],
         |r| r.get(0),
     )
@@ -638,14 +639,14 @@ fn terminal_error(row: &Map<String, Value>) -> Option<String> {
 
 /// §7.3: a job of this node is over; it leaves `GET jobs`.
 fn record_terminal(
-    tx: &Transaction,
+    tx: &ScopedTransaction,
     node_id: i64,
     p: &Parsed,
     verified: &VerifiedJob,
 ) -> Result<(), String> {
     let owned = tx
         .query_row(
-            "SELECT 1 FROM jobs WHERE job_id = ?1 AND node_id = ?2",
+            "SELECT 1 FROM jobs WHERE +org_id = :org_id AND job_id = ?1 AND node_id = ?2",
             params![p.subject, node_id],
             |_| Ok(()),
         )
@@ -658,7 +659,7 @@ fn record_terminal(
     let row = &verified.row;
     let had_terminal = tx
         .query_row(
-            "SELECT 1 FROM jobs WHERE job_id = ?1 AND terminal_row IS NOT NULL",
+            "SELECT 1 FROM jobs WHERE +org_id = :org_id AND job_id = ?1 AND terminal_row IS NOT NULL",
             params![p.subject],
             |_| Ok(()),
         )
@@ -674,7 +675,7 @@ fn record_terminal(
     let error = (state == "error").then(|| terminal_error(row)).flatten();
     tx.execute(
         "UPDATE jobs SET state = ?1, finished_at = ?2, terminal_row = ?3, run_id = COALESCE(?4, run_id),
-             error = ?5 WHERE job_id = ?6",
+             error = ?5 WHERE +org_id = :org_id AND (job_id = ?6)",
         params![state, now_utc(), p.row_line, run_id, error, p.subject],
     )
     .map_err(|e| format!("database: {e}"))?;
@@ -689,9 +690,11 @@ fn record_terminal(
     // The run now shows which job (and intent) it belongs to.
     if let Some(run) = run_id
         && tx
-            .query_row("SELECT 1 FROM runs WHERE run_id = ?1", params![run], |_| {
-                Ok(())
-            })
+            .query_row(
+                "SELECT 1 FROM runs WHERE +org_id = :org_id AND run_id = ?1",
+                params![run],
+                |_| Ok(()),
+            )
             .optional()
             .map_err(|e| format!("database: {e}"))?
             .is_some()
@@ -865,7 +868,7 @@ mod tests {
         let verifier = thread::spawn(move || receive(&store_recv, 1, &bytes));
         test_seam::wait_until_verifying();
         let db = store.db();
-        let n: i64 = db.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let n: i64 = db.query_row("SELECT COUNT(*) FROM nodes", params![], |r| r.get(0))?;
         assert_eq!(n, 1, "the database answered while verification was paused");
         drop(db);
         test_seam::release_verify_pause();

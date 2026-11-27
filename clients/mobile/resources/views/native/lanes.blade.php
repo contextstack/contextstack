@@ -1,7 +1,9 @@
 @use('App\NativeComponents\Lanes')
 
 <native:top-bar title="Task lanes">
-    <native:top-bar-action id="new" label="New lane" icon="plus" @tap="newLane" />
+    @if ($this->can('start_work'))
+        <native:top-bar-action id="new" label="New lane" icon="plus" @tap="newLane" />
+    @endif
     <native:top-bar-action id="refresh" label="Refresh" icon="refresh" @tap="refresh" />
 </native:top-bar>
 
@@ -13,6 +15,7 @@
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
+            @include('native.partials.signed-out')
 
             @if ($loaded && $lanes === [])
                 <native:text class="text-base text-theme-on-surface-variant">No task lanes yet. Tap + to start one.</native:text>

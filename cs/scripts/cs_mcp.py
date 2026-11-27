@@ -51,6 +51,12 @@ agents = sibling(HERE / "cs_agents.py")  # shared model selection and node-local
 Refused = agents.Refused
 run_files = sibling(HERE / "cs_runs.py")  # reading a run's transcript and diff
 job_reason = sibling(HERE.parent / "ops/bin/_job_reason.py")  # shared credential redaction
+PROCEDURES = HERE.parent / "lead/procedures"
+PROCEDURE_NAME = re.compile(r"[a-z0-9-]+")
+RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
+CANDIDATE_DIFF = "evidence/candidate.diff"
+RUN_FILES = ("check.json", "execution-check.json", "cli.log", "transcript.md", CANDIDATE_DIFF)
+PAGE_LIMIT = 50000
 STUCK_CHARS = 12000
 PREVIOUS_ATTEMPT = "## Previous attempt\n"
 
@@ -148,6 +154,12 @@ def one(body, name):
     return body.get(name, body) if isinstance(body, dict) else body
 
 
+def evidence_page(text, offset, limit):
+    end = min(offset + limit, len(text))
+    return {"offset": offset, "next_offset": end if end < len(text) else None,
+            "total_chars": len(text), "content": text[offset:end]}
+
+
 # ---- the bundle ------------------------------------------------------------------------------------------------
 def slug(text):
     s = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")[:40].strip("-")
@@ -242,13 +254,14 @@ def job_brief(job, intent=None, run=None):
 
 # ---- the tools -------------------------------------------------------------------------------------------------------
 class Tools:
-    def __init__(self, director, node, land_command=None, can_land=True, max_wait=3600):
+    def __init__(self, director, node, land_command=None, can_land=True, max_wait=3600, check_land=None, request_land=False):
         self.d, self.node, self.land_command = director, node, land_command
         # A hosted lead's turn has its own deadline; a long wait_tasks outlives it (2026-11-12: a 300 s wait
         # ended the lead's turn). The hosted lead is woken when its lanes end instead.
         self.max_wait = max(1, min(float(max_wait), 3600))
-        # The hosted lead runs cs mcp --no-land: landing stays with the owner until an isolated runner exists.
+        self.request_land = request_land
         self.withheld = set() if can_land else {"land_task"}
+        self.check_land = check_land
         self._land_lock_guard = threading.Lock()
         self._land_locks = {}
 
@@ -257,6 +270,21 @@ class Tools:
             if repo not in self._land_locks:
                 self._land_locks[repo] = threading.Lock()
             return self._land_locks[repo]
+
+    def _release_route(self, operation):
+        cid = self.d.get("me").get("conversation_id")
+        if not cid:
+            raise Refused("release tools require a conversation-bound credential")
+        return "conversations/" + q(cid) + "/" + operation
+
+    def install_release(self, bundle=None):
+        return self.d.post(self._release_route("install-release"), {"bundle": bundle} if bundle else {})
+
+    def rollback(self):
+        return self.d.post(self._release_route("rollback"), {})
+
+    def smoke(self):
+        return self.d.get(self._release_route("smoke"))
 
     def job(self, job_id, timeout=None):
         if timeout is None:
@@ -268,6 +296,22 @@ class Tools:
         if not cid:
             raise Refused("needs_you requires a lead credential bound to a conversation")
         return cid
+
+    def message_peers(self):
+        if not isinstance(self.d, Director):
+            return []
+        try:
+            cid = self.d.get("me").get("conversation_id")
+            return self.d.get("conversations/%s/peer-messages" % q(cid)).get("peers", []) if cid else []
+        except (Refused, TimeoutError):
+            return []
+
+    def message_conversation(self, to, text, idempotency_key=None):
+        cid = self.d.get("me").get("conversation_id")
+        if not cid:
+            raise Refused("message_conversation requires a lead credential bound to a conversation")
+        return self.d.post("conversations/%s/peer-messages" % q(cid), {"to": to, "text": text},
+                           key=idempotency_key, want=(200, 201))
 
     def needs_you(self, question, job_id=None):
         if not (question and str(question).strip()):
@@ -426,6 +470,8 @@ class Tools:
         explicit_model = model is not None
         given = dict(model=model, check=check, repo=repo, budget=budget, system=system, task_type=task_type)
         profile = self._profile(agent) if agent else None
+        if agent == "gate" and (not repo or not lane or model not in (None, "gate") or plan_with):
+            raise Refused("gate requires an existing repo lane and uses the gate executor")
         if budget is not None and not isinstance(budget, dict):
             raise Refused("budget must be an object")
         agents.check_budget(budget)
@@ -436,7 +482,7 @@ class Tools:
         node = node or self.node
         prior = given["model"]
         model, skipped = prior, []
-        if prior != "auto":
+        if prior not in ("auto", "gate"):
             validate_model(prior)
             limits = self._provider_limits_for_node(node)
             model, skipped, limit_err = agents.choose_model(
@@ -481,6 +527,8 @@ class Tools:
         elif repo:
             out["workspace"] = dict(repo=repo, lane=lane, branch="lane/" + lane,
                                     note="the node runs the agent in the repo's worktree <repo parent>/<lane> (config/repos.json) and commits on the lane branch when the check passes")
+            if agent == "gate":
+                out["workspace"]["note"] = "the node runs the configured gate in the existing lane worktree"
         if repo and not repo_view and requested_lane != lane:
             out["lane_renamed"] = {"from": requested_lane, "to": lane}
         _report_lead_watch(out.get("job_id"), lane or name)
@@ -678,6 +726,8 @@ class Tools:
             check = json.loads(fetch("check.json") or b"{}")
             out["check"] = {k: check.get(k) for k in ("verdict", "exit_code", "skipped")}
             out["check"]["output"] = job_reason.redact(str(check.get("output") or ""))[-2000:]
+        if "gate.json" in listed:
+            out["gate"] = json.loads(fetch("gate.json") or b"null")
         if "evidence/candidate.diff" in listed:
             out["diff"] = run_files.diff_stat(fetch("evidence/candidate.diff") or b"")
         if "transcript.md" in listed:
@@ -688,6 +738,67 @@ class Tools:
             stuck = fetch("stuck.md") or b""
             out["stuck"] = job_reason.clip(stuck.decode("utf-8", "replace"), min(tail, STUCK_CHARS))
         return job_reason.redact_obj(out)
+
+    def procedure(self, action="list", name=None):
+        if action == "list" and name is None:
+            return {"procedures": sorted(path.stem for path in PROCEDURES.glob("*.md")
+                                         if PROCEDURE_NAME.fullmatch(path.stem)
+                                         and not path.is_symlink() and path.is_file())}
+        if action != "read" or not isinstance(name, str) or not PROCEDURE_NAME.fullmatch(name):
+            raise Refused("use list or read with a procedure name matching [a-z0-9-]+")
+        path = PROCEDURES / (name + ".md")
+        if path.is_symlink() or not path.is_file():
+            raise Refused("unknown procedure")
+        return {"name": name, "content": path.read_text(encoding="utf-8")}
+
+    def _run_evidence(self, run_id, path, offset, limit):
+        if not isinstance(run_id, str) or not RUN_NAME.fullmatch(run_id) or ".." in run_id:
+            raise Refused("invalid run id")
+        if path not in RUN_FILES:
+            raise Refused("unsupported run file")
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= PAGE_LIMIT:
+            raise Refused("offset must be a non-negative integer and limit must be between 1 and %s" % PAGE_LIMIT)
+        body = self.d.get("runs/%s/files/%s" % (q(run_id), path))
+        if isinstance(body, bytes):
+            text = body.decode("utf-8", "replace")
+        else:
+            text = json.dumps(job_reason.redact_obj(body), indent=2, ensure_ascii=False)
+        # Redact the complete document before slicing, including secrets that span a page boundary.
+        return job_reason.redact(text)
+
+    def run_file(self, run_id, path, offset=0, limit=4000):
+        text = self._run_evidence(run_id, path, offset, limit)
+        return {"run_id": run_id, "path": path, **evidence_page(text, offset, limit)}
+
+    def lane_diff(self, run_id, offset=0, limit=4000):
+        text = self._run_evidence(run_id, CANDIDATE_DIFF, offset, limit)
+        return {"files": run_files.diff_paths(text), "run_id": run_id,
+                **evidence_page(text, offset, limit)}
+
+    def steer_task(self, intent_id, message):
+        if not isinstance(intent_id, str) or not job_reason.JOB_ID.fullmatch(intent_id):
+            raise Refused("invalid intent id")
+        if not isinstance(message, str) or not message.strip():
+            raise Refused("message must be non-empty")
+        status, body = self.d.request("PUT", "intents/%s/owner-messages" % q(intent_id),
+                                      body={"message": message})
+        if not 200 <= status < 300:
+            raise Refused("Director rejected the owner message: %s %s" % (status, refusal(body)))
+        return job_reason.redact_obj(body)
+
+    def heartbeat(self, project_id, action="get", interval_seconds=UNSET):
+        if action == "get":
+            return self.d.get("projects/%s/heartbeat" % q(project_id))
+        if action != "set" or interval_seconds is UNSET:
+            raise Refused("use get or set with an explicit interval_seconds")
+        path = "projects/%s/heartbeat" % q(project_id)
+        body = {"interval_seconds": interval_seconds}
+        if interval_seconds is not None:
+            body["conversation_id"] = self._lead_conversation_id()
+        status, reply = self.d.request("PUT", path, body=body)
+        if status != 200:
+            raise Refused("PUT %s: %s %s" % (path, status, refusal(reply)))
+        return reply
 
     def wait_tasks(self, job_ids, timeout_seconds=300):
         ids = [str(j) for j in job_ids][:50]
@@ -854,22 +965,31 @@ class Tools:
         """`cs land REPO LANE --json`: the full check, then a squash merge into the repo's local main; never pushes.
         One landing per repo at a time in this process; a concurrent call on the same repo returns busy.
         `job_id`, when given, is the Director job whose run the landing records (`cs land --job`)."""
-        if job_id is not None and job_id != "":
-            if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
-                raise Refused("invalid job_id")
-        else:
-            job_id = None
         lock = self._land_lock(str(repo))
         if not lock.acquire(blocking=False):
             raise Refused("land_task for repo %s is busy: another landing is already running" % repo)
-        # Owner configuration overrides belong only to the CLI; never forward one from MCP.
-        argv = [sys.executable, "-I", str(agents.kit_dir() / "scripts" / "cs"), "land", repo, lane, "--json"]
-        timeout_seconds = Tools.land_timeout(str(repo), timeout_seconds)
-        if job_id:
-            argv += ["--job", job_id]
-        if message:
-            argv += ["-m", message]
         try:
+            if check_land := getattr(self, "check_land", None):
+                check_land()
+            if getattr(self, "request_land", False):
+                if message is not None or job_id is not None or timeout_seconds != 1800:
+                    raise Refused("hosted land_task accepts repo and lane only")
+                cid = self.d.get("me").get("conversation_id")
+                if not cid:
+                    raise Refused("hosted land_task requires a conversation-bound credential")
+                return self.d.post("conversations/" + q(cid) + "/land", {"repo": repo, "lane": lane})
+            if job_id is not None and job_id != "":
+                if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
+                    raise Refused("invalid job_id")
+            else:
+                job_id = None
+            # Owner configuration overrides belong only to the CLI; never forward one from MCP.
+            argv = [sys.executable, "-I", str(agents.kit_dir() / "scripts" / "cs"), "land", repo, lane, "--json"]
+            timeout_seconds = Tools.land_timeout(str(repo), timeout_seconds)
+            if job_id:
+                argv += ["--job", job_id]
+            if message:
+                argv += ["-m", message]
             if self.land_command is not None:
                 done = self.land_command(repo, lane, message, timeout_seconds)
             else:
@@ -914,7 +1034,30 @@ def S(kind, about, **more):
 
 
 ID = S("string", "a job id (job_id from start_task or list_tasks)")
+RUN_ID = S("string", "a Director run id")
+PAGE = {"offset": S("integer", "zero-based character offset in redacted content", minimum=0, default=0),
+        "limit": S("integer", "maximum characters to return", minimum=1, maximum=PAGE_LIMIT, default=4000)}
 TOOLS = [
+    ("install_release", "Request owner approval to install a named local bundle or the current local main commit.",
+     {"bundle": S("string", "local bundle directory name; omit for main")}, []),
+    ("rollback", "Request owner approval to restore the node's previous release.", {}, []),
+    ("smoke", "Read the node's latest post-install smoke result without starting jobs.", {}, []),
+    ("procedure", "List shipped runbooks or read one by name on demand.",
+     {"action": S("string", "operation", enum=["list", "read"]),
+      "name": S("string", "required for read", pattern="^[a-z0-9-]+$")}, []),
+    ("run_file", "Read an allowed run file through the Director. Follow next_offset until it is null.",
+     {"run_id": RUN_ID, "path": S("string", "run file path", enum=list(RUN_FILES)), **PAGE},
+     ["run_id", "path"]),
+    ("lane_diff", "List affected files and page through the redacted candidate diff for a run.",
+     {"run_id": RUN_ID, **PAGE}, ["run_id"]),
+    ("steer_task", "Send an owner message to a running intent.",
+     {"intent_id": S("string", "a Director intent id"), "message": S("string", "owner message")},
+     ["intent_id", "message"]),
+    ("heartbeat", "Read or set the heartbeat for the hosted lead's project.",
+     {"project_id": S("string", "the Director project id"),
+      "action": S("string", "operation", enum=["get", "set"]),
+      "interval_seconds": S(["integer", "null"], "seconds between wakes, or null to turn off",
+                            minimum=1, maximum=4294967295)}, ["project_id"]),
     ("start_task", "Start a task on a node in a scratch workspace or an isolated lane. "
      "Returns the task and job ids.",
      {"title": S("string", "short title for the task"), "goal": S("string", "the task, in markdown: what done looks like"),
@@ -954,6 +1097,11 @@ TOOLS = [
                                            "ref": {"type": "string"}},
           "required": ["kind", "ref"], "additionalProperties": False}),
       "blocked_reason": S("string", "explain what's blocking the item"),
+      "needs_you": S("object", "labelled choices for an owner blocker", properties={
+          "options": {"type": "array", "items": {"type": "object", "properties": {
+              "id": {"type": "string"}, "label": {"type": "string"}}, "required": ["id", "label"]}},
+          "default": {"type": "string"}, "links": {"type": "object"}},
+          required=["options"]),
       "stop": S("boolean", "pause heartbeat while an owner blocker is present"),
       "intent_ids": S("array", "linked intent IDs", items={"type": "string"}),
       "job_ids": S("array", "linked job IDs", items={"type": "string"}),
@@ -968,7 +1116,8 @@ TOOLS = [
       "action": S("string", "operation", enum=["create", "revise", "supersede", "retire"]),
       "entry_id": S("string", "required for changes to an existing entry"),
       "revision": S("integer", "current entry revision, required for changes"),
-      "decision": S("string", "one-line decision, required on create"),
+      "kind": S("string", "tag durable lessons", enum=["decision", "lesson"]),
+      "decision": S("string", "one-line decision or lesson, required on create"),
       "why": S("string", "rationale, required on create"),
       "alternatives": S("array", "options considered and why they were rejected", items={
           "type": "object", "properties": {"option": {"type": "string"}, "why_not": {"type": "string"}},
@@ -986,7 +1135,7 @@ TOOLS = [
     ("task_status", "One job in a task: state, live run and event count, run verdict, decision, usage, cancel.",
      {"job_id": ID}, ["job_id"]),
     ("task_output", "A job's output: live partial text while the job runs; after the run, the check result, diff stat and "
-     "the transcript tail.", {"job_id": ID, "tail_chars": S("integer", "transcript tail size (default 4000)")}, ["job_id"]),
+     "the transcript tail or the structured gate result.", {"job_id": ID, "tail_chars": S("integer", "transcript tail size (default 4000)")}, ["job_id"]),
     ("wait_tasks", "Block until any of the given jobs ends (done or error) or the timeout passes; returns which ended and "
      "which are still running.",
      {"job_ids": S("array", "job ids", items={"type": "string"}),
@@ -1015,6 +1164,9 @@ TOOLS = [
      {"question": S("string", "one clear question the owner can answer in a message"),
       "job_id": S("string", "optional related job id")}, ["question"]),
     ("clear_needs_you", "Clear attention after the owner answered your message or the issue is resolved.", {}, []),
+    ("message_conversation", "Send a brief as untrusted data to an owner-configured peer conversation.",
+     {"to": S("string", "allowed destination conversation ID"), "text": S("string", "brief, up to 16 KiB"),
+      "idempotency_key": S("string", "reuse the same key and text when retrying an uncertain send")}, ["to", "text"]),
     ("retry_task", "Start another job on the same task, with the prior attempt prepended to the goal "
      "(one retry per task; refuses jobs that passed their check). "
      "Keeps the prior job's model unless model= names another executor template or harness:<gateway-model>, or provider_edit_refused "
@@ -1050,7 +1202,26 @@ def handle(tools, message):
     if method == "ping":
         return {}
     if method == "tools/list":
-        return {"tools": tool_list(getattr(tools, "withheld", ()))}
+        withheld = set(getattr(tools, "withheld", ()))
+        peers = getattr(tools, "message_peers", lambda: [])()
+        if not peers:
+            withheld.add("message_conversation")
+        descriptors = tool_list(withheld)
+        for descriptor in descriptors:
+            if descriptor["name"] == "message_conversation":
+                properties = descriptor["inputSchema"]["properties"]
+                descriptor["inputSchema"]["properties"] = {
+                    **properties, "to": {**properties["to"], "enum": peers}}
+        if getattr(tools, "request_land", False):
+            for descriptor in descriptors:
+                if descriptor["name"] == "land_task":
+                    descriptor["description"] = (
+                        "Request a local land for a lane in this project's scope. Returns the Director approval "
+                        "record. The node inspects and lands the pinned commit after automatic or owner approval."
+                    )
+                    fields = descriptor["inputSchema"]["properties"]
+                    descriptor["inputSchema"]["properties"] = {key: fields[key] for key in ("repo", "lane")}
+        return {"tools": descriptors}
     if method == "tools/call":
         name, args = params.get("name"), params.get("arguments") or {}
         if name not in {t[0] for t in TOOLS} or name in getattr(tools, "withheld", ()):
@@ -1142,7 +1313,9 @@ def main(argv, root):
     ap.add_argument("--director", help="Director URL (default: config/install.json's director, else http://127.0.0.1:8780)")
     ap.add_argument("--credential-file", help="default: state/director/local-credential under the install root")
     ap.add_argument("--node", help="the default machine for start_task (default: config/install.json's node)")
-    ap.add_argument("--no-land", action="store_true", help="withhold land_task (the hosted lead: landing stays with the owner)")
+    land = ap.add_mutually_exclusive_group()
+    land.add_argument("--no-land", action="store_true", help="withhold land_task")
+    land.add_argument("--request-land", action="store_true", help="request local landing through the Director")
     ap.add_argument("--max-wait", type=int, default=3600, help="cap wait_tasks at this many seconds (the hosted lead: 30)")
     args = ap.parse_args(argv)
     try:
@@ -1151,5 +1324,11 @@ def main(argv, root):
         record = {}
     director = Director(args.director or record.get("director") or "http://127.0.0.1:8780",
                         args.credential_file or root / "state/director/local-credential")
+    def check_land():
+        # Paired credentials are issued with the csd_ prefix. Landing is host-local.
+        if director.token().startswith("csd_"):
+            raise Refused("landing requires the Director's host owner credential")
+
     return serve(Tools(director, args.node or record.get("node"), can_land=not args.no_land,
-                       max_wait=args.max_wait))
+                       max_wait=args.max_wait, check_land=check_land if args.credential_file else None,
+                       request_land=args.request_land))

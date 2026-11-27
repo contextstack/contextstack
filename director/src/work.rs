@@ -9,9 +9,10 @@ use crate::access::Client;
 use crate::jobs::{self, Plan, Unusable};
 use crate::records;
 use crate::server::{Call, Reply, State, internal, json, refusal};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::util::{self, now_utc, sha256_hex};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
 /// The longest idempotency key accepted.
@@ -91,7 +92,7 @@ pub fn content(op: &str, target: &str, body: &Value) -> String {
 
 /// Check lead scope under the same database lock used for idempotency replay/conflicts.
 pub fn scoped_prior(
-    db: &Connection,
+    db: &ScopedConnection,
     key: &str,
     sha: &str,
     client: &Client,
@@ -99,7 +100,7 @@ pub fn scoped_prior(
     if client.kind == crate::access::Kind::Lead {
         let found: Option<(String, String)> = db
             .query_row(
-                "SELECT record_kind, record_id FROM writes WHERE key = ?1",
+                "SELECT record_kind, record_id FROM writes WHERE +org_id = :org_id AND key = ?1",
                 params![key],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -121,14 +122,31 @@ pub fn scoped_prior(
             }
         }
     }
+    if client.member.scope.role != Some(crate::access::Role::Owner) {
+        let foreign = db.prepare_cached(
+            "SELECT 1 FROM (SELECT credential_id FROM writes WHERE +org_id = :org_id AND key = ?1) w
+             WHERE w.credential_id != ?2 AND NOT EXISTS (
+                 SELECT 1 FROM credentials WHERE +org_id = :org_id AND id = w.credential_id AND member_id = ?3
+             )"
+        ).and_then(|mut stmt| stmt.exists(params![key, client.id, client.member_id()]))
+            .map_err(|e| No::internal(&e))?;
+        if foreign {
+            return Err(No(
+                409,
+                "idempotency_conflict",
+                "this Idempotency-Key is unavailable".into(),
+                Value::Null,
+            ));
+        }
+    }
     prior(db, key, sha)
 }
 
 /// What a key already made: `Ok(Some(..))` for the same content, a 409 for other content.
-pub fn prior(db: &Connection, key: &str, sha: &str) -> Result<Option<(Record, String)>, No> {
+pub fn prior(db: &ScopedConnection, key: &str, sha: &str) -> Result<Option<(Record, String)>, No> {
     let found: Option<(String, String, String)> = db
         .query_row(
-            "SELECT request_sha256, record_kind, record_id FROM writes WHERE key = ?1",
+            "SELECT request_sha256, record_kind, record_id FROM writes WHERE +org_id = :org_id AND key = ?1",
             params![key],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -136,6 +154,12 @@ pub fn prior(db: &Connection, key: &str, sha: &str) -> Result<Option<(Record, St
         .map_err(|e| No::internal(&e))?;
     match found {
         None => Ok(None),
+        Some((_, kind, _)) if kind == "member_patch" => Err(No(
+            409,
+            "idempotency_conflict",
+            "this Idempotency-Key is unavailable".into(),
+            Value::Null,
+        )),
         Some((was, kind, id)) if was == sha => Ok(Record::named(&kind).map(|k| (k, id))),
         Some((_, kind, id)) => Err(No(
             409,
@@ -147,7 +171,7 @@ pub fn prior(db: &Connection, key: &str, sha: &str) -> Result<Option<(Record, St
 }
 
 pub fn remember(
-    db: &Connection,
+    db: &ScopedConnection,
     key: &str,
     sha: &str,
     kind: Record,
@@ -155,8 +179,8 @@ pub fn remember(
     client: &Client,
 ) -> rusqlite::Result<()> {
     db.execute(
-        "INSERT INTO writes (key, request_sha256, record_kind, record_id, credential_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO writes (org_id, key, request_sha256, record_kind, record_id, credential_id, created_at)
+         VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![key, sha, kind.name(), id, client.id, now_utc()],
     )
     .map(|_| ())
@@ -164,7 +188,7 @@ pub fn remember(
 
 /// Remember a node-route write (idempotency); `node_id` is stored as `node:{id}`.
 pub fn remember_node(
-    db: &Connection,
+    db: &ScopedConnection,
     key: &str,
     sha: &str,
     kind: Record,
@@ -172,8 +196,8 @@ pub fn remember_node(
     node_id: i64,
 ) -> rusqlite::Result<()> {
     db.execute(
-        "INSERT INTO writes (key, request_sha256, record_kind, record_id, credential_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO writes (org_id, key, request_sha256, record_kind, record_id, credential_id, created_at)
+         VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![key, sha, kind.name(), id, format!("node:{node_id}"), now_utc()],
     )
     .map(|_| ())
@@ -240,11 +264,11 @@ fn normalise_intent(m: &Map<String, Value>) -> Result<Value, No> {
 }
 
 /// A project named in a write must exist.
-pub fn project_exists(db: &Connection, id: Option<&str>) -> Result<(), No> {
+pub fn project_exists(db: &ScopedConnection, id: Option<&str>) -> Result<(), No> {
     let Some(id) = id else { return Ok(()) };
     let found = db
         .query_row(
-            "SELECT 1 FROM projects WHERE project_id = ?1",
+            "SELECT 1 FROM projects WHERE +org_id = :org_id AND project_id = ?1",
             params![id],
             |_| Ok(()),
         )
@@ -254,7 +278,7 @@ pub fn project_exists(db: &Connection, id: Option<&str>) -> Result<(), No> {
 }
 
 /// A record as a reply; an intent answers with its jobs and runs.
-pub fn render(db: &Connection, status: u16, kind: Record, id: &str, replayed: bool) -> Reply {
+pub fn render(db: &ScopedConnection, status: u16, kind: Record, id: &str, replayed: bool) -> Reply {
     let found = if kind == Record::Intent {
         records::intent_bundle(db, id)
     } else {
@@ -277,14 +301,14 @@ pub fn render(db: &Connection, status: u16, kind: Record, id: &str, replayed: bo
 /// was stamped with (`stamp.rs`), which the new intent may replace.
 fn source(
     state: &State,
-    db: &Connection,
+    db: &ScopedConnection,
     s: &Value,
 ) -> Result<(Vec<jobs::BundleFile>, Option<String>), No> {
     if let Some(job) = s.get("from_job") {
         let job = job.as_str().unwrap_or_default();
         let stamped = db
             .query_row(
-                "SELECT intent_id FROM jobs WHERE job_id = ?1",
+                "SELECT intent_id FROM jobs WHERE +org_id = :org_id AND job_id = ?1",
                 params![job],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -360,7 +384,7 @@ struct IntentInsert<'a> {
 }
 
 fn insert_intent_record(
-    db: &mut Connection,
+    tx: &ScopedConnection,
     store: &crate::store::Store,
     row: &IntentInsert<'_>,
 ) -> Result<(), String> {
@@ -377,32 +401,30 @@ fn insert_intent_record(
         key,
         sha,
     } = *row;
-    let tx = crate::store::write_tx(db).map_err(|e| e.to_string())?;
     let s = |f: &str| want[f].as_str().unwrap_or_default();
     tx.execute(
-        "INSERT INTO intents (intent_id, title, node, spec, task, trials, grant_id, meta, bundle_sha256,
+        "INSERT INTO intents (org_id, intent_id, title, node, spec, task, trials, grant_id, meta, bundle_sha256,
                               created_by, created_at, project_id, conversation_id, lead_conversation_id,
-                              origin_kind, origin_conversation_id, origin_turn_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                              origin_kind, origin_conversation_id, origin_turn_id, responsible_member_id)
+         VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![intent_id, want["title"].as_str(), s("node"), s("spec"), s("task"),
                 want["trials"].as_i64(), want["grant"].as_str(), json!(plan.meta()).to_string(),
                 plan.digest, client.id, now_utc(), project, conversation, lead_conversation,
-                origin.kind, origin.conversation_id, origin.turn_id],
+                origin.kind, origin.conversation_id, origin.turn_id, client.member_id()],
     )
     .map_err(|e| e.to_string())?;
     if let Some(planner) = planner {
-        crate::planning::insert(store, &tx, intent_id, planner, plan)?;
+        crate::planning::insert(store, tx, intent_id, planner, plan)?;
     } else {
-        plan.insert(store, &tx, Some(intent_id))?;
+        plan.insert(store, tx, Some(intent_id))?;
     }
-    touch(&tx, Record::Intent, intent_id).map_err(|e| e.to_string())?;
-    remember(&tx, key, sha, Record::Intent, intent_id, client).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+    touch(tx, Record::Intent, intent_id).map_err(|e| e.to_string())?;
+    remember(tx, key, sha, Record::Intent, intent_id, client).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 fn intent_origin_fields(
-    db: &Connection,
+    db: &ScopedConnection,
     origin: crate::work_trace::Origin,
     client: &Client,
     from_job: Option<&str>,
@@ -411,7 +433,7 @@ fn intent_origin_fields(
 }
 
 fn submit_conversation(
-    db: &Connection,
+    db: &ScopedConnection,
     client: &Client,
     from_job: Option<&str>,
 ) -> Result<Option<String>, String> {
@@ -421,19 +443,20 @@ fn submit_conversation(
     let Some(job) = from_job else {
         return Ok(None);
     };
-    db.query_row(
-        "SELECT COALESCE((SELECT conversation_id FROM turns WHERE job_id = ?1),
-                         (SELECT i.conversation_id FROM jobs j JOIN intents i
+    let conversation: Option<String> = db.query_row(
+        "SELECT COALESCE((SELECT conversation_id FROM turns WHERE +org_id = :org_id AND job_id = ?1),
+                         (SELECT i.conversation_id FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j JOIN (SELECT * FROM intents WHERE +org_id = :org_id) i
                           ON i.intent_id = j.intent_id WHERE j.job_id = ?1))",
         params![job],
         |r| r.get::<_, Option<String>>(0),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(conversation)
 }
 
 fn submitted_job(
     state: &State,
-    db: &Connection,
+    db: &ScopedConnection,
     want: &Value,
     files: Vec<jobs::BundleFile>,
 ) -> Result<Plan, No> {
@@ -452,6 +475,7 @@ fn submitted_job(
     .under(crate::reservations::JobScope {
         project: want["project_id"].as_str().map(String::from),
         conversation: None,
+        schedule: None,
     });
     if want["source"].get("from_job").is_some() || plan.spec_names_task(&state.store) {
         plan.fill_missing_check(&state.store)
@@ -462,7 +486,7 @@ fn submitted_job(
 
 fn stamp_and_check(
     state: &State,
-    db: &Connection,
+    db: &ScopedConnection,
     plan: &mut Plan,
     intent: &str,
     previous: Option<&str>,
@@ -480,6 +504,7 @@ fn stamp_and_check(
 }
 
 /// `POST intents`: record the intent and offer its first job.
+#[allow(clippy::too_many_lines)]
 pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
     let (key, mut m) = match dispatch_body(call) {
         Ok(pair) => pair,
@@ -514,25 +539,41 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
     if let Err(r) = project_exists(&db, project) {
         return r.reply();
     }
-    let mut plan = match submitted_job(state, &db, &want, files) {
-        Ok(plan) => plan,
-        Err(no) => return no.reply(),
+    let tx = match crate::store::write_tx(&mut db) {
+        Ok(tx) => tx,
+        Err(e) => return internal(&e),
     };
     // Provenance is Director-owned, never supplied through request metadata. It survives
     // credential rotation and bundle reuse through arbitrarily many descendant intents.
     let lead_conversation = (client.kind == crate::access::Kind::Lead)
         .then(|| client.conversation_id.clone())
         .flatten();
-    let conversation = match submit_conversation(&db, client, want["source"]["from_job"].as_str()) {
+    let conversation = match submit_conversation(&tx, client, want["source"]["from_job"].as_str()) {
         Ok(c) => c,
         Err(e) => return internal(&e),
+    };
+    if let Some(id) = &conversation {
+        let allowed = client.reload_member(&tx).and_then(|fresh| {
+            fresh.map_or(Ok(false), |fresh| {
+                crate::policy::can_control_conversation(&tx, &fresh, id)
+            })
+        });
+        match allowed {
+            Ok(true) => {}
+            Ok(false) => return crate::policy::denied(),
+            Err(e) => return internal(&e),
+        }
+    }
+    let mut plan = match submitted_job(state, &tx, &want, files) {
+        Ok(plan) => plan,
+        Err(no) => return no.reply(),
     };
     let intent_id = match util::ulid() {
         Ok(id) => id,
         Err(e) => return internal(&e),
     };
     let origin =
-        match intent_origin_fields(&db, origin, client, want["source"]["from_job"].as_str()) {
+        match intent_origin_fields(&tx, origin, client, want["source"]["from_job"].as_str()) {
             Ok(o) => o,
             Err(no) => return no.reply(),
         };
@@ -542,7 +583,7 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
     } else {
         stamp_and_check(
             state,
-            &db,
+            &tx,
             &mut plan,
             &intent_id,
             stamped_before.as_deref(),
@@ -550,14 +591,14 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
         )
     }
     .and_then(|()| {
-        crate::planning::prepare_if_requested(state, &db, &want, &m, &intent_id, &mut plan)
+        crate::planning::prepare_if_requested(state, &tx, &want, &m, &intent_id, &mut plan)
     });
     let planner = match planner {
         Ok(planner) => planner,
         Err(no) => return no.reply(),
     };
     match insert_intent_record(
-        &mut db,
+        &tx,
         &state.store,
         &IntentInsert {
             intent_id: &intent_id,
@@ -572,13 +613,16 @@ pub fn submit(state: &State, call: &Call, client: &Client) -> Reply {
             key: &key,
             sha: &sha,
         },
-    ) {
+    )
+    .and_then(|()| tx.commit().map_err(|e| e.to_string()))
+    {
         Ok(()) => render(&db, 201, Record::Intent, &intent_id, false),
         Err(e) => internal(&e),
     }
 }
 
 /// `POST intents/{id}/jobs`: one further attempt, retaining the task's identity and node.
+#[allow(clippy::too_many_lines)]
 pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> Reply {
     let (key, m) = match (key(call), body(call)) {
         (Ok(k), Ok(m)) => (k, m),
@@ -604,7 +648,7 @@ pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> 
         Err(e) => return internal(&e),
     };
     match db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM planning_jobs p JOIN jobs j ON j.job_id = p.job_id WHERE j.intent_id = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM (SELECT * FROM planning_jobs WHERE +org_id = :org_id) p JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = p.job_id WHERE j.intent_id = ?1)",
         [intent_id], |r| r.get::<_, bool>(0),
     ) {
         Ok(true) => return refusal(409, "planning_pending", "the coding job follows its planning job automatically", Value::Null),
@@ -646,8 +690,13 @@ pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> 
         Ok(p) => p.under(crate::reservations::JobScope {
             project: intent["project_id"].as_str().map(String::from),
             conversation: None,
+            schedule: None,
         }),
         Err(e) => return invalid(&e),
+    };
+    let tx = match crate::store::write_tx(&mut db) {
+        Ok(tx) => tx,
+        Err(e) => return internal(&e),
     };
     if want["source"].get("from_job").is_some()
         && let Err(e) = plan.fill_missing_check(&state.store)
@@ -657,18 +706,17 @@ pub fn add_job(state: &State, call: &Call, client: &Client, intent_id: &str) -> 
     if let Err(e) = plan.stamp(&state.store, intent_id, stamped.as_deref()) {
         return invalid(&format!("{e:?}"));
     }
-    if let Err(no) = crate::work_trace::stamp_job_reason(&mut plan, &db, intent_id, client) {
+    if let Err(no) = crate::work_trace::stamp_job_reason(&mut plan, &tx, intent_id, client) {
         return no.reply();
     }
     if let Err(e) = plan.refuse_if_node_lacks_capability(
         &state.store,
-        &db,
+        &tx,
         intent["node"].as_str().unwrap_or_default(),
     ) {
         return invalid(&e);
     }
     let made = (|| -> Result<String, String> {
-        let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
         let id = plan.insert(&state.store, &tx, Some(intent_id))?;
         touch(&tx, Record::Intent, intent_id).map_err(|e| e.to_string())?;
         remember(&tx, &key, &sha, Record::Job, &id, client).map_err(|e| e.to_string())?;
@@ -712,7 +760,7 @@ pub fn decide(state: &State, call: &Call, client: &Client, run_id: &str) -> Repl
     }
     let existing = db
         .query_row(
-            "SELECT (SELECT decision_id FROM decisions WHERE run_id = ?1) FROM runs WHERE run_id = ?1",
+            "SELECT (SELECT decision_id FROM decisions WHERE +org_id = :org_id AND run_id = ?1) FROM runs WHERE +org_id = :org_id AND run_id = ?1",
             params![run_id],
             |r| r.get::<_, Option<String>>(0),
         )
@@ -735,8 +783,8 @@ pub fn decide(state: &State, call: &Call, client: &Client, run_id: &str) -> Repl
         let id = format!("dec_{}", util::ulid()?.to_lowercase());
         let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
         tx.execute(
-            "INSERT INTO decisions (decision_id, run_id, decision, note, decided_by, decided_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO decisions (org_id, decision_id, run_id, decision, note, decided_by, decided_at)
+             VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, run_id, decision, note, client.id, now_utc()],
         )
         .map_err(|e| e.to_string())?;
@@ -777,7 +825,7 @@ pub fn cancel(state: &State, call: &Call, client: &Client, job_id: &str) -> Repl
     }
     let job = db
         .query_row(
-            "SELECT state, (SELECT cancel_id FROM cancels WHERE job_id = ?1), node_id FROM jobs WHERE job_id = ?1",
+            "SELECT state, (SELECT cancel_id FROM cancels WHERE +org_id = :org_id AND job_id = ?1), node_id FROM jobs WHERE +org_id = :org_id AND job_id = ?1",
             params![job_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)?)),
         )
@@ -823,7 +871,7 @@ pub fn cancel(state: &State, call: &Call, client: &Client, job_id: &str) -> Repl
 /// Record a cancel request for a job and the control message that carries it, inside the caller's transaction.
 /// Returns the cancel's id.
 pub fn issue_cancel(
-    tx: &Connection,
+    tx: &ScopedConnection,
     job_id: &str,
     node_id: i64,
     reason: Option<&str>,
@@ -832,8 +880,8 @@ pub fn issue_cancel(
     let id = format!("can_{}", util::ulid()?.to_lowercase());
     let control_id = crate::control::issue(tx, node_id, "cancel", &json!({"job_id": job_id}))?;
     tx.execute(
-        "INSERT INTO cancels (cancel_id, job_id, state, reason, requested_by, requested_at, control_id)
-         VALUES (?1, ?2, 'requested', ?3, ?4, ?5, ?6)",
+        "INSERT INTO cancels (org_id, cancel_id, job_id, state, reason, requested_by, requested_at, control_id)
+         VALUES (:org_id, ?1, ?2, 'requested', ?3, ?4, ?5, ?6)",
         params![id, job_id, reason, requested_by, now_utc(), control_id],
     )
     .map_err(|e| e.to_string())?;
@@ -843,7 +891,7 @@ pub fn issue_cancel(
     // the node is never asked.
     let waiting = tx
         .query_row(
-            "SELECT 1 FROM jobs WHERE job_id = ?1 AND state = 'waiting'",
+            "SELECT 1 FROM jobs WHERE +org_id = :org_id AND job_id = ?1 AND state = 'waiting'",
             params![job_id],
             |_| Ok(()),
         )
@@ -854,7 +902,7 @@ pub fn issue_cancel(
         tx.execute(
             "UPDATE controls SET state = 'applied', outcome = 'stopped', settled_at = ?1,
                                  detail = 'stopped before it reached its node: it was waiting for budget'
-             WHERE control_id = ?2",
+             WHERE +org_id = :org_id AND (control_id = ?2)",
             params![now_utc(), control_id],
         )
         .map_err(|e| e.to_string())?;

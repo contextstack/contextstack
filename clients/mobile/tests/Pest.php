@@ -1,5 +1,8 @@
 <?php
 
+use App\Client\ConnectionStore;
+use Illuminate\Support\Facades\Http;
+use Native\Mobile\Testing\Native;
 use Tests\TestCase;
 
 /*
@@ -43,7 +46,30 @@ expect()->extend('toBeOne', function () {
 |
 */
 
-function something()
+const DirectorUrl = 'http://192.0.2.1:8780';
+
+/**
+ * A temporary connection file and lock file, no stray HTTP requests, and the fake bridge with secure storage.
+ */
+function isolateDevice(): void
 {
-    // ..
+    $directory = sys_get_temp_dir().'/cs-mobile-test-'.bin2hex(random_bytes(4));
+    config(['client.settings_path' => $directory.'/connection.json', 'client.lock_path' => $directory.'/lock.json', 'client.director_url' => DirectorUrl]);
+    Http::preventStrayRequests();
+    Native::fakeBridge()->withSecureStorage();
+}
+
+/**
+ * Pair this device. Register a screen's own fakes (and any `me`) before calling it: the first matching fake wins.
+ */
+function pairDevice(): void
+{
+    app(ConnectionStore::class)->saveDevice(DirectorUrl, 'csd_test_token', 'cred_ipad', 'iPad');
+    Http::fake([
+        DirectorUrl.'/api/v1/client/projects' => Http::response(['projects' => []]),
+        // A Director from before teams: no member, role or capabilities, so every action is offered.
+        DirectorUrl.'/api/v1/client/me' => Http::response(['credential_id' => 'cred_ipad', 'owner' => true]),
+        // A Director without the member directory yet.
+        DirectorUrl.'/api/v1/client/members/directory' => Http::response(['error' => 'Not found', 'code' => 'not_found'], 404),
+    ]);
 }

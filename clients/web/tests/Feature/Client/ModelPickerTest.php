@@ -42,6 +42,7 @@ function fakePickerDirector(): void
         director('intents') => Http::response(['intent' => ['intent_id' => 'int_1'], 'jobs' => [['job_id' => 'job_1']], 'runs' => []], 201),
         director('conversations') => Http::response(['conversation' => ['conversation_id' => 'con_new']], 201),
     ]);
+    fakeDirectorBackground();
 }
 
 it('hides role-only rows and groups the rest by provider with the catalog\'s provider label', function () {

@@ -15,6 +15,7 @@ it('shows a not-set-up screen on desktop when the local credential is missing', 
     connectClientWeb();
     unlink(config('client.local_credential'));
     Http::fake();
+    fakeDirectorBackground();
     enableNativeDesktop();
 
     $this->get(route('intents.index'))
@@ -37,6 +38,7 @@ it('shows a not-running screen on desktop when the Director cannot be reached', 
             throw new ConnectionException('Connection refused');
         },
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('intents.index'))
         ->assertRedirect(route('desktop.gate'));
@@ -51,10 +53,11 @@ it('shows a not-running screen on desktop when the Director cannot be reached', 
 it('serves normal pages on desktop when the Director answers', function () {
     connectClientWeb();
     enableNativeDesktop();
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => true]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => true]),
-        director('intents') => Http::response(['intents' => [], 'jobs' => []]),
+        director('intents*') => Http::response(['intents' => [], 'jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('intents.index'))->assertOk();
 
@@ -65,6 +68,7 @@ it('keeps the browser connect page when not on desktop', function () {
     connectClientWeb();
     unlink(config('client.local_credential'));
     Http::fake();
+    fakeDirectorBackground();
 
     $this->get(route('intents.index'))->assertRedirect(route('connect'));
     $this->get(route('connect'))->assertOk()->assertSee('Pair this device', false);
@@ -86,6 +90,7 @@ it('rechecks from the desktop gate without a full reload', function () {
 
         return Http::response(['credential_id' => 'cred_local', 'owner' => true]);
     });
+    fakeDirectorBackground();
 
     $component = Livewire::test('pages::client.desktop-gate')
         ->assertSee('data-test="desktop-gate-not-running"', false)
@@ -101,9 +106,7 @@ it('rechecks from the desktop gate without a full reload', function () {
 
 it('treats a credential the Director rejects as not set up', function () {
     connectClientWeb();
-    Http::fake([
-        director('me') => Http::response(['error' => 'Unauthorized', 'code' => 'unauthorized', 'detail' => 'unknown credential'], 401),
-    ]);
+    meOnDirector([['error' => 'Unauthorized', 'code' => 'unauthorized', 'detail' => 'unknown credential'], 401]);
     enableNativeDesktop();
 
     $this->get(route('intents.index'))->assertRedirect(route('desktop.gate'));
@@ -114,11 +117,12 @@ it('lets a Mac without cs init reach Settings from the gate and pair with a Dire
     connectClientWeb();
     unlink(config('client.local_credential'));
     enableNativeDesktop();
+    meOnDirector(['credential_id' => 'cred_mac', 'owner' => true]);
     Http::fake([
         'http://other.test/api/v1/pair' => Http::response(['credential_id' => 'cred_mac', 'name' => 'mac', 'token' => 'csd_mac_token']),
-        'http://other.test/api/v1/client/me' => Http::response(['credential_id' => 'cred_mac', 'owner' => true]),
         'http://other.test/api/v1/client/intents?*' => Http::response(['intents' => [], 'jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('desktop.gate'))
         ->assertOk()
@@ -147,10 +151,11 @@ it('serves pages on a desktop that has only a paired device token, with that tok
         'mode' => 'device', 'url' => 'http://other.test', 'token' => 'csd_mac_token', 'credential_id' => 'cred_mac', 'name' => 'mac',
     ]));
     enableNativeDesktop();
+    meOnDirector(['credential_id' => 'cred_mac', 'owner' => true]);
     Http::fake([
-        'http://other.test/api/v1/client/me' => Http::response(['credential_id' => 'cred_mac', 'owner' => true]),
         'http://other.test/api/v1/client/intents?*' => Http::response(['intents' => [], 'jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('intents.index'))->assertOk();
     $this->get(route('connect'))->assertOk()->assertSee('this device, paired as mac', false);
@@ -163,6 +168,7 @@ it('offers Settings from the not-running gate, so a Director on another machine 
     connectClientWeb();
     enableNativeDesktop();
     Http::fake([director('me') => fn () => throw new ConnectionException('Connection refused')]);
+    fakeDirectorBackground();
 
     $this->get(route('desktop.gate'))->assertOk()->assertSee('data-test="desktop-gate-settings"', false);
     $this->get(route('connect'))->assertOk()->assertSee('Pair this device', false);

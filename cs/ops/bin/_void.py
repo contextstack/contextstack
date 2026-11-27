@@ -36,7 +36,7 @@ def schedule_rows(path):
                for index, row in enumerate(rows)
                if row.get('event') == 'schedule_updated' and row.get('repairs_revision_sha')}
     for index, row in enumerate(rows):
-        if row['id'] in current and row.get('event') != 'schedule_updated':
+        if row['id'] in current and row.get('event') not in ('schedule_updated', 'schedule_deleted'):
             digest = hashlib.sha256(json.dumps(row, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
             if repairs.get((digest, row['id']), -1) <= index:
                 raise ValueError('duplicate schedule id without a revision event')

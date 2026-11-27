@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Draft ContextStack release notes from local Git history."""
+
+import argparse
+import re
+import subprocess
+import sys
+
+
+def git(*args):
+    return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+
+
+def commit(revision):
+    return git("rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
+
+
+def previous_tag(target):
+    parents = git("rev-list", "--parents", "-n", "1", target).split()
+    if len(parents) == 1:
+        return None
+    tag = git("describe", "--first-parent", "--tags", "--match", "v[0-9]*",
+              "--exclude", "channel-*", "--abbrev=0", "--always", parents[1])
+    return tag if tag.startswith("v") else None
+
+
+def markdown(text):
+    return re.sub(r"([\\`*_\[\]<>])", r"\\\1", text)
+
+
+def draft(args):
+    target = commit(args.commit)
+    base_tag = args.since or previous_tag(target)
+    base = None
+    if base_tag:
+        git("check-ref-format", f"refs/tags/{base_tag}")
+        base = commit(f"refs/tags/{base_tag}")
+        if base == target:
+            raise ValueError("the previous tag must precede the target")
+        try:
+            git("merge-base", "--is-ancestor", base, target)
+        except subprocess.CalledProcessError:
+            raise ValueError("the previous tag must be an ancestor of the target") from None
+    version = args.tag.removeprefix("v")
+    print(f"# ContextStack {version}\n")
+    print("ContextStack runs coding agents on your own machines. Each task gets an")
+    print("isolated git branch and worktree. You review the result and choose whether to land it.\n")
+    print(f"Draft for owner review. Commit `{target}`.")
+    if base:
+        print(f"Changes since {markdown(base_tag)} at `{base}`.\n")
+    else:
+        print("Changes from the start of the repository history.\n")
+    print("## What's new\n")
+    revision_range = f"{base}..{target}" if base else target
+    for subject in git("log", "--no-merges", "--format=%s", revision_range, "--").splitlines():
+        print(f"- {markdown(subject)}")
+    print("\n## Before you install\n")
+    print("See [Getting started](getting-started.md) and [known issues](alpha-known-issues.md).")
+    print("Confirm the supported platforms and update the install guidance before publishing.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tag", required=True, help="proposed release tag")
+    parser.add_argument("--commit", default="HEAD", help="release commit or revision")
+    parser.add_argument("--since", help="previous release tag to use as the base")
+    args = parser.parse_args()
+    if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.(?:0|[1-9][0-9]*))?", args.tag):
+        parser.error("--tag must be vX.Y.Z or vX.Y.Z-rc.N")
+    try:
+        draft(args)
+    except ValueError as error:
+        parser.exit(2, f"release-notes: {error}\n")
+    except (OSError, subprocess.CalledProcessError):
+        parser.exit(2, "release-notes: could not read local Git history\n")
+
+
+if __name__ == "__main__":
+    main()

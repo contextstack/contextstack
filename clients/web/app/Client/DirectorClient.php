@@ -52,6 +52,37 @@ class DirectorClient
     }
 
     /**
+     * POST /api/v1/invites/accept: exchange an invite code for this device's token, as the invited member. Needs no
+     * credential. The answer has the pairing answer's shape plus the member and role (CLIENT-API.md §2, Member
+     * management and enrollment). A spent, expired, revoked or unknown code is 403 invite_refused; too many tries
+     * 429 with `retry_after` (seconds) in the refusal's body.
+     *
+     * @return array{credential_id: string, name: string, token: string, member: array<string, mixed>, role: string}
+     */
+    public static function acceptInvite(string $url, string $code, string $name, int $timeout = 15): array
+    {
+        try {
+            $response = Http::acceptJson()->timeout($timeout)->post(rtrim($url, '/').'/api/v1/invites/accept', ['code' => trim($code), 'name' => $name]);
+        } catch (ConnectionException $exception) {
+            throw new DirectorUnavailable('The Director at '.$url.' could not be reached: '.$exception->getMessage(), 0, $exception);
+        }
+
+        $body = self::decode($response);
+
+        if (! in_array($response->status(), [200, 201], true) || ! is_string($body['token'] ?? null) || ! is_string($body['credential_id'] ?? null)) {
+            throw self::refusal($response, $body);
+        }
+
+        return [
+            'credential_id' => $body['credential_id'],
+            'name' => (string) ($body['name'] ?? $name),
+            'token' => $body['token'],
+            'member' => is_array($body['member'] ?? null) ? $body['member'] : [],
+            'role' => (string) ($body['role'] ?? ''),
+        ];
+    }
+
+    /**
      * @param  array<string, scalar|null>  $query
      * @return array<string, mixed>
      */
@@ -93,7 +124,48 @@ class DirectorClient
      */
     public function write(string $path, array $body, string $key): WriteAnswer
     {
-        $response = $this->send(fn (PendingRequest $request) => $request->withHeaders(['Idempotency-Key' => $key])
+        return $this->writeWithHeaders($path, $body, ['Idempotency-Key' => $key]);
+    }
+
+    /**
+     * POST invites: a new member's invite, or a fresh code for a pending one. No Idempotency-Key: issuing never
+     * replays a code (CLIENT-API.md §2). The code is in the answer only: callers show it once. `origin`, when given,
+     * goes as `X-ContextStack-Invite-Origin`: the address the invitee's device will use, for a Director with no
+     * advertised URL (AdvertisedUrl). The Director honours it only from loopback and puts it in the answer's link.
+     *
+     * @param  array<string, mixed>  $body
+     */
+    public function issueInvite(array $body, ?string $origin): WriteAnswer
+    {
+        return $this->writeWithHeaders('invites', $body, self::originHeader($origin));
+    }
+
+    /**
+     * POST pairings: a one-time pairing code, under the write rules. `origin` as for issueInvite: the Director writes
+     * the address into the answer's `contextstack://pair` link.
+     *
+     * @param  array<string, mixed>  $body
+     */
+    public function issuePairing(array $body, string $key, ?string $origin): WriteAnswer
+    {
+        return $this->writeWithHeaders('pairings', $body, ['Idempotency-Key' => $key, ...self::originHeader($origin)]);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function originHeader(?string $origin): array
+    {
+        return $origin !== null && $origin !== '' ? ['X-ContextStack-Invite-Origin' => $origin] : [];
+    }
+
+    /**
+     * @param  array<string, mixed>  $body
+     * @param  array<string, string>  $headers
+     */
+    private function writeWithHeaders(string $path, array $body, array $headers): WriteAnswer
+    {
+        $response = $this->send(fn (PendingRequest $request) => $request->withHeaders($headers)
             ->withBody(json_encode((object) $body, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR), 'application/json')
             ->post($this->url($path)));
         $decoded = self::decode($response);
@@ -247,6 +319,15 @@ class DirectorClient
     }
 
     /**
+     * GET browser-action-screenshots/{sha}: a browser action approval's screenshot (JPEG, owner-only), the raw answer.
+     * The credential stays here; the desktop route relays only the bytes.
+     */
+    public function browserScreenshot(string $sha): Response
+    {
+        return $this->send(fn (PendingRequest $request) => $request->accept('image/jpeg')->get($this->url('browser-action-screenshots/'.rawurlencode($sha))));
+    }
+
+    /**
      * GET events, held open, each chunk handed to $forward as it arrives (CLIENT-API.md §8). Ends when the Director
      * ends the stream, after $seconds, or when $forward returns false (the receiver is gone). With a conversation id,
      * only that conversation's events (`GET events?conversation=ID`).
@@ -333,6 +414,11 @@ class DirectorClient
      */
     private static function refusal(Response $response, array $body): DirectorRefused
     {
+        $retryAfter = $response->header('Retry-After');
+        if ($response->status() === 429 && is_numeric($retryAfter)) {
+            $body['retry_after'] = (int) $retryAfter;
+        }
+
         if ($response->status() >= 500 && ! isset($body['code'])) {
             return new DirectorRefused($response->status(), 'director_error', 'The Director answered '.$response->status().'.', $body);
         }

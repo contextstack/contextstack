@@ -7,6 +7,8 @@ use crate::{
 };
 use std::path::{Path, PathBuf};
 
+pub(crate) const DEFAULT_RESERVED_PORTS: [u16; 2] = [8780, 9200];
+
 pub fn apply(
     effective: &mut Effective,
     grant: &Widening,
@@ -16,7 +18,10 @@ pub fn apply(
 ) -> Result<Vec<PathBuf>, Failure> {
     let loopback = !grant.loopback_ports.is_empty();
     for port in &grant.loopback_ports {
-        if matches!(port, 0 | 8780 | 9200) || grant.reserved_ports.contains(port) {
+        if *port == 0
+            || DEFAULT_RESERVED_PORTS.contains(port)
+            || grant.reserved_ports.contains(port)
+        {
             return Err(unenforceable(format!(
                 "loopback port {port} is reserved or invalid"
             )));

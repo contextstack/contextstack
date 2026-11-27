@@ -9,8 +9,8 @@
 //! An estimated API price (`est_usd`) is never shown: it is not a charge.
 
 use crate::budget::{self, Micros};
+use crate::store::ScopedConnection;
 use chrono::NaiveDate;
-use rusqlite::Connection;
 #[cfg(test)]
 use rusqlite::params;
 use serde_json::{Map, Value, json};
@@ -38,6 +38,8 @@ pub enum By {
     Intent,
     /// The node that ran it.
     Node,
+    /// The schedule ID carried by the job.
+    Schedule,
 }
 
 impl By {
@@ -49,6 +51,7 @@ impl By {
             "conversation" => Self::Conversation,
             "intent" => Self::Intent,
             "node" => Self::Node,
+            "schedule" => Self::Schedule,
             _ => return None,
         })
     }
@@ -60,6 +63,7 @@ impl By {
             Self::Conversation => "conversation_id",
             Self::Intent => "intent_id",
             Self::Node => "node",
+            Self::Schedule => "schedule_id",
         }
     }
 }
@@ -243,15 +247,16 @@ struct Row {
     node: String,
 }
 
-fn rows(db: &Connection, span: &Span, only: &Only) -> rusqlite::Result<Vec<Row>> {
-    const CONV: &str = "COALESCE(b.conversation_id, (SELECT t.conversation_id FROM turns t WHERE t.job_id = j.job_id), (SELECT s.conversation_id FROM summaries s WHERE s.job_id = j.job_id))";
-    const PROJ: &str = "COALESCE(b.project_id, (SELECT i.project_id FROM intents i WHERE i.intent_id = j.intent_id))";
+fn rows(db: &ScopedConnection, span: &Span, only: &Only) -> rusqlite::Result<Vec<Row>> {
+    const CONV: &str = "COALESCE(b.conversation_id, (SELECT t.conversation_id FROM turns t WHERE +org_id = :org_id AND t.job_id = j.job_id), (SELECT s.conversation_id FROM summaries s WHERE +org_id = :org_id AND s.job_id = j.job_id))";
+    const PROJ: &str = "COALESCE(b.project_id, (SELECT i.project_id FROM intents i WHERE +org_id = :org_id AND i.intent_id = j.intent_id))";
     let mut sql = format!(
-        "SELECT r.usage, r.received_at, n.name, j.intent_id, {CONV}, {PROJ}, r.run_id
-         FROM runs r JOIN nodes n ON n.id = r.node_id
-           LEFT JOIN jobs j ON j.job_id = COALESCE(r.job_id, (SELECT x.job_id FROM jobs x WHERE x.run_id = r.run_id LIMIT 1),
-                                                   (SELECT l.job_id FROM live_runs l WHERE l.run_id = r.run_id))
-           LEFT JOIN job_budgets b ON b.job_id = j.job_id
+        "SELECT r.usage, r.received_at, n.name, j.intent_id, {CONV}, {PROJ},
+                CASE WHEN json_type(j.meta, '$.schedule_id') = 'text' THEN json_extract(j.meta, '$.schedule_id') END
+         FROM (SELECT * FROM runs WHERE +org_id = :org_id) r JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = r.node_id
+           LEFT JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = COALESCE(r.job_id, (SELECT x.job_id FROM jobs x WHERE +org_id = :org_id AND x.run_id = r.run_id LIMIT 1),
+                                                   (SELECT l.job_id FROM live_runs l WHERE +org_id = :org_id AND l.run_id = r.run_id))
+           LEFT JOIN (SELECT * FROM job_budgets WHERE +org_id = :org_id) b ON b.job_id = j.job_id
          WHERE (? IS NULL OR r.received_at >= ?) AND (? IS NULL OR r.received_at < ?)"
     );
     let mut bind: Vec<rusqlite::types::Value> = vec![
@@ -286,7 +291,7 @@ fn rows(db: &Connection, span: &Span, only: &Only) -> rusqlite::Result<Vec<Row>>
     sql.push_str(" ORDER BY r.received_at");
     let mut stmt = db.prepare(&sql)?;
     let out = stmt
-        .query_map(rusqlite::params_from_iter(bind.iter()), |r| {
+        .query_map(bind.iter(), |r| {
             let usage: String = r.get(0)?;
             let intent: Option<String> = r.get(3)?;
             let conversation: Option<String> = r.get(4)?;
@@ -295,7 +300,7 @@ fn rows(db: &Connection, span: &Span, only: &Only) -> rusqlite::Result<Vec<Row>>
                 usage: serde_json::from_str(&usage).unwrap_or(Value::Null),
                 at: r.get(1)?,
                 node: r.get(2)?,
-                keys: [project, conversation, intent, None],
+                keys: [project, conversation, intent, r.get(6)?],
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -318,7 +323,7 @@ fn render_group(buckets: &BTreeMap<&'static str, Bucket>) -> Map<String, Value> 
 }
 
 /// `GET usage`: `{by, period, from, to, groups, total}`.
-pub fn rollup(db: &Connection, by: By, span: &Span, only: &Only) -> rusqlite::Result<Value> {
+pub fn rollup(db: &ScopedConnection, by: By, span: &Span, only: &Only) -> rusqlite::Result<Value> {
     let rows = rows(db, span, only)?;
     let mut total: BTreeMap<&'static str, Bucket> = BTreeMap::new();
     let mut groups: BTreeMap<String, (Value, BTreeMap<&'static str, Bucket>)> = BTreeMap::new();
@@ -335,6 +340,7 @@ pub fn rollup(db: &Connection, by: By, span: &Span, only: &Only) -> rusqlite::Re
                 let i = match other {
                     By::Project => 0,
                     By::Conversation => 1,
+                    By::Schedule => 3,
                     _ => 2,
                 };
                 let k = row.keys[i].clone();
@@ -476,43 +482,44 @@ mod tests {
         })?;
         let db = store.db();
         db.execute(
-            "INSERT OR IGNORE INTO nodes (id, name, token_hash, created_at) VALUES (1, 'estate', 'th', 'now')",
-            [],
+            "INSERT OR IGNORE INTO nodes (org_id, id, name, token_hash, created_at) VALUES (:org_id, 1, 'estate', 'th', 'now')",
+            rusqlite::params![],
         )?;
         for (iid, by) in [("mine", "lead_cred"), ("other", "owner")] {
             db.execute(
-                "INSERT INTO intents (intent_id, node, spec, task, trials, meta, bundle_sha256, created_by, created_at)
-                 VALUES (?1, 'estate', 's', 't', 1, '{}', 'sha', ?2, '2026-11-10T00:00:00Z')",
+                "INSERT INTO intents (org_id, intent_id, node, spec, task, trials, meta, bundle_sha256, created_by, created_at)
+                 VALUES (:org_id, ?1, 'estate', 's', 't', 1, '{}', 'sha', ?2, '2026-11-10T00:00:00Z')",
                 params![iid, by],
             )?;
         }
         for (jid, iid) in [("job_mine", "mine"), ("job_other", "other")] {
             db.execute(
-                "INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
-                 VALUES (?1, 1, 's', 't', 1, 'sha', '{}', 'done', '2026-11-10T00:00:00Z', ?2)",
+                "INSERT INTO jobs (org_id, job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
+                 VALUES (:org_id, ?1, 1, 's', 't', 1, 'sha', '{}', 'done', '2026-11-10T00:00:00Z', ?2)",
                 params![jid, iid],
             )?;
         }
         let usage = r#"{"input_tokens":1,"source":{"class":"free_local","model":"m"}}"#;
         for (rid, jid) in [("run_mine", "job_mine"), ("run_other", "job_other")] {
             db.execute(
-                "INSERT INTO runs (run_id, node_id, job_id, usage, received_at) VALUES (?1, 1, ?2, ?3, '2026-11-10T01:00:00Z')",
+                "INSERT INTO runs (org_id, run_id, node_id, job_id, usage, received_at) VALUES (:org_id, ?1, 1, ?2, ?3, '2026-11-10T01:00:00Z')",
                 params![rid, jid, usage],
             )?;
         }
         db.execute(
-            "INSERT INTO conversations (conversation_id, node, spec, spec_version, model, instructions_tokens, tools, created_by, created_at)
-             VALUES ('conv', 'estate', 'lead', '1', 'm', 0, 0, 'owner', 'now')",
-            [],
+            "INSERT INTO conversations (org_id, conversation_id, node, spec, spec_version, model, instructions_tokens, tools, created_by, created_at)
+             VALUES (:org_id, 'conv', 'estate', 'lead', '1', 'm', 0, 0, 'owner', 'now')",
+            rusqlite::params![],
         )?;
         db.execute(
-            "INSERT INTO credentials (id, kind, name, token_hash, created_at, conversation_id, intent_id, node)
-             VALUES ('lead_cred', 'lead', 'lead', 'h', 'now', 'conv', 'mine', 'estate')",
-            [],
+            "INSERT INTO credentials (org_id, member_id, id, kind, name, token_hash, created_at, conversation_id, intent_id, node)
+             VALUES (:org_id, :member_id, 'lead_cred', 'lead', 'lead', 'h', 'now', 'conv', 'mine', 'estate')",
+            rusqlite::params![],
         )?;
         let lead = Client {
             id: "lead_cred".into(),
             kind: Kind::Lead,
+            member: crate::access::Member::fixture(),
             conversation_id: Some("conv".into()),
             intent_id: Some("mine".into()),
             node: Some("estate".into()),

@@ -2,9 +2,10 @@
 //! node. Each has a stable id and moves requested → received → applied or refused. A cancel and a schedule change
 //! each own one; a change of state is a new revision of its owner.
 
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::util::{self, now_utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
 /// The longest `detail` a node may report.
@@ -40,11 +41,16 @@ fn outcomes(kind: &str) -> (&'static [&'static str], &'static [&'static str]) {
 }
 
 /// Record a new control message for a node, inside the caller's transaction. Returns its id.
-pub fn issue(tx: &Connection, node_id: i64, kind: &str, body: &Value) -> Result<String, String> {
+pub fn issue(
+    tx: &ScopedConnection,
+    node_id: i64,
+    kind: &str,
+    body: &Value,
+) -> Result<String, String> {
     let id = format!("ctl_{}", util::ulid()?.to_lowercase());
     tx.execute(
-        "INSERT INTO controls (control_id, node_id, kind, body, state, issued_at)
-         VALUES (?1, ?2, ?3, ?4, 'requested', ?5)",
+        "INSERT INTO controls (org_id, control_id, node_id, kind, body, state, issued_at)
+         VALUES (:org_id, ?1, ?2, ?3, ?4, 'requested', ?5)",
         params![id, node_id, kind, body.to_string(), now_utc()],
     )
     .map_err(|e| e.to_string())?;
@@ -52,7 +58,7 @@ pub fn issue(tx: &Connection, node_id: i64, kind: &str, body: &Value) -> Result<
 }
 
 const SELECT: &str = "SELECT control_id, kind, state, issued_at, body, outcome, detail, result, received_at, settled_at
-                      FROM controls";
+                      FROM (SELECT rowid, * FROM controls WHERE +org_id = :org_id)";
 
 fn shape(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let parse = |s: Option<String>| s.and_then(|s| serde_json::from_str::<Value>(&s).ok());
@@ -66,14 +72,14 @@ fn shape(r: &rusqlite::Row) -> rusqlite::Result<Value> {
 }
 
 /// `GET control`: this node's messages that are requested or received, oldest first.
-pub fn open_for(db: &Connection, node_id: i64) -> rusqlite::Result<Vec<Value>> {
+pub fn open_for(db: &ScopedConnection, node_id: i64) -> rusqlite::Result<Vec<Value>> {
     let mut stmt = db.prepare_cached(&format!(
         "{SELECT} WHERE node_id = ?1 AND state IN ('requested', 'received') ORDER BY rowid"
     ))?;
     stmt.query_map(params![node_id], shape)?.collect()
 }
 
-fn one(db: &Connection, node_id: i64, id: &str) -> rusqlite::Result<Option<Value>> {
+fn one(db: &ScopedConnection, node_id: i64, id: &str) -> rusqlite::Result<Option<Value>> {
     db.query_row(
         &format!("{SELECT} WHERE control_id = ?1 AND node_id = ?2"),
         params![id, node_id],
@@ -83,10 +89,10 @@ fn one(db: &Connection, node_id: i64, id: &str) -> rusqlite::Result<Option<Value
 }
 
 /// Touch the record that owns a control message (and what it shows on), so clients see the new state.
-fn touch_owner(tx: &Connection, control_id: &str) -> rusqlite::Result<()> {
+fn touch_owner(tx: &ScopedConnection, control_id: &str) -> rusqlite::Result<()> {
     let cancel: Option<(String, String)> = tx
         .query_row(
-            "SELECT cancel_id, job_id FROM cancels WHERE control_id = ?1",
+            "SELECT cancel_id, job_id FROM cancels WHERE +org_id = :org_id AND control_id = ?1",
             params![control_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -97,12 +103,18 @@ fn touch_owner(tx: &Connection, control_id: &str) -> rusqlite::Result<()> {
     }
     let change: Option<(String, String)> = tx
         .query_row(
-            "SELECT change_id, schedule_key FROM schedule_changes WHERE control_id = ?1",
+            "SELECT change_id, schedule_key FROM schedule_changes WHERE +org_id = :org_id AND control_id = ?1",
             params![control_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     if let Some((change_id, key)) = change {
+        tx.execute(
+            "UPDATE schedules SET removed_at = (SELECT settled_at FROM controls WHERE +org_id = :org_id AND control_id = ?2)
+             WHERE +org_id = :org_id AND schedule_key = ?1 AND schedule_revision = 0
+               AND EXISTS (SELECT 1 FROM controls WHERE +org_id = :org_id AND control_id = ?2 AND state = 'refused')",
+            params![key, control_id],
+        )?;
         touch(tx, Record::ScheduleChange, &change_id)?;
         touch(tx, Record::Schedule, &key)?;
     }
@@ -160,7 +172,7 @@ fn parse_report(kind: &str, body: &[u8]) -> Result<Report, Refused> {
 /// outcome answers the same record; a different outcome on a settled message is a conflict.
 pub fn report(
     store: &crate::store::Store,
-    db: &mut Connection,
+    db: &mut ScopedConnection,
     node_id: i64,
     control_id: &str,
     body: &[u8],
@@ -195,14 +207,14 @@ pub fn report(
     let stamp = now_utc();
     let changed = if state == "received" {
         tx.execute(
-            "UPDATE controls SET state = 'received', received_at = ?1 WHERE control_id = ?2",
+            "UPDATE controls SET state = 'received', received_at = ?1 WHERE +org_id = :org_id AND (control_id = ?2)",
             params![stamp, control_id],
         )
     } else {
         tx.execute(
             "UPDATE controls SET state = ?1, outcome = ?2, detail = ?3, result = ?4, settled_at = ?5,
                                  received_at = COALESCE(received_at, ?5)
-             WHERE control_id = ?6",
+             WHERE +org_id = :org_id AND (control_id = ?6)",
             params![
                 state,
                 outcome,
@@ -223,7 +235,7 @@ pub fn report(
         && state == "applied"
         && let Some(job) = tx
             .query_row(
-                "SELECT job_id FROM cancels WHERE control_id = ?1",
+                "SELECT job_id FROM cancels WHERE +org_id = :org_id AND control_id = ?1",
                 params![control_id],
                 |r| r.get::<_, String>(0),
             )
@@ -243,10 +255,10 @@ pub fn report(
 }
 
 /// A job's `job_terminal` was acked: a cancel the node never picked up is settled here, as already finished.
-pub fn settle_on_terminal(tx: &Connection, job_id: &str) -> rusqlite::Result<()> {
+pub fn settle_on_terminal(tx: &ScopedConnection, job_id: &str) -> rusqlite::Result<()> {
     let open: Option<String> = tx
         .query_row(
-            "SELECT k.control_id FROM cancels c JOIN controls k ON k.control_id = c.control_id
+            "SELECT k.control_id FROM (SELECT * FROM cancels WHERE +org_id = :org_id) c JOIN (SELECT * FROM controls WHERE +org_id = :org_id) k ON k.control_id = c.control_id
              WHERE c.job_id = ?1 AND k.state = 'requested'",
             params![job_id],
             |r| r.get(0),
@@ -258,11 +270,11 @@ pub fn settle_on_terminal(tx: &Connection, job_id: &str) -> rusqlite::Result<()>
     tx.execute(
         "UPDATE controls SET state = 'applied', outcome = 'already_finished', settled_at = ?1,
                              detail = 'the node reported the job over before it picked the cancel up'
-         WHERE control_id = ?2",
+         WHERE +org_id = :org_id AND (control_id = ?2)",
         params![now_utc(), control_id],
     )?;
     tx.execute(
-        "UPDATE cancels SET state = 'applied' WHERE control_id = ?1",
+        "UPDATE cancels SET state = 'applied' WHERE +org_id = :org_id AND (control_id = ?1)",
         params![control_id],
     )?;
     touch_owner(tx, &control_id)
@@ -270,7 +282,7 @@ pub fn settle_on_terminal(tx: &Connection, job_id: &str) -> rusqlite::Result<()>
 
 /// A control message's state as its owner record shows it: `{state, outcome, pending, delivered, detail, …}`.
 pub fn view(
-    db: &Connection,
+    db: &ScopedConnection,
     control_id: Option<&str>,
     node_protocol: Option<i64>,
 ) -> rusqlite::Result<Map<String, Value>> {

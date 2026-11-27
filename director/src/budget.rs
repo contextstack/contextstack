@@ -142,10 +142,10 @@ fn midnight<Tz: TimeZone>(date: NaiveDate, tz: &Tz) -> Option<String> {
     )
 }
 
-/// Which budget: a project's or a conversation's.
+/// Which budget: a project's, a conversation's or a schedule's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
-    /// `project` or `conversation`.
+    /// `project`, `conversation` or `schedule`.
     pub kind: &'static str,
     /// Its id.
     pub id: String,

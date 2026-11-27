@@ -59,6 +59,7 @@ function fakeThread(array $conversation, array $turns, array $summaries = [], ar
         director('conversations/con_1/thread') => Http::response(['conversation' => $conversation, 'turns' => $turns, 'summaries' => $summaries]),
         ...$more,
     ]);
+    fakeDirectorBackground();
 }
 
 it('starts a built-in chat attached to a task, naming the node and model, uploading nothing, and opens it', function () {
@@ -76,6 +77,7 @@ it('starts a built-in chat attached to a task, naming the node and model, upload
         director('objects/*') => Http::response(['stored' => true]),
         director('conversations') => Http::response(['conversation' => conversationRecord()], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation-create')->set('showAdvanced', true)
         ->assertSee('say hello')->assertSee('site')
@@ -113,6 +115,7 @@ it('names the project for a conversation that stands alone, and shows the Direct
         director('objects/*') => Http::response(['stored' => true]),
         director('conversations') => Http::response(['error' => 'Unprocessable', 'code' => 'invalid_request', 'detail' => 'the spec must list tasks/turn in tasks'], 422),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation-create')->set('showAdvanced', true)->set('projectId', 'prj_1')->call('submit')
         ->assertSee('the spec must list tasks/turn in tasks');
@@ -125,6 +128,7 @@ it('lists conversations newest first with their state and budget', function () {
         conversationRecord(['conversation_id' => 'con_old', 'title' => 'older', 'created_at' => '2026-11-09T10:00:00Z']),
         conversationRecord(['title' => 'newer', 'state' => 'held', 'held' => true, 'queued_turn_ids' => ['trn_2']]),
     ]])]);
+    fakeDirectorBackground();
 
     $this->get(route('conversations.index'))->assertOk()
         ->assertSeeInOrder(['newer', 'older'])->assertSee('stopped: messages queue')->assertSee('1 queued')->assertSee('no budget set');
@@ -148,6 +152,7 @@ it('shows the whole thread, with each summary shown as a summary after the turns
 
 it('answers 404 for a conversation the Director does not know', function () {
     Http::fake([director('conversations/nope/thread') => Http::response(['error' => 'Not Found', 'code' => 'not_found', 'detail' => 'no such conversation'], 404)]);
+    fakeDirectorBackground();
 
     $this->get(route('conversations.show', 'nope'))->assertNotFound();
 });
@@ -167,6 +172,7 @@ it('posts a turn with a key, shows it queued behind the active turn, and keeps t
             default => Http::response([], 404),
         };
     });
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation', ['conversation' => 'con_1']);
     $key = $page->get('postKey');
@@ -227,6 +233,7 @@ it('stops with a key, showing the queue held and the turn stopping, then resumes
             'cancel' => [...$cancel, 'job_id' => 'job_t1', 'revision' => 40]], 202),
         director('conversations/con_1/resume') => Http::response(['conversation' => conversationRecord(['state' => 'idle', 'held' => false, 'revision' => 50]), 'cancel' => null]),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation', ['conversation' => 'con_1']);
     $stopKey = $page->get('stopKey');
@@ -295,6 +302,7 @@ it('sets and clears the conversation\'s budget, with no key since a budget write
 
 it('relays only this conversation\'s events when the page asks for them', function () {
     Http::fake([director('events*') => Http::response("event: hello\ndata: {\"revision\": 1, \"conversation\": \"con_1\"}\n\n", 200, ['Content-Type' => 'text/event-stream'])]);
+    fakeDirectorBackground();
 
     $this->get(route('stream', ['conversation' => 'con_1']))->streamedContent();
     $this->get(route('stream', ['conversation' => '../bad id']))->streamedContent();
@@ -309,6 +317,7 @@ it('lists needs-you first with the question shown, and hides the badge when atte
         conversationRecord(['conversation_id' => 'con_old', 'title' => 'older needs you', 'created_at' => '2026-11-09T10:00:00Z',
             'attention' => attentionRecord(['question' => 'Which branch?'])]),
     ]])]);
+    fakeDirectorBackground();
 
     $page = $this->get(route('conversations.index'))->assertOk()
         ->assertSeeInOrder(['older needs you', 'newer'])
@@ -344,6 +353,7 @@ it('shows the attention question and job link, dismiss clears via DELETE, and po
             default => Http::response([], 404),
         };
     });
+    fakeDirectorBackground();
 
     $this->get(route('conversations.show', 'con_1'))->assertOk()
         ->assertSee('Approve merge?')
@@ -457,6 +467,7 @@ it('creates the Director\'s built-in chat on the chosen model from the simple fo
         director('objects/*') => Http::response(['stored' => true]),
         director('conversations') => Http::response(['conversation' => conversationRecord(['model' => 'codex'])], 201),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation-create')
         ->assertSet('model', 'codex')
@@ -479,6 +490,7 @@ it('asks for a spec before sending a system prompt or files of your own', functi
         director('intents?*') => Http::response(['intents' => [], 'jobs' => []]),
         director('projects') => Http::response(['projects' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation-create')->set('kind', 'chat')->set('showAdvanced', true)
         ->set('system', 'Be terse.')->call('submit')->assertHasErrors('spec');
@@ -494,6 +506,7 @@ it('still creates a conversation from advanced fields with a custom spec', funct
         director('objects/*') => Http::response(['stored' => true]),
         director('conversations') => Http::response(['conversation' => conversationRecord(['model' => 'fake'])], 201),
     ]);
+    fakeDirectorBackground();
 
     $custom = "id: chat\nmodel: fake\nsystem: prompts/system.md\ncontext: [conversation/context.md]\ntools: []\nmcp: []\n".
         "budget: {turns: 4, tool_calls: 0, usd: 0, seconds: 300}\ntasks: [tasks/turn]\ntrials: 1\n";
@@ -520,6 +533,7 @@ it('posts the first message when starting a conversation', function () {
             'conversation' => conversationRecord(['state' => 'running', 'active_turn_id' => 'trn_1']),
         ], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation-create')
         ->set('message', 'Hello there.');
@@ -544,6 +558,7 @@ it('shows ready and unavailable models in the picker with reasons', function () 
         director('intents?*') => Http::response(['intents' => [], 'jobs' => []]),
         director('projects') => Http::response(['projects' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation-create')
         ->assertSet('model', 'codex')
@@ -569,6 +584,7 @@ it('defaults to the first ready subscription model when the Director default is 
         director('intents?*') => Http::response(['intents' => [], 'jobs' => []]),
         director('projects') => Http::response(['projects' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation-create')
         ->assertSet('model', 'codex');
@@ -587,6 +603,7 @@ it('disables start when no model is ready', function () {
         director('intents?*') => Http::response(['intents' => [], 'jobs' => []]),
         director('projects') => Http::response(['projects' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation-create')
         ->assertSet('canStart', false)
@@ -671,6 +688,7 @@ it('try again posts the same message text as a new turn with a fresh key', funct
             'conversation' => conversationRecord(['queued_turn_ids' => ['trn_2'], 'revision' => 31]),
         ], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation', ['conversation' => 'con_1']);
     $page->call('retryTurn', 'trn_1')->assertSee('Queued behind the current reply.');
@@ -704,6 +722,7 @@ it('continues a provider-failed turn in a new conversation on another model', fu
             'conversation' => conversationRecord(['conversation_id' => 'con_2', 'model' => 'codex', 'state' => 'running', 'active_turn_id' => 'trn_9']),
         ], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation', ['conversation' => 'con_1'])
         ->set('retryModel.trn_1', 'codex')
@@ -734,6 +753,7 @@ it('offers Stop while messages wait', function () {
 
 it('names an untitled conversation by its model, not its id', function () {
     Http::fake([director('conversations?*') => Http::response(['conversations' => [conversationRecord(['title' => null, 'model' => 'claude-code-sonnet'])]])]);
+    fakeDirectorBackground();
 
     $this->get(route('conversations.index'))->assertSeeText('Untitled conversation with claude-code-sonnet')->assertDontSeeText('con_1');
 });
@@ -812,6 +832,7 @@ it('says so when the message does not reach the new conversation after a model s
         director('conversations') => Http::response(['conversation' => conversationRecord(['conversation_id' => 'con_2', 'model' => 'codex'])], 201),
         director('conversations/con_2/turns') => Http::response(['error' => 'Unprocessable', 'code' => 'invalid_turn', 'detail' => 'message refused'], 422),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation', ['conversation' => 'con_1'])
         ->set('retryModel.trn_1', 'codex')
@@ -843,6 +864,7 @@ it('carries a refused first message to the new conversation\'s page instead of d
         director('conversations') => Http::response(['conversation' => conversationRecord()], 201),
         director('conversations/con_1/turns') => Http::response(['error' => 'Unprocessable', 'code' => 'invalid_turn', 'detail' => 'message refused'], 422),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.conversation-create')
         ->set('kind', 'chat')
@@ -911,6 +933,7 @@ it('lists archived conversations apart, and moves one between the views as it is
     Http::fake(fn (Request $request) => Http::response(['conversations' => ($request->data()['archived'] ?? null) === '1'
         ? [conversationRecord(['conversation_id' => 'con_old', 'title' => 'put away', 'archived_at' => '2026-11-14T00:00:00Z'])]
         : [conversationRecord(['title' => 'still here'])]]));
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversations')->assertSee('still here')->assertDontSee('put away');
     $page->call('applyStream', [['kind' => 'conversation', 'id' => 'con_1', 'revision' => 20,

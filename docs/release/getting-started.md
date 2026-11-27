@@ -22,7 +22,7 @@ Install the latest stable release:
 curl -fsSL https://github.com/contextstack/contextstack/releases/latest/download/install.sh | sh
 ```
 
-To install a pre-release, including a 0.2.0 release candidate, use the `latest` channel:
+To install a pre-release, including a 0.3.0 release candidate, use the `latest` channel:
 
 ```sh
 curl -fsSL https://github.com/contextstack/contextstack/releases/download/channel-latest/install.sh | sh -s -- --channel latest

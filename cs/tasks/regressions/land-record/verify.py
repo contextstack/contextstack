@@ -322,7 +322,7 @@ def main():
         (main_repo / "README").write_text("seed\n")
         git(main_repo, "add", "README")
         git(main_repo, "commit", "-q", "-m", "seed")
-        repos.write_text(json.dumps({"demo": {"path": str(main_repo), "gate":
+        repos.write_text(json.dumps({"demo": {"path": str(main_repo), "land_check": "host", "gate":
                                               "test -f green.txt || { echo 'FAIL rule-green: no green.txt'; exit 1; }"}}))
         sys.path.insert(0, str(KIT / "ops/bin"))
         import _lanes
@@ -397,6 +397,23 @@ def main():
                    and git(main_repo, "rev-parse", "HEAD") == before_head,
                    "a red check is failed, with its first FAIL line, and main stays", (code, out, body, err))
 
+            config = json.loads(repos.read_text())
+            config["demo"]["land_check"] = "sandbox"
+            repos.write_text(json.dumps(config))
+            policy = Path(__file__).resolve().parents[3] / "policy/land-host-probes.json"
+            (home / ".contextstack/config/land-host-probes.json").write_bytes(policy.read_bytes())
+            mark = len(director.calls)
+            code, out, err = cs_land(home, "demo", "red")
+            posted = posts_since(director, mark)
+            body = check_post(posted[0], out, "run_red", "refused") if posted else {}
+            expect(code == 2 and out.get("main_unchanged") is True and body.get("reason") == out.get("reason")
+                   and body.get("host_probe_coverage") == {"covered": [], "uncovered": sorted(json.loads(
+                       policy.read_text())["probes"])}
+                   and git(main_repo, "rev-parse", "HEAD") == before_head,
+                   "unavailable sandbox is recorded as a refusal and never falls back to the host gate", (out, body, err))
+            config["demo"]["land_check"] = "host"
+            repos.write_text(json.dumps(config))
+
             make_lane("ok", {"green.txt": "g\n"})
             mark = len(director.calls)
             code, out, err = cs_land(home, "demo", "ok")
@@ -447,7 +464,7 @@ def main():
                    and len(director.calls) == node_calls and len(api.calls) == client_calls
                    and (main_repo / "down.txt").is_file(),
                    "an unreachable Director does not change the landing", (code, out, err))
-            expect(len(KEYS) == 5, "each landing attempt uses its own idempotency key", KEYS)
+            expect(len(KEYS) == 6, "each landing attempt uses its own idempotency key", KEYS)
         finally:
             director.close()
             api.close()

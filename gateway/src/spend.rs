@@ -12,7 +12,8 @@
 //!
 //! `"*"` is one budget shared by every source: it turns every source on, and a source with its own
 //! budget must fit both. A source's own budget of $0 turns it off even under `"*"`. The legacy
-//! `{"api_usd_per_day": X}` reads as `"*": {"usd": X, "period": "day"}` (both at once is invalid).
+//! `{"api_usd_per_day": X}` reads as `"*": {"usd": X, "period": "day"}` and conflicts with an
+//! explicit shared budget in `sources`. Named source budgets may accompany either shared form.
 //! Periods are local calendar days and months.
 //!
 //! Admission, before any connection: the call's reservation is the most it can cost at list price (input
@@ -845,6 +846,33 @@ mod tests {
             );
         }
         assert!(Guard::new(None).limits().is_err(), "no HOME refuses");
+        Ok(())
+    }
+
+    #[test]
+    fn limit_fixtures_match_cs_doctor() -> Res {
+        let fixtures: Vec<(String, Option<String>, Option<Value>)> =
+            serde_json::from_str(include_str!("../tests/fixtures/spend-limits.json"))?;
+        for (name, body, expected) in fixtures {
+            let dir = tempfile::tempdir()?;
+            let guard = Guard::new(Some(dir.path()));
+            if let Some(body) = body {
+                let path = guard.limits.as_ref().ok_or("no limit path")?;
+                std::fs::create_dir_all(path.parent().ok_or("no parent")?)?;
+                std::fs::write(path, body)?;
+            }
+            match expected {
+                Some(expected) => {
+                    let expected: Limits = serde_json::from_value(expected)?;
+                    assert_eq!(
+                        serde_json::to_value(guard.limits()?)?,
+                        serde_json::to_value(expected)?,
+                        "{name}"
+                    );
+                }
+                None => assert!(guard.limits().is_err(), "{name}"),
+            }
+        }
         Ok(())
     }
 

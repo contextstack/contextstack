@@ -264,6 +264,7 @@ new #[Layout('layouts::client')] #[Title('Decision')] class extends DirectorPage
         @endif
         <x-slot:actions>
             @if ($entry && ($entry['status'] ?? null) === 'active' && ! $editing)
+                @capable('edit_decision_log')
                 <flux:button size="sm" icon="pencil-square" wire:click="edit" data-test="edit-decision">{{ __('Edit') }}</flux:button>
                 <flux:dropdown>
                     <flux:button size="sm" variant="ghost" icon="ellipsis-horizontal" square :aria-label="__('More')" />
@@ -276,6 +277,7 @@ new #[Layout('layouts::client')] #[Title('Decision')] class extends DirectorPage
                         </flux:modal.trigger>
                     </flux:menu>
                 </flux:dropdown>
+                @endcapable
             @endif
             <x-client.stream-dot />
         </x-slot:actions>

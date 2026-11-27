@@ -156,7 +156,9 @@ new #[Layout('layouts::client')] #[Title('Decision log')] class extends Director
     <x-client.page-header :back="route('projects.show', $projectId)" :back-label="$projectName">
         {{ __('Decision log') }}
         <x-slot:actions>
+            @capable('edit_decision_log')
             <flux:button size="sm" variant="primary" icon="plus" wire:click="newDecision" data-test="new-decision">{{ __('New decision') }}</flux:button>
+            @endcapable
             <x-client.stream-dot />
         </x-slot:actions>
     </x-client.page-header>

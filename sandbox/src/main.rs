@@ -13,10 +13,16 @@ mod cli;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod cli_executor;
 mod env_deny;
+#[cfg(any(target_os = "linux", test))]
+mod executor_mounts;
 mod failure;
 mod json_status;
+#[cfg(target_os = "macos")]
+mod land_check;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod linux_relay;
 mod policy;
 mod probe;
 mod profile;
@@ -58,11 +64,64 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<i32, Failure> {
+    #[cfg(target_os = "linux")]
+    if args.first().is_some_and(|arg| arg == "--exec-with-sockets") {
+        return linux::exec_with_sockets(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if let [flag, socket] = args.as_slice()
+        && flag == "--executor-loopback-relay"
+    {
+        return linux_relay::serve_sandbox(std::path::Path::new(socket));
+    }
     match cli::parse(args)? {
         cli::Command::Probe { policy } => probe(&policy),
         cli::Command::EmitCliExecutor { policy, request } => emit_cli_executor(&policy, &request),
+        cli::Command::RunCliExecutor {
+            policy,
+            request,
+            command,
+        } => run_cli_executor(&policy, &request, &command),
+        cli::Command::EmitLandCheck { request } => emit_land_check(&request),
         cli::Command::Run(run) => execute(&run),
     }
+}
+
+fn emit_land_check(request: &Path) -> Result<i32, Failure> {
+    #[cfg(target_os = "macos")]
+    {
+        print!(
+            "{}",
+            land_check::profile(&read_profile_request(request, "land-check")?)?
+        );
+        Ok(0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = request;
+        Err(unenforceable(
+            "land-check profile is unsupported outside macOS",
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_profile_request<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    kind: &str,
+) -> Result<T, Failure> {
+    let body = if path == Path::new("-") {
+        std::io::read_to_string(std::io::stdin())
+    } else {
+        std::fs::read_to_string(path)
+    }
+    .map_err(|error| unenforceable(format!("cannot read {}: {error}", path.display())))?;
+    serde_json::from_str(&body).map_err(|error| {
+        unenforceable(format!(
+            "invalid {kind} request {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn emit_cli_executor(policy_path: &Path, request_path: &Path) -> Result<i32, Failure> {
@@ -77,27 +136,25 @@ fn emit_cli_executor(policy_path: &Path, request_path: &Path) -> Result<i32, Fai
     {
         let host = policy::load_host(policy_path)?;
         cli_executor::assert_host_allows_cli_executor(&host)?;
-        let body = if request_path == Path::new("-") {
-            use std::io::Read;
-            let mut body = String::new();
-            std::io::stdin().read_to_string(&mut body).map(|_| body)
-        } else {
-            std::fs::read_to_string(request_path)
-        }
-        .map_err(|error| {
-            unenforceable(format!("cannot read {}: {error}", request_path.display()))
-        })?;
-        let request: cli_executor::ExecutorRequest =
-            serde_json::from_str(&body).map_err(|error| {
-                unenforceable(format!(
-                    "invalid executor request {}: {error}",
-                    request_path.display()
-                ))
-            })?;
-        let profile = cli_executor::seatbelt_profile(&request)?;
+        let profile =
+            cli_executor::seatbelt_profile(&read_profile_request(request_path, "executor")?)?;
         print!("{profile}");
         Ok(0)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_cli_executor(policy: &Path, request: &str, command: &[String]) -> Result<i32, Failure> {
+    let host = policy::load_host(policy)?;
+    cli_executor::assert_host_allows_cli_executor(&host)?;
+    let request = serde_json::from_str(request)
+        .map_err(|e| unenforceable(format!("invalid executor request: {e}")))?;
+    linux::run_executor(&request, command).map(|status| outcome(status).2)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_cli_executor(_: &Path, _: &str, _: &[String]) -> Result<i32, Failure> {
+    Err(unenforceable("bwrap executor runs require Linux"))
 }
 
 #[cfg(target_os = "macos")]

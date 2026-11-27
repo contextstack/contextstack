@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Exercise Director control application against a private schedule ledger."""
+import sys
+import tempfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "ops/bin"))
+from _node_control import apply
+from _node_schedules import report, rows
+from _void import schedule_rows
+
+with tempfile.TemporaryDirectory() as tmp:
+    state = Path(tmp)
+    create = {"kind": "schedule_change", "control_id": "ctl_create",
+              "body": {"kind": "create", "schedule_id": "nightly", "node": "fixture", "expect_revision": 0,
+                       "set": {"name": "Nightly", "cron": "0 2 * * *", "timezone": "UTC", "enabled": True,
+                               "agent": "reviewer", "task": "tasks/t", "missed": "catch_up"}}}
+    assert apply(create, state, None)[3] == {"revision": 1}
+    assert apply(create, state, None)[3] == {"revision": 1}
+    assert apply(dict(create, control_id="ctl_other"), state, None)[1] == "revision_mismatch"
+    row, = rows(state)
+    assert row["event"] == "schedule_created" and row["agent"] == "reviewer" and row["node"] == "fixture"
+    edit = {"kind": "schedule_change", "control_id": "ctl_edit",
+            "body": {"schedule_id": "nightly", "expect_revision": 1, "set": {"cron": "15 2 * * *", "timezone": "Europe/Paris"}}}
+    assert apply(edit, state, None)[3] == {"revision": 2}
+    delete = {"kind": "schedule_change", "control_id": "ctl_delete",
+              "body": {"kind": "delete", "schedule_id": "nightly", "expect_revision": 2, "set": {"enabled": False}}}
+    assert apply(delete, state, None)[3] == {"revision": 3}
+    assert apply(delete, state, None)[3] == {"revision": 3}
+    assert apply(dict(edit, control_id="ctl_late"), state, None)[1] == "unknown_schedule"
+    assert len(rows(state)) == 3
+    latest, = schedule_rows(state / "schedules.jsonl")
+    assert latest["deleted"] and not latest["enabled"]
+    snapshot, _ = report(state, {})
+    schedule, = snapshot["schedules"]
+    assert schedule["revision"] == 3 and schedule["enabled"] is False and schedule["definition"]["deleted"] is True
+    assert schedule["cron"] == "15 2 * * *" and schedule["timezone"] == "Europe/Paris"
+print("schedule controls create, replay, edit and tombstone")

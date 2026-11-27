@@ -6,8 +6,10 @@ use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Json;
+use App\Native\AnswersNeedsYou;
 use App\Native\Backlog;
 use App\Native\DirectorScreen;
+use App\Native\NeedsYou;
 use Illuminate\View\View;
 use Native\Mobile\Attributes\Poll;
 
@@ -19,6 +21,8 @@ use Native\Mobile\Attributes\Poll;
  */
 class ProjectBacklog extends DirectorScreen
 {
+    use AnswersNeedsYou;
+
     public string $projectId = '';
 
     public string $projectName = '';
@@ -68,6 +72,20 @@ class ProjectBacklog extends DirectorScreen
         if ($this->selected !== null && ! isset($this->items[$this->selected])) {
             $this->selected = null;
         }
+    }
+
+    /**
+     * Press one of an item's needs-you options, against the revision shown.
+     */
+    public function choose(string $itemId, string $choice): void
+    {
+        $item = $this->items[$itemId] ?? null;
+        if ($item === null || ! $this->can('edit_backlog')
+            || ! in_array($choice, array_column(NeedsYou::options(NeedsYou::ofBacklogItem($item)), 'id'), true)) {
+            return;
+        }
+        $revision = $item['revision'] ?? null;
+        $this->answerBacklog($this->projectId, $itemId, is_int($revision) ? $revision : 0, $choice);
     }
 
     public function toggleClosed(): void

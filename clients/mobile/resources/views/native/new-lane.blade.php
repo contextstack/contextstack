@@ -27,8 +27,13 @@
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
+            @include('native.partials.signed-out')
 
-            <native:button label="Start lane" variant="primary" class="w-full" @tap="start" />
+            @if ($this->can('start_work'))
+                <native:button label="Start lane" variant="primary" class="w-full" @tap="start" />
+            @else
+                <native:text class="text-sm text-theme-on-surface-variant">Your role on this Director does not start work.</native:text>
+            @endif
         </native:column>
     </native:column>
 </native:scroll-view>

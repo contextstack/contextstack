@@ -117,7 +117,7 @@ def _(ctx):
 @case("client", AREA, "backlog-installation-and-lead-scope")
 def _(ctx):
     o, node = owner(ctx), ctx.node2()
-    pid, path, heartbeat = routes(ctx, o)
+    pid, path, _ = routes(ctx, o)
     other, other_path, _ = routes(ctx, o)
     first = add(ctx, o, path, "Private")
     item_path = path + "/" + first["item_id"]
@@ -133,8 +133,6 @@ def _(ctx):
         ("POST", path + "/reorder", {"items": []}),
     ):
         refused(ctx, outsider.call(method, route, body=data, key=new_key()), 403, "owner_only", "lead project scope")
-    refused(ctx, bound.call("PUT", heartbeat, body={"interval_seconds": None}), 403, "owner_only", "lead cannot schedule")
-
     stream = outsider.stream()
     try:
         stream.until(lambda name, _data: name == "hello")
@@ -176,6 +174,89 @@ def _(ctx):
     ctx.expect(tool("backlog", action="next")["item"] == first, "next tool returns eligible item")
     updated = tool("backlog_update", item_id=first["item_id"], revision=first["revision"], status="now")["item"]
     ctx.expect(tool("backlog", status="now")["items"] == read(o, path) == [updated], "list tool filters Director records")
+    blockers = [{"kind": "owner", "ref": "rollout"}]
+    question = {"options": [{"id": "small", "label": "Small rollout"}]}
+    asked = tool("backlog_update", item_id=updated["item_id"], revision=updated["revision"], status="blocked",
+                 blocked_on=blockers, needs_you=question)["item"]
+    ctx.expect(asked["blocked_on"] == blockers and asked["needs_you"] == question
+               and read(o, path, "/needs_you") == [{**asked, "actions": {"answer": True}}],
+               "lead asks through backlog_update and owner can answer")
+
+
+@case("client", AREA, "heartbeat-lead-project-scope")
+def _(ctx):
+    import sqlite3
+    from cases.policy import device
+
+    o, node = owner(ctx), ctx.node2()
+    pid, _, heartbeat = routes(ctx, o)
+    other, _, other_heartbeat = routes(ctx, o)
+    pin_lead_node(o, node)
+    node.status([], agent_capabilities={"templates": ["claude-code-sonnet"]})
+    def hosted(project_id, actor=o):
+        made = post(actor, "conversations", {"spec": "hosted-lead", "model": "claude-code-sonnet",
+                                         "project_id": project_id})
+        ctx.expect(made.status == 201, "hosted conversation created", made)
+        return made.json["conversation"]
+
+    own, same_project, foreign = hosted(pid), hosted(pid), hosted(other)
+    bound = lead(ctx, o, own)
+    config = {"interval_seconds": 3600, "conversation_id": own["conversation_id"]}
+    ctx.expect(bound.call("GET", heartbeat).json["interval_seconds"] is None, "lead can read own schedule")
+    result = bound.call("PUT", heartbeat, body=config)
+    ctx.expect(result.status == 200 and result.json["interval_seconds"] == 3600, "lead enables own schedule", result)
+    refused(ctx, bound.call("PUT", heartbeat, body={**config, "interval_seconds": 60}),
+            422, "invalid_request", "a lead cannot wake itself more often than every 15 minutes")
+    refused(ctx, bound.call("GET", other_heartbeat), 403, "owner_only", "lead cannot read another project")
+    refused(ctx, bound.call("PUT", other_heartbeat, body={"interval_seconds": None}),
+            403, "owner_only", "lead cannot disable another project's schedule")
+    refused(ctx, bound.call("PUT", heartbeat, body={**config, "conversation_id": foreign["conversation_id"]}),
+            403, "forbidden", "lead cannot send its heartbeat to another project")
+    refused(ctx, bound.call("PUT", heartbeat, body={**config, "conversation_id": same_project["conversation_id"]}),
+            403, "forbidden", "lead cannot target another conversation in its project")
+    disabled = bound.call("PUT", heartbeat, body={"interval_seconds": None})
+    ctx.expect(disabled.status == 200 and disabled.json["interval_seconds"] is None, "lead disables own schedule", disabled)
+
+    member, future_viewer = device(ctx, "member"), device(ctx, "member")
+    admin = device(ctx, "admin")
+    own = hosted(pid, member)
+    member_lead = lead(ctx, member, own)
+    viewer_lead = lead(ctx, future_viewer, hosted(other, future_viewer))
+    admin_lead = lead(ctx, admin, hosted(other, admin))
+    lead_caps = set("read_work start_work control_work decide_run edit_backlog edit_decision_log".split())
+    for actor in (bound, admin_lead, member_lead):
+        ctx.expect(set(actor.call("GET", "me").json["capabilities"]) == lead_caps, "full active lead capabilities")
+    config = {"interval_seconds": 900, "conversation_id": own["conversation_id"]}
+    refused(ctx, member.call("PUT", heartbeat, body=config), 403, "forbidden", "member cannot set heartbeat")
+    ctx.expect(member.call("GET", "schedules").status == 200, "member can read fleet schedules")
+    ctx.expect(member_lead.call("GET", "schedules").status == 403, "lead cannot read fleet schedules")
+    for actor in (member, member_lead):
+        for method, path in (("POST", "schedules"), ("DELETE", f"schedules/{node.name}/unknown"),
+                             ("POST", f"schedules/{node.name}/unknown/changes")):
+            ctx.expect(actor.call(method, path, body={}, key=new_key()).status == 403, "schedule write denied")
+    owner_config = {**config, "conversation_id": same_project["conversation_id"]}
+    ctx.expect(admin.call("PUT", heartbeat, body=owner_config).status == 200, "admin can set project heartbeat")
+    refused(ctx, member_lead.call("PUT", heartbeat, body={"interval_seconds": None}), 403, "forbidden",
+            "lead cannot disable another conversation's heartbeat")
+    ctx.expect(o.call("GET", heartbeat).json == {"project_id": pid, **owner_config}, "owner schedule is intact")
+    ctx.expect(admin.call("PUT", heartbeat, body={"interval_seconds": None}).status == 200, "admin clears heartbeat")
+    ctx.expect(member_lead.call("PUT", heartbeat, body=config).status == 200, "member's lead sets own heartbeat")
+    refused(ctx, member_lead.call("PUT", heartbeat, body={**config, "conversation_id": same_project["conversation_id"]}),
+            403, "forbidden", "member's lead cannot target an owner's conversation")
+    with sqlite3.connect(ctx.target.data / "director.sqlite") as db:
+        db.executemany("UPDATE members SET role = 'viewer' WHERE id = ?",
+                       [("policy-" + actor.credential_id,) for actor in (member, future_viewer)])
+    viewer_me = viewer_lead.call("GET", "me").json
+    ctx.expect(viewer_me["role"] == "viewer" and viewer_me["capabilities"] == ["read_work"],
+               "full viewer-sponsored lead capabilities", viewer_me)
+    viewer_config = {**config, "conversation_id": viewer_me["conversation_id"]}
+    refused(ctx, viewer_lead.call("PUT", other_heartbeat, body=viewer_config), 403, "forbidden", "viewer-sponsored lead")
+    refused(ctx, member_lead.call("PUT", heartbeat, body=config), 403, "forbidden", "demoted sponsor")
+    ctx.expect(o.call("GET", heartbeat).json == {"project_id": pid, **config}, "refusals preserve schedule")
+    with sqlite3.connect(ctx.target.data / "director.sqlite") as db:
+        db.execute("UPDATE members SET status = 'disabled' WHERE id = ?", ("policy-" + member.credential_id,))
+    ctx.expect(member.call("GET", "me").status == 401, "disabled member cannot authenticate")
+    ctx.expect(member_lead.call("PUT", heartbeat, body=config).status == 401, "disabled sponsor invalidates lead")
 
 
 @case("client", AREA, "backlog-heartbeat-off-stop-and-overlap")
@@ -201,7 +282,7 @@ def _(ctx):
             422, "invalid_request", "requires hosted lead")
     blocked = add(ctx, o, path, "Owner decision", status="blocked", blocked_on=[{"kind": "owner", "ref": "owner"}],
                   blocked_reason="Approve the rollout?", stop=True)
-    ctx.expect(read(o, path, "/needs_you") == [blocked], "owner blocker is on needs-you")
+    ctx.expect(read(o, path, "/needs_you") == [{**blocked, "actions": {"answer": True}}], "owner blocker is on needs-you")
     attention = o.call("GET", conv_path).json["conversation"]["attention"]
     ctx.expect(attention["backlog_item_id"] == blocked["item_id"] and attention["question"] == "Approve the rollout?",
                "conversation attention exposes the owner blocker", attention)
@@ -227,3 +308,65 @@ def _(ctx):
     change(ctx, o, path, blocked, status="done")
     ctx.expect(read(o, path, "/needs_you") == [] and o.call("GET", conv_path).json["conversation"]["attention"] is None,
                "resolved item clears needs-you and attention")
+
+
+@case("client", AREA, "structured-needs-you-unblocks-backlog")
+def _(ctx):
+    from cases.policy import device as role_device
+
+    o, node = owner(ctx), ctx.node2()
+    pid, path, _ = routes(ctx, o)
+    viewer, member = role_device(ctx, "viewer"), role_device(ctx, "member")
+    pin_lead_node(o, node)
+    made = post(member, "conversations", {"spec": "hosted-lead", "model": "claude-code-sonnet", "project_id": pid})
+    ctx.expect(made.status == 201, "member creates hosted conversation", made)
+    conv = made.json["conversation"]
+    conv_path = "conversations/" + conv["conversation_id"]
+    plain = o.call("PUT", conv_path + "/attention", body={"question": "Plain question"})
+    attention = plain.json["conversation"]["attention"]
+    ctx.expect(attention["question"] == "Plain question" and "options" not in attention
+               and "links" not in attention and "default" not in attention
+               and attention["actions"] == {"control": True}, "plain attention can be cleared", plain)
+    ctx.expect(o.call("DELETE", conv_path + "/attention").status == 200, "plain attention still clears")
+
+    choices = {"options": [{"id": "small", "label": "Small rollout"}, {"id": "full", "label": "Full rollout"}],
+               "default": "small", "links": {"lane": "lane/example"}}
+    item = add(ctx, o, path, "Choose a rollout", status="blocked", blocked_reason="Pick a rollout",
+               blocked_on=[{"kind": "owner", "ref": "rollout"}], needs_you=choices)
+    attention = o.call("GET", conv_path).json["conversation"]["attention"]
+    ctx.expect(attention["options"] == choices["options"] and attention["default"] == "small"
+               and attention["links"] == {"lane": "lane/example", "backlog": item["item_id"]}
+               and attention["actions"] == {"answer": True},
+               "client receives options and navigation", attention)
+    queue = o.call("GET", path + ".md")
+    ctx.expect(queue.status == 200 and all(heading in queue.body for heading in
+               (b"## Now", b"## Next", b"## Blocked", b"## Needs you", b"Choose a rollout")), "Markdown queue", queue)
+    answer_path = path + "/" + item["item_id"] + "/answer"
+    answer = {"revision": item["revision"], "choice": "full"}
+    bound = lead(ctx, member, conv)
+    item_path = answer_path.removesuffix("/answer")
+    before = o.call("GET", item_path).json
+    refused(ctx, post(bound, answer_path, answer), 403, "forbidden", "lead cannot answer")
+    update_path = item_path + "/update"
+    for edit in ({"blocked_on": []}, {"blocked_on": [{"kind": "owner", "ref": "other"}]}, {"status": "dropped"},
+                 {"needs_you": None}, {"needs_you": {**choices, "default": "full"}},
+                 {"needs_you_answer": {"choice": "full"}}):
+        refused(ctx, post(bound, update_path, {"revision": item["revision"], **edit}),
+                403, "forbidden", "lead cannot change an owner decision")
+    ctx.expect(read(o, path, "/needs_you") == [{**item, "actions": {"answer": True}}], "lead refusals preserve the item")
+    ctx.expect(o.call("GET", item_path).json == before, "lead refusals preserve revision history")
+    ctx.expect(o.call("GET", conv_path).json["conversation"]["attention"] == attention,
+               "lead refusals preserve attention")
+    refused(ctx, post(viewer, answer_path, answer), 403, "forbidden", "viewer cannot answer")
+    refused(ctx, post(member, answer_path, answer), 403, "forbidden", "unassigned member cannot answer")
+    refused(ctx, post(member, update_path, {"revision": item["revision"], "blocked_on": []}),
+            403, "forbidden", "unassigned member cannot remove the blocker")
+    refused(ctx, post(o, answer_path, {**answer, "revision": -1}), 409, "conflict", "stale revision")
+    result = post(o, answer_path, answer)
+    after = result.json["item"]
+    recorded = after["needs_you_answer"]
+    ctx.expect(result.status == 200 and after["status"] == "next" and after["blocked_on"] == []
+               and recorded["choice"] == "full" and recorded["label"] == "Full rollout"
+               and recorded["member_id"] == o.call("GET", "me").json["member"]["id"],
+               "answer unblocks and records the member", result)
+    ctx.expect(o.call("GET", conv_path).json["conversation"]["attention"] is None, "resolved attention disappears")

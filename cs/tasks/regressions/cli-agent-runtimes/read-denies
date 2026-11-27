@@ -384,23 +384,24 @@ for path in denied:
     for rule in render_profile(home, ws, tmp, read_links=(keychain,)).splitlines():
         if 'Library/Keychains' in rule and rule.startswith('(allow file-read'):
             assert rule in muse_profile, rule
-    for platform in ('linux', 'freebsd'):
-        with patch.object(sys, 'platform', platform), patch.dict(os.environ, {}, clear=True):
-            try:
-                ns['sandbox_cmd']('stub', ['arg'], ws, tmp, root / 'unused')
-            except ValueError as error:
-                assert 'executor sandbox not available on ' + platform in str(error)
-            else:
-                raise AssertionError('unconfined executor accepted')
-            os.environ['CS_EXECUTOR_ALLOW_UNSANDBOXED'] = 'true'
-            try:
-                ns['require_executor_sandbox']()
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('opt-in must be exactly 1')
-            os.environ['CS_EXECUTOR_ALLOW_UNSANDBOXED'] = '1'
-            assert ns['sandbox_cmd']('stub', ['arg'], ws, tmp, root / 'unused') == ['stub', 'arg']
+    flags = {'CS_SANDBOX_BIN': '/fixture/cs-sandbox'}
+    import _estate_io
+    request = {'version': 1, 'workspace': str(ws)}
+    # Linux wraps the CLI in cs-sandbox's executor profile (bwrap plus seccomp); nothing runs unconfined.
+    with patch.object(sys, 'platform', 'linux'), patch.dict(os.environ, flags), \
+            patch.object(_estate_io, 'native_sandbox_request', return_value=dict(request)):
+        linux_command = ns['sandbox_cmd']('stub', ['arg'], ws, tmp, root / 'unused')
+        assert linux_command[0] == '/fixture/cs-sandbox' and linux_command[-3:] == ['--', 'stub', 'arg'], linux_command
+        assert linux_command[linux_command.index('--profile') + 1] == 'cli-executor', linux_command
+        sent = json.loads(linux_command[linux_command.index('--request-json') + 1])
+        assert sent['workspace'] == str(ws) and sent['loopback_ports'] == [], sent
+    with patch.object(sys, 'platform', 'freebsd'), patch.dict(os.environ, flags):
+        try:
+            ns['sandbox_cmd']('stub', ['arg'], ws, tmp, root / 'unused')
+        except ValueError as error:
+            assert 'executor sandbox not available on freebsd' in str(error)
+        else:
+            raise AssertionError('unconfined executor accepted')
     if RUN_DARWIN_PROBE:
         # Stub CLI attempts actual opens, including via symlinks. Never contact a provider.
         probe = tmp / 'stub.py'

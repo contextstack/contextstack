@@ -216,7 +216,9 @@ new #[Layout('layouts::client')] #[Title('Backlog')] class extends DirectorPage
     <x-client.page-header :back="route('projects.show', $projectId)" :back-label="$projectName">
         {{ __('Backlog') }}
         <x-slot:actions>
+            @capable('edit_backlog')
             <flux:button size="sm" variant="primary" icon="plus" wire:click="newItem" data-test="new-backlog-item">{{ __('New item') }}</flux:button>
+            @endcapable
             <x-client.stream-dot />
         </x-slot:actions>
     </x-client.page-header>

@@ -473,7 +473,7 @@ def credential_path(config_root: Path, conversation_id: str, state: Path) -> Pat
 def build_mcp_config(workspace: Path, cred: Path, meta: dict | None = None) -> dict:
     # Fixed host-owned command: bundle bytes never select host code or credentials.
     server = {"command": sys.executable,
-              "args": [str(HERE.parents[1] / "scripts/cs"), "mcp", "--no-land", "--max-wait", "30",
+              "args": [str(HERE.parents[1] / "scripts/cs"), "mcp", "--request-land", "--max-wait", "30",
                        "--credential-file", str(cred)]}
     for flag, key in (("--node", "node"), ("--director", "director")):
         if (meta or {}).get(key):
@@ -484,7 +484,7 @@ def build_mcp_config(workspace: Path, cred: Path, meta: dict | None = None) -> d
 def turn_message(workspace: Path, *, first_turn: bool) -> str:
     goal = (workspace / "tasks/turn/goal.md").read_text(encoding="utf-8")
     files = ["prompts/system.md", "conversation/context.md"] if first_turn else []
-    files.append("conversation/decision-log.md")
+    files.extend(["conversation/decision-log.md", "conversation/lessons.md"])
     parts = [(workspace / path).read_text(encoding="utf-8").strip()
              for path in files if (workspace / path).is_file()]
     if not first_turn and not parts:
@@ -506,16 +506,18 @@ def _load_sandbox_cmd():
 
 
 def require_host_sandbox(sandbox: bool) -> bool:
-    """Fail closed: the hosted CLI has no supported Linux confinement yet."""
+    """Require an OS sandbox unless using the macOS development override."""
     disabled = not sandbox or os.environ.get("LEAD_HOST_NO_SANDBOX") == "1"
     if disabled:
+        if sys.platform == "linux":
+            fail("Linux hosted leads require executor confinement")
         if (os.environ.get("LEAD_HOST_NO_SANDBOX") != "1"
                 or os.environ.get("CS_EXECUTOR_ALLOW_UNSANDBOXED") != "1"):
             fail("unconfined hosted lead requires both LEAD_HOST_NO_SANDBOX=1 and CS_EXECUTOR_ALLOW_UNSANDBOXED=1")
         print("WARNING: HOSTED LEAD SANDBOX DISABLED; the lead can access host files (development only)", file=sys.stderr, flush=True)
         return False
-    if sys.platform != "darwin":
-        fail("hosted lead sandbox unavailable on %s; refusing an unconfined turn (Linux bwrap integration is not supported)" % sys.platform)
+    if sys.platform not in ("darwin", "linux"):
+        fail("hosted lead sandbox unavailable on %s" % sys.platform)
     return True
 
 

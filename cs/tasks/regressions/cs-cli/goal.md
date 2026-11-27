@@ -28,8 +28,8 @@ running the release's own `code_root/scripts/cs`, the check must show:
 6. `cs stop|start|restart` go through launchctl bootout, bootstrap and
    `kickstart -k`; `cs release list|switch|rollback` go through
    node-install (current moves; an unknown id is refused, current kept).
-7. `CS_PLATFORM=linux`: start says "not supported here yet"; status and
-   doctor degrade, no traceback. A HOME without an install: a clear message.
+7. `CS_PLATFORM=linux`: start and status explain an unreachable systemd user manager;
+   doctor still runs without a traceback. A HOME without an install: a clear message.
 8. `cs ui --print` prints a one-time Director UI URL from a stub
    `bin/director-rs ui-link` with the install's `--data-dir` and a
    non-default `--listen`; `cs ui` opens it via `open`/`xdg-open` on

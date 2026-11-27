@@ -10,12 +10,26 @@
 
 use crate::thread;
 use crate::util::{self, sha256_hex};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection as RawConnection, OptionalExtension, Transaction as RawTransaction,
+    TransactionBehavior, params,
+};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+mod land_requests;
+mod scoped;
+mod sql;
+mod teams;
+
+pub use scoped::{OrgScope, ScopedConnection, ScopedTransaction, write_tx};
+#[cfg(test)]
+mod plan_regressions;
+#[cfg(test)]
+mod teams_tests;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -173,10 +187,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS lands_one_current ON lands(run_id) WHERE curre
 ";
 
 /// Schema version this binary creates and upgrades through.
-pub(crate) const SCHEMA_VERSION: u32 = 9;
+pub(crate) const SCHEMA_VERSION: u32 = teams::SPONSORSHIP_VERSION;
+const LAST_LEGACY_VERSION: u32 = 9;
 
 /// Numbered migrations after the v0 baseline path. Each entry is the `user_version` after it runs.
-type MigrationFn = fn(&Connection) -> rusqlite::Result<()>;
+type MigrationFn = fn(&RawConnection) -> rusqlite::Result<()>;
 
 const MIGRATIONS: &[(u32, MigrationFn)] = &[
     (2, migrate_v1_to_v2),
@@ -184,8 +199,9 @@ const MIGRATIONS: &[(u32, MigrationFn)] = &[
     (4, migrate_v3_to_v4),
     (5, |db| db.execute_batch(crate::action_approvals::SCHEMA)),
     (6, |db| {
-        db.execute_batch(
-            "ALTER TABLE action_approvals ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        add_columns(
+            db,
+            &[("action_approvals", "revision", "INTEGER NOT NULL DEFAULT 0")],
         )
     }),
     (7, |db| db.execute_batch(crate::backlog::SCHEMA)),
@@ -204,17 +220,20 @@ const MIGRATIONS: &[(u32, MigrationFn)] = &[
 ];
 
 /// v2: a turn says who started it: `person` (a posted message) or `wake` (a hosted lead's follow-up after a lane ended).
-fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("ALTER TABLE turns ADD COLUMN origin TEXT NOT NULL DEFAULT 'person'")
+fn migrate_v1_to_v2(conn: &RawConnection) -> rusqlite::Result<()> {
+    add_columns(
+        conn,
+        &[("turns", "origin", "TEXT NOT NULL DEFAULT 'person'")],
+    )
 }
 
 /// v3: reversible conversation archival.
-fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("ALTER TABLE conversations ADD COLUMN archived_at TEXT")
+fn migrate_v2_to_v3(conn: &RawConnection) -> rusqlite::Result<()> {
+    add_columns(conn, &[("conversations", "archived_at", "TEXT")])
 }
 
 /// v4: work-trace origin, job reasons, needs-you history and owner-message marks.
-fn migrate_v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_v3_to_v4(conn: &RawConnection) -> rusqlite::Result<()> {
     for (table, column, definition) in [
         ("intents", "origin_kind", "TEXT NOT NULL DEFAULT 'api'"),
         ("intents", "origin_conversation_id", "TEXT"),
@@ -392,28 +411,30 @@ impl Record {
 
 /// Record that a record changed: the next revision of the whole installation becomes its revision, and the
 /// change is queued for the event stream. Call it inside the transaction that made the change.
-pub fn touch(db: &Connection, kind: Record, id: &str) -> rusqlite::Result<i64> {
+pub fn touch(db: &ScopedConnection, kind: Record, id: &str) -> rusqlite::Result<i64> {
     db.execute(
-        "INSERT INTO changes (kind, record_id, at) VALUES (?1, ?2, ?3)",
+        "INSERT INTO changes (org_id, kind, record_id, at) VALUES (:org_id, ?1, ?2, ?3)",
         params![kind.name(), id, util::now_utc()],
     )?;
     let revision = db.last_insert_rowid();
     let (table, key) = kind.table();
     db.execute(
-        &format!("UPDATE {table} SET revision = ?1 WHERE {key} = ?2"),
+        &format!("UPDATE {table} SET revision = ?1 WHERE +org_id = :org_id AND ({key} = ?2)"),
         params![revision, id],
     )?;
     Ok(revision)
 }
 
 /// The newest revision recorded.
-pub fn revision(db: &Connection) -> rusqlite::Result<i64> {
-    db.query_row("SELECT COALESCE(MAX(seq), 0) FROM changes", [], |r| {
-        r.get(0)
-    })
+pub fn revision(db: &ScopedConnection) -> rusqlite::Result<i64> {
+    db.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM changes WHERE +org_id = :org_id",
+        params![],
+        |r| r.get(0),
+    )
 }
 
-fn backfill_conversation_lead(conn: &Connection, data_dir: &Path) -> rusqlite::Result<()> {
+fn backfill_conversation_lead(conn: &RawConnection, data_dir: &Path) -> rusqlite::Result<()> {
     let done = conn
         .prepare("SELECT 1 FROM meta WHERE key = 'backfill_conversation_lead'")?
         .exists([])?;
@@ -447,18 +468,14 @@ fn backfill_conversation_lead(conn: &Connection, data_dir: &Path) -> rusqlite::R
 
 /// A land used to be one row per run. Until the record is `landed`, a later report keeps that row
 /// (so an idempotent replay still answers it) and stores the earlier attempt on the new current row.
-fn lands_keep_earlier_attempts(conn: &Connection) -> rusqlite::Result<()> {
+fn lands_keep_earlier_attempts(conn: &RawConnection) -> rusqlite::Result<()> {
     let sql: String = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lands'",
         [],
         |r| r.get(0),
     )?;
     if sql.contains("run_id TEXT NOT NULL UNIQUE") {
-        conn.pragma_update(None, "foreign_keys", "OFF")?;
-        let rebuilt = rebuild_lands(conn);
-        let fk = conn.pragma_update(None, "foreign_keys", "ON");
-        rebuilt?;
-        fk?;
+        rebuild_lands(conn)?;
     }
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS lands_one_current ON lands(run_id) WHERE current = 1",
@@ -466,9 +483,8 @@ fn lands_keep_earlier_attempts(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn rebuild_lands(conn: &Connection) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
+fn rebuild_lands(conn: &RawConnection) -> rusqlite::Result<()> {
+    conn.execute_batch(
         "CREATE TABLE lands_next (
            land_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(run_id), state TEXT NOT NULL,
            repo TEXT NOT NULL, lane TEXT NOT NULL, main TEXT NOT NULL, \"commit\" TEXT, reason TEXT,
@@ -480,12 +496,10 @@ fn rebuild_lands(conn: &Connection) -> rusqlite::Result<()> {
          FROM lands;
          DROP TABLE lands;
          ALTER TABLE lands_next RENAME TO lands;",
-    )?;
-    tx.commit()?;
-    Ok(())
+    )
 }
 
-fn ensure_indexes(conn: &Connection) -> rusqlite::Result<()> {
+fn ensure_indexes(conn: &RawConnection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS jobs_intent ON jobs(intent_id);
          CREATE INDEX IF NOT EXISTS jobs_node_state ON jobs(node_id, state);
@@ -496,11 +510,11 @@ fn ensure_indexes(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Begin a write transaction under WAL: immediate lock, so a deferred read-then-write does not fail with `SQLITE_BUSY`.
-pub fn write_tx(conn: &mut Connection) -> rusqlite::Result<Transaction<'_>> {
+fn migration_tx(conn: &mut RawConnection) -> rusqlite::Result<RawTransaction<'_>> {
     conn.transaction_with_behavior(TransactionBehavior::Immediate)
 }
 
-fn add_columns(conn: &Connection, columns: &[(&str, &str, &str)]) -> rusqlite::Result<()> {
+fn add_columns(conn: &RawConnection, columns: &[(&str, &str, &str)]) -> rusqlite::Result<()> {
     for &(table, column, definition) in columns {
         let present = conn
             .prepare(&format!(
@@ -516,12 +530,12 @@ fn add_columns(conn: &Connection, columns: &[(&str, &str, &str)]) -> rusqlite::R
     Ok(())
 }
 
-fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
+fn user_version(conn: &RawConnection) -> rusqlite::Result<u32> {
     conn.pragma_query_value(None, "user_version", |r| r.get(0))
 }
 
 /// Pre–schema-version installs: improvised column adds, `lands` rebuild, backfills, then stamp v1.
-fn migrate_v0_to_v1(conn: &Connection, data_dir: &Path) -> rusqlite::Result<()> {
+fn migrate_v0_to_v1(conn: &RawConnection, data_dir: &Path) -> rusqlite::Result<()> {
     add_columns(conn, &ADDED)?;
     lands_keep_earlier_attempts(conn)?;
     backfill_conversation_lead(conn, data_dir)?;
@@ -529,10 +543,11 @@ fn migrate_v0_to_v1(conn: &Connection, data_dir: &Path) -> rusqlite::Result<()> 
     conn.pragma_update(None, "user_version", 1)
 }
 
-fn apply_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
+fn apply_legacy_migrations(conn: &mut RawConnection, target: u32) -> rusqlite::Result<()> {
     loop {
-        let current = user_version(conn)?;
-        if current >= SCHEMA_VERSION {
+        let tx = migration_tx(conn)?;
+        let current = user_version(&tx)?;
+        if current >= target {
             break;
         }
         let next = current + 1;
@@ -541,7 +556,6 @@ fn apply_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
                 "database schema version {current} has no migration to version {next}"
             )));
         };
-        let tx = write_tx(conn)?;
         migrate(&tx)?;
         tx.pragma_update(None, "user_version", next)?;
         tx.commit()?;
@@ -549,36 +563,79 @@ fn apply_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn open_database(path: &Path, dir: &Path) -> Result<Connection, String> {
+fn legacy_schema(conn: &mut RawConnection, dir: &Path) -> rusqlite::Result<()> {
+    let tx = migration_tx(conn)?;
+    let version = user_version(&tx)?;
+    if version < LAST_LEGACY_VERSION {
+        tx.execute_batch(SCHEMA)?;
+        if version == 0 {
+            migrate_v0_to_v1(&tx, dir)?;
+        } else {
+            tx.execute_batch(SCHEMA_INDEXES)?;
+        }
+    }
+    tx.commit()
+}
+
+fn open_database(
+    path: &Path,
+    dir: &Path,
+    owner_name: Option<&str>,
+) -> Result<ScopedConnection, String> {
     let mut conn =
-        Connection::open(path).map_err(|e| format!("database {}: {e}", path.display()))?;
+        RawConnection::open(path).map_err(|e| format!("database {}: {e}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("database {}: {e}", path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(10))
         .map_err(|e| format!("database {}: {e}", path.display()))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .and_then(|()| conn.pragma_update(None, "foreign_keys", "ON"))
-        .and_then(|()| conn.execute_batch(SCHEMA))
-        .map_err(|e| format!("database {}: {e}", path.display()))?;
-    let ver = user_version(&conn).map_err(|e| format!("database {}: {e}", path.display()))?;
+    let context = |e| format!("database {}: {e}", path.display());
+    let ver = user_version(&conn).map_err(context)?;
     if ver > SCHEMA_VERSION {
         return Err(format!(
             "database schema version {ver} is newer than this director supports ({SCHEMA_VERSION})"
         ));
     }
-    if ver == 0 {
-        migrate_v0_to_v1(&conn, dir).map_err(|e| format!("database {}: {e}", path.display()))?;
-    } else {
-        conn.execute_batch(SCHEMA_INDEXES)
-            .map_err(|e| format!("database {}: {e}", path.display()))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .and_then(|()| conn.pragma_update(None, "foreign_keys", "ON"))
+        .map_err(context)?;
+    if ver < LAST_LEGACY_VERSION {
+        legacy_schema(&mut conn, dir).map_err(context)?;
+        apply_legacy_migrations(&mut conn, LAST_LEGACY_VERSION).map_err(context)?;
     }
-    apply_migrations(&mut conn).map_err(|e| format!("database {}: {e}", path.display()))?;
-    Ok(conn)
+    if ver < teams::VERSION {
+        teams::migrate(&mut conn, owner_name.filter(|_| ver == 0)).map_err(context)?;
+    }
+    let scope = teams::migrate_identity(&mut conn).map_err(context)?;
+    land_requests::migrate(&mut conn, &scope).map_err(context)?;
+    teams::migrate_invites(&mut conn).map_err(context)?;
+    teams::migrate_sponsorship(&mut conn).map_err(context)?;
+    teams::check_assignment_members(&conn)
+        .map_err(|e| format!("database {}: {e}", path.display()))?;
+    let ver = user_version(&conn).map_err(context)?;
+    if ver != SCHEMA_VERSION {
+        return Err(format!(
+            "database schema version {ver} is unsupported by this director ({SCHEMA_VERSION})"
+        ));
+    }
+    Ok(ScopedConnection::new(conn, scope))
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_fixture(
+    dir: &Path,
+    version: u32,
+) -> Result<RawConnection, Box<dyn std::error::Error>> {
+    private_dir(dir)?;
+    let mut db = RawConnection::open(dir.join("director.sqlite"))?;
+    db.pragma_update(None, "foreign_keys", true)?;
+    legacy_schema(&mut db, dir)?;
+    apply_legacy_migrations(&mut db, version)?;
+    Ok(db)
 }
 
 /// The data directory, opened: the database behind a lock and the object store.
 pub struct Store {
-    db: Mutex<Connection>,
+    db: Mutex<ScopedConnection>,
     /// The data directory.
     pub dir: PathBuf,
     /// This Director's installation ID, created once.
@@ -588,10 +645,14 @@ pub struct Store {
 impl Store {
     /// Open (creating on first use) the data directory, its database and installation ID.
     pub fn open(dir: &Path) -> Result<Self, String> {
+        Self::open_with_owner(dir, None)
+    }
+
+    pub fn open_with_owner(dir: &Path, owner_name: Option<&str>) -> Result<Self, String> {
         private_dir(dir)?;
         private_dir(&dir.join("objects"))?;
         let path = dir.join("director.sqlite");
-        let conn = open_database(&path, dir)?;
+        let conn = open_database(&path, dir, owner_name)?;
         let installation = installation(&conn)?;
         Ok(Self {
             db: Mutex::new(conn),
@@ -601,8 +662,20 @@ impl Store {
     }
 
     /// The database, locked. One writer at a time keeps every receipt a single consistent step.
-    pub fn db(&self) -> MutexGuard<'_, Connection> {
+    pub fn db(&self) -> MutexGuard<'_, ScopedConnection> {
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Serialize human mutations with credential changes from this process or the host CLI.
+    pub fn lock_client_mutation(&self) -> std::io::Result<std::fs::File> {
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(self.dir.join("client-mutations.lock"))?;
+        lock.lock()?;
+        Ok(lock)
     }
 
     fn object_path(&self, sha: &str) -> PathBuf {
@@ -633,7 +706,14 @@ impl Store {
     /// Store bytes under their own hash. `Ok(true)` when newly stored; existing bytes are never replaced.
     pub fn put_object(&self, data: &[u8]) -> Result<bool, String> {
         let sha = sha256_hex(data);
-        let path = self.object_path(&sha);
+        Self::put_blob(&self.object_path(&sha), &sha, data)
+    }
+
+    pub(crate) fn put_browser_screenshot(&self, sha: &str, data: &[u8]) -> Result<bool, String> {
+        Self::put_blob(&self.dir.join("browser-screenshots").join(sha), sha, data)
+    }
+
+    fn put_blob(path: &Path, sha: &str, data: &[u8]) -> Result<bool, String> {
         if path.is_file() {
             return Ok(false);
         }
@@ -649,7 +729,7 @@ impl Store {
             .mode(0o600)
             .open(&tmp)
             .and_then(|mut f| f.write_all(data).and_then(|()| f.sync_all()))
-            .and_then(|()| fs::rename(&tmp, &path));
+            .and_then(|()| fs::rename(&tmp, path));
         if let Err(e) = written {
             let _ = fs::remove_file(&tmp);
             return Err(format!("object {sha}: {e}"));
@@ -659,11 +739,11 @@ impl Store {
 }
 
 /// The installation ID: `inst_<ulid>`, created on first open and never changed.
-fn installation(conn: &Connection) -> Result<String, String> {
-    let get = |conn: &Connection| {
+fn installation(conn: &ScopedConnection) -> Result<String, String> {
+    let get = |conn: &ScopedConnection| {
         conn.query_row(
             "SELECT value FROM meta WHERE key = 'installation'",
-            [],
+            params![],
             |r| r.get::<_, String>(0),
         )
         .optional()
@@ -726,6 +806,57 @@ mod tests {
 
     type Res = Result<(), Box<dyn std::error::Error>>;
 
+    #[test]
+    fn bootstrap_owner_name_is_set_once() -> Res {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("data");
+        for input in ["Alex Owner", "Different Name"] {
+            let store = Store::open_with_owner(&path, Some(input))?;
+            let db = store.db();
+            let member = crate::access::Member::load(&db, db.scope().member_id.clone())?;
+            assert_eq!(
+                member.as_ref().map(|member| member.display_name.as_str()),
+                Some("Alex Owner")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_install_creates_bootstrap_graph() -> Res {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("data"))?;
+        let db = store.db();
+        let valid: bool = db.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM orgs o JOIN teams t ON t.org_id = o.id
+                JOIN members m ON m.org_id = o.id
+                JOIN team_members tm ON tm.org_id = o.id AND tm.team_id = t.id AND tm.member_id = m.id
+                WHERE o.id = (SELECT value FROM meta WHERE key = 'default_org_id')
+                  AND t.id = (SELECT value FROM meta WHERE key = 'default_team_id')
+                  AND m.id = (SELECT value FROM meta WHERE key = 'bootstrap_member_id')
+                  AND o.name = 'Default' AND t.name = 'Default' AND m.display_name = 'Owner'
+                  AND m.role = 'owner' AND m.status = 'active' AND tm.role = 'owner'
+            )",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert!(valid);
+        assert_eq!(user_version(db.raw())?, SCHEMA_VERSION);
+        let empty: bool = db.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM land_requests WHERE +org_id = :org_id)",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert!(empty);
+        assert!(
+            db.raw()
+                .pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))?
+        );
+        assert_eq!(revision(&db)?, 0);
+        Ok(())
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct ColumnInfo {
         table: String,
@@ -735,12 +866,12 @@ mod tests {
         dflt: Option<String>,
     }
 
-    fn column_set(conn: &Connection) -> rusqlite::Result<Vec<ColumnInfo>> {
+    fn column_set(conn: &RawConnection) -> rusqlite::Result<Vec<ColumnInfo>> {
         let mut tables = Vec::new();
         let mut stmt = conn.prepare(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![], |r| r.get::<_, String>(0))?;
         for name in rows {
             tables.push(name?);
         }
@@ -749,7 +880,7 @@ mod tests {
             let mut info = conn.prepare(&format!(
                 "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('{table}')"
             ))?;
-            let rows = info.query_map([], |r| {
+            let rows = info.query_map(params![], |r| {
                 Ok(ColumnInfo {
                     table: table.clone(),
                     name: r.get(0)?,
@@ -766,26 +897,28 @@ mod tests {
         Ok(cols)
     }
 
-    fn index_ddl(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    fn index_ddl(conn: &RawConnection) -> rusqlite::Result<Vec<(String, String)>> {
         let mut stmt = conn.prepare(
             "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'
              ORDER BY name",
         )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map(params![], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     type SchemaSnapshot = (Vec<ColumnInfo>, Vec<(String, String)>);
 
-    fn schema_snapshot(conn: &Connection) -> rusqlite::Result<SchemaSnapshot> {
+    fn schema_snapshot(conn: &RawConnection) -> rusqlite::Result<SchemaSnapshot> {
         Ok((column_set(conn)?, index_ddl(conn)?))
     }
 
     fn seed_v0_fixture(dir: &Path) -> Res {
         private_dir(dir)?;
-        let db = Connection::open(dir.join("director.sqlite"))?;
+        let db = RawConnection::open(dir.join("director.sqlite"))?;
         db.execute_batch(
             r#"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
            CREATE TABLE nodes (
@@ -819,11 +952,11 @@ mod tests {
         seed_v0_fixture(&upgraded_dir)?;
         let fresh = Store::open(&fresh_dir)?;
         let upgraded = Store::open(&upgraded_dir)?;
-        assert_eq!(user_version(&fresh.db())?, SCHEMA_VERSION);
-        assert_eq!(user_version(&upgraded.db())?, SCHEMA_VERSION);
+        assert_eq!(user_version(fresh.db().raw())?, SCHEMA_VERSION);
+        assert_eq!(user_version(upgraded.db().raw())?, SCHEMA_VERSION);
         assert_eq!(
-            schema_snapshot(&fresh.db())?,
-            schema_snapshot(&upgraded.db())?,
+            schema_snapshot(fresh.db().raw())?,
+            schema_snapshot(upgraded.db().raw())?,
             "fresh and upgraded schemas match"
         );
         Store::open(&fresh_dir)?;
@@ -835,32 +968,29 @@ mod tests {
     fn v2_upgrades_to_v3_preserving_conversations() -> Res {
         let tmp = tempfile::tempdir()?;
         let dir = tmp.path().join("data");
-        let store = Store::open(&dir)?;
-        store.db().execute_batch(
-            "DROP TABLE action_approvals;
-            ALTER TABLE conversations DROP COLUMN archived_at;
-            INSERT INTO conversations (conversation_id, node, spec, spec_version, model,
+        let db = legacy_fixture(&dir, 2)?;
+        db.execute_batch(
+            "INSERT INTO conversations (conversation_id, node, spec, spec_version, model,
                 instructions_tokens, tools, created_by, created_at)
-            VALUES ('existing', 'n', 's', 'v', 'm', 0, 0, 'owner', 'then');
-            PRAGMA user_version = 2;",
+            VALUES ('existing', 'n', 's', 'v', 'm', 0, 0, 'owner', 'then');",
         )?;
-        drop(store);
+        drop(db);
         let upgraded = Store::open(&dir)?;
-        assert_eq!(user_version(&upgraded.db())?, SCHEMA_VERSION);
+        assert_eq!(user_version(upgraded.db().raw())?, SCHEMA_VERSION);
         let archived: Option<String> = upgraded.db().query_row(
             "SELECT archived_at FROM conversations WHERE conversation_id = 'existing'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert!(archived.is_none());
         upgraded
             .db()
-            .execute("UPDATE conversations SET archived_at = 'now'", [])?;
+            .execute("UPDATE conversations SET archived_at = 'now'", params![])?;
         drop(upgraded);
         let reopened = Store::open(&dir)?;
         let archived: String = reopened.db().query_row(
             "SELECT archived_at FROM conversations WHERE conversation_id = 'existing'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert_eq!(archived, "now");
@@ -873,7 +1003,7 @@ mod tests {
         let dir = tmp.path().join("data");
         private_dir(&dir)?;
         let path = dir.join("director.sqlite");
-        let db = Connection::open(&path)?;
+        let db = RawConnection::open(&path)?;
         db.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta VALUES ('installation', 'inst_test');
@@ -902,20 +1032,20 @@ mod tests {
         )?;
         drop(db);
         let store = Store::open(&dir)?;
-        assert_eq!(user_version(&store.db())?, SCHEMA_VERSION);
+        assert_eq!(user_version(store.db().raw())?, SCHEMA_VERSION);
         let origin: String = store.db().query_row(
             "SELECT origin_kind FROM intents WHERE intent_id = 'keep-intent'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert_eq!(origin, "api");
         let job: String = store.db().query_row(
             "SELECT job_id FROM jobs WHERE job_id = 'keep-job'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert_eq!(job, "keep-job");
-        store.db().execute_batch(
+        store.db().raw().execute_batch(
             "SELECT 1 FROM task_needs_you LIMIT 0;
              SELECT 1 FROM owner_message_marks LIMIT 0;",
         )?;
@@ -928,10 +1058,11 @@ mod tests {
         let dir = tmp.path().join("data");
         private_dir(&dir)?;
         let path = dir.join("director.sqlite");
-        let db = Connection::open(&path)?;
+        let db = RawConnection::open(&path)?;
         db.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
         db.pragma_update(None, "user_version", SCHEMA_VERSION + 1)?;
         drop(db);
+        let before = fs::read(&path)?;
         let Err(err) = Store::open(&dir) else {
             panic!("expected open to fail for too-new schema");
         };
@@ -939,6 +1070,17 @@ mod tests {
             err.contains(&format!("schema version {}", SCHEMA_VERSION + 1))
                 && err.contains(&format!("supports ({SCHEMA_VERSION})")),
             "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(&path)?, before);
+        let db = RawConnection::open(&path)?;
+        assert_eq!(user_version(&db)?, SCHEMA_VERSION + 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT group_concat(name) FROM sqlite_schema WHERE type = 'table'",
+                params![],
+                |r| r.get::<_, String>(0)
+            )?,
+            "meta"
         );
         Ok(())
     }
@@ -948,7 +1090,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let dir = tmp.path().join("data");
         private_dir(&dir)?;
-        let db = Connection::open(dir.join("director.sqlite"))?;
+        let db = RawConnection::open(dir.join("director.sqlite"))?;
         db.execute_batch(
             "CREATE TABLE credentials (
                id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
@@ -961,7 +1103,7 @@ mod tests {
         let store = Store::open(&dir)?;
         let row: (String, Option<String>, Option<String>, Option<String>) = store.db().query_row(
             "SELECT token_hash, conversation_id, intent_id, node FROM credentials WHERE id = 'cred_existing'",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            params![], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         assert_eq!(row, ("kept-hash".into(), None, None, None));
         drop(store);
@@ -989,7 +1131,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let dir = tmp.path().join("data");
         private_dir(&dir)?;
-        let old = Connection::open(dir.join("director.sqlite"))?;
+        let old = RawConnection::open(dir.join("director.sqlite"))?;
         old.execute_batch(
             "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, node_id INTEGER NOT NULL, spec TEXT NOT NULL,
                task TEXT NOT NULL, trials INTEGER NOT NULL, bundle_sha256 TEXT NOT NULL, grant_id TEXT,
@@ -1009,7 +1151,7 @@ mod tests {
             "every change a higher revision"
         );
         let (rev, intent): (i64, Option<String>) =
-            db.query_row("SELECT revision, intent_id FROM jobs", [], |r| {
+            db.query_row("SELECT revision, intent_id FROM jobs", params![], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
         assert_eq!((rev, intent), (2, None));
@@ -1027,7 +1169,7 @@ mod tests {
         private_dir(&shard)?;
         fs::write(shard.join(&sha), spec_yaml)?;
         let path = dir.join("director.sqlite");
-        let old = Connection::open(&path)?;
+        let old = RawConnection::open(&path)?;
         old.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -1050,7 +1192,7 @@ mod tests {
         let store = Store::open(&dir)?;
         let lead: i64 = store.db().query_row(
             "SELECT lead FROM conversations WHERE conversation_id = 'con_old'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert_eq!(lead, 1, "hosted-lead spec backfills lead marker");
@@ -1062,7 +1204,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let dir = tmp.path().join("data");
         private_dir(&dir)?;
-        let old = Connection::open(dir.join("director.sqlite"))?;
+        let old = RawConnection::open(dir.join("director.sqlite"))?;
         old.execute_batch(
             "CREATE TABLE nodes (
                id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL UNIQUE,
@@ -1084,22 +1226,26 @@ mod tests {
         let db = store.db();
         let (state, attempts, current): (String, String, i64) = db.query_row(
             "SELECT state, attempts, current FROM lands WHERE land_id = 'lnd_old'",
-            [],
+            params![],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         assert_eq!(
             (state.as_str(), attempts.as_str(), current),
             ("failed", "[]", 1)
         );
-        db.execute("UPDATE lands SET current = 0 WHERE land_id = 'lnd_old'", [])?;
         db.execute(
-            "INSERT INTO lands (land_id, run_id, state, repo, lane, main, \"commit\", reason, landed_by, landed_at, attempts, current)
-             VALUES ('lnd_new', 'run_1', 'landed', 'r', 'lane/x', 'main', 'abc', NULL, 'owner', 't2', ?1, 1)",
+            "UPDATE lands SET current = 0 WHERE land_id = 'lnd_old'",
+            params![],
+        )?;
+        db.execute(
+            "INSERT INTO lands (org_id, land_id, run_id, state, repo, lane, main, \"commit\", reason,
+                                landed_by, landed_at, attempts, current)
+             VALUES (:org_id, 'lnd_new', 'run_1', 'landed', 'r', 'lane/x', 'main', 'abc', NULL, 'owner', 't2', ?1, 1)",
             params!["[{\"land_id\":\"lnd_old\"}]"],
         )?;
         let n: i64 = db.query_row(
             "SELECT COUNT(*) FROM lands WHERE run_id = 'run_1'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert_eq!(n, 2);
@@ -1108,7 +1254,7 @@ mod tests {
         let again = Store::open(&dir)?;
         let n: i64 = again.db().query_row(
             "SELECT COUNT(*) FROM lands WHERE run_id = 'run_1'",
-            [],
+            params![],
             |r| r.get(0),
         )?;
         assert_eq!(n, 2, "a second open keeps both rows");
@@ -1132,7 +1278,7 @@ mod tests {
     fn concurrent_immediate_read_write_transactions_both_commit() -> Res {
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("director.sqlite");
-        let setup = Connection::open(&path)?;
+        let setup = RawConnection::open(&path)?;
         setup.execute_batch(
             "CREATE TABLE slots (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
              INSERT INTO slots (v) VALUES (0);",
@@ -1141,24 +1287,25 @@ mod tests {
         setup.busy_timeout(std::time::Duration::from_secs(10))?;
         drop(setup);
         // A holds a write transaction; B's write_tx waits for it (busy_timeout) instead of failing at once.
-        let mut a = Connection::open(&path)?;
+        let mut a = RawConnection::open(&path)?;
         a.busy_timeout(std::time::Duration::from_secs(10))?;
-        let tx = write_tx(&mut a)?;
-        tx.execute("UPDATE slots SET v = v + 1 WHERE id = 1", [])?;
+        let tx = migration_tx(&mut a)?;
+        tx.execute("UPDATE slots SET v = v + 1 WHERE id = 1", params![])?;
         let b_path = path.clone();
         let b = std::thread::spawn(move || -> rusqlite::Result<()> {
-            let mut db = Connection::open(&b_path)?;
+            let mut db = RawConnection::open(&b_path)?;
             db.busy_timeout(std::time::Duration::from_secs(10))?;
-            let tx = write_tx(&mut db)?;
-            let v: i32 = tx.query_row("SELECT v FROM slots WHERE id = 1", [], |r| r.get(0))?;
+            let tx = migration_tx(&mut db)?;
+            let v: i32 =
+                tx.query_row("SELECT v FROM slots WHERE id = 1", params![], |r| r.get(0))?;
             tx.execute("UPDATE slots SET v = ?1 WHERE id = 1", params![v + 10])?;
             tx.commit()
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
         tx.commit()?;
         b.join().map_err(|_| "thread b panicked")??;
-        let db = Connection::open(&path)?;
-        let v: i32 = db.query_row("SELECT v FROM slots WHERE id = 1", [], |r| r.get(0))?;
+        let db = RawConnection::open(&path)?;
+        let v: i32 = db.query_row("SELECT v FROM slots WHERE id = 1", params![], |r| r.get(0))?;
         assert_eq!(v, 11);
         Ok(())
     }
@@ -1180,3 +1327,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "store/scope_guard.rs"]
+mod scope_guard;

@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Exercise the gate executor and machine finisher with an isolated repo and run."""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+CS = HERE.parents[2]
+sys.path[:0] = [str(HERE.parent / "_lib"), str(CS / "ops/bin")]
+sys.dont_write_bytecode = True
+
+from hermetic_env import hermetic_env
+from scratch import scratch_dir
+from _lanes import ensure_lane, lane_lock, repo_config
+
+
+def check(root):
+    main = root / "repo"
+    main.mkdir()
+    state = root / "state"
+    config = root / "config"
+    home = root / "home"
+    for path in (state, config, home):
+        path.mkdir()
+    repos = config / "repos.json"
+    repos.write_text(json.dumps({"fixture": {"path": str(main), "gate_steps": [
+        {"name": "fake gate", "command": "./fake-gate"},
+        {"name": "host probe", "command": "exit 99", "host_only": True},
+    ]}}))
+    env = {key: value for key, value in hermetic_env().items()
+           if not key.startswith(("CS_", "CSGATEWAY_", "GIT_", "FINALIZE_RUN_"))}
+    env.update(HOME=str(home), CS_CONFIG_ROOT=str(config), CS_STATE_ROOT=str(state),
+               CS_REPOS_FILE=str(repos), PYTHONDONTWRITEBYTECODE="1",
+               CS_JOB_ID="fixture-job", CS_TRIAL="1")
+    if os.environ.get("CS_SANDBOX_BIN"):
+        env["CS_SANDBOX_BIN"] = os.environ["CS_SANDBOX_BIN"]
+    (main / "candidate").write_text("main\n")
+    gate = main / "fake-gate"
+    gate.write_text('#!/bin/sh\nset -eu\n[ "${PWD##*/}" = fixture-lane ]\n'
+                    '[ "$(cat candidate)" = lane ]\nprintf "verified lane\\n"\n')
+    gate.chmod(0o755)
+    for args in (("init", "-qb", "main"), ("add", "."),
+                 ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base")):
+        subprocess.run(["git", *args], cwd=main, env=env, check=True)
+    task = root / "task"
+    task.mkdir()
+    (task / "goal.md").write_text("fixture gate\n")
+    (task / "check").write_text("#!/bin/sh\nexit 98\n")
+    (task / "check").chmod(0o755)
+    spec = root / "spec.yaml"
+    spec.write_text("id: fixture-gate\nmodel: gate\nrepo: fixture\nlane: fixture-lane\n"
+                    "budget: {seconds: 30, usd: 0}\ncheck_window: 15\n")
+    order = dict(executor="gate", agent="gate", writes=False, task=str(task), spec=str(spec))
+    with patch.dict(os.environ, env, clear=True):
+        cfg = repo_config("fixture")
+        with lane_lock(cfg, "fixture-lane"):
+            lane = Path(ensure_lane(cfg, "fixture-lane")["path"])
+    (lane / "candidate").write_text("lane\n")
+    env.update(CS_RUNNER_BIN=str(root / "unused-runner"),
+               CSGATEWAY_CLI_ENDPOINT="http://127.0.0.1:1")
+    finished = subprocess.run([str(CS / "ops/bin/executor")], cwd=CS, env=env, text=True,
+                              input=json.dumps(order), capture_output=True, timeout=60)
+    gate_files = list((state / "runs").glob("*/gate.json"))
+    assert finished.returncode == 0, (finished.stdout, finished.stderr,
+                                      [path.read_text() for path in gate_files])
+
+    run, = (state / "runs").iterdir()
+    receipt = json.loads((run / "execution-receipt.json").read_text())
+    assert receipt["finish"]["mode"] == "gate"
+    assert receipt["finish"]["check_window"] == 15
+    assert receipt["row"]["cost_usd"] == 0 and receipt["row"]["cli_invoked"] is False
+    assert not (run / "sandbox.sb").exists()
+    evidence = json.loads((run / "gate.json").read_text())
+    assert evidence["verdict"] == "pass", evidence
+    assert evidence["complete"] is False and evidence["uncovered"] == ["host probe"], evidence
+    first, second = evidence["steps"]
+    assert first["exit"] == 0 and first["tail"] == "verified lane\n", evidence
+    assert second["skipped"] == "host_only" and second["exit"] is None, evidence
+    assert (main / "candidate").read_text() == "main\n"
+    assert (lane / "candidate").read_text() == "lane\n"
+    envelope = json.loads((state / "outbox" / (run.name + ".json")).read_text())
+    assert "gate.json" in {item["path"] for item in envelope["files"]}
+
+
+def main():
+    if sys.platform != "darwin":
+        print("gate-job: skipped: needs host (macOS Seatbelt)")
+        return
+    probe = subprocess.run(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+                           capture_output=True, text=True, timeout=10, env=hermetic_env())
+    if probe.returncode and "sandbox_apply: Operation not permitted" in probe.stderr:
+        print("gate-job: skipped: needs host (nested Seatbelt is blocked)")
+        return
+    probe.check_returncode()
+    with scratch_dir(prefix="gate-job-") as temp:
+        check(Path(temp).resolve())
+    print("check: gate-job PASS")
+
+
+if __name__ == "__main__":
+    main()

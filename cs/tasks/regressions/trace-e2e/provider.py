@@ -103,7 +103,7 @@ def main():
                 observations = [str(m.get("content")) for m in json.loads(request)["messages"]
                                 if m["role"] == "tool"]
                 expected = ("approved command output", "single execution claim") if scenario == "action-go" else (
-                    "waiting on the owner", "Continue without it if possible")
+                    "waiting for a human decision", "Continue without it if possible")
                 if not all(any(word in observation for observation in observations) for word in expected):
                     return self.send_error(400, "missing action observation")
                 return self._json(chat_completion("action observations received"))

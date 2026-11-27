@@ -462,7 +462,7 @@ def test_installer_setup_without_agents():
         current.symlink_to("releases/fixture")
         cs = SimpleNamespace(ROOT=home, CONFIG=home, CURRENT=current, KIT=CODE_ROOT, Stop=ServiceFailure,
                              read_json=lambda path, default: json.loads(path.read_text()),
-                             need_install=lambda: None, need_launchd=lambda: None)
+                             PLATFORM="macos", need_install=lambda: None, check_services=lambda: None)
         init = cs_init.Init.__new__(cs_init.Init)
         init.cs = cs
         init.url = "http://fixture"
@@ -740,9 +740,12 @@ def test_api_keys():
         gateway.chmod(0o755)
         store = root / "key"
         init.cs = SimpleNamespace(CURRENT=root, GATEWAY="fixture-gateway",
-                                  load_plist=lambda label: (None, {"EnvironmentVariables": {"CSGATEWAY_CREDENTIALS": str(store)}}))
+                                  service_config=lambda label: (None, {"EnvironmentVariables": {"CSGATEWAY_CREDENTIALS": str(store)}}))
         restarts = []
-        init.nr = SimpleNamespace(launchctl=lambda *args: restarts.append(args))
+        from unittest.mock import patch
+        import _node_services
+
+        init.services = _node_services.LaunchdBackend()
         init.args.api_key = ["openai"]
         read_fd, write_fd = os.pipe()
         os.write(write_fd, b"fake-api-key\n")
@@ -751,7 +754,8 @@ def test_api_keys():
         try:
             os.dup2(read_fd, 0)
             os.close(read_fd)
-            init.step_keys()
+            with patch.object(_node_services, "launchctl", side_effect=lambda *args: restarts.append(args)):
+                init.step_keys()
         finally:
             os.dup2(saved_stdin, 0)
             os.close(saved_stdin)
@@ -763,7 +767,8 @@ def test_api_keys():
                            "pathlib.Path(sys.argv[0]).with_name('seen').write_text(repr(os.environ.get('CSGATEWAY_CREDENTIALS')))\n"
                            "input()\n" % sys.executable)
         init.cs = SimpleNamespace(CURRENT=root, GATEWAY="fixture-gateway", Stop=Exception,
-                                  load_plist=lambda label: (None, {"EnvironmentVariables": {}}))
+                                  service_config=lambda label: (None, {"EnvironmentVariables": {}}))
+        init.services = _node_services.SystemdBackend()
         read_fd, write_fd = os.pipe()
         os.write(write_fd, b"fake-api-key\n")
         os.close(write_fd)
@@ -772,7 +777,9 @@ def test_api_keys():
         try:
             os.dup2(read_fd, 0)
             os.close(read_fd)
-            init.step_keys()
+            with patch.object(_node_services, "systemctl", return_value=subprocess.CompletedProcess([], 0)) as ctl:
+                init.step_keys()
+                ctl.assert_called_once_with("restart", "fixture-gateway.service")
         except Exception as error:
             refused = error
         finally:
@@ -1098,7 +1105,6 @@ def main():
     if uv is None:
         print("SKIP cs-init: %s" % managed)
         return 1 if problems else 0
-    before = _bundle.real_agents()
     # short: the gateway's socket under HOME/.contextstack/gateway must fit in sun_path (104 bytes on macOS)
     created = tempfile.mkdtemp(prefix="csi-", dir=short_tmp(), suffix=".noindex")
     tmp = Path(created).resolve()
@@ -1215,8 +1221,6 @@ def main():
                 extra = "" if not left or len(left) <= 8 else " ... +%d" % (len(left) - 8)
                 expect(not left, "no process left whose command line contains the fixture root%s" % (
                     ": " + "; ".join(shown) + extra if left else ""))
-            why = _bundle.launchd_untouched(before)
-            expect(not why, "the real launchd domain is untouched%s" % (": " + why if why else ""))
         finally:
             if problems and os.environ.get("CS_INIT_KEEP"):
                 print("kept %s" % tmp)

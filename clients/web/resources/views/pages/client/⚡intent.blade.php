@@ -263,7 +263,9 @@ new #[Layout('layouts::client')] #[Title('Task')] class extends DirectorPage
                             <x-client.job-state :job="$job" />
                             <span class="font-mono text-xs text-zinc-500">{{ $job['job_id'] }}</span>
                             @if (in_array($job['state'], ['done', 'error'], true))
+                                @capable('start_work')
                                 <flux:button size="xs" variant="ghost" icon="arrow-path" class="ms-auto" wire:click="runAgain({{ Js::from($job['job_id']) }})">{{ __('Run again') }}</flux:button>
+                                @endcapable
                             @endif
                         </div>
 
@@ -295,10 +297,12 @@ new #[Layout('layouts::client')] #[Title('Task')] class extends DirectorPage
                                 @endif
                             </div>
                         @elseif (! in_array($job['state'], ['done', 'error'], true))
+                            @allowed($job, 'cancel', 'control_work')
                             <form wire:submit="requestCancel({{ Js::from($job['job_id']) }})" class="flex items-center gap-2">
                                 <flux:input size="sm" wire:model="cancelReasons.{{ $job['job_id'] }}" :placeholder="__('Reason (optional)')" :aria-label="__('Reason for cancelling (optional)')" class="max-w-xs" />
                                 <flux:button size="sm" type="submit" variant="danger" icon="stop">{{ __('Request cancel') }}</flux:button>
                             </form>
+                            @endallowed
                         @endif
 
                         @foreach ((array) ($job['live_run_ids'] ?? []) as $runId)
@@ -347,6 +351,9 @@ new #[Layout('layouts::client')] #[Title('Task')] class extends DirectorPage
                     <x-client.fact :label="__('Trials')">{{ trans_choice(':count trial|:count trials', $intent['trials'] ?? 1) }}</x-client.fact>
                     @if (is_string($intent['project_id'] ?? null))
                         <x-client.fact :label="__('Project')" mono><flux:link :href="route('projects.show', $intent['project_id'])" wire:navigate>{{ $intent['project_id'] }}</flux:link></x-client.fact>
+                    @endif
+                    @if (($responsible = app(\App\Client\MemberNames::class)->label($intent['responsible_member_id'] ?? null, $intent['responsible_display_name'] ?? null)) !== null)
+                        <x-client.fact :label="__('Responsible')" data-test="intent-responsible">{{ $responsible }}</x-client.fact>
                     @endif
                     <x-client.fact :label="__('ID')" mono title="{{ $intent['intent_id'] }}">{{ $intent['intent_id'] }}</x-client.fact>
                 </x-client.facts>

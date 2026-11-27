@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from _estate_io import append_jsonl
+from _schedule_delivery import config_directory, deliver, job_destinations, result_markdown
 
 SCHEDULE_ID = "weekly-review"
 COMMAND = "review-weekly"
@@ -204,7 +205,14 @@ def deliver_weekly(state, schedule, slot, now):
     report_rel = "reviews/%s.md" % date
     report = Path(state) / report_rel
     if not report.is_file():
-        _write_new(report, review_text(now))
+        _write_new(report, result_markdown(review_text(now), {"cost_usd": 0}))
     attention_id = "%s@%s" % (SCHEDULE_ID, date)
     ensure_attention(state, attention_id, date, report_rel, slot, now)
+    config_dir = config_directory()
+    targets = job_destinations(SCHEDULE_ID, config_dir)
+    if targets:
+        markdown = report.read_text(encoding="utf-8")
+        if not markdown.endswith("\n\nCost: $0 (actual)\n"):
+            markdown = result_markdown(markdown, {"cost_usd": 0})
+        deliver(targets, markdown, attention_id, config_dir, schedule_id=SCHEDULE_ID)
     return {"job": "review:%s" % date, "report": report_rel, "attention_id": attention_id}

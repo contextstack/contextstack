@@ -3,6 +3,11 @@
 use App\Client\ChiefOfStaff;
 use App\Client\ConversationOrder;
 use App\Client\DirectorClient;
+use App\Client\Identity;
+use App\Client\MemberNames;
+use App\Client\NeedsYou;
+use App\Client\RecordActions;
+use App\Client\ReleaseApproval;
 use App\Client\Leads;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
@@ -11,6 +16,7 @@ use App\Client\ModelCatalog;
 use App\Client\TurnFailure;
 use App\Livewire\ApprovalsPage;
 use App\Livewire\Forms\BudgetForm;
+use Flux\Flux;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Locked;
 use Livewire\Attributes\Title;
@@ -89,6 +95,19 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
     public int $window = self::WINDOW;
 
 
+    /** @var list<string> conversations this one may send a brief to (`GET conversations/{id}/peer-messages`) */
+    #[Locked]
+    public array $peers = [];
+
+    public string $peerTo = '';
+
+    public string $peerText = '';
+
+    #[Locked]
+    public string $peerKey = '';
+
+    public string $peerProblem = '';
+
     /** Whether this is a lead conversation, which starts lanes; its page shows them beside the thread. */
     #[Locked]
     public bool $isLead = false;
@@ -96,6 +115,10 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
     /** The chief of staff's own conversation (ChiefOfStaff), named as the slot is; not archived or deleted while the slot is on. */
     #[Locked]
     public string $chiefName = '';
+
+    /** @var array<string, mixed>|null the node's last smoke (`GET conversations/{id}/smoke`), when it has one */
+    #[Locked]
+    public ?array $lastSmoke = null;
 
     public function mount(string $conversation): void
     {
@@ -109,8 +132,13 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
         $this->refetch();
         abort_if($this->refusedStatus === 404, 404);
         $this->loadModelChoices();
+        $this->peerKey = DirectorClient::newKey();
+        $this->loadPeers();
         $held = $this->conversation();
         $this->isLead = $held !== null && Leads::is($held);
+        if ($this->isLead) {
+            $this->loadReleaseApprovals();
+        }
         if (app(ChiefOfStaff::class)->conversationId() === $this->conversationId) {
             $this->chiefName = app(ChiefOfStaff::class)->slot()['name'];
         }
@@ -144,6 +172,82 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
         }
 
         parent::applyStream($changes, $runEvents);
+    }
+
+    /**
+     * Where this conversation may send briefs. Only a Director with teams has the route and only a member who can
+     * drive the conversation may ask; anything else leaves the list empty and the form hidden.
+     */
+    private function loadPeers(): void
+    {
+        $identity = app(Identity::class);
+        if (! is_array($identity->me()['capabilities'] ?? null) || ! $identity->can('start_work')) {
+            return;
+        }
+
+        try {
+            $answer = $this->director()->find('conversations/'.rawurlencode($this->conversationId).'/peer-messages');
+        } catch (DirectorRefused|DirectorUnavailable) {
+            return;
+        }
+        $this->peers = array_values(array_filter((array) ($answer['peers'] ?? []), fn ($peer): bool => is_string($peer) && $peer !== ''));
+    }
+
+    /**
+     * A changed brief or destination is a different send: it gets its own key, so it is never taken for a replay.
+     */
+    public function updatedPeerText(): void
+    {
+        $this->peerKey = DirectorClient::newKey();
+    }
+
+    public function updatedPeerTo(): void
+    {
+        $this->peerKey = DirectorClient::newKey();
+    }
+
+    /**
+     * Send a brief to another conversation (CLIENT-API.md §11.6, Peer messages): one key per send, kept until the
+     * Director answers so a lost answer is retried as the same send. Over the hourly limit (429) the Director raises
+     * a needs-you item on this conversation; the page shows it and sends nothing again by itself.
+     */
+    public function sendPeer(): void
+    {
+        $this->peerProblem = '';
+        $this->validate([
+            'peerTo' => ['required', 'in:'.implode(',', $this->peers ?: [''])],
+            'peerText' => ['required', 'string', 'max:16384'],
+        ]);
+        if (strlen($this->peerText) > 16384) {
+            $this->addError('peerText', __('A brief is at most 16 KB.'));
+
+            return;
+        }
+
+        try {
+            $this->director()->write('conversations/'.rawurlencode($this->conversationId).'/peer-messages', ['to' => $this->peerTo, 'text' => $this->peerText], $this->peerKey);
+        } catch (DirectorRefused $refused) {
+            $this->peerProblem = match (true) {
+                $refused->status === 429 => __('That pair has sent its limit of briefs this hour. Nothing was sent, and nothing will be retried; this conversation shows it under Needs you.'),
+                $refused->is('peer_not_allowed') => __('Briefs from this conversation to that one are not allowed any more.'),
+                default => $refused->explain(),
+            };
+            if ($refused->status !== 429) {
+                $this->peerKey = DirectorClient::newKey();
+                $this->loadPeers();
+            }
+            $this->refetch();
+
+            return;
+        } catch (DirectorUnavailable $unavailable) {
+            $this->peerProblem = $unavailable->getMessage();
+
+            return;
+        }
+
+        $this->peerText = '';
+        $this->peerKey = DirectorClient::newKey();
+        Flux::toast(variant: 'success', text: __('Brief sent. The other conversation reads it as untrusted text.'));
     }
 
     private function loadModelChoices(): void
@@ -241,6 +345,88 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
     }
 
     /**
+     * An approval this thread shows, one its attention links, or a land approval of this conversation (whose change
+     * carries `conversation_id`, CLIENT-API.md "Action approvals").
+     *
+     * @param  array<string, mixed>  $change
+     */
+    protected function followsApproval(array $change): bool
+    {
+        return parent::followsApproval($change)
+            || ($change['id'] ?? null) === $this->attentionApprovalId()
+            || ($change['record']['conversation_id'] ?? null) === $this->conversationId;
+    }
+
+    /**
+     * The release approvals (install, rollback) this lead conversation asked for, newest few: they stay on the page
+     * after they are decided, with the node's result. The Director filters by conversation (CLIENT-API.md
+     * `action-approvals?conversation=`). Only approvers can list approvals; others see the one the conversation's
+     * attention links.
+     */
+    private function loadReleaseApprovals(): void
+    {
+        $identity = app(Identity::class);
+        if (! $identity->legacy() && ! $identity->can('approve_action')) {
+            return;
+        }
+        try {
+            $answer = $this->director()->get('action-approvals', ['conversation' => $this->conversationId]);
+        } catch (DirectorRefused|DirectorUnavailable|\App\Client\Exceptions\NotConnected) {
+            return;
+        }
+        $mine = array_values(array_filter((array) ($answer['action_approvals'] ?? []), fn (mixed $record): bool => ReleaseApproval::is($record)
+            && is_string($record['id'] ?? null) && ($record['conversation_id'] ?? null) === $this->conversationId));
+        usort($mine, fn (array $a, array $b): int => strcmp((string) ($b['created_at'] ?? ''), (string) ($a['created_at'] ?? '')));
+        foreach (array_slice($mine, 0, 5) as $record) {
+            $this->approvals[(string) $record['id']] = $record;
+        }
+        $this->loadSmokeIfReported();
+    }
+
+    /**
+     * A release approval came back from the Director: once the node has reported, read its last smoke too.
+     */
+    protected function loadApproval(string $id): void
+    {
+        parent::loadApproval($id);
+        if (ReleaseApproval::is($this->approvals[$id] ?? null)) {
+            $this->loadSmokeIfReported();
+        }
+    }
+
+    /**
+     * The node's last smoke (`GET conversations/{id}/smoke`), read only when one of this conversation's release
+     * approvals has a reported outcome. A side read: a refusal or an unreachable Director leaves it as it was.
+     */
+    private function loadSmokeIfReported(): void
+    {
+        $reported = array_filter($this->releaseApprovals(), fn (array $approval): bool => ReleaseApproval::phase($approval) === 'reported');
+        if ($reported === []) {
+            return;
+        }
+        try {
+            $answer = $this->director()->get('conversations/'.rawurlencode($this->conversationId).'/smoke');
+            $this->lastSmoke = is_array($answer['last_smoke'] ?? null) ? $answer['last_smoke'] : null;
+        } catch (DirectorRefused|DirectorUnavailable|\App\Client\Exceptions\NotConnected) {
+            // Nothing to add: each approval already shows its own outcome.
+        }
+    }
+
+    /**
+     * The held release approvals of this conversation, oldest first.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function releaseApprovals(): array
+    {
+        $releases = array_values(array_filter($this->approvals, fn (array $approval): bool => ReleaseApproval::is($approval)
+            && ($approval['conversation_id'] ?? null) === $this->conversationId));
+        usort($releases, fn (array $a, array $b): int => strcmp((string) ($a['created_at'] ?? ''), (string) ($b['created_at'] ?? '')));
+
+        return $releases;
+    }
+
+    /**
      * Fetch the job of each turn or summary still in progress (to show a budget wait and its live runs), and catch
      * up the live output of runs not yet shown.
      */
@@ -248,7 +434,14 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
     {
         $this->trim();
         $approvalId = $this->attentionApprovalId();
-        if ($approvalId !== null && ($this->approvals[$approvalId]['status'] ?? null) !== 'needs_owner') {
+        $needs = NeedsYou::from($this->conversation()['attention'] ?? null);
+        // An item that names its kind and offers its own options needs no separate approval read, unless it is a land,
+        // whose repository, commit and flags come from the approval.
+        // A release approval (install or rollback) shows its pin and outcome from the approval too; once held, its own
+        // change events keep it current. A browser action shows its values and screenshot from the approval as well.
+        $selfDescribed = $needs !== null && $needs['kind'] !== null && ! in_array($needs['kind'], ['land', \App\Client\BrowserApproval::Kind, ...ReleaseApproval::Kinds], true) && $needs['options'] !== [];
+        $held = $approvalId !== null ? ($this->approvals[$approvalId] ?? null) : null;
+        if ($approvalId !== null && ! $selfDescribed && ($held === null || (! ReleaseApproval::is($held) && ($held['status'] ?? null) !== 'needs_owner'))) {
             $this->loadApproval($approvalId);
         }
         foreach ([...$this->turns(), ...$this->summaries()] as $item) {
@@ -579,9 +772,75 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
     {
         $attention = $this->conversation()['attention'] ?? null;
 
-        return is_array($attention) && ($attention['source_kind'] ?? null) === 'action_approval' && is_string($attention['action_approval_id'] ?? null)
+        return is_array($attention) && is_string($attention['action_approval_id'] ?? null) && $attention['action_approval_id'] !== ''
             ? $attention['action_approval_id']
             : null;
+    }
+
+    /**
+     * Adopt this hosted conversation (owner or admin): `PATCH conversations/{id}` with this member as its sponsor.
+     * The Director revokes the old lead credentials in the same step and resumes paused work (CLIENT-API.md §11).
+     */
+    public function adopt(): void
+    {
+        $memberId = app(Identity::class)->memberId();
+        if ($memberId === null || ! RecordActions::allows($this->conversation(), 'adopt', fn (): bool => app(Identity::class)->can('manage_members'))) {
+            return;
+        }
+
+        $this->takeConversation($this->attempt(fn () => $this->director()->put(
+            'conversations/'.rawurlencode($this->conversationId),
+            ['sponsor_member_id' => $memberId],
+            DirectorClient::newKey(),
+            'PATCH',
+        )));
+    }
+
+    /**
+     * Answer the needs-you question with one of its options, only when pressed (docs/design/hosted-needs-you-client.md).
+     * 403 or 404: it is no longer this member's to answer. 409: someone answered first, or it changed; read it again.
+     */
+    public function answerChoice(string $choice): void
+    {
+        $needs = NeedsYou::from($this->conversation()['attention'] ?? null);
+        if ($needs === null || ! in_array($choice, array_column($needs['options'], 'id'), true)) {
+            return;
+        }
+
+        try {
+            if ($needs['approval'] !== null) {
+                $answer = $this->director()->write('action-approvals/'.rawurlencode($needs['approval']).'/answer', ['choice' => $choice], DirectorClient::newKey());
+                if (is_string($answer->body['id'] ?? null)) {
+                    $this->approvals[$answer->body['id']] = $answer->body;
+                }
+            } elseif ($needs['backlog'] !== null && $needs['project'] !== null) {
+                $this->director()->write('projects/'.rawurlencode($needs['project']).'/backlog/'.rawurlencode($needs['backlog']).'/answer',
+                    ['choice' => $choice, 'revision' => $needs['revision']], DirectorClient::newKey());
+            } else {
+                return;
+            }
+            $this->problem = '';
+        } catch (DirectorRefused $refused) {
+            $this->problem = match (true) {
+                in_array($refused->status, [403, 404], true) => __('This question is no longer yours to answer here.'),
+                $refused->status === 409 => __('This question changed or was answered elsewhere. It shows its latest state.'),
+                default => $refused->explain(),
+            };
+            if ($refused->status === 401) {
+                $this->refused($refused);
+
+                return;
+            }
+            app(Identity::class)->forget();
+        } catch (DirectorUnavailable $unavailable) {
+            $this->problem = $unavailable->getMessage();
+
+            return;
+        }
+
+        $problem = $this->problem;
+        $this->refetch();
+        $this->problem = $problem;
     }
 
     public function dismissAttention(): void
@@ -798,6 +1057,7 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
             <x-client.stream-dot class="shrink-0" />
             <div class="ms-auto flex items-center gap-1">
                 @if ($conversation && $chiefName === '')
+                    @allowed($conversation, 'archive', 'control_work')
                     <flux:dropdown position="bottom" align="end">
                         <flux:button size="sm" variant="ghost" square icon="ellipsis-horizontal" :aria-label="__('Conversation actions')" data-test="conversation-menu" />
                         <flux:menu>
@@ -811,6 +1071,7 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                             </flux:modal.trigger>
                         </flux:menu>
                     </flux:dropdown>
+                    @endallowed
                 @endif
                 <flux:tooltip :content="__('Thread panel')">
                     <flux:button size="sm" variant="ghost" square x-on:click="toggleSide()" :aria-label="__('Thread panel')" data-test="side-toggle">
@@ -847,7 +1108,29 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                             <article class="group flex flex-col gap-2" wire:key="turn-{{ $turn['turn_id'] }}"
                                      data-test="turn" data-turn="{{ $turn['turn_id'] }}" data-state="{{ $turn['state'] }}">
                                 {{-- A wake turn is the agent's follow-up when its lanes ended: no message from the person, only the reply. --}}
-                                @if (($turn['origin'] ?? 'person') === 'wake')
+                                @if (is_array($turn['peer'] ?? null))
+                                    {{-- A brief from another conversation (CLIENT-API.md §11.6, Peer messages): data, never instructions or approvals. Plain text only. --}}
+                                    <div class="space-y-1.5 rounded-xl border border-dashed border-zinc-400/50 px-4 py-3" data-test="peer-brief">
+                                        <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-zinc-500">
+                                            <flux:icon.arrows-right-left variant="micro" />
+                                            <span>{{ __('Brief from another conversation') }}:</span>
+                                            <span class="font-medium text-zinc-700 dark:text-zinc-300" data-test="peer-from">{{ (string) ($turn['peer']['from_title'] ?? '') !== '' ? $turn['peer']['from_title'] : ($turn['peer']['from_conversation'] ?? '') }}</span>
+                                            <span class="font-mono">({{ $turn['peer']['from_conversation'] ?? '' }})</span>
+                                            <flux:badge size="sm" color="amber" data-test="peer-untrusted">{{ __('Untrusted') }}</flux:badge>
+                                        </div>
+                                        <div class="whitespace-pre-wrap break-words text-sm" data-test="peer-text">{{ $turn['message'] ?? '' }}</div>
+                                    </div>
+                                @elseif (($releaseWake = ReleaseApproval::wakeApprovalId($turn)) !== null)
+                                    {{-- The node's post-install wake (CLIENT-API.md "Hosted release approvals"): its summary, linked to the approval. --}}
+                                    <div class="space-y-1 text-xs text-zinc-500" data-test="release-wake">
+                                        <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                                            <flux:icon.rocket-launch variant="micro" />
+                                            <span>{{ __('The node reported on release request') }}</span>
+                                            <a href="#release-{{ $releaseWake }}" class="font-mono hover:text-zinc-800 hover:underline dark:hover:text-zinc-200" data-test="release-wake-approval">{{ $releaseWake }}</a>
+                                        </div>
+                                        <p class="whitespace-pre-wrap break-words" data-test="release-wake-text">{{ $turn['message'] }}</p>
+                                    </div>
+                                @elseif (($turn['origin'] ?? 'person') === 'wake')
                                     @php($wakeJobs = array_values(array_filter((array) (is_array($turn['detail'] ?? null) ? ($turn['detail']['jobs'] ?? []) : []), 'is_string')))
                                     <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-zinc-500" data-test="wake-marker">
                                         <flux:icon.check-circle variant="micro" class="text-emerald-500" />
@@ -1004,13 +1287,31 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                         @endforeach
 
                         @php($attentionApproval = $this->attentionApprovalId() !== null ? ($this->approvals[$this->attentionApprovalId()] ?? null) : null)
-                        @if (is_array($attentionApproval))
+                        @php($needsYou = \App\Client\NeedsYou::from($conversation['attention'] ?? null))
+                        @php($releases = array_values(array_filter($this->releaseApprovals(), fn (array $approval): bool => $approval['id'] !== $this->attentionApprovalId())))
+                        @if ($releases !== [] || $lastSmoke !== null)
+                            <section class="space-y-3" data-test="release-approvals">
+                                @foreach ($releases as $release)
+                                    <x-client.release-approval :approval="$release" :show-conversation="false" />
+                                @endforeach
+                                @if ($lastSmoke !== null)
+                                    <x-client.release-smoke :smoke="$lastSmoke" />
+                                @endif
+                            </section>
+                        @endif
+                        @if (ReleaseApproval::is($attentionApproval))
+                            <x-client.release-approval :approval="$attentionApproval" :needs-you="true" :show-conversation="false" />
+                        @elseif (\App\Client\BrowserApproval::is($attentionApproval))
+                            <x-client.browser-approval :approval="$attentionApproval" :needs-you="true" />
+                        @elseif ($needsYou !== null && $needsYou['options'] !== [])
+                            <x-client.needs-you-choices :needs="$needsYou" :approval="$attentionApproval" />
+                        @elseif (is_array($attentionApproval))
                             <x-client.action-approval :approval="$attentionApproval" />
                         @elseif ($attention !== null)
                             <article class="space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/[.06] px-4 py-3" data-test="attention-message">
                                 <div class="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
                                     <flux:icon.bell variant="micro" class="text-amber-500" />
-                                    <span class="font-medium text-zinc-800 dark:text-zinc-200" data-test="attention-from">{{ __('Needs your answer') }}</span>
+                                    <span class="font-medium text-zinc-800 dark:text-zinc-200" data-test="attention-from">{{ \App\Client\NeedsYou::assignedElsewhere($attention) ?? __('Needs your answer') }}</span>
                                     @if (filled($attention['set_at'] ?? null))
                                         <span>· <x-client.time :at="$attention['set_at']" /></span>
                                     @endif
@@ -1041,14 +1342,20 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                 @if ($notice !== '')
                     <p class="mb-2 px-1 text-sm text-zinc-500" data-test="notice">{{ $notice }}</p>
                 @endif
+                @if (filled($paused = \App\Client\PausedReason::words($conversation)))
+                    <p class="mb-2 px-1 text-sm text-amber-600 dark:text-amber-400" data-test="conversation-paused">{{ $paused }}</p>
+                @endif
                 @if (filled($conversation['archived_at'] ?? null))
                     {{-- An archived conversation takes no messages (the Director answers 409 archived): offer to unarchive instead. --}}
                     <div class="flex items-center gap-3 rounded-[1.5rem] border border-black/10 px-4 py-3 text-sm text-zinc-600 dark:border-white/10 dark:text-zinc-300" data-test="archived-banner">
                         <flux:icon.archive-box variant="micro" class="shrink-0 text-zinc-400" />
                         <span class="flex-1">{{ __('This conversation is archived. Unarchive it to send messages.') }}</span>
+                        @allowed($conversation, 'archive', 'control_work')
                         <flux:button size="sm" wire:click="unarchive" data-test="archived-unarchive">{{ __('Unarchive') }}</flux:button>
+                        @endallowed
                     </div>
                 @else
+                @capable('start_work')
                 @error('message')
                     <p class="mb-2 px-1 text-sm text-red-600 dark:text-red-400" role="alert" data-test="message-error">{{ $message }}</p>
                 @enderror
@@ -1070,7 +1377,8 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                             <span class="text-xs text-zinc-500" data-test="queued">{{ trans_choice(':count message queued|:count messages queued', count($conversation['queued_turn_ids'])) }}</span>
                         @endif
                         <div class="ms-auto flex items-center gap-1.5">
-                            @if ($conversation['held'] ?? false)
+                            @if (! \App\Client\RecordActions::allowsOr($conversation, 'control', 'control_work'))
+                            @elseif ($conversation['held'] ?? false)
                                 <flux:button type="button" size="sm" variant="ghost" icon="play" wire:click="resume" data-test="resume">{{ __('Resume') }}</flux:button>
                             @elseif (filled($conversation['active_turn_id'] ?? null) || count((array) ($conversation['queued_turn_ids'] ?? [])) > 0)
                                 <flux:tooltip :content="__('Stop')">
@@ -1087,6 +1395,9 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                         </div>
                     </div>
                 </div>
+                @else
+                    <p class="px-1 text-sm text-zinc-500" data-test="read-only">{{ __('Your role can read this conversation but not send messages to it.') }}</p>
+                @endcapable
                 @endif
             </div>
         @endif
@@ -1144,11 +1455,45 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                             <dt class="text-zinc-500">{{ __('Project') }}</dt>
                             <dd class="truncate"><flux:link :href="route('projects.show', $conversation['project_id'])" wire:navigate class="font-mono text-xs">{{ $conversation['project_id'] }}</flux:link></dd>
                         @endif
+                        @php($names = app(MemberNames::class))
+                        @if (($sponsor = $names->label($conversation['sponsor_member_id'] ?? null, $conversation['sponsor_display_name'] ?? null)) !== null)
+                            <dt class="text-zinc-500">{{ __('Sponsor') }}</dt>
+                            <dd class="truncate" data-test="conversation-sponsor">{{ $sponsor }}</dd>
+                        @endif
+                        @if (($responsible = $names->label($conversation['responsible_member_id'] ?? null, $conversation['responsible_display_name'] ?? null)) !== null)
+                            <dt class="text-zinc-500">{{ __('Responsible') }}</dt>
+                            <dd class="truncate" data-test="conversation-responsible">{{ $responsible }}</dd>
+                        @endif
                         <dt class="text-zinc-500">{{ __('Messages') }}</dt>
                         <dd>{{ $conversation['turns'] ?? 0 }}</dd>
                         <dt class="text-zinc-500">{{ __('ID') }}</dt>
                         <dd class="truncate font-mono text-xs leading-5" title="{{ $conversation['conversation_id'] }}">{{ $conversation['conversation_id'] }}</dd>
                     </dl>
+
+                    @if ($isLead && \App\Client\RecordActions::allows($conversation, 'adopt', fn (): bool => is_array(app(Identity::class)->me()['capabilities'] ?? null)
+                        && app(Identity::class)->can('manage_members') && ! app(Identity::class)->isMe($conversation['sponsor_member_id'] ?? null)))
+                        <div class="space-y-2" data-test="adopt">
+                            <p class="text-xs leading-5 text-zinc-500">{{ __('Adopting makes you this conversation\'s sponsor. Its agent\'s current credentials are revoked at once, and paused work resumes under you.') }}</p>
+                            <flux:button size="sm" wire:click="adopt" wire:confirm="{{ __('Adopt this conversation? Its agent\'s current credentials stop working now.') }}">{{ __('Adopt') }}</flux:button>
+                        </div>
+                    @endif
+
+                    @if ($peers !== [] && ! filled($conversation['archived_at'] ?? null))
+                        <form wire:submit="sendPeer" class="space-y-2" data-test="peer-send">
+                            <h2 class="text-sm font-medium">{{ __('Send a brief to another conversation') }}</h2>
+                            <p class="text-xs leading-5 text-zinc-500">{{ __('It arrives there as untrusted text: information, never instructions or approvals.') }}</p>
+                            <flux:select size="sm" wire:model="peerTo" :placeholder="__('Choose…')" :aria-label="__('To')">
+                                @foreach ($peers as $peer)
+                                    <flux:select.option :value="$peer" wire:key="peer-{{ $peer }}">{{ $peer }}</flux:select.option>
+                                @endforeach
+                            </flux:select>
+                            <flux:textarea size="sm" wire:model="peerText" rows="3" :aria-label="__('Brief')" />
+                            <flux:button size="sm" type="submit">{{ __('Send brief') }}</flux:button>
+                            @if ($peerProblem !== '')
+                                <p class="text-xs text-red-600 dark:text-red-400" data-test="peer-problem">{{ $peerProblem }}</p>
+                            @endif
+                        </form>
+                    @endif
 
                     @if (is_array($conversation['compaction'] ?? null))
                         <p class="text-xs leading-5 text-zinc-500" data-test="compaction">
@@ -1164,6 +1509,7 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                         <h2 class="text-sm font-medium">{{ __('Budget') }}</h2>
                         <p class="text-xs leading-5 text-zinc-500">{{ __('Dollars of actual pay-as-you-go spending, on top of its project\'s budget and the gateway\'s source budgets.') }}</p>
                         <x-client.budget :budget="$conversation['budget'] ?? null" />
+                        @capable('manage_director_budgets')
                         <form wire:submit="setBudget" class="flex flex-wrap items-end gap-2">
                             <flux:input size="sm" wire:model="budget.usd" :label="__('Dollars')" type="number" step="0.01" min="0" class="w-24" />
                             <flux:select size="sm" wire:model="budget.period" :label="__('Per')" class="w-28">
@@ -1176,6 +1522,7 @@ new #[Layout('layouts::client')] #[Title('Conversation')] class extends Approval
                                 <flux:button size="sm" type="button" variant="ghost" wire:click="clearBudget" data-test="clear-budget">{{ __('Clear budget') }}</flux:button>
                             @endif
                         </form>
+                        @endcapable
                     </div>
                 @endif
             </div>

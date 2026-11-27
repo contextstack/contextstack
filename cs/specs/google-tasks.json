@@ -1,0 +1,7 @@
+{
+  "browser": {
+    "origins": ["https://tasks.google.com"],
+    "actions": {"read": true}
+  },
+  "model": "local-coder"
+}

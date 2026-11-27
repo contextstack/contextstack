@@ -361,9 +361,40 @@ def sandbox_request(*, workspace, tmpdir, home, executable, lookup_path, ssh_aut
 
 def render_sandbox_request(binary, policy, request, *, timeout=10):
     """Return Rust's bytes or fail closed; this helper never launches the executor."""
+    return _render_profile_request(binary, ["--policy", str(policy), "--profile", "cli-executor"],
+                                   request, timeout)
+
+
+def land_check_request(*, root, home, main_checkout, worktree, run_tmp, cargo_target_dir,
+                       tmpdir, scratch, darwin_user_temp, cache_dirs=(), toolchain_roots=(),
+                       ssh_auth_sock=None, env=None, toolchain_links=(), git_dir=None,
+                       readonly_dirs=()):
+    """Build the versioned land-check request using the host's reserved localhost ports."""
+    from _action_approval import reserved_loopback_ports
+
+    return dict(version=1, home=os.path.abspath(home), main_checkout=os.path.abspath(main_checkout),
+                worktree=os.path.abspath(worktree), run_tmp=os.path.abspath(run_tmp),
+                cargo_target_dir=os.path.abspath(cargo_target_dir), tmpdir=os.path.abspath(tmpdir),
+                scratch=os.path.abspath(scratch),
+                darwin_user_temp=os.path.abspath(darwin_user_temp) if darwin_user_temp else None,
+                cache_dirs=[os.path.abspath(path) for path in cache_dirs],
+                toolchain_roots=[os.path.abspath(path) for path in toolchain_roots],
+                toolchain_links=[os.path.abspath(path) for path in toolchain_links],
+                git_dir=os.path.abspath(git_dir) if git_dir else None,
+                readonly_dirs=[os.path.abspath(path) for path in readonly_dirs],
+                ssh_auth_sock=os.path.abspath(ssh_auth_sock) if ssh_auth_sock else None,
+                reserved_ports=reserved_loopback_ports(root, env))
+
+
+def render_land_check_request(binary, request, *, timeout=10):
+    """Return the macOS Seatbelt profile for a land-check request."""
+    return _render_profile_request(binary, ["--profile", "land-check"], request, timeout)
+
+
+def _render_profile_request(binary, args, request, timeout):
     try:
         result = subprocess.run(
-            [str(binary), "--policy", str(policy), "--profile", "cli-executor", "--request", "-"],
+            [str(binary), *args, "--request", "-"],
             input=json.dumps(request).encode(), capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError("sandbox request failed: %s" % error) from error
@@ -456,6 +487,16 @@ def native_sandbox_binary(code_root, *, env=None):
 def sandbox_runtime_code_root():
     """Use the installed runtime even when Muse is loaded from a frozen bundle."""
     return Path(__file__).resolve().parents[2]
+
+
+def linux_executor_command(code_root, policy, request, command):
+    from _action_approval import reserved_loopback_ports
+
+    if request.get("loopback_ports") or (request.get("adapter") or {}).get("localhost_port"):
+        request = dict(request, reserved_ports=reserved_loopback_ports(code_root))
+    profile = "lane-check-run" if request.get("check_scratch") else "cli-executor"
+    return [str(native_sandbox_binary(code_root)), "--policy", str(policy), "--profile", profile,
+            "--request-json", json.dumps(request, separators=(",", ":")), "--", *map(str, command)]
 
 
 def render_native_sandbox(code_root, policy, request):

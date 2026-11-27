@@ -56,7 +56,7 @@ class RustTarget:
     a free localhost port. Registration and job creation are its own admin subcommands, run against the same
     data dir. The environment is PATH, a temp HOME and nothing else."""
 
-    def __init__(self, tmp, binary):
+    def __init__(self, tmp, binary, *, owner_name=None):
         self.binary = Path(binary).resolve()
         if not self.binary.is_file():
             raise SystemExit("director-spec: no Rust Director at %s (cargo build --release -p cs-director, "
@@ -71,6 +71,8 @@ class RustTarget:
             dest.write_bytes(data)
             dest.chmod(mode)
         self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.tmp / "home"), "TMPDIR": str(self.tmp)}
+        if owner_name is not None:
+            self.env["DIRECTOR_OWNER_NAME"] = owner_name
         code = self.tmp / "code"
         (code / "cs").mkdir(parents=True, exist_ok=True)
         (code / "cs/agents").symlink_to(Path(__file__).resolve().parents[3] / "cs/agents")

@@ -423,7 +423,7 @@ fn one_line(text: &str) -> String {
 }
 
 /// Replace any word that starts with a secret prefix, or follows `Bearer`, with `<redacted>`.
-fn redact(text: &str) -> String {
+pub(crate) fn redact(text: &str) -> String {
     let mut out = Vec::new();
     let mut after_bearer = false;
     for word in text.split(' ') {

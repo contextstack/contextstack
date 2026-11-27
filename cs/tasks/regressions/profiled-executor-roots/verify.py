@@ -38,7 +38,7 @@ def check_harvest_lock():
             (root / 'answer.txt').write_text('done\n')
             git('add', 'answer.txt')
             blocked = git('commit', '-qm', 'must refuse', check=False)
-            assert blocked.returncode and 'cs land is running' in blocked.stderr, blocked
+            assert blocked.returncode and 'cs land lock names pid' in blocked.stderr, blocked
             harvested = subprocess.run([str(SOURCE / 'ops/bin/harvest')], env=env, text=True,
                                        capture_output=True, input=json.dumps({
                                            'workspace': str(root), 'slug': 'lock', 'run_id': 'fixture'}))

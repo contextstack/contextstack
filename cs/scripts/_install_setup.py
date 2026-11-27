@@ -26,6 +26,7 @@ def init_setup_refusal(system=None, machine=None):
     """Return (summary, alternative) when cs init setup is unsupported, else None."""
     system = system if system is not None else platform.system()
     machine = machine if machine is not None else platform.machine()
+    # Open the public Linux gate after the first-land smoke.
     if system == "Linux":
         return (
             "ContextStack's setup currently supports Apple Silicon Macs.",

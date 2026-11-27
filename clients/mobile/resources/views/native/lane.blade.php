@@ -8,6 +8,7 @@
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
+            @include('native.partials.signed-out')
 
             @if ($loaded && $job !== [])
                 @php($route = $this->modelRoute())

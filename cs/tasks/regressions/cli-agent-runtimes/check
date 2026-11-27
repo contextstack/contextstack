@@ -4,6 +4,11 @@ each binary swapped for a fake that records its environment, proves where it can
 stream-json (goal.md)."""
 import sys
 from pathlib import Path
+
+if sys.platform != "darwin":
+    print("SKIP cli-agent-runtimes (macOS only)")
+    sys.exit(0)
+
 sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__).resolve().parents if (p / "tasks/regressions/_lib").is_dir())))  # frozen copies too
 from scratch import scratch_dir
 from hermetic_env import hermetic_env

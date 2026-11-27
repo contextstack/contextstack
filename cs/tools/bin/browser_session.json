@@ -1,7 +1,7 @@
 {
   "runtime": "python3",
   "sandbox": {"net": "none", "sockets": ["browser-public"]},
-  "description": "Open one HTTPS page in the dedicated Google Chrome the host's browser broker runs (its own profile, Chrome's sandbox on) and save its visible text as evidence. The broker allows only its set's origins: the URL, every redirect hop and the final URL must be on them, and every navigation allowed or blocked is recorded. This tool has no network; it reaches only the broker's socket for its set (public: https://example.com). Args: {url}.",
+  "description": "Open one HTTPS page in the dedicated Google Chrome the host's browser broker runs (its own profile, Chrome's sandbox on) and save its visible text as evidence. The broker allows only its set's origins: the URL, every redirect hop and the final URL must be on them, and every navigation allowed or blocked is recorded. The tool reaches its separate-profile broker over a sandbox-granted Unix socket. The owner's logged-in browser uses a different socket. Args: {url}.",
   "inputSchema": {
     "type": "object",
     "properties": {

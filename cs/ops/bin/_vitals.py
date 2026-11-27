@@ -425,9 +425,12 @@ def agent_capabilities(config_root, *, cache_ttl=0, background_discovery=False):
         install = {}
     ready = {a["name"] for a in agents if a.get("signed_in") is True and a.get("path")
              and shutil.which(a["path"])}
-    out = {"templates": sorted(name for name, template in templates.items()
-            if Path(template.get("binary") or "").name in ready), "preferred": install.get("default_model"),
+    runnable = {name for name, template in templates.items()
+                if Path(template.get("binary") or "").name in ready}
+    out = {"templates": sorted(runnable), "preferred": install.get("default_model"),
            "harness": harness_available(HERE.parents[1])}
+    if platform.system() == "Darwin" and (HERE / "gate-template.json").is_file():
+        out["gate"] = True
     if out["harness"]:
         now = time.monotonic()
         cached_at, models = _GATEWAY_CATALOG_CACHE.get(key, (0, None))

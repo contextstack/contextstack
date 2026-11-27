@@ -22,7 +22,7 @@ class Locked extends NativeComponent
     public function mount(): void
     {
         if (! app(AppLock::class)->locked()) {
-            $this->replace(app(AppLock::class)->returnTo());
+            $this->goBackToAskedScreen();
 
             return;
         }
@@ -50,7 +50,18 @@ class Locked extends NativeComponent
         }
 
         app(AppLock::class)->unlock();
-        $this->replace(app(AppLock::class)->returnTo());
+        $this->goBackToAskedScreen();
+    }
+
+    /**
+     * Back to the screen that was asked for. Its query travels as navigation data, not in the URL, so a link's code
+     * is not written into a route on the way.
+     */
+    private function goBackToAskedScreen(): void
+    {
+        $lock = app(AppLock::class);
+        $query = $lock->takeReturnQuery();
+        $this->replace($lock->returnTo(), $query === [] ? [] : [Connect::ReturnQuery => $query]);
     }
 
     public function forget(): void

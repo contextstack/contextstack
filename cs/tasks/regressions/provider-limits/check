@@ -134,7 +134,7 @@ def main():
             (state / "provider-limits.json").unlink(missing_ok=True)
             row = {}
             context = dict(cli=subprocess.CompletedProcess([], code, stdout, stderr), row=row,
-                           tmpl=templates["grok"], name="grok", binary="grok", Path=Path,
+                           tmpl=templates["grok"], template_name="grok", binary="grok", Path=Path,
                            terminal_stop=terminal_stop, forced_meta=None, budget_broker=None,
                            AUTH_EXPIRED=re.compile(r"never-match-fixture"), auth_text=stdout + stderr,
                            LOGIN_REFRESH_CLIS=("pi", "codex", "grok"), LOGIN_EXPIRED=re.compile(r"never-match-fixture"),

@@ -47,6 +47,19 @@ class CsShim:
         self.ROOT = self.HOME / ".contextstack"
         self.CONFIG = self.ROOT / "config"
 
+    def service_backend(self):
+        # cs_init asks for the platform service backend; this check never starts services, so record calls only.
+        shim = self
+
+        class Recorder:
+            def __getattr__(self, name):
+                def record(*args, **kwargs):
+                    shim.service_calls.append((name, args))
+                return record
+
+        self.service_calls = getattr(self, "service_calls", [])
+        return Recorder()
+
     def run(self, argv, timeout=10):
         try:
             return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)

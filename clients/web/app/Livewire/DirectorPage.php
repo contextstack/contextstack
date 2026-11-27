@@ -6,6 +6,7 @@ use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Exceptions\NotConnected;
+use App\Client\Identity;
 use App\Client\LiveUpdates;
 use Livewire\Attributes\Locked;
 use Livewire\Component;
@@ -26,6 +27,30 @@ abstract class DirectorPage extends Component
     public array $records = [];
 
     public string $problem = '';
+
+    /**
+     * The Director refused this device's credential (401): what the page held is cleared and it offers to reconnect
+     * or forget this device instead (CLIENT-API.md §2).
+     */
+    #[Locked]
+    public bool $signedOut = false;
+
+    /** Set while a stale refusal is refreshing the page, so a refusal during that refresh does not refresh again. */
+    private bool $refreshing = false;
+
+    /** The action this request runs (set from Livewire's `call` hook in AppServiceProvider); null while mounting. */
+    protected ?string $action = null;
+
+    /** Actions that read rather than write: a refusal to one is not followed by a second read. */
+    private const array Reads = ['refetch', 'applyStream', 'streamRefused', 'showMore', 'showEarlier'];
+
+    /**
+     * Livewire is about to run $method on this page.
+     */
+    public function calling(string $method): void
+    {
+        $this->action = $method;
+    }
 
     /** The status of the last refusal attempt() saw, for this request only (not kept between requests). */
     protected ?int $refusedStatus = null;
@@ -184,6 +209,7 @@ abstract class DirectorPage extends Component
         } catch (DirectorRefused $refused) {
             $this->problem = $refused->explain();
             $this->refusedStatus = $refused->status;
+            $this->refused($refused);
         } catch (DirectorUnavailable $unavailable) {
             $this->problem = $unavailable->getMessage();
         } catch (NotConnected $notConnected) {
@@ -191,5 +217,53 @@ abstract class DirectorPage extends Component
         }
 
         return null;
+    }
+
+    /**
+     * What a refusal means for the page beyond its words. 401: the credential is gone, so nothing protected stays on
+     * screen. 403 or 404: the role or the record changed under the page, so it asks who it is again; after a refused
+     * write it also fetches what it shows (once), keeping the refusal's words. A refused read (mounting, refetch) is
+     * not read again: that read was the fresh one.
+     */
+    protected function refused(DirectorRefused $refused): void
+    {
+        $identity = app(Identity::class);
+
+        if ($refused->status === 401) {
+            $identity->forget();
+            $this->signOut();
+
+            return;
+        }
+
+        if (! in_array($refused->status, [403, 404], true)) {
+            return;
+        }
+
+        $identity->forget();
+        if ($this->refreshing || $this->action === null || in_array($this->action, self::Reads, true)) {
+            return;
+        }
+
+        $problem = $this->problem;
+        $this->refreshing = true;
+        try {
+            $this->refetch();
+        } finally {
+            $this->refreshing = false;
+        }
+        $this->problem = $problem;
+    }
+
+    /**
+     * Drop every held record: after a 401 nothing the Director showed this credential stays on screen.
+     */
+    protected function signOut(): void
+    {
+        $this->records = [];
+        $this->signedOut = true;
+        // The frame's banner (layouts/client) offers Settings, where this device reconnects or is forgotten.
+        $this->dispatch('cs-signed-out');
+        $this->problem = __('The Director no longer accepts this device\'s credential. It may have been revoked or its member disabled. Reconnect or forget this device in Settings.');
     }
 }

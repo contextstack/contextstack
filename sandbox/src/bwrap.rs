@@ -25,6 +25,19 @@ pub enum Mount {
     Ro(PathBuf),
     /// Read-write bind of a path onto itself.
     Rw(PathBuf),
+    /// Cover a file with an empty, read-only regular file.
+    MaskFile(PathBuf),
+    /// Hide the contents of a directory.
+    MaskDir(PathBuf),
+    /// A private mount point for the executor bootstrap.
+    RoAt {
+        /// Host path to the trusted binary.
+        source: PathBuf,
+        /// Sandbox path used to launch it.
+        target: PathBuf,
+    },
+    /// An empty, writable directory in the private mount namespace.
+    Scratch(PathBuf),
     /// A symlink at `link` pointing at the absolute `target`.
     Link {
         /// The canonical path the link resolves to.
@@ -103,13 +116,21 @@ pub fn plan(effective: &Effective, links: &[(PathBuf, PathBuf)], tool: &Path) ->
     mounts.sort_by_key(|mount| match mount {
         Mount::Ro(path) => (depth(path), 0),
         Mount::Rw(path) => (depth(path), 1),
-        Mount::Link { .. } => (usize::MAX, 2),
+        Mount::Link { .. }
+        | Mount::MaskFile(_)
+        | Mount::MaskDir(_)
+        | Mount::RoAt { .. }
+        | Mount::Scratch(_) => (usize::MAX, 2),
     });
     let bound: Vec<PathBuf> = mounts
         .iter()
         .filter_map(|mount| match mount {
             Mount::Ro(path) | Mount::Rw(path) => Some(path.clone()),
-            Mount::Link { .. } => None,
+            Mount::Link { .. }
+            | Mount::MaskFile(_)
+            | Mount::MaskDir(_)
+            | Mount::RoAt { .. }
+            | Mount::Scratch(_) => None,
         })
         .collect();
     for (link, target) in links {
@@ -140,7 +161,12 @@ pub fn mask_roots(plan: &Plan, workspace: &Path) -> Vec<PathBuf> {
         .iter()
         .filter_map(|mount| match mount {
             Mount::Rw(path) => Some(path.clone()),
-            Mount::Ro(_) | Mount::Link { .. } => None,
+            Mount::Ro(_)
+            | Mount::Link { .. }
+            | Mount::MaskFile(_)
+            | Mount::MaskDir(_)
+            | Mount::RoAt { .. }
+            | Mount::Scratch(_) => None,
         })
         .collect();
     let repo_view = plan
@@ -208,6 +234,24 @@ fn push_paths(argv: &mut Vec<OsString>, flag: &str, a: &Path, b: &Path) {
 
 /// bwrap's arguments (not including the bwrap path). Deterministic for a given plan and launch.
 pub fn argv(plan: &Plan, launch: &Launch<'_>) -> Result<Vec<OsString>, Failure> {
+    render_argv(plan, launch, None)
+}
+
+/// Render an executor plan whose masks have already been selected by its ordered rules.
+pub fn executor_argv(
+    plan: &Plan,
+    launch: &Launch<'_>,
+    mut empty_file_fd: impl FnMut() -> Result<i32, Failure>,
+) -> Result<Vec<OsString>, Failure> {
+    render_argv(plan, launch, Some(&mut empty_file_fd))
+}
+
+fn render_argv(
+    plan: &Plan,
+    launch: &Launch<'_>,
+    mut empty_file_fd: Option<&mut dyn FnMut() -> Result<i32, Failure>>,
+) -> Result<Vec<OsString>, Failure> {
+    let executor = empty_file_fd.is_some();
     let mut argv = Vec::new();
     push(
         &mut argv,
@@ -243,6 +287,24 @@ pub fn argv(plan: &Plan, launch: &Launch<'_>) -> Result<Vec<OsString>, Failure> 
         match mount {
             Mount::Ro(path) => push_paths(&mut argv, "--ro-bind", path, path),
             Mount::Rw(path) => push_paths(&mut argv, "--bind", path, path),
+            Mount::MaskFile(path) => {
+                let Some(next_fd) = empty_file_fd.as_mut() else {
+                    return Err(crate::failure::unenforceable("executor mask in tool plan"));
+                };
+                // Ordinary binds are nodev. Use an empty regular file so the mask can be read.
+                push(&mut argv, &["--perms", "0444", "--ro-bind-data"]);
+                argv.push(next_fd()?.to_string().into());
+                argv.push(path.into());
+            }
+            Mount::MaskDir(path) => {
+                push(&mut argv, &["--perms", "0111", "--tmpfs"]);
+                argv.push(path.into());
+            }
+            Mount::RoAt { source, target } => push_paths(&mut argv, "--ro-bind", source, target),
+            Mount::Scratch(path) => {
+                push(&mut argv, &["--perms", "0700", "--tmpfs"]);
+                argv.push(path.into());
+            }
             Mount::Link { target, link } => push_paths(&mut argv, "--symlink", target, link),
         }
     }
@@ -252,9 +314,32 @@ pub fn argv(plan: &Plan, launch: &Launch<'_>) -> Result<Vec<OsString>, Failure> 
     for (socket, seen) in launch.sockets {
         push_paths(&mut argv, "--ro-bind", socket, seen);
     }
-    let null = Path::new("/dev/null");
-    for path in env_deny::masked_paths(&mask_roots(plan, launch.workspace))? {
-        push_paths(&mut argv, "--ro-bind", null, &path);
+    if !executor {
+        let null = Path::new("/dev/null");
+        for path in env_deny::masked_paths(&mask_roots(plan, launch.workspace))? {
+            push_paths(&mut argv, "--ro-bind", null, &path);
+        }
+    }
+    if executor {
+        for mount in &plan.mounts {
+            if let Mount::MaskDir(path) = mount {
+                argv.push("--remount-ro".into());
+                argv.push(path.into());
+            }
+        }
+        push(
+            &mut argv,
+            &[
+                "--perms",
+                "1777",
+                "--tmpfs",
+                "/dev/shm",
+                "--remount-ro",
+                "/dev",
+                "--remount-ro",
+                "/proc",
+            ],
+        );
     }
     // Last mount step: the root tmpfs itself becomes read-only; the binds keep their own flags.
     push(&mut argv, &["--remount-ro", "/"]);
@@ -358,7 +443,11 @@ mod tests {
         want[..5].sort_by_key(|mount| match mount {
             Mount::Ro(path) => (depth(path), 0),
             Mount::Rw(path) => (depth(path), 1),
-            Mount::Link { .. } => (usize::MAX, 2),
+            Mount::Link { .. }
+            | Mount::MaskFile(_)
+            | Mount::MaskDir(_)
+            | Mount::RoAt { .. }
+            | Mount::Scratch(_) => (usize::MAX, 2),
         });
         assert_eq!(got.mounts, want);
         assert_eq!(got.missing, vec![r.join("absent")]);
@@ -398,7 +487,11 @@ mod tests {
         assert!(got.mounts.contains(&Mount::Rw(r.join("tmp/call"))));
         assert!(!got.mounts.iter().any(|mount| match mount {
             Mount::Ro(path) | Mount::Rw(path) => cache.starts_with(path),
-            Mount::Link { .. } => false,
+            Mount::Link { .. }
+            | Mount::MaskFile(_)
+            | Mount::MaskDir(_)
+            | Mount::RoAt { .. }
+            | Mount::Scratch(_) => false,
         }));
         Ok(())
     }
@@ -493,6 +586,60 @@ mod tests {
         assert!(started("{ \"child-pid\": 12 }\n{ \"exit-code\": 1 }\n"));
         assert!(!started(""));
         assert!(!started("{ \"exit-code\": 1 }\n"));
+    }
+
+    #[test]
+    fn executor_argv_masks_files_and_directories() -> Result<(), String> {
+        let workspace = Path::new("/workspace");
+        let plan = Plan {
+            mounts: vec![
+                Mount::Rw(workspace.into()),
+                Mount::MaskFile(workspace.join(".env")),
+                Mount::MaskDir(workspace.join("home/.env")),
+                Mount::MaskFile(workspace.join(".envrc")),
+            ],
+            ..Plan::default()
+        };
+        let launch = Launch {
+            net: Net::Loopback,
+            gateway: None,
+            sockets: &[],
+            workspace,
+            seccomp_fd: 3,
+            status_fd: 4,
+            tool: Path::new("/bin/sh"),
+            args: &[],
+        };
+        let mut fds = [5, 6].into_iter();
+        let argv = executor_argv(&plan, &launch, || {
+            fds.next()
+                .ok_or_else(|| crate::failure::unenforceable("unexpected file mask"))
+        })
+        .map_err(|e| e.message().to_owned())?;
+        let dir = "/workspace/home/.env";
+        let expected = [
+            "--bind",
+            "/workspace",
+            "/workspace",
+            "--perms",
+            "0444",
+            "--ro-bind-data",
+            "5",
+            "/workspace/.env",
+            "--perms",
+            "0111",
+            "--tmpfs",
+            dir,
+            "--perms",
+            "0444",
+            "--ro-bind-data",
+            "6",
+            "/workspace/.envrc",
+            "--remount-ro",
+            dir,
+        ];
+        assert!(argv.windows(expected.len()).any(|args| args == expected));
+        Ok(())
     }
 
     #[test]

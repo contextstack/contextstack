@@ -30,8 +30,7 @@
   },
   "requires_manual": {
     "browser_fetch": [
-      "gstack browse (CS_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)",
-      "Playwright chromium_headless_shell-1208 (PLAYWRIGHT_BROWSERS_PATH or .estate/runtime/ms-playwright)"
+      "a running ops/bin/browser-broker (Google Chrome; policy/browser.json sets), granted by sandbox.json sockets"
     ],
     "defuddle_extract": [
       "tools/defuddle/extract.mjs with its node_modules"
@@ -49,9 +48,8 @@
         "operator_roots"
       ],
       "requires": [
-        "Playwright chromium_headless_shell-1208 (PLAYWRIGHT_BROWSERS_PATH or .estate/runtime/ms-playwright)",
-        "curl",
-        "gstack browse (CS_BROWSE, .estate/runtime/browse or ~/.claude/skills/gstack/browse/dist/browse)"
+        "a running ops/bin/browser-broker (Google Chrome; policy/browser.json sets), granted by sandbox.json sockets",
+        "curl"
       ]
     },
     {
@@ -59,6 +57,9 @@
       "descriptor": "tools/bin/browser_session.json",
       "runtime": "python3",
       "reached_from": [
+        "check",
+        "dispatcher",
+        "operator_doc",
         "operator_roots"
       ],
       "requires": [

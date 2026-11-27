@@ -47,7 +47,7 @@ ENV["HOME"] = str(fixture_home)
 ENV["GIT_CONFIG_GLOBAL"] = "/dev/null"
 os.environ.update({"CS_REPOS_FILE": str(repos), "HOME": str(fixture_home), "GIT_CONFIG_GLOBAL": "/dev/null"})
 main = gwt(tmp / "stale-base")
-repos.write_text(json.dumps({"policy": {"path": str(main)}}))
+repos.write_text(json.dumps({"policy": {"path": str(main), "land_check": "host"}}))
 sys.path.insert(0, str(KIT / "ops/bin"))
 import _lanes  # noqa: E402
 branch_from = git(main, "rev-parse", "HEAD")
@@ -85,6 +85,13 @@ except ValueError:
 expect(done2.returncode == 2 and "AGENTS.md" in out2.get("reason", ""),
        "a lane that changes a protected path is still refused", out2)
 expect(git(main, "rev-parse", "HEAD") == before, "protected refusal leaves main unchanged")
+
+repos.write_text(json.dumps({"policy": {"path": str(main), "land_check": "sandbox"}}))
+rc, result = _lanes.land("policy", "protected")
+expect(rc == 2 and "AGENTS.md" in result.get("reason", "") and git(main, "rev-parse", "HEAD") == before,
+       "sandbox opt-in retains the protected-path check before sandbox setup", result)
+expect(not (fixture_home / ".contextstack/state/land-check").exists(),
+       "policy refusal never creates a land-check workspace")
 
 if problems:
     print("lane-policy: %d failed" % len(problems))

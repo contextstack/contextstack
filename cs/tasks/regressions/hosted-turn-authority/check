@@ -20,15 +20,19 @@ import _lead_host as lead
 from _muse import sandbox_command
 from _cli_native import HOSTED_PATHS
 
-# Linux never silently falls through to the executor's unsandboxed development path.
-for flags in ({}, {'LEAD_HOST_NO_SANDBOX': '1'}, {'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}):
+# Linux always requests confinement, including when the old override is set.
+for flags in ({}, {'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}):
     with patch.dict(os.environ, flags, clear=True), patch.object(sys, 'platform', 'linux'):
+        assert lead.require_host_sandbox(True)
+with patch.dict(os.environ, {'LEAD_HOST_NO_SANDBOX': '1', 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}, clear=True):
+    with patch.object(sys, 'platform', 'linux'):
         try:
             lead.require_host_sandbox(True)
-            raise AssertionError('Linux ran without confinement')
+            raise AssertionError('Linux accepted the unconfined override')
         except SystemExit as error:
-            assert 'sandbox' in str(error).lower()
-with patch.dict(os.environ, {'LEAD_HOST_NO_SANDBOX': '1', 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}, clear=True):
+            assert 'confinement' in str(error).lower()
+with patch.dict(os.environ, {'LEAD_HOST_NO_SANDBOX': '1', 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}, clear=True), \
+        patch.object(sys, 'platform', 'darwin'):
     import contextlib, io
     warning = io.StringIO()
     with contextlib.redirect_stderr(warning):
@@ -88,7 +92,7 @@ with scratch_dir(prefix='hosted-authority-') as raw:
     assert set(fixed['mcpServers']) == {'contextstack'}
     server = fixed['mcpServers']['contextstack']
     assert server['command'] == sys.executable and 'env' not in server
-    assert server['args'][0] == str(KIT / 'scripts/cs') and '--no-land' in server['args']
+    assert server['args'][0] == str(KIT / 'scripts/cs') and '--request-land' in server['args'] and '--no-land' not in server['args']
     assert '/evil' not in server['args']
     # The retained check invokes the exact normal-executor sandbox helper.
     source = (OPS / '_lead_host.py').read_text()
@@ -108,7 +112,7 @@ with scratch_dir(prefix='hosted-authority-') as raw:
         assert found == root / 'state/lead-sessions/con_real/lead-credential', found
         assert found.read_text() == 'fixture-not-a-credential' and found.stat().st_mode & 0o777 == 0o600
         lead._SANDBOX_CMD_CACHE = None
-        with patch.object(sys, 'platform', 'darwin'):
+        if sys.platform == 'darwin':
             ws, tmp, runtime = root / 'ws', root / 'tmp', root / 'home/.contextstack/state/lead-sessions/con_real/home'
             ws.mkdir(); tmp.mkdir(); runtime.mkdir(parents=True)
             profile = tmp / 'sandbox.sb'
@@ -137,4 +141,6 @@ with scratch_dir(prefix='hosted-authority-') as raw:
             muse = sandbox_command(['/usr/bin/true'], ws, root / 'home')
             for rel in HOSTED_PATHS:
                 assert str(root / 'home' / rel) in muse[2]
+if sys.platform != 'darwin':
+    print('SKIP hosted-turn-authority Seatbelt checks (macOS only)')
 print('hosted-turn-authority: pass')

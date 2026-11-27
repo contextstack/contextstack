@@ -110,7 +110,7 @@ CRASH_AFTER = os.environ.get("FINALIZE_RUN_CRASH_AFTER", "")
 ENOSPC_BEFORE = os.environ.get("FINALIZE_RUN_ENOSPC_BEFORE", "")
 ROW_VERSION = 2
 ENVELOPE_FILES = ("terminal.json", "messages.jsonl", "events.jsonl", "cli-events.jsonl",
-                  "check.json", "transcript.md", "stuck.md", "trace.jsonl", "plan.md")
+                  "check.json", "transcript.md", "stuck.md", "trace.jsonl", "plan.md", "gate.json")
 ENVELOPE_DIRS = ("stimulus", "evidence", "sandbox")
 
 
@@ -219,7 +219,7 @@ def run_check(run_dir, term):
             timeout = harness_check_time(window, term)
             if timeout <= 0:
                 raise subprocess.TimeoutExpired("check", 0)
-            if grader and sys.platform == "darwin":
+            if (grader and sys.platform == "darwin") or (lane and sys.platform == "linux"):
                 from _estate_io import native_caller
                 from _machine_finish import collect_check, sandboxed_check
 
@@ -633,7 +633,7 @@ def step_envelope(run_dir, steps, result, sandbox=None):
     files = []
     for name in ENVELOPE_FILES:
         # A replay must retain the original file set for envelopes from older finalizers.
-        if name == "trace.jsonl" and prior is not None and not any(
+        if name in ("trace.jsonl", "gate.json") and prior is not None and not any(
                 f["path"] == name for f in prior.get("files", [])):
             continue
         if (run_dir / name).is_file():

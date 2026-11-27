@@ -32,6 +32,8 @@ from harness import wire  # noqa: E402
 from harness.node2 import delta, stop  # noqa: E402
 from harness.run import Ctx  # noqa: E402
 from harness.targets import RustTarget  # noqa: E402
+from cases.client import device, lead, owner as director_owner  # noqa: E402
+from cases.conversations import created  # noqa: E402
 
 problems = []
 
@@ -285,6 +287,7 @@ def bridged_watch(target, node):
 
 
 def main():
+    subprocess.run([sys.executable, str(HERE / "output_fallback.py")], check=True, env={**hermetic_env()})
     spec = importlib.util.spec_from_file_location("review_cases", HERE / "review_cases.py")
     cases = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cases)
@@ -293,7 +296,6 @@ def main():
     spec.loader.exec_module(module)
     cases.check(module, scratch_dir)
     model_injection_offline()
-    subprocess.run([sys.executable, str(HERE / "output_fallback.py")], check=True, env={**hermetic_env()})
     binary = Path(os.environ.get("DIRECTOR_BIN") or REPO / "target/release/cs-director")
     if not binary.is_file():
         print("SKIP cs-mcp: no director-rs at %s (cargo build --release -p cs-director)" % binary)
@@ -341,7 +343,9 @@ def scenario(server, node, target, token, tmp):
     server.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     names = {t["name"] for t in server.rpc("tools/list")["result"]["tools"]}
     want = {"start_task", "list_agents", "list_tasks", "task_status", "task_output", "wait_tasks", "cancel_task", "decide", "usage",
-            "machines", "list_repos", "land_task", "needs_you", "clear_needs_you", "retry_task", "find_task", "decision_log", "record_decision", "backlog", "backlog_update"}
+            "machines", "list_repos", "land_task", "needs_you", "clear_needs_you", "retry_task", "find_task",
+            "decision_log", "record_decision", "backlog", "backlog_update", "procedure", "run_file", "lane_diff",
+            "steer_task", "heartbeat", "install_release", "rollback", "smoke"}
     expect(names == want, "tools/list names the tools", names)
 
     # 1b. the shipped profiles (cs/agents), and a budget over the gateway's hour refused before any upload.
@@ -390,7 +394,7 @@ def scenario(server, node, target, token, tmp):
     expect([l["state"] for l in lanes["lanes"] if l["job_id"] == job_id] == ["offered"]
            and lanes["lanes"][0]["title"] == "Say hello", "list_tasks shows it offered", lanes)
     node.accept(job_id)
-    run_id = "cs-mcp-run-%d" % int(time.time())
+    run_id = "cs-mcp-run.%d" % int(time.time())
     a = node.events(run_id, job_id, [delta(1, "Hel"), delta(2, "lo"), stop(3)])
     expect(a.status in (200, 201, 202), "node sends live events", a)
     status, _ = server.tool("task_status", job_id=job_id)
@@ -427,6 +431,23 @@ def scenario(server, node, target, token, tmp):
     out, _ = server.tool("task_output", job_id=job_id)
     expect(out.get("check", {}).get("verdict") == "pass" and out.get("diff", {}).get("files") == ["a.txt"]
            and "Done: a.txt says hello." in out.get("transcript_tail", ""), "task_output after the run", out)
+    ctx = Ctx("cs-mcp-evidence-scope", target)
+    director_client = director_owner(ctx)
+    for allowed in (True, False):
+        intent = started["intent_id"] if allowed else None
+        lead_node = node if allowed else ctx.node2("evidence-outsider")
+        conv = created(ctx, director_client, lead_node, intent_id=intent)
+        credential = Path(tmp) / ("evidence-lead-" + str(allowed))
+        credential.write_text(lead(ctx, director_client, conv, intent).token)
+        scoped = Server(target.url, credential, lead_node.name)
+        try:
+            for name, args in (("run_file", {"path": "check.json"}), ("lane_diff", {})):
+                result, err = scoped.tool(name, run_id=run_id, limit=8, **args)
+                expect((not err and result.get("next_offset") == 8) if allowed
+                       else (err and "403" in result.get("error", "") and "content" not in result),
+                       "%s respects Director lead scope (allowed=%s)" % (name, allowed), result)
+        finally:
+            scoped.close()
     decided, err = server.tool("decide", decision="approve", job_id=job_id, note="looks right")
     expect(not err and decided.get("decision") == "approve" and decided.get("run_id") == run_id, "decide approves", decided)
     status, _ = server.tool("task_status", job_id=job_id)
@@ -519,6 +540,15 @@ def scenario(server, node, target, token, tmp):
         lander.read(slow)
     finally:
         lander.close()
+
+    paired_credential = Path(tmp) / "paired-credential"
+    paired_credential.write_text(device(Ctx("cs-mcp-land", target)).token)
+    paired = Server(target.url, paired_credential, node.name, env={"CS_MCP_LAND_STUB": str(stub)})
+    try:
+        result, err = paired.tool("land_task", repo="contextstack", lane="say-hello")
+        expect(err and "host owner credential" in result.get("error", ""), "paired owner cannot land", result)
+    finally:
+        paired.close()
 
     # 9. a long-running server follows ~/.contextstack/current: release A, switch to B, delete A.
     release_switch(target.url, target.data / "local-credential", node.name, tmp)

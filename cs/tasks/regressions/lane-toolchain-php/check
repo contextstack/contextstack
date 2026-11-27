@@ -14,6 +14,7 @@ KIT = HERE.parents[2]
 sys.path[:0] = [str(KIT / "ops/bin"), str(HERE.parent / "_lib")]
 from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
+from land_toolchain import check_land_toolchain
 import _executor
 import _toolchains
 
@@ -53,4 +54,5 @@ with scratch_dir(dir=short_tmp(), prefix="lane-php-") as raw:
     result = subprocess.run(cmd, env=env, cwd=ws, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0 and result.stdout.strip() == "PHP_OK", result
     assert not (wrapper / "forbidden").exists() and not (real / "forbidden").exists()
+    check_land_toolchain(root, KIT, command, (sibling, wrapper, real), env, "PHP_OK")
 print("lane-toolchain-php: PASS")

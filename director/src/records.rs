@@ -3,7 +3,8 @@
 //! with its own `revision` (CLIENT-API.md §3). One place renders them, for the API and the event stream alike.
 
 use crate::store::Record;
-use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
+use crate::store::ScopedConnection;
+use rusqlite::{OptionalExtension, Row, ToSql, params};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -73,10 +74,10 @@ pub(crate) fn waiting(w: &Wait, grace: i64, stale: i64) -> Value {
 }
 
 /// A job's `waiting` field, read from the store; null for an unknown job or one that is not waiting.
-pub(crate) fn job_waiting(db: &Connection, job_id: &str) -> rusqlite::Result<Value> {
+pub(crate) fn job_waiting(db: &ScopedConnection, job_id: &str) -> rusqlite::Result<Value> {
     let mut stmt = db.prepare_cached(
         "SELECT j.state, n.name, COALESCE(j.offered_at, j.created_at), n.last_seen_at, b.reason, b.detail
-         FROM jobs j JOIN nodes n ON n.id = j.node_id LEFT JOIN job_budgets b ON b.job_id = j.job_id
+         FROM (SELECT rowid AS rowid, * FROM jobs WHERE +org_id = :org_id) j JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id LEFT JOIN (SELECT * FROM job_budgets WHERE +org_id = :org_id) b ON b.job_id = j.job_id
          WHERE j.job_id = ?1 AND j.state IN ('offered', 'waiting')",
     )?;
     let row = stmt
@@ -112,7 +113,7 @@ pub(crate) struct View {
     pub(crate) select: &'static str,
     pub(crate) key: &'static str,
     pub(crate) order: &'static str,
-    pub(crate) shape: fn(&Connection, &Row) -> rusqlite::Result<Value>,
+    pub(crate) shape: fn(&ScopedConnection, &Row) -> rusqlite::Result<Value>,
 }
 
 fn parse(s: Option<String>) -> Option<Value> {
@@ -138,17 +139,17 @@ pub fn is_lane_meta(meta: &Value) -> bool {
 
 const INTENTS: View = View {
     select: "SELECT i.intent_id, i.title, i.node, i.spec, i.task, i.trials, i.grant_id, i.meta, i.bundle_sha256,
-                    i.created_by, i.created_at, i.revision, i.project_id, i.lead_conversation_id
-             FROM intents i",
+                    i.created_by, i.created_at, i.revision, i.project_id, i.lead_conversation_id, i.responsible_member_id
+             FROM (SELECT rowid AS rowid, * FROM intents WHERE +org_id = :org_id) i",
     key: "i.intent_id",
     order: "i.rowid DESC",
     shape: |db, r| {
         let id: String = r.get(0)?;
-        let mut stmt = db.prepare_cached("SELECT job_id FROM jobs WHERE intent_id = ?1 ORDER BY rowid")?;
+        let mut stmt = db.prepare_cached("SELECT job_id FROM jobs WHERE +org_id = :org_id AND intent_id = ?1 ORDER BY rowid")?;
         let jobs = stmt
             .query_map(params![id], |j| j.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut stmt = db.prepare_cached("SELECT conversation_id FROM conversations WHERE intent_id = ?1 ORDER BY rowid")?;
+        let mut stmt = db.prepare_cached("SELECT conversation_id FROM conversations WHERE +org_id = :org_id AND intent_id = ?1 ORDER BY rowid")?;
         let conversations = stmt
             .query_map(params![id], |c| c.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -160,6 +161,7 @@ const INTENTS: View = View {
                   "created_at": r.get::<_, String>(10)?, "revision": r.get::<_, i64>(11)?, "job_ids": jobs,
                   "project_id": r.get::<_, Option<String>>(12)?,
                   "lead_conversation_id": r.get::<_, Option<String>>(13)?,
+                  "responsible_member_id": r.get::<_, Option<String>>(14)?.unwrap_or_else(|| db.scope().member_id.clone()),
                   "lane": is_lane_meta(&meta)}))
     },
 };
@@ -167,18 +169,18 @@ const INTENTS: View = View {
 const JOBS: View = View {
     select: "SELECT j.job_id, n.name, j.state, j.spec, j.task, j.trials, j.bundle_sha256, j.grant_id, j.meta,
                     j.created_at, j.accepted_at, j.finished_at, j.run_id, j.terminal_row, j.revision, j.intent_id,
-                    c.cancel_id, COALESCE(k.state, c.state), (SELECT r.run_id FROM runs r WHERE r.run_id = j.run_id),
+                    c.cancel_id, COALESCE(k.state, c.state), (SELECT r.run_id FROM runs r WHERE +org_id = :org_id AND r.run_id = j.run_id),
                     k.outcome,
-                    COALESCE((SELECT t.conversation_id FROM turns t WHERE t.job_id = j.job_id),
-                             (SELECT s.conversation_id FROM summaries s WHERE s.job_id = j.job_id)),
+                    COALESCE((SELECT t.conversation_id FROM turns t WHERE +org_id = :org_id AND t.job_id = j.job_id),
+                             (SELECT s.conversation_id FROM summaries s WHERE +org_id = :org_id AND s.job_id = j.job_id)),
                     li.lead_conversation_id,
                     j.error,
                     ld.land_id, ld.state, ld.repo, ld.lane, ld.main, ld.\"commit\", ld.reason, ld.landed_by, ld.landed_at,
                     ld.attempts
-             FROM jobs j JOIN nodes n ON n.id = j.node_id LEFT JOIN cancels c ON c.job_id = j.job_id
-               LEFT JOIN controls k ON k.control_id = c.control_id
-               LEFT JOIN intents li ON li.intent_id = j.intent_id
-               LEFT JOIN lands ld ON ld.run_id = j.run_id AND ld.current = 1",
+             FROM (SELECT rowid AS rowid, * FROM jobs WHERE +org_id = :org_id) j JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id LEFT JOIN (SELECT * FROM cancels WHERE +org_id = :org_id) c ON c.job_id = j.job_id
+               LEFT JOIN (SELECT * FROM controls WHERE +org_id = :org_id) k ON k.control_id = c.control_id
+               LEFT JOIN (SELECT * FROM intents WHERE +org_id = :org_id) li ON li.intent_id = j.intent_id
+               LEFT JOIN (SELECT * FROM lands WHERE +org_id = :org_id) ld ON ld.run_id = j.run_id AND ld.current = 1",
     key: "j.job_id",
     order: "j.rowid DESC",
     shape: |db, r| {
@@ -189,14 +191,14 @@ const JOBS: View = View {
                             "outcome": r.get::<_, Option<String>>(19).ok().flatten()}));
         // The run its end names, then each run whose report names this job (every trial's run).
         let mut runs: Vec<String> = r.get::<_, Option<String>>(18)?.into_iter().collect();
-        let mut named = db.prepare_cached("SELECT run_id FROM runs WHERE job_id = ?1 ORDER BY rowid")?;
+        let mut named = db.prepare_cached("SELECT run_id FROM runs WHERE +org_id = :org_id AND job_id = ?1 ORDER BY rowid")?;
         for run in named.query_map(params![id], |l| l.get::<_, String>(0))? {
             let run = run?;
             if !runs.contains(&run) {
                 runs.push(run);
             }
         }
-        let mut live = db.prepare_cached("SELECT run_id FROM live_runs WHERE job_id = ?1 ORDER BY rowid")?;
+        let mut live = db.prepare_cached("SELECT run_id FROM live_runs WHERE +org_id = :org_id AND job_id = ?1 ORDER BY rowid")?;
         let live: Vec<String> = live
             .query_map(params![id], |l| l.get(0))?
             .collect::<Result<_, _>>()?;
@@ -223,25 +225,25 @@ const JOBS: View = View {
 
 const RUNS: View = View {
     select: "SELECT r.run_id, n.name, r.usage, r.verdict, r.transcript, r.row_line, r.received_at, r.revision,
-                    COALESCE(r.job_id, (SELECT j.job_id FROM jobs j WHERE j.run_id = r.run_id LIMIT 1)),
-                    COALESCE((SELECT j.intent_id FROM jobs j WHERE j.job_id = r.job_id),
-                             (SELECT j.intent_id FROM jobs j WHERE j.run_id = r.run_id LIMIT 1)),
+                    COALESCE(r.job_id, (SELECT j.job_id FROM jobs j WHERE +org_id = :org_id AND j.run_id = r.run_id LIMIT 1)),
+                    COALESCE((SELECT j.intent_id FROM jobs j WHERE +org_id = :org_id AND j.job_id = r.job_id),
+                             (SELECT j.intent_id FROM jobs j WHERE +org_id = :org_id AND j.run_id = r.run_id LIMIT 1)),
                     d.decision_id, d.decision, d.decided_at,
                     ld.land_id, ld.state, ld.repo, ld.lane, ld.main, ld.\"commit\", ld.reason, ld.landed_by, ld.landed_at,
-                    (SELECT l.confirmed FROM live_runs l WHERE l.run_id = r.run_id),
-                    COALESCE((SELECT t.conversation_id FROM turns t JOIN jobs j ON j.job_id = t.job_id
+                    (SELECT l.confirmed FROM live_runs l WHERE +org_id = :org_id AND l.run_id = r.run_id),
+                    COALESCE((SELECT t.conversation_id FROM (SELECT * FROM turns WHERE +org_id = :org_id) t JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = t.job_id
                               WHERE j.run_id = r.run_id OR j.job_id = r.job_id),
-                             (SELECT s.conversation_id FROM summaries s JOIN jobs j ON j.job_id = s.job_id
+                             (SELECT s.conversation_id FROM (SELECT rowid AS rowid, * FROM summaries WHERE +org_id = :org_id) s JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = s.job_id
                               WHERE j.run_id = r.run_id OR j.job_id = r.job_id)),
                     ld.attempts
-             FROM runs r JOIN nodes n ON n.id = r.node_id LEFT JOIN decisions d ON d.run_id = r.run_id
-               LEFT JOIN lands ld ON ld.run_id = r.run_id AND ld.current = 1",
+             FROM (SELECT rowid AS rowid, * FROM runs WHERE +org_id = :org_id) r JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = r.node_id LEFT JOIN (SELECT * FROM decisions WHERE +org_id = :org_id) d ON d.run_id = r.run_id
+               LEFT JOIN (SELECT * FROM lands WHERE +org_id = :org_id) ld ON ld.run_id = r.run_id AND ld.current = 1",
     key: "r.run_id",
     order: "r.rowid DESC",
     shape: |db, r| {
         let id: String = r.get(0)?;
         let mut stmt = db
-            .prepare("SELECT path, sha256, bytes FROM run_files WHERE run_id = ?1 ORDER BY path")?;
+            .prepare("SELECT path, sha256, bytes FROM run_files WHERE +org_id = :org_id AND run_id = ?1 ORDER BY path")?;
         let files = stmt
             .query_map(params![id], |f| {
                 Ok(
@@ -270,10 +272,10 @@ const RUNS: View = View {
 const DECISIONS: View = View {
     select:
         "SELECT d.decision_id, d.run_id, d.decision, d.note, d.decided_by, d.decided_at, d.revision,
-                    (SELECT j.job_id FROM jobs j WHERE j.run_id = d.run_id LIMIT 1),
-                    (SELECT j.intent_id FROM jobs j WHERE j.run_id = d.run_id LIMIT 1),
-                    (SELECT c.name FROM credentials c WHERE c.id = d.decided_by)
-             FROM decisions d",
+                    (SELECT j.job_id FROM jobs j WHERE +org_id = :org_id AND j.run_id = d.run_id LIMIT 1),
+                    (SELECT j.intent_id FROM jobs j WHERE +org_id = :org_id AND j.run_id = d.run_id LIMIT 1),
+                    (SELECT c.name FROM credentials c WHERE +org_id = :org_id AND c.id = d.decided_by)
+             FROM (SELECT rowid AS rowid, * FROM decisions WHERE +org_id = :org_id) d",
     key: "d.decision_id",
     order: "d.rowid DESC",
     shape: |_, r| {
@@ -288,59 +290,63 @@ const DECISIONS: View = View {
     },
 };
 
-fn attempts_of(raw: &str) -> Value {
-    serde_json::from_str::<Value>(raw)
-        .ok()
-        .filter(Value::is_array)
-        .unwrap_or_else(|| json!([]))
-}
-
 /// The land embedded on a job or run. `attempts_at` sits apart from the contiguous land columns so
 /// later fields on the same row keep their indexes.
 fn land_summary(r: &Row, base: usize, attempts_at: usize) -> rusqlite::Result<Value> {
     let id: Option<String> = r.get(base)?;
     Ok(match id {
         None => Value::Null,
-        Some(land_id) => json!({
-            "land_id": land_id,
-            "state": r.get::<_, String>(base + 1)?,
-            "repo": r.get::<_, String>(base + 2)?,
-            "lane": r.get::<_, String>(base + 3)?,
-            "main": r.get::<_, String>(base + 4)?,
-            "commit": r.get::<_, Option<String>>(base + 5)?,
-            "reason": r.get::<_, Option<String>>(base + 6)?,
-            "landed_by": r.get::<_, String>(base + 7)?,
-            "landed_at": r.get::<_, String>(base + 8)?,
-            "attempts": attempts_of(&r.get::<_, String>(attempts_at)?),
-        }),
+        Some(land_id) => with_land_attempts(
+            json!({
+                "land_id": land_id,
+                "state": r.get::<_, String>(base + 1)?,
+                "repo": r.get::<_, String>(base + 2)?,
+                "lane": r.get::<_, String>(base + 3)?,
+                "main": r.get::<_, String>(base + 4)?,
+                "commit": r.get::<_, Option<String>>(base + 5)?,
+                "reason": r.get::<_, Option<String>>(base + 6)?,
+                "landed_by": r.get::<_, String>(base + 7)?,
+                "landed_at": r.get::<_, String>(base + 8)?,
+            }),
+            &r.get::<_, String>(attempts_at)?,
+        ),
     })
+}
+
+fn with_land_attempts(mut land: Value, raw: &str) -> Value {
+    let (attempts, coverage) = crate::land::decode_attempts(raw);
+    land["attempts"] = attempts;
+    if let Some(coverage) = coverage {
+        land["host_probe_coverage"] = coverage;
+    }
+    land
 }
 
 const LANDS: View = View {
     select:
         "SELECT l.land_id, l.run_id, l.state, l.repo, l.lane, l.main, l.\"commit\", l.reason, l.landed_by, l.landed_at,
                     l.revision,
-                    (SELECT j.job_id FROM jobs j WHERE j.run_id = l.run_id LIMIT 1),
-                    (SELECT j.intent_id FROM jobs j WHERE j.run_id = l.run_id LIMIT 1),
+                    (SELECT j.job_id FROM jobs j WHERE +org_id = :org_id AND j.run_id = l.run_id LIMIT 1),
+                    (SELECT j.intent_id FROM jobs j WHERE +org_id = :org_id AND j.run_id = l.run_id LIMIT 1),
                     l.attempts
-             FROM lands l",
+             FROM (SELECT rowid AS rowid, * FROM lands WHERE +org_id = :org_id) l",
     key: "l.land_id",
     order: "l.rowid DESC",
     shape: |_, r| {
-        Ok(json!({"land_id": r.get::<_, String>(0)?, "run_id": r.get::<_, String>(1)?,
+        Ok(with_land_attempts(json!({"land_id": r.get::<_, String>(0)?, "run_id": r.get::<_, String>(1)?,
                   "state": r.get::<_, String>(2)?, "repo": r.get::<_, String>(3)?, "lane": r.get::<_, String>(4)?,
                   "main": r.get::<_, String>(5)?, "commit": r.get::<_, Option<String>>(6)?,
                   "reason": r.get::<_, Option<String>>(7)?, "landed_by": r.get::<_, String>(8)?,
                   "landed_at": r.get::<_, String>(9)?, "revision": r.get::<_, i64>(10)?,
-                  "job_id": r.get::<_, Option<String>>(11)?, "intent_id": r.get::<_, Option<String>>(12)?,
-                  "attempts": attempts_of(&r.get::<_, String>(13)?)}))
+                  "job_id": r.get::<_, Option<String>>(11)?, "intent_id": r.get::<_, Option<String>>(12)?}),
+                  &r.get::<_, String>(13)?))
     },
 };
 
 const CANCELS: View = View {
     select: "SELECT c.cancel_id, c.job_id, c.control_id, c.reason, c.requested_by, c.requested_at, c.revision,
-                    j.intent_id, (SELECT k.name FROM credentials k WHERE k.id = c.requested_by), n.name, n.protocol
-             FROM cancels c JOIN jobs j ON j.job_id = c.job_id JOIN nodes n ON n.id = j.node_id",
+                    j.intent_id, (SELECT k.name FROM credentials k WHERE +org_id = :org_id AND k.id = c.requested_by), n.name, n.protocol
+             FROM (SELECT rowid AS rowid, * FROM cancels WHERE +org_id = :org_id) c JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = c.job_id JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id",
     key: "c.cancel_id",
     order: "c.rowid DESC",
     shape: |db, r| {
@@ -365,8 +371,8 @@ const CANCELS: View = View {
 const NODES: View = View {
     select: "SELECT n.id, n.name, n.created_at, n.last_seen_at, n.revoked_at, n.protocol, n.status, n.status_at,
                     n.revision,
-                    (SELECT COUNT(*) FROM jobs j WHERE j.node_id = n.id AND j.state IN ('offered', 'accepted'))
-             FROM nodes n",
+                    (SELECT COUNT(*) FROM jobs j WHERE +org_id = :org_id AND j.node_id = n.id AND j.state IN ('offered', 'accepted'))
+             FROM (SELECT * FROM nodes WHERE +org_id = :org_id) n",
     key: "n.name",
     order: "n.name",
     shape: |_, r| {
@@ -388,8 +394,8 @@ const NODES: View = View {
 
 const SCHEDULES: View = View {
     select: "SELECT s.schedule_key, n.name, s.schedule_id, s.schedule_revision, s.body, s.reported_at, s.removed_at,
-                    s.revision, s.node_id
-             FROM schedules s JOIN nodes n ON n.id = s.node_id",
+                    s.revision, s.node_id, s.responsible_member_id
+             FROM (SELECT rowid AS rowid, * FROM schedules WHERE +org_id = :org_id) s JOIN (SELECT rowid AS rowid, * FROM nodes WHERE +org_id = :org_id) n ON n.id = s.node_id",
     key: "s.schedule_key",
     order: "n.name, s.schedule_id",
     shape: |db, r| {
@@ -397,20 +403,21 @@ const SCHEDULES: View = View {
         let (node_id, schedule_id): (i64, String) = (r.get(8)?, r.get(2)?);
         let last = db
             .query_row(
-                "SELECT body FROM firings WHERE node_id = ?1 AND schedule_id = ?2
+                "SELECT body FROM firings WHERE +org_id = :org_id AND node_id = ?1 AND schedule_id = ?2
                  ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
                 params![node_id, schedule_id],
                 |f| f.get::<_, String>(0),
             )
             .ok();
         let mut stmt = db.prepare_cached(
-            "SELECT c.change_id FROM schedule_changes c JOIN controls k ON k.control_id = c.control_id
+            "SELECT c.change_id FROM (SELECT rowid AS rowid, * FROM schedule_changes WHERE +org_id = :org_id) c JOIN (SELECT rowid AS rowid, * FROM controls WHERE +org_id = :org_id) k ON k.control_id = c.control_id
              WHERE c.schedule_key = ?1 AND k.state IN ('requested', 'received') ORDER BY c.rowid",
         )?;
         let pending: Vec<String> = stmt.query_map(params![key], |c| c.get(0))?.collect::<Result<_, _>>()?;
         let mut out = parse(r.get(4)?).unwrap_or_else(|| json!({}));
         for (k, v) in [
             ("schedule_key", json!(key)),
+            ("responsible_member_id", json!(r.get::<_, Option<String>>(9)?.unwrap_or_else(|| db.scope().member_id.clone()))),
             ("node", json!(r.get::<_, String>(1)?)),
             ("schedule_id", json!(schedule_id)),
             ("schedule_revision", json!(r.get::<_, i64>(3)?)),
@@ -422,6 +429,14 @@ const SCHEDULES: View = View {
         ] {
             out[k] = v;
         }
+        if out["definition"]["director_managed"] == true
+            && let Some(name) = out["definition"]["name"].as_str()
+        {
+            out["name"] = json!(name);
+        }
+        if crate::scopes::budget_of(db, "schedule", &key)?.is_some() {
+            out["budget"] = crate::scopes::scope_view(db, "schedule", &key)?;
+        }
         Ok(out)
     },
 };
@@ -429,9 +444,10 @@ const SCHEDULES: View = View {
 const SCHEDULE_CHANGES: View = View {
     select: "SELECT c.change_id, c.schedule_key, s.schedule_id, n.name, c.control_id, c.expect_revision, c.change,
                     c.requested_by, c.requested_at, c.revision, n.protocol,
-                    (SELECT k.name FROM credentials k WHERE k.id = c.requested_by)
-             FROM schedule_changes c JOIN schedules s ON s.schedule_key = c.schedule_key
-               JOIN nodes n ON n.id = s.node_id",
+                    (SELECT k.name FROM credentials k WHERE +org_id = :org_id AND k.id = c.requested_by),
+                    (SELECT json_extract(k.body, '$.kind') FROM controls k WHERE +org_id = :org_id AND k.control_id = c.control_id)
+             FROM (SELECT rowid AS rowid, * FROM schedule_changes WHERE +org_id = :org_id) c JOIN (SELECT * FROM schedules WHERE +org_id = :org_id) s ON s.schedule_key = c.schedule_key
+               JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = s.node_id",
     key: "c.change_id",
     order: "c.rowid DESC",
     shape: |db, r| {
@@ -451,6 +467,9 @@ const SCHEDULE_CHANGES: View = View {
             ("requested_at".into(), json!(r.get::<_, String>(8)?)),
             ("revision".into(), json!(r.get::<_, i64>(9)?)),
         ]);
+        if let Some(kind) = r.get::<_, Option<String>>(12)? {
+            out.insert("kind".into(), json!(kind));
+        }
         Ok(Value::Object(out))
     },
 };
@@ -461,12 +480,12 @@ fn conversation_attention(r: &Row) -> rusqlite::Result<Value> {
         None => Value::Null,
         Some(q) => json!({"question": q, "job_id": r.get::<_, Option<String>>(15)?,
                           "set_at": r.get::<_, String>(16)?, "set_by": r.get::<_, String>(17)?,
-                          "source_kind": r.get::<_, Option<String>>(18)?}),
+                          "source_kind": r.get::<_, Option<String>>(18)?, "assignee_member_id": r.get::<_, Option<String>>(23)?}),
     })
 }
 
 fn turn_waiting(
-    db: &Connection,
+    db: &ScopedConnection,
     conversation: &str,
     state: &str,
     job: Option<String>,
@@ -477,7 +496,7 @@ fn turn_waiting(
     let job = match job {
         None if state == "summarising" => db
             .query_row(
-                "SELECT job_id FROM summaries WHERE conversation_id = ?1 AND state = 'running'",
+                "SELECT job_id FROM summaries WHERE +org_id = :org_id AND conversation_id = ?1 AND state = 'running'",
                 params![conversation],
                 |row| row.get(0),
             )
@@ -491,15 +510,16 @@ const CONVERSATIONS: View = View {
     select: "SELECT c.conversation_id, c.title, c.node, c.spec, c.spec_version, c.model, c.intent_id, c.held,
                     c.created_by, c.created_at, c.revision, c.instructions_tokens, c.tools, c.project_id,
                     c.attention_question, c.attention_job_id, c.attention_set_at, c.attention_set_by,
-                    (SELECT kind FROM credentials WHERE id = c.attention_set_by), c.lead, c.archived_at
-             FROM conversations c",
+                    (SELECT kind FROM credentials WHERE +org_id = :org_id AND id = c.attention_set_by), c.lead, c.archived_at, c.responsible_member_id,
+                    COALESCE(c.sponsor_member_id,c.responsible_member_id), c.attention_assignee_member_id
+             FROM (SELECT rowid AS rowid, * FROM conversations WHERE +org_id = :org_id) c",
     key: "c.conversation_id",
     order: "c.rowid DESC",
     shape: |db, r| {
         let id: String = r.get(0)?;
         let mut stmt = db.prepare_cached(
             "SELECT turn_id, state, job_id FROM turns
-             WHERE conversation_id = ?1 AND state IN ('queued', 'summarising', 'running') ORDER BY seq",
+             WHERE +org_id = :org_id AND conversation_id = ?1 AND state IN ('queued', 'summarising', 'running') ORDER BY seq",
         )?;
         let open: Vec<(String, String, Option<String>)> = stmt
             .query_map(params![id], |t| Ok((t.get(0)?, t.get(1)?, t.get(2)?)))?
@@ -511,8 +531,8 @@ const CONVERSATIONS: View = View {
             _ => Value::Null,
         };
         let (turns, summaries): (i64, i64) = db.query_row(
-            "SELECT (SELECT COUNT(*) FROM turns WHERE conversation_id = ?1),
-                    (SELECT COUNT(*) FROM summaries WHERE conversation_id = ?1)",
+            "SELECT (SELECT COUNT(*) FROM turns WHERE +org_id = :org_id AND conversation_id = ?1),
+                    (SELECT COUNT(*) FROM summaries WHERE +org_id = :org_id AND conversation_id = ?1)",
             params![id],
             |c| Ok((c.get(0)?, c.get(1)?)),
         )?;
@@ -524,7 +544,13 @@ const CONVERSATIONS: View = View {
         };
         let model: String = r.get(5)?;
         let budget = crate::thread::budget(&model, r.get(11)?, r.get(12)?);
-        let attention = conversation_attention(r)?;
+        let assignee: Option<String> = r.get(23)?;
+        let raised_by: Option<String> = r.get(17)?;
+        let attention = if crate::policy::attention_visible(assignee.as_deref(), raised_by.as_deref()) {
+            conversation_attention(r)?
+        } else {
+            Value::Null
+        };
         let attention = if attention.is_null() {
             crate::action_approvals::attention(db, &id)?
         } else {
@@ -548,13 +574,15 @@ const CONVERSATIONS: View = View {
                   "attention": attention,
                   "budget": crate::scopes::scope_view(db, "conversation", &id)?,
                   "lead": r.get::<_, i64>(19)? != 0,
+                  "responsible_member_id": r.get::<_, Option<String>>(21)?.unwrap_or_else(|| db.scope().member_id.clone()),
+                  "sponsor_member_id": r.get::<_, Option<String>>(22)?.unwrap_or_else(|| db.scope().member_id.clone()),
                   "archived_at": r.get::<_, Option<String>>(20)?,
                   "revision": r.get::<_, i64>(10)?}))
     },
 };
 
 const PROJECTS: View = View {
-    select: "SELECT p.project_id, p.name, p.created_by, p.created_at, p.revision FROM projects p",
+    select: "SELECT p.project_id, p.name, p.created_by, p.created_at, p.revision FROM (SELECT rowid AS rowid, * FROM projects WHERE +org_id = :org_id) p",
     key: "p.project_id",
     order: "p.rowid DESC",
     shape: |db, r| {
@@ -571,10 +599,10 @@ const PROJECTS: View = View {
 const TURNS: View = View {
     select: "SELECT t.turn_id, t.conversation_id, t.seq, t.message, t.state, t.posted_by, t.posted_at, t.job_id,
                     t.reply, t.detail, t.context, t.started_at, t.finished_at, t.revision,
-                    (SELECT k.name FROM credentials k WHERE k.id = t.posted_by), j.run_id, c.cancel_id,
+                    (SELECT k.name FROM credentials k WHERE +org_id = :org_id AND k.id = t.posted_by), j.run_id, c.cancel_id,
                     COALESCE(x.state, c.state), x.outcome, t.origin, j.terminal_row, j.error
-             FROM turns t LEFT JOIN jobs j ON j.job_id = t.job_id LEFT JOIN cancels c ON c.job_id = t.job_id
-               LEFT JOIN controls x ON x.control_id = c.control_id",
+             FROM (SELECT * FROM turns WHERE +org_id = :org_id) t LEFT JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = t.job_id LEFT JOIN (SELECT * FROM cancels WHERE +org_id = :org_id) c ON c.job_id = t.job_id
+               LEFT JOIN (SELECT * FROM controls WHERE +org_id = :org_id) x ON x.control_id = c.control_id",
     key: "t.turn_id",
     order: "t.seq",
     shape: |db, r| {
@@ -582,30 +610,42 @@ const TURNS: View = View {
             json!({"cancel_id": c, "state": r.get::<_, Option<String>>(17).ok().flatten(),
                    "outcome": r.get::<_, Option<String>>(18).ok().flatten()})
         });
-        // A wake turn's detail is the object `{nudge, jobs}`; other turns keep the error text.
+        // Wake turns can carry structured detail; other turns keep the error text.
         let origin = r.get::<_, String>(19)?;
         let detail = match (origin.as_str(), r.get::<_, Option<String>>(9)?) {
-            ("wake", Some(d)) => serde_json::from_str(&d).unwrap_or(Value::String(d)),
+            ("wake" | "browser_data", Some(d)) => serde_json::from_str(&d).unwrap_or(Value::String(d)),
             (_, d) => d.map_or(Value::Null, Value::String),
         };
         let waiting = turn_waiting(db, r.get_ref(1)?.as_str()?, r.get_ref(4)?.as_str()?, r.get(7)?)?;
-        Ok(json!({"turn_id": r.get::<_, String>(0)?, "conversation_id": r.get::<_, String>(1)?,
-                  "seq": r.get::<_, i64>(2)?, "message": r.get::<_, String>(3)?, "state": r.get::<_, String>(4)?,
-                  "posted_by": r.get::<_, String>(5)?, "posted_by_name": r.get::<_, Option<String>>(14)?,
+        let stored_message: String = r.get(3)?;
+        let peer = crate::peer_messages::attribution(&origin, &stored_message);
+        let message = peer.as_ref().and_then(|peer| peer["text"].as_str()).unwrap_or(&stored_message);
+        let mut turn = json!({"turn_id": r.get::<_, String>(0)?, "conversation_id": r.get::<_, String>(1)?,
+                  "seq": r.get::<_, i64>(2)?, "message": message, "state": r.get::<_, String>(4)?,
+                  "posted_by": r.get::<_, String>(5)?, "posted_by_name": if origin == "browser_data" {
+                      Some("Google Tasks".to_owned())
+                  } else { r.get::<_, Option<String>>(14)? },
                   "posted_at": r.get::<_, String>(6)?, "job_id": r.get::<_, Option<String>>(7)?,
                   "run_id": r.get::<_, Option<String>>(15)?, "reply": r.get::<_, Option<String>>(8)?,
                   "failure": crate::failure::classify(&r.get::<_, String>(4)?, &parse(r.get(20)?).unwrap_or(Value::Null),
-                      r.get::<_, Option<String>>(21)?.as_deref(), detail.as_str()),
+                      r.get::<_, Option<String>>(21)?.as_deref(), detail.as_str().or_else(|| detail["error"].as_str())),
                   "detail": detail, "context": parse(r.get(10)?), "cancel": cancel,
                   "started_at": r.get::<_, Option<String>>(11)?, "finished_at": r.get::<_, Option<String>>(12)?,
-                  "revision": r.get::<_, i64>(13)?, "origin": origin, "waiting": waiting}))
+                  "revision": r.get::<_, i64>(13)?, "origin": origin, "waiting": waiting});
+        if let Some(mut peer) = peer {
+            if let Some(fields) = peer.as_object_mut() {
+                fields.remove("text");
+            }
+            turn["peer"] = peer;
+        }
+        Ok(turn)
     },
 };
 
 const SUMMARIES: View = View {
     select: "SELECT s.summary_id, s.conversation_id, s.through_seq, s.based_on, s.redoes, s.job_id, s.state, s.text,
                     s.detail, s.requested_by, s.created_at, s.finished_at, s.revision, j.run_id
-             FROM summaries s LEFT JOIN jobs j ON j.job_id = s.job_id",
+             FROM (SELECT rowid AS rowid, * FROM summaries WHERE +org_id = :org_id) s LEFT JOIN (SELECT rowid AS rowid, * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = s.job_id",
     key: "s.summary_id",
     order: "s.rowid",
     shape: |_, r| {
@@ -640,9 +680,20 @@ fn view(kind: Record) -> &'static View {
     }
 }
 
+fn project_row(
+    db: &ScopedConnection,
+    kind: Record,
+    view: &View,
+    row: &Row,
+) -> rusqlite::Result<Value> {
+    let mut value = (view.shape)(db, row)?;
+    crate::projections::record(db, kind, &mut value)?;
+    Ok(value)
+}
+
 /// Records of a kind matching `filter` (an SQL condition on `?1`), newest first, at most 500.
 pub fn select(
-    db: &Connection,
+    db: &ScopedConnection,
     kind: Record,
     filter: &str,
     arg: &dyn ToSql,
@@ -650,11 +701,12 @@ pub fn select(
     let v = view(kind);
     let sql = format!("{} WHERE {filter} ORDER BY {} LIMIT 500", v.select, v.order);
     let mut stmt = db.prepare(&sql)?;
-    stmt.query_map([arg], |r| (v.shape)(db, r))?.collect()
+    stmt.query_map([arg], |r| project_row(db, kind, v, r))?
+        .collect()
 }
 
 /// The complete conversation thread, including turns covered by summaries.
-pub fn thread_rows(db: &Connection, kind: Record, id: &str) -> rusqlite::Result<Vec<Value>> {
+pub fn thread_rows(db: &ScopedConnection, kind: Record, id: &str) -> rusqlite::Result<Vec<Value>> {
     let (v, alias) = match kind {
         Record::Turn => (&TURNS, "t"),
         Record::Summary => (&SUMMARIES, "s"),
@@ -665,13 +717,13 @@ pub fn thread_rows(db: &Connection, kind: Record, id: &str) -> rusqlite::Result<
         v.select, v.order
     );
     db.prepare(&sql)?
-        .query_map([id], |r| (v.shape)(db, r))?
+        .query_map([id], |r| project_row(db, kind, v, r))?
         .collect()
 }
 
 /// Jobs and runs visible to this client, with the scope applied before the cap.
 pub fn list_work(
-    db: &Connection,
+    db: &ScopedConnection,
     kind: Record,
     node: Option<&str>,
     client: &crate::access::Client,
@@ -686,12 +738,12 @@ pub fn list_work(
     }
     let _ = write!(sql, " ORDER BY {} LIMIT {MAX_INTENTS}", v.order);
     db.prepare(&sql)?
-        .query_map(rusqlite::params_from_iter(bind), |r| (v.shape)(db, r))?
+        .query_map(bind, |r| project_row(db, kind, v, r))?
         .collect()
 }
 
 /// One record by its id.
-pub fn one(db: &Connection, kind: Record, id: &str) -> rusqlite::Result<Option<Value>> {
+pub fn one(db: &ScopedConnection, kind: Record, id: &str) -> rusqlite::Result<Option<Value>> {
     let v = view(kind);
     Ok(select(db, kind, &format!("{} = ?1", v.key), &id)?
         .into_iter()
@@ -704,7 +756,7 @@ pub const MAX_INTENTS: u32 = 500;
 /// Intents, optionally filtered by node, lead conversation, and/or project, newest first, at most `limit`
 /// (clamped to 1..=[`MAX_INTENTS`]). With `lanes`, only task lanes ([`is_lane_meta`] / [`INTENT_IS_LANE_SQL`]).
 pub fn list_intents(
-    db: &Connection,
+    db: &ScopedConnection,
     node: Option<&str>,
     conversation: Option<&str>,
     lanes: bool,
@@ -730,14 +782,14 @@ pub fn list_intents(
     let _ = write!(sql, " ORDER BY {} LIMIT ?", v.order);
     bind.push(limit.clamp(1, MAX_INTENTS).into());
     db.prepare(&sql)?
-        .query_map(rusqlite::params_from_iter(bind), |r| (v.shape)(db, r))?
+        .query_map(bind, |r| project_row(db, Record::Intent, v, r))?
         .collect()
 }
 
 /// Conversations, optionally filtered by node, intent, hosted-lead marker, and/or project, newest first by
 /// `created_at`, at most `limit` (clamped to 1..=[`MAX_INTENTS`]).
 pub fn list_conversations(
-    db: &Connection,
+    db: &ScopedConnection,
     node: Option<&str>,
     intent: Option<&str>,
     lead_only: bool,
@@ -757,14 +809,14 @@ pub fn list_conversations(
     let limit = limit.clamp(1, MAX_INTENTS);
     stmt.query_map(
         params![node, intent, lead_only, project, limit, archived],
-        |r| (v.shape)(db, r),
+        |r| project_row(db, Record::Conversation, v, r),
     )?
     .collect()
 }
 
 /// The jobs of the given intents, optionally only those of one node, newest first, at most 500.
 pub fn jobs_of_intents(
-    db: &Connection,
+    db: &ScopedConnection,
     intent_ids: &[&str],
     node: Option<&str>,
 ) -> rusqlite::Result<Vec<Value>> {
@@ -779,12 +831,16 @@ pub fn jobs_of_intents(
         v.select, v.order
     );
     let mut stmt = db.prepare(&sql)?;
-    stmt.query_map(params![ids, node], |r| (v.shape)(db, r))?
+    stmt.query_map(params![ids, node], |r| project_row(db, Record::Job, v, r))?
         .collect()
 }
 
 /// Records of a kind, optionally only those of one node, newest first.
-pub fn list(db: &Connection, kind: Record, node: Option<&str>) -> rusqlite::Result<Vec<Value>> {
+pub fn list(
+    db: &ScopedConnection,
+    kind: Record,
+    node: Option<&str>,
+) -> rusqlite::Result<Vec<Value>> {
     let filter = match kind {
         Record::Intent => "(?1 IS NULL OR i.node = ?1)",
         Record::Job | Record::Run | Record::Node | Record::Schedule | Record::ScheduleChange => {
@@ -805,7 +861,7 @@ pub fn list(db: &Connection, kind: Record, node: Option<&str>) -> rusqlite::Resu
 }
 
 /// An intent with its jobs and their runs: `{intent, jobs, runs}`; `None` when there is no such intent.
-pub fn intent_bundle(db: &Connection, id: &str) -> rusqlite::Result<Option<Value>> {
+pub fn intent_bundle(db: &ScopedConnection, id: &str) -> rusqlite::Result<Option<Value>> {
     let Some(intent) = one(db, Record::Intent, id)? else {
         return Ok(None);
     };
@@ -813,10 +869,21 @@ pub fn intent_bundle(db: &Connection, id: &str) -> rusqlite::Result<Option<Value
     let runs = select(
         db,
         Record::Run,
-        "r.run_id IN (SELECT run_id FROM jobs WHERE intent_id = ?1)",
+        "r.run_id IN (SELECT run_id FROM jobs WHERE +org_id = :org_id AND intent_id = ?1)",
         &id,
     )?;
     Ok(Some(json!({"intent": intent, "jobs": jobs, "runs": runs})))
+}
+
+/// Resolve a finalized or live run to its job, including older terminal reports.
+pub fn job_for_run(db: &ScopedConnection, id: &str) -> rusqlite::Result<Option<String>> {
+    db.query_row(
+        "SELECT COALESCE((SELECT job_id FROM runs WHERE +org_id = :org_id AND run_id = ?1),
+                         (SELECT job_id FROM jobs WHERE +org_id = :org_id AND run_id = ?1),
+                         (SELECT job_id FROM live_runs WHERE +org_id = :org_id AND run_id = ?1))",
+        params![id],
+        |row| row.get(0),
+    )
 }
 
 #[cfg(test)]
@@ -826,33 +893,33 @@ mod tests {
 
     type Res = Result<(), Box<dyn std::error::Error>>;
 
-    fn seed_intent(db: &Connection, id: &str, lead: Option<&str>) -> rusqlite::Result<()> {
+    fn seed_intent(db: &ScopedConnection, id: &str, lead: Option<&str>) -> rusqlite::Result<()> {
         seed_intent_meta(db, id, lead, "{}")
     }
 
     fn seed_intent_meta(
-        db: &Connection,
+        db: &ScopedConnection,
         id: &str,
         lead: Option<&str>,
         meta: &str,
     ) -> rusqlite::Result<()> {
         db.execute(
-            "INSERT INTO intents (intent_id, node, spec, task, trials, meta, bundle_sha256,
+            "INSERT INTO intents (org_id, intent_id, node, spec, task, trials, meta, bundle_sha256,
              created_by, created_at, lead_conversation_id)
-             VALUES (?1, 'estate', 's', 't', 1, ?3, 'sha', 'owner', 'now', ?2)",
+             VALUES (:org_id, ?1, 'estate', 's', 't', 1, ?3, 'sha', 'owner', 'now', ?2)",
             params![id, lead, meta],
         )
         .map(|_| ())
     }
 
-    fn seed_job(db: &Connection, job: &str, intent: &str) -> rusqlite::Result<()> {
+    fn seed_job(db: &ScopedConnection, job: &str, intent: &str) -> rusqlite::Result<()> {
         db.execute(
-            "INSERT OR IGNORE INTO nodes (id, name, token_hash, created_at) VALUES (1, 'estate', 'th', 'now')",
-            [],
+            "INSERT OR IGNORE INTO nodes (org_id, id, name, token_hash, created_at) VALUES (:org_id, 1, 'estate', 'th', 'now')",
+            params![],
         )?;
         db.execute(
-            "INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
-             VALUES (?1, 1, 's', 't', 1, 'sha', '{}', 'offered', 'now', ?2)",
+            "INSERT INTO jobs (org_id, job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
+             VALUES (:org_id, ?1, 1, 's', 't', 1, 'sha', '{}', 'offered', 'now', ?2)",
             params![job, intent],
         )
         .map(|_| ())
@@ -987,27 +1054,27 @@ mod tests {
         Ok(())
     }
 
-    fn seed_intent_project(db: &Connection, id: &str, project: &str) -> rusqlite::Result<()> {
+    fn seed_intent_project(db: &ScopedConnection, id: &str, project: &str) -> rusqlite::Result<()> {
         db.execute(
-            "INSERT INTO intents (intent_id, node, spec, task, trials, meta, bundle_sha256,
+            "INSERT INTO intents (org_id, intent_id, node, spec, task, trials, meta, bundle_sha256,
              created_by, created_at, project_id)
-             VALUES (?1, 'estate', 's', 't', 1, '{}', 'sha', 'owner', ?2, ?3)",
+             VALUES (:org_id, ?1, 'estate', 's', 't', 1, '{}', 'sha', 'owner', ?2, ?3)",
             params![id, format!("at_{id}"), project],
         )
         .map(|_| ())
     }
 
     fn seed_conversation(
-        db: &Connection,
+        db: &ScopedConnection,
         id: &str,
         at: &str,
         lead: bool,
         project: Option<&str>,
     ) -> rusqlite::Result<()> {
         db.execute(
-            "INSERT INTO conversations (conversation_id, node, spec, spec_version, model, instructions_tokens,
+            "INSERT INTO conversations (org_id, conversation_id, node, spec, spec_version, model, instructions_tokens,
              tools, created_by, created_at, lead, project_id)
-             VALUES (?1, 'estate', 'spec.yaml', 'sha', 'm', 0, 0, 'owner', ?2, ?3, ?4)",
+             VALUES (:org_id, ?1, 'estate', 'spec.yaml', 'sha', 'm', 0, 0, 'owner', ?2, ?3, ?4)",
             params![id, at, i64::from(lead), project],
         )
         .map(|_| ())
@@ -1019,8 +1086,8 @@ mod tests {
         let store = Store::open(&tmp.path().join("data"))?;
         let db = store.db();
         db.execute(
-            "INSERT INTO projects (project_id, name, created_by, created_at) VALUES ('p1', 'one', 'o', 'now'), ('p2', 'two', 'o', 'now')",
-            [],
+            "INSERT INTO projects (org_id, project_id, name, created_by, created_at) VALUES (:org_id, 'p1', 'one', 'o', 'now'), (:org_id, 'p2', 'two', 'o', 'now')",
+            params![],
         )?;
         seed_intent_project(&db, "i_a", "p1")?;
         seed_intent_project(&db, "i_b", "p2")?;
@@ -1104,16 +1171,16 @@ mod tests {
         seed_job(&db, "j1", "i1")?;
         db.execute(
             "UPDATE jobs SET offered_at = '2026-01-01T00:00:00Z' WHERE job_id = 'j1'",
-            [],
+            params![],
         )?;
         db.execute(
             "UPDATE nodes SET last_seen_at = ?1 WHERE id = 1",
             params![crate::util::now_utc()],
         )?;
         db.execute(
-            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at, job_id)
-             VALUES ('t1', 'c1', 1, 'hi', 'running', 'owner', 'now', 'j1')",
-            [],
+            "INSERT INTO turns (org_id, turn_id, conversation_id, seq, message, state, posted_by, posted_at, job_id)
+             VALUES (:org_id, 't1', 'c1', 1, 'hi', 'running', 'owner', 'now', 'j1')",
+            params![],
         )?;
         let want =
             json!({"reason": "node_not_pulled", "node": "estate", "since": "2026-01-01T00:00:00Z"});
@@ -1133,15 +1200,18 @@ mod tests {
             "the thread view"
         );
 
-        db.execute("UPDATE jobs SET state = 'accepted' WHERE job_id = 'j1'", [])?;
+        db.execute(
+            "UPDATE jobs SET state = 'accepted' WHERE job_id = 'j1'",
+            params![],
+        )?;
         assert!(one(&db, Record::Turn, "t1")?.unwrap_or_default()["waiting"].is_null());
         assert!(one(&db, Record::Conversation, "c1")?.unwrap_or_default()["waiting"].is_null());
         assert!(one(&db, Record::Job, "j1")?.unwrap_or_default()["waiting"].is_null());
 
-        db.execute_batch(
+        db.fixture_batch(
             "UPDATE jobs SET state = 'waiting' WHERE job_id = 'j1';
-             INSERT INTO job_budgets (job_id, state, trials, reason, detail, created_at)
-             VALUES ('j1', 'waiting', 1, 'budget_exhausted', 'the project budget is used up', 'now')",
+             INSERT INTO job_budgets (org_id, job_id, state, trials, reason, detail, created_at)
+             VALUES (:org_id, 'j1', 'waiting', 1, 'budget_exhausted', 'the project budget is used up', 'now')",
         )?;
         let turn = one(&db, Record::Turn, "t1")?.unwrap_or_default();
         assert_eq!(turn["waiting"]["reason"], "held");
@@ -1155,14 +1225,14 @@ mod tests {
         let db = store.db();
         seed_conversation(&db, "c1", "now", false, None)?;
         seed_job(&db, "j1", "i1")?;
-        db.execute_batch(
-            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at)
-             VALUES ('t1', 'c1', 2, 'hi', 'summarising', 'owner', 'now');
-             INSERT INTO summaries (summary_id, conversation_id, through_seq, job_id, state, requested_by, created_at)
-             VALUES ('s1', 'c1', 1, 'j1', 'running', 'owner', 'now');
+        db.fixture_batch(
+            "INSERT INTO turns (org_id, turn_id, conversation_id, seq, message, state, posted_by, posted_at)
+             VALUES (:org_id, 't1', 'c1', 2, 'hi', 'summarising', 'owner', 'now');
+             INSERT INTO summaries (org_id, summary_id, conversation_id, through_seq, job_id, state, requested_by, created_at)
+             VALUES (:org_id, 's1', 'c1', 1, 'j1', 'running', 'owner', 'now');
              UPDATE jobs SET state = 'waiting' WHERE job_id = 'j1';
-             INSERT INTO job_budgets (job_id, state, trials, reason, detail, created_at)
-             VALUES ('j1', 'waiting', 1, 'budget_exhausted', 'the project budget is used up', 'now')",
+             INSERT INTO job_budgets (org_id, job_id, state, trials, reason, detail, created_at)
+             VALUES (:org_id, 'j1', 'waiting', 1, 'budget_exhausted', 'the project budget is used up', 'now')",
         )?;
         let turn = one(&db, Record::Turn, "t1")?.unwrap_or_default();
         assert!(turn["job_id"].is_null());
@@ -1171,7 +1241,10 @@ mod tests {
             json!({"reason": "held", "detail": "budget_exhausted",
                    "message": "the project budget is used up", "node": "estate"})
         );
-        db.execute("UPDATE jobs SET state = 'accepted' WHERE job_id = 'j1'", [])?;
+        db.execute(
+            "UPDATE jobs SET state = 'accepted' WHERE job_id = 'j1'",
+            params![],
+        )?;
         assert!(one(&db, Record::Turn, "t1")?.unwrap_or_default()["waiting"].is_null());
         Ok(())
     }

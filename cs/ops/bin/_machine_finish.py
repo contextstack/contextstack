@@ -101,7 +101,7 @@ def check_environment(env, scratch):
 
 
 def sandboxed_check(run_dir, ws, child_env, window, memory_cap_mb, policy, caller, read_roots, protected,
-                    *, grader=None):
+                    *, grader=None, step=None):
     from _executor import sandbox_cmd
 
     profile = run_dir / "check-sandbox.sb"
@@ -113,13 +113,38 @@ def sandboxed_check(run_dir, ws, child_env, window, memory_cap_mb, policy, calle
     try:
         # A physical directory under /tmp stays short after canonicalization.
         with check_environment(child_env, "/tmp") as env:
-            command = sandbox_cmd(str(stimulus / "check"), [], ws, run_dir / "tmp", profile, protected,
+            binary, args = str(stimulus / "check"), []
+            workdir = grader.root if grader else ws
+            if step:
+                binary, args = "/bin/sh", ["-c", 'exec "$@"', "gate", *step["command"]]
+                if not step.get("frozen"):
+                    workdir = ws
+                workdir /= step.get("cwd", ".")
+            command = sandbox_cmd(binary, args, ws, run_dir / "tmp", profile, protected,
                                   read_roots=(stimulus, *read_roots), policy=policy, caller=caller,
                                   check_scratch=env["TMPDIR"])
-            return run_process(command, str(grader.root if grader else ws), env, window, memory_cap_mb=memory_cap_mb,
+            return run_process(command, str(workdir), env, window, memory_cap_mb=memory_cap_mb,
                                on_evidence=lambda rows: record_process_evidence(run_dir, rows))
     finally:
         profile.unlink(missing_ok=True)
+
+
+def gate_check(run_dir, ws, lane, env, window, deadline, run):
+    from _gate_job import run_steps, select_steps, step
+    from _lanes import assert_lane_git_pointer, repo_config, workspace_changed_paths
+
+    try:
+        config = repo_config(lane["repo"])
+        if config["path"] != Path(lane["main"]) or ws == config["path"]:
+            raise ValueError("gate workspace does not match the configured lane")
+        assert_lane_git_pointer(ws, config["path"], lane["lane"])
+        with lane_grader(lane, ws, run_dir) as grader:
+            paths = workspace_changed_paths(ws, lane["grader_base_sha"], lane_ctx=lane, env=env)
+            steps = select_steps(lane["repo"], config, paths, ws, frozen_root=grader.root if grader else None)
+            limit = min(window, int(config["gate_timeout_s"]))
+            return run_steps(steps, partial(run, grader=grader), remaining_check_time(limit, deadline), grader)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        return {"steps": [step("gate setup", [], exit=1, seconds=0, tail=redact(str(error)))], "verdict": "fail"}
 
 
 @dataclass
@@ -375,7 +400,7 @@ def validate_receipt(code_root, run_dir, receipt):
     if (row["transcript"] != transcript_id(run_dir.name) or row["trial"] != receipt["trial"]
             or row.get("cli_exit") != receipt["native"]["exit"] or stimulus["sha256"] != row["stimulus_sha"]):
         raise ValueError("receipt metadata differs from its run identity")
-    if finish["mode"] not in ("task", "semantic", "hosted", "terminal", "profiled"):
+    if finish["mode"] not in ("task", "semantic", "hosted", "terminal", "profiled", "gate"):
         raise ValueError("unknown receipt finish mode")
     verdicts = {"terminal": ("pass", "fail"), "profiled": (None, "void", "fail")}
     if finish["verdict"] not in verdicts.get(finish["mode"], (None,)):
@@ -438,7 +463,7 @@ def finish_receipt(code_root, run_dir, receipt):
             pass
 
         def conclude(verdict, stop, extra=None):
-            if mode == "profiled":
+            if mode in ("profiled", "gate"):
                 row["seconds"] = time.time() - started
             raise Finished(verdict, stop, extra)
 
@@ -499,6 +524,24 @@ def finish_receipt(code_root, run_dir, receipt):
         try:
             if mode == "terminal":
                 conclude(settings["verdict"], stop)
+            elif mode == "gate":
+                gate_path = run_dir / "gate.json"
+                if gate_path.is_file():
+                    gate = json.loads(gate_path.read_text())
+                else:
+                    def run_step(step, timeout, *, grader):
+                        return sandboxed_check(
+                            run_dir, ws, env, timeout, settings["memory_cap_mb"],
+                            code_root / sandbox["policy"], sandbox["caller"], sandbox["read_roots"], protected,
+                            grader=grader, step=step,
+                        )
+
+                    gate = gate_check(run_dir, ws, lane, env, window, settings.get("deadline"), run_step)
+                    write_atomic(gate_path, (json.dumps(gate) + "\n").encode())
+                verdict = gate["verdict"]
+                _run_record.check_json(run_dir, row["stimulus_sha"], window, int(verdict != "pass"),
+                                       "\n".join(item["tail"] for item in gate["steps"]))
+                conclude(verdict, "done" if verdict == "pass" else "check")
             elif mode == "semantic":
                 semantic(row, check, conclude, paths, settings["grant_paths"], started)
             elif mode == "hosted":

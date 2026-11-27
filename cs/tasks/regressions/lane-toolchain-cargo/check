@@ -13,6 +13,7 @@ KIT = HERE.parents[2]
 sys.path[:0] = [str(KIT / "ops/bin"), str(HERE.parent / "_lib")]
 from scratch import scratch_dir, short_tmp
 from hermetic_env import hermetic_env
+from land_toolchain import check_land_toolchain
 import _executor
 import _toolchains
 
@@ -154,4 +155,8 @@ with scratch_dir(dir=short_tmp(), prefix="lane-cargo-") as raw:
     )
     check_result = subprocess.run(check_cmd, env=cli_env, cwd=ws, capture_output=True, text=True, timeout=30)
     assert check_result.returncode == 0 and "cargo 1.0.0" in check_result.stdout, check_result
+    check_land_toolchain(root, KIT,
+                         'cargo --version && ! /bin/cat "$1" && ! /usr/bin/touch "$2/forbidden" && '
+                         'cargo build --target-dir "$CARGO_TARGET_DIR" && test -f "$CARGO_TARGET_DIR/debug/probe"',
+                         (credentials, registry), child, "cargo 1.0.0")
 print("lane-toolchain-cargo: PASS")

@@ -18,7 +18,7 @@ from pathlib import Path
 from _atomic_write import write_atomic as _estate_write_atomic  # noqa: E402
 
 FORBIDDEN_PREFIX = "tasks/turn/"
-FORBIDDEN_EXACT = frozenset({"conversation/context.md"})
+FORBIDDEN_EXACT = frozenset({"conversation/context.md", "conversation/lessons.md"})
 CONTEXT_NEED = "conversation/context.md"
 TASK_NEED = "tasks/turn"
 # The hosted bundle needs session/mcp.json. Restricted planner/judge/patch

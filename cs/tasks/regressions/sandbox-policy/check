@@ -14,6 +14,7 @@ sys.path.insert(0, str(next(p / "tasks/regressions/_lib" for p in Path(__file__)
 from hermetic_env import hermetic_env
 
 # Direct ops imports and calls must not resolve the caller's estate either.
+LAND_SANDBOX = os.environ.get("CS_SANDBOXED_LAND_CHECK") == "1"
 _fixture_env = hermetic_env()
 os.environ.clear()
 os.environ.update(_fixture_env)
@@ -138,7 +139,8 @@ def real_wrapper_cell(scratch):
     expect(actual.get("exit_code") == 0 and verdicts == ["pass"], "real: run-spec cell passes under the release wrapper",
            (actual.get("exit_code"), verdicts, actual.get("stderr")))
     expect("hello" in transcript and "sandboxed-echo" in transcript, "real: fs_write, fs_read and exec echo observed in the transcript")
-    expect("Operation not permitted" in transcript and sentinel not in transcript, "real: exec cat through a symlink out of the workspace is denied",
+    denial = "No such file or directory" if sys.platform.startswith("linux") else "Operation not permitted"
+    expect(denial in transcript and sentinel not in transcript, "real: exec cat through a symlink out of the workspace is denied",
            transcript[-600:])
     expect("path escapes workspace: link.txt" in transcript, "real: fs_read (cs-tools) refuses the same symlink itself", transcript[-600:])
     expect(secret.read_text() == sentinel + "\n" and not leftover, "real: the outside file is untouched and no per-call tmp dir is left", leftover)
@@ -302,17 +304,17 @@ def main():
     expect(len(tools) == 14 and all(isinstance(r, dict) and r.get("net") in sp.NETS for r in reqs.values()),
            "descriptors: every manifest tool requests a sandbox net", reqs)
     env_requests = {t: r["write_env"] for t, r in reqs.items() if "write_env" in r}
-    expect(env_requests == {"browser_fetch": ["CS_BROWSER_STATE"]}
-           and committed.get("write_env") == {"CS_BROWSER_STATE": ["$HOME/.contextstack"]},
-           "write_env: only browser_fetch requests CS_BROWSER_STATE; the host confines it to $HOME/.contextstack",
+    expect(env_requests == {} and not committed.get("write_env"),
+           "write_env: model tools request no additional write paths",
            (env_requests, committed.get("write_env")))
     profile_requests = {t: r["profile"] for t, r in reqs.items() if "profile" in r}
-    expect(profile_requests == {"browser_fetch": "browser"} and set(committed.get("profiles", {})) == {"browser", "cli-executor"},
-           "profiles: only browser_fetch requests a profile (browser); the host lists browser and the coding agents' cli-executor (ADR 0021)",
+    expect(profile_requests == {} and set(committed.get("profiles", {})) == {"cli-executor"},
+           "profiles: model tools request no additional read profiles",
            (profile_requests, committed.get("profiles")))
     socket_requests = {t: r["sockets"] for t, r in reqs.items() if r.get("sockets")}
-    expect(socket_requests == {"browser_session": ["browser-public"]} and set(committed.get("sockets", {})) == {"browser-public"},
-           "sockets: only browser_session requests one (browser-public); the host lists it",
+    expect(socket_requests == {"browser_session": ["browser-public"], "browser_fetch": ["browser-public"]}
+           and committed.get("sockets") == {"browser-public": "$HOME/.contextstack/public-browser/sockets/public.sock"},
+           "sockets: both browser tools request the public broker socket only",
            (socket_requests, committed.get("sockets")))
     scratch = Path(tempfile.mkdtemp(prefix="sandbox-policy-", suffix=".noindex"))
     try:
@@ -472,13 +474,16 @@ def main():
         expect(len(cells) == 1 and [re.sub(r"sandbox-reports/\S+ --", "sandbox-reports/<CELL> --", l) for l in log] == calls,
                "e2e: every tool call reached the runner as prefix + tool, one report dir for the cell (fake wrapper log)", log)
         # 7b. runtime exe: the argv both runners build, and the wrapper's descriptor lookup.
-        exe_descriptors(scratch)
+        if not LAND_SANDBOX:
+            exe_descriptors(scratch)
         # 9. reports: the per-cell prefix, the sweep's scan, and two concurrent cells sharing a dir.
         cell_prefix_rules(scratch)
         sweep_claims(scratch)
         concurrent_cells(scratch)
         # 8. End to end with the real wrapper, found as run-spec finds it (<repo>/target/release beside the code_root).
-        if REAL.is_file():
+        if LAND_SANDBOX:
+            print("sandbox-policy: skipped: needs host (nested Seatbelt wrapper)")
+        elif REAL.is_file():
             real_wrapper_cell(scratch)
         else:
             print("skip e2e real wrapper: %s is not built (cargo build --release at the repo root)" % REAL)

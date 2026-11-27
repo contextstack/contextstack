@@ -547,6 +547,7 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
         </flux:callout>
     @endif
 
+    @capable('start_work')
     <form wire:submit="submit" class="space-y-6">
         <flux:radio.group wire:model.live="kind" variant="segmented" data-test="kind">
             <flux:radio value="lead" :label="__('Runs tasks')" />
@@ -674,6 +675,11 @@ new #[Layout('layouts::client')] #[Title('New conversation')] class extends Comp
 
         <flux:button type="submit" variant="primary" :disabled="! $canStart" data-test="start-conversation">{{ __('Start') }}</flux:button>
     </form>
+    @else
+        <flux:callout icon="information-circle" data-test="cannot-start">
+            <flux:callout.text>{{ __('Your role can read work here but not start new conversations. An owner, admin or member can.') }}</flux:callout.text>
+        </flux:callout>
+    @endcapable
 
     @assets
         <flux:editor.scripts />

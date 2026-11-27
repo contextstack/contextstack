@@ -22,6 +22,8 @@ pub enum Domain {
     NotUnix,
     /// Every domain except IPv4 and IPv6.
     NotIp,
+    /// Every domain except IPv4, IPv6, and Unix sockets.
+    NotIpOrUnix,
     /// `AF_VSOCK` only.
     Vsock,
 }
@@ -44,13 +46,20 @@ const fn any(syscall: &'static str) -> Deny {
 
 /// Denied in every mode: tracing other processes, and `io_uring` (which can open sockets
 /// without a `socket()` call, so it would bypass the socket rules).
-pub const ALWAYS: [Deny; 6] = [
+pub const ALWAYS: [Deny; 13] = [
     any("ptrace"),
     any("process_vm_readv"),
     any("process_vm_writev"),
     any("io_uring_setup"),
     any("io_uring_enter"),
     any("io_uring_register"),
+    any("keyctl"),
+    any("add_key"),
+    any("request_key"),
+    any("bpf"),
+    any("perf_event_open"),
+    any("userfaultfd"),
+    any("pidfd_getfd"),
 ];
 
 /// `net: none`: Codex's `Restricted` list. `recvfrom` stays allowed (socketpair-based
@@ -105,6 +114,27 @@ pub fn rules(net: Net) -> Vec<Deny> {
     list
 }
 
+/// Private IP loopback; pathname Unix access is enabled only with a Landlock layer.
+pub fn executor_rules(named_sockets: bool, deny_symlinks: bool) -> Vec<Deny> {
+    let mut list = rules(Net::Loopback);
+    #[cfg(target_arch = "x86_64")]
+    list.push(any("link"));
+    list.push(any("linkat"));
+    if deny_symlinks {
+        #[cfg(target_arch = "x86_64")]
+        list.push(any("symlink"));
+        list.push(any("symlinkat"));
+    }
+    if named_sockets {
+        for rule in &mut list {
+            if rule.syscall == "socket" {
+                rule.domain = Domain::NotIpOrUnix;
+            }
+        }
+    }
+    list
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,7 +147,18 @@ mod tests {
     fn every_mode_denies_tracing_and_io_uring() {
         for net in [Net::None, Net::Gateway, Net::Loopback, Net::All] {
             let list = names(net);
-            for syscall in ["ptrace", "process_vm_readv", "io_uring_setup"] {
+            for syscall in [
+                "ptrace",
+                "process_vm_readv",
+                "io_uring_setup",
+                "keyctl",
+                "add_key",
+                "request_key",
+                "bpf",
+                "perf_event_open",
+                "userfaultfd",
+                "pidfd_getfd",
+            ] {
                 assert!(list.contains(&syscall), "{net:?} {syscall}");
             }
         }

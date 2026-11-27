@@ -20,7 +20,7 @@
     $decidedByOwner = filled($approval['decided_by'] ?? null);
     [$label, $color] = match (true) {
         $status === 'pending' => [__('Under review'), 'zinc'],
-        $status === 'needs_owner' => [__('Needs you'), 'amber'],
+        $status === 'needs_owner' => [\App\Client\NeedsYou::assignment($approval), 'amber'],
         $status === 'denied' => [__('Denied'), 'red'],
         $status === 'expired' => [__('Expired'), 'zinc'],
         $status === 'approved' && $decidedByOwner => [__('Approved by you'), 'green'],
@@ -28,8 +28,19 @@
         default => [$status, 'zinc'],
     };
     $waiting = $status === 'needs_owner';
+    $isLand = ($approval['kind'] ?? null) === 'land';
+    // Decide controls show only when the Director advertises the capability and the assignment allows it; a land
+    // also needs its commit pinned (CLIENT-API.md "Hosted land approvals").
+    // The approval's own `actions.decide`, when the Director sends it, alone decides.
+    $decidable = $waiting && \App\Client\RecordActions::allows($approval, 'decide', fn (): bool => \App\Client\NeedsYou::answerable(['approval' => $id, 'backlog' => null, 'assignee' => is_string($approval['assignee_member_id'] ?? null) ? $approval['assignee_member_id'] : null], $approval)
+        && (! $isLand || filled($approval['commit'] ?? null)));
 @endphp
 
+@if (\App\Client\ReleaseApproval::is($approval))
+    <x-client.release-approval :approval="$approval" />
+@elseif (\App\Client\BrowserApproval::is($approval))
+    <x-client.browser-approval :approval="$approval" :show-job="$showJob" />
+@else
 <article @class([
     'space-y-3 rounded-xl border px-4 py-3',
     'border-amber-500/30 bg-amber-500/[.06]' => $waiting,
@@ -37,12 +48,16 @@
 ]) data-test="action-approval" data-approval="{{ $id }}" data-status="{{ $status }}" wire:key="approval-{{ $id }}">
     <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
         <flux:icon.shield-exclamation variant="micro" @class(['text-amber-500' => $waiting]) />
-        <span class="font-medium text-zinc-800 dark:text-zinc-200">{{ __('An agent asks to go beyond its sandbox') }}</span>
+        <span class="font-medium text-zinc-800 dark:text-zinc-200">{{ $isLand ? __('A lane asks to land on main') : __('An agent asks to go beyond its sandbox') }}</span>
         <flux:badge size="sm" :color="$color" data-test="approval-status">{{ $label }}</flux:badge>
         @if (filled($approval['created_at'] ?? null))
             <span>· <x-client.time :at="$approval['created_at']" /></span>
         @endif
     </div>
+
+    @if ($isLand)
+        <x-client.land-facts :approval="$approval" />
+    @endif
 
     <pre class="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-black/5 px-3 py-2 font-mono text-[13px] dark:bg-white/[.07]" data-test="approval-command">{{ $command }}</pre>
 
@@ -91,7 +106,11 @@
         @endif
     </dl>
 
-    @if ($waiting)
+    @if ($waiting && ! $decidable)
+        <p class="text-xs text-zinc-500" data-test="approval-read-only">
+            {{ $isLand && ! filled($approval['commit'] ?? null) ? __('Waiting for its machine to pin the commit before it can be decided.') : __('You can read this; the person it is assigned to decides it.') }}
+        </p>
+    @elseif ($waiting)
         <div class="flex flex-wrap items-center gap-2">
             <flux:button size="sm" variant="primary" icon="check" wire:click="decideApproval(@js($id), 'approve')" data-test="approve-action">{{ __('Approve') }}</flux:button>
             <flux:button size="sm" variant="danger" icon="x-mark" wire:click="decideApproval(@js($id), 'deny')" data-test="deny-action">{{ __('Deny') }}</flux:button>
@@ -118,3 +137,4 @@
         </p>
     @endif
 </article>
+@endif

@@ -4,20 +4,22 @@
 use crate::access::{Client, Kind};
 use crate::records::{self, View};
 use crate::server::{Call, Reply, State, json};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch, write_tx};
 use crate::util::{now_utc, percent_decode, ulid};
 use crate::work::{self, No};
-use rusqlite::{Connection, params};
+use rusqlite::params;
 use serde_json::{Map, Value, json};
 use std::fmt::Write as _;
 
+pub const LESSONS_PATH: &str = "conversation/lessons.md";
 pub const TURN_PATH: &str = "conversation/decision-log.md";
 const TURN_LIMIT: usize = 12_000;
 const HEADING: &str = "# Decision log\n";
 
 const KIND: Record = Record::DecisionLog;
 const SELECT: &str = "SELECT entry_id, project_id, number, body, status, superseded_by,
-    created_by, created_at, updated_by, updated_at, revision FROM decision_log";
+    created_by, created_at, updated_by, updated_at, revision FROM (SELECT * FROM decision_log WHERE +org_id = :org_id) AS decision_log";
 
 pub(crate) const VIEW: View = View {
     select: SELECT,
@@ -46,11 +48,11 @@ fn shape(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(entry)
 }
 
-pub fn project_visible(db: &Connection, client: &Client, id: &str) -> rusqlite::Result<bool> {
+pub fn project_visible(db: &ScopedConnection, client: &Client, id: &str) -> rusqlite::Result<bool> {
     if client.kind != Kind::Lead {
         return Ok(true);
     }
-    db.prepare("SELECT 1 FROM conversations WHERE conversation_id = ?1 AND project_id = ?2")?
+    db.prepare("SELECT 1 FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1 AND project_id = ?2")?
         .exists(params![client.conversation_id, id])
 }
 
@@ -67,7 +69,7 @@ fn conflict(detail: &str) -> No {
     No(409, "conflict", detail.into(), Value::Null)
 }
 
-fn check_project(db: &Connection, client: &Client, project: &str) -> Result<(), No> {
+fn check_project(db: &ScopedConnection, client: &Client, project: &str) -> Result<(), No> {
     if !project_visible(db, client, project).map_err(|e| No::internal(&e))? {
         return Err(missing());
     }
@@ -75,7 +77,7 @@ fn check_project(db: &Connection, client: &Client, project: &str) -> Result<(), 
 }
 
 fn list(
-    db: &Connection,
+    db: &ScopedConnection,
     project: &str,
     status: Option<&str>,
     search: Option<&str>,
@@ -115,18 +117,19 @@ fn matches_search(entry: &Value, query: &str) -> bool {
         .any(|field| contains(&entry[field], query))
 }
 
-pub fn attachment(db: &Connection, client: &Client, project: &str) -> Result<String, No> {
+pub fn attachment(db: &ScopedConnection, client: &Client, project: &str) -> Result<String, No> {
     check_project(db, client, project)?;
     Ok(render(&list(db, project, Some("active"), None)?))
 }
 
 pub struct TurnLog {
     pub markdown: String,
+    pub lessons: String,
     pub revision: i64,
     pub entry_count: usize,
 }
 
-pub fn for_turn(db: &Connection, project: &str) -> Result<Option<TurnLog>, No> {
+pub fn for_turn(db: &ScopedConnection, project: &str) -> Result<Option<TurnLog>, No> {
     let entries = list(db, project, Some("active"), None)?;
     if entries.is_empty() {
         return Ok(None);
@@ -134,17 +137,60 @@ pub fn for_turn(db: &Connection, project: &str) -> Result<Option<TurnLog>, No> {
     // A retirement or supersession also changes the active snapshot.
     let revision = db
         .query_row(
-            "SELECT MAX(revision) FROM decision_log WHERE project_id = ?1",
+            "SELECT MAX(revision) FROM decision_log WHERE +org_id = :org_id AND project_id = ?1",
             [project],
             |row| row.get(0),
         )
         .map_err(|e| No::internal(&e))?;
-    let (markdown, entry_count) = render_turn(entries);
+    let (lessons, decisions): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|entry| entry["kind"] == "lesson");
+    let lessons = render_lessons(lessons);
+    let (markdown, entry_count) = render_turn(decisions);
     Ok(Some(TurnLog {
         markdown,
+        lessons,
         revision,
         entry_count,
     }))
+}
+
+fn render_lessons(mut entries: Vec<Value>) -> String {
+    fn one_line(value: &Value, limit: usize) -> String {
+        value
+            .as_str()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(limit)
+            .collect()
+    }
+    entries.sort_by_key(|entry| {
+        std::cmp::Reverse((
+            entry["sources"].as_array().map_or(0, Vec::len),
+            entry["revision"].as_i64(),
+        ))
+    });
+    let mut out = String::from("# Lessons\n");
+    for entry in entries.iter().take(38) {
+        let _ = writeln!(
+            out,
+            "- {} {} — {}",
+            entry["number"].as_str().unwrap_or_default(),
+            one_line(&entry["decision"], 140),
+            one_line(&entry["why"], 180)
+        );
+    }
+    if entries.len() > 38 {
+        let _ = writeln!(
+            out,
+            "- {} more lessons in the decision log.",
+            entries.len() - 38
+        );
+    }
+    out
 }
 
 fn render_turn(mut entries: Vec<Value>) -> (String, usize) {
@@ -228,11 +274,18 @@ fn text_field(value: &Value, name: &str) -> Result<(), No> {
         .ok_or_else(|| No::invalid(&format!("{name} must be non-empty text")))
 }
 
-const FIELDS: [&str; 5] = ["decision", "why", "alternatives", "reopen_when", "sources"];
+const FIELDS: [&str; 6] = [
+    "decision",
+    "why",
+    "alternatives",
+    "reopen_when",
+    "sources",
+    "kind",
+];
 
 fn fields(input: &Map<String, Value>, previous: Option<&Value>) -> Result<Value, No> {
     let mut content = json!({});
-    for name in FIELDS {
+    for name in FIELDS.into_iter().filter(|name| *name != "kind") {
         content[name] = input
             .get(name)
             .or_else(|| previous.and_then(|v| v.get(name)))
@@ -244,6 +297,15 @@ fn fields(input: &Map<String, Value>, previous: Option<&Value>) -> Result<Value,
                     json!([])
                 }
             });
+    }
+    if let Some(kind) = input
+        .get("kind")
+        .or_else(|| previous.and_then(|v| v.get("kind")))
+    {
+        if kind != "lesson" && kind != "decision" {
+            return Err(No::invalid("kind must be lesson or decision"));
+        }
+        content["kind"] = kind.clone();
     }
     text_field(&content["decision"], "decision")?;
     if content["decision"]
@@ -272,7 +334,7 @@ fn fields(input: &Map<String, Value>, previous: Option<&Value>) -> Result<Value,
     Ok(content)
 }
 
-fn entry(db: &Connection, project: &str, id: &str) -> Result<Value, No> {
+fn entry(db: &ScopedConnection, project: &str, id: &str) -> Result<Value, No> {
     records::one(db, KIND, id)
         .map_err(|e| No::internal(&e))?
         .filter(|v| v["project_id"] == project)
@@ -280,7 +342,7 @@ fn entry(db: &Connection, project: &str, id: &str) -> Result<Value, No> {
 }
 
 fn insert(
-    db: &Connection,
+    db: &ScopedConnection,
     client: &Client,
     project: &str,
     number: i64,
@@ -291,8 +353,8 @@ fn insert(
         ulid().map_err(|e| No::internal(&e))?.to_lowercase()
     );
     let added = db.execute(
-        "INSERT INTO decision_log (entry_id, project_id, number, body, status, created_by, created_at, updated_by, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?5, ?6) ON CONFLICT(project_id, number) DO NOTHING",
+        "INSERT INTO decision_log (org_id, entry_id, project_id, number, body, status, created_by, created_at, updated_by, updated_at)
+         VALUES (:org_id, ?1, ?2, ?3, ?4, 'active', ?5, ?6, ?5, ?6) ON CONFLICT(project_id, number) DO NOTHING",
         params![id, project, number, body.to_string(), client.id, now_utc()],
     ).map_err(|e| No::internal(&e))?;
     if added == 0 {
@@ -303,7 +365,7 @@ fn insert(
 }
 
 fn update(
-    db: &Connection,
+    db: &ScopedConnection,
     client: &Client,
     project: &str,
     id: &str,
@@ -339,23 +401,23 @@ fn update(
         _ => "active",
     };
     db.execute(
-        "INSERT INTO decision_log_revisions (entry_id, revision, snapshot) VALUES (?1, ?2, ?3)",
+        "INSERT INTO decision_log_revisions (org_id, entry_id, revision, snapshot) VALUES (:org_id, ?1, ?2, ?3)",
         params![id, old["revision"].as_i64(), old.to_string()],
     )
     .map_err(|e| No::internal(&e))?;
     db.execute("UPDATE decision_log SET body = ?2, status = ?3, superseded_by = ?4, updated_by = ?5, updated_at = ?6
-                  WHERE entry_id = ?1",
+                  WHERE +org_id = :org_id AND (entry_id = ?1)",
         params![id, fields(input, Some(&old))?.to_string(), status, replacement, client.id, now_utc()])
         .map_err(|e| No::internal(&e))?;
     touch(db, KIND, id).map_err(|e| No::internal(&e))?;
     Ok(())
 }
 
-fn entry_answer(db: &Connection, project: &str, id: &str) -> Result<Value, No> {
+fn entry_answer(db: &ScopedConnection, project: &str, id: &str) -> Result<Value, No> {
     let entry = entry(db, project, id)?;
     let mut stmt = db
         .prepare(
-            "SELECT snapshot FROM decision_log_revisions WHERE entry_id = ?1 ORDER BY revision",
+            "SELECT snapshot FROM decision_log_revisions WHERE +org_id = :org_id AND entry_id = ?1 ORDER BY revision",
         )
         .map_err(|e| No::internal(&e))?;
     let history = stmt
@@ -453,7 +515,7 @@ fn parse_table(markdown: &str) -> Result<Vec<(i64, Value)>, No> {
 }
 
 fn import_rows(
-    db: &Connection,
+    db: &ScopedConnection,
     client: &Client,
     project: &str,
     rows: &[(i64, Value)],
@@ -463,7 +525,7 @@ fn import_rows(
     for (number, body) in rows {
         let id = if replayed {
             db.query_row(
-                "SELECT entry_id FROM decision_log WHERE project_id = ?1 AND number = ?2",
+                "SELECT entry_id FROM decision_log WHERE +org_id = :org_id AND project_id = ?1 AND number = ?2",
                 params![project, number],
                 |r| r.get(0),
             )
@@ -533,7 +595,7 @@ fn write(
         } else {
             let number: i64 = tx
                 .query_row(
-                    "SELECT COALESCE(MAX(number), 0) FROM decision_log WHERE project_id = ?1",
+                    "SELECT COALESCE(MAX(number), 0) FROM decision_log WHERE +org_id = :org_id AND project_id = ?1",
                     [project],
                     |r| r.get(0),
                 )

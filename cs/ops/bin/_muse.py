@@ -26,15 +26,17 @@ def subscription_metadata(path):
 
 
 def sandbox_command(command, workspace, real_home, readonly_paths=(), extra=(), read_roots=(), *,
-                    adapter=None, check_scratch=None):
-    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-        raise ValueError("Muse requires the macOS OS sandbox; no fallback")
+                    adapter=None, check_scratch=None, loopback_ports=()):
+    if sys.platform not in ("darwin", "linux") or (
+            sys.platform == "darwin" and not Path("/usr/bin/sandbox-exec").is_file()):
+        raise ValueError("Muse requires an OS sandbox")
     ws, home = Path(workspace).resolve(), Path(real_home).resolve()
     if home.is_relative_to(ws):
         raise ValueError("workspace cannot contain the personal home")
     if any(not Path(p).resolve().is_relative_to(ws) for p in readonly_paths):
         raise ValueError("protected configuration must be inside workspace")
-    from _estate_io import native_sandbox_request, render_native_sandbox, sandbox_runtime_code_root
+    from _estate_io import (linux_executor_command, native_sandbox_request, render_native_sandbox,
+                            sandbox_runtime_code_root)
     code_root = sandbox_runtime_code_root()
     request = native_sandbox_request(command[0], workspace, workspace, real_home,
                                      read_links=(Path(real_home) / "Library/Keychains",),
@@ -44,7 +46,11 @@ def sandbox_command(command, workspace, real_home, readonly_paths=(), extra=(), 
                    adapter=adapter)
     if check_scratch is not None:
         request["check_scratch"] = str(Path(check_scratch).resolve())
-    profile = render_native_sandbox(code_root, code_root / "policy/sandbox.json", request)
+    policy = code_root / "policy/sandbox.json"
+    if sys.platform == "linux":
+        request["loopback_ports"] = list(loopback_ports)
+        return linux_executor_command(code_root, policy, request, command)
+    profile = render_native_sandbox(code_root, policy, request)
     return ["/usr/bin/sandbox-exec", "-p", profile.decode("utf-8"), *map(str, command)]
 
 

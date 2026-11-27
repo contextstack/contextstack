@@ -54,6 +54,7 @@ it('keeps a limit with no reset time, and ignores rows it cannot read', function
 
 it('shows each machine\'s out-of-quota models on the machines page', function () {
     Http::fake([director('nodes') => Http::response(limitedNodes())]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.fleet')
         ->assertSeeText('cursor-sol out of quota until Nov 17')
@@ -66,6 +67,7 @@ it('marks out-of-quota models in the new task lane picker and does not preselect
         director('models') => Http::response(limitedModels()),
         director('repos') => Http::response(['repos' => [['name' => 'contextstack']]]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.lane-create')
         ->assertSet('node', 'laptop')
@@ -79,14 +81,15 @@ it('marks out-of-quota models in the new task lane picker and does not preselect
 });
 
 it('marks out-of-quota models in the new conversation picker for the machine it would run on', function () {
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => true]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => true]),
         director('lead-node') => Http::response(['node' => 'workstation', 'source' => 'set']),
         director('nodes') => Http::response(limitedNodes()),
         director('models') => Http::response(limitedModels()),
         director('intents*') => Http::response(['intents' => [], 'jobs' => []]),
         director('projects') => Http::response(['projects' => []]),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.conversation-create')
         ->assertSet('kind', 'lead')

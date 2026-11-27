@@ -3,7 +3,7 @@
 //! (`tests/director-spec/CLIENT-API.md`) behind credentials that need no login (`access.rs`).
 //!
 //! ```text
-//! cs-director serve [--data-dir D] [--listen ADDR]... [--tls-cert PEM --tls-key PEM] [--allow-origin O]...
+//! cs-director serve [--data-dir D] [--owner-name NAME] [--listen ADDR]... [--tls-cert PEM --tls-key PEM] [--allow-origin O]...
 //! cs-director node register NAME          prints {"node", "token", "installation"} once
 //! cs-director node revoke NAME
 //! cs-director job create --node NAME --bundle DIR [--task tasks/x] [--trials N] [--grant ID] [--meta k=v]...
@@ -27,6 +27,7 @@ mod context_windows;
 mod control;
 mod conversations;
 mod decision_log;
+mod enrollment_origin;
 mod envelope;
 mod events;
 mod failure;
@@ -37,20 +38,29 @@ mod jobs;
 mod land;
 mod lane;
 mod lead;
+mod lead_install;
+mod lead_land;
 mod lead_node;
 mod live;
+mod members;
 mod models;
 mod node_api;
+mod peer_messages;
 mod planning;
+mod policy;
+mod projections;
 mod records;
 mod repos;
 mod reservations;
+mod schedule_fields;
 mod scopes;
 mod server;
 mod settings;
+mod settings_write;
 mod settle;
 mod spec_edit;
 mod spend;
+mod sponsorship;
 mod stamp;
 mod store;
 mod thread;
@@ -68,7 +78,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use store::Store;
 
-const USAGE: &str = "usage: cs-director --schema-version | serve | node register NAME | node revoke NAME | \
+const USAGE: &str = "usage: cs-director --schema-version | serve [--owner-name NAME] | node register NAME | node revoke NAME | \
 job create --node NAME --bundle DIR | ui-link [--listen ADDR] | pair NAME | credential list | credential revoke ID | installation \
 (all take --data-dir DIR)";
 
@@ -107,12 +117,14 @@ fn run(raw: &[String]) -> Result<(), String> {
     let known: &[&str] = match words.as_slice() {
         ["serve"] => &[
             "data-dir",
+            "owner-name",
             "listen",
             "tls-cert",
             "tls-key",
             "allow-origin",
             "stale-after",
             "offer-grace",
+            "browser-action-ttl",
             "context-window",
             "compact-at",
             "gateway",
@@ -133,7 +145,11 @@ fn run(raw: &[String]) -> Result<(), String> {
         return serve(&args);
     }
     let store = Store::open(&args.data_dir()?)?;
+    let _mutation = store.lock_client_mutation().map_err(|e| e.to_string())?;
     access::ensure_local_credential(&store)?;
+    let capability = policy::local_route(&words).ok_or(USAGE)?;
+    let note_usage = matches!(words.as_slice(), ["pair", _] | ["credential", "revoke", _]);
+    let actor = local_actor(&store, capability, note_usage)?;
     match words.as_slice() {
         ["node", "register", name] => {
             let token = access::register_node(&store, name)?;
@@ -143,27 +159,45 @@ fn run(raw: &[String]) -> Result<(), String> {
             access::revoke_node(&store, name)?;
             print(&json!({"node": name, "revoked": true}));
         }
-        ["job", "create"] => print(&jobs::create(&store, &new_job(&args)?)?),
+        ["job", "create"] => {
+            print(&jobs::create(&store, &new_job(&args)?)?);
+        }
         ["pair", name] => {
-            let (code, expires_at) = access::issue_pairing(&store, name, &local_actor(&store)?)?;
+            let (code, expires_at) = access::issue_pairing(&store, name, &actor, None)?;
             print(&json!({"name": name, "code": code, "expires_at": expires_at}));
         }
-        ["credential", "list"] => print(&access::credentials(&store)?),
+        ["credential", "list"] => {
+            print(&access::credentials(&store)?);
+        }
         ["credential", "revoke", id] => {
-            access::revoke_credential(&store, id, &local_actor(&store)?)?;
+            access::revoke_credential(&store, id, &actor)?;
             print(&json!({"id": id, "revoked": true}));
         }
-        ["ui-link"] => println!("{}", ui::link(&store, &args)?),
+        ["ui-link"] => {
+            println!("{}", ui::link(&store, &args)?);
+        }
         ["installation"] => println!("{}", store.installation),
         _ => return Err(USAGE.into()),
     }
     Ok(())
 }
 
-fn local_actor(store: &Store) -> Result<String, String> {
+fn local_actor(
+    store: &Store,
+    capability: policy::Capability,
+    note_usage: bool,
+) -> Result<String, String> {
     let token =
         std::fs::read_to_string(access::local_credential_path(store)).map_err(|e| e.to_string())?;
-    access::client(store, token.trim())?
+    access::authenticate(store, token.trim(), note_usage)?
+        .filter(|client| {
+            client.kind == access::Kind::Local
+                && policy::allows(
+                    client,
+                    capability,
+                    policy::Target::Org(&client.member.scope.org_id),
+                )
+        })
         .map(|client| client.id)
         .ok_or_else(|| "local credential is unavailable".to_string())
 }
@@ -198,7 +232,16 @@ fn new_job(args: &Args) -> Result<jobs::NewJob, String> {
 
 fn serve(args: &Args) -> Result<(), String> {
     let settings = Settings::from_args(args)?;
-    let store = Store::open(&settings.data_dir)?;
+    let name = args.one("owner-name", "DIRECTOR_OWNER_NAME");
+    let name = name.as_deref().map(str::trim);
+    let store = if let Some(name) = name {
+        if !members::valid_display_name(name) {
+            return Err("--owner-name needs a display name of at most 100 UTF-8 bytes without control characters".into());
+        }
+        Store::open_with_owner(&settings.data_dir, Some(name))?
+    } else {
+        Store::open(&settings.data_dir)?
+    };
     access::ensure_local_credential(&store)?;
     logf!("data directory {}", settings.data_dir.display());
     // Applied cancels that left a job open with no run (before the Director finished those): end them now.

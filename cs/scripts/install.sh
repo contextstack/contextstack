@@ -48,6 +48,7 @@ UNAME_S=$(uname -s)
 UNAME_M=$(uname -m)
 setup_refuse() {
   case "$UNAME_S/$UNAME_M" in
+    # Open the public Linux gate after the first-land smoke.
     Linux/*)
       fail "ContextStack's setup currently supports Apple Silicon Macs. Linux support is coming; you can follow progress at $DOC_URL"
       ;;

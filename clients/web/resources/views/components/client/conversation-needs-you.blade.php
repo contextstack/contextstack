@@ -8,7 +8,7 @@
 
 @if ($active)
     <div @class(['flex flex-col gap-1' => $compact]) data-test="conversation-needs-you">
-        <flux:badge size="sm" color="amber" icon="bell" data-test="needs-you-badge">{{ __('Needs you') }}</flux:badge>
+        <flux:badge size="sm" color="amber" icon="bell" data-test="needs-you-badge">{{ \App\Client\NeedsYou::assignment($attention) }}</flux:badge>
         @if (($attention['source_kind'] ?? null) === 'lead')
             <span data-test="needs-you-source">{{ __('asked by the agent in :conversation', ['conversation' => $conversation['conversation_id']]) }}</span>
         @endif

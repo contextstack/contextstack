@@ -162,7 +162,8 @@ class Lane extends DirectorScreen
     {
         $state = $this->cancelState();
 
-        return ! $this->finished() && ($state === '' || $state === 'applied');
+        return ! $this->finished() && ($state === '' || $state === 'applied')
+            && (self::action($this->job, 'cancel') ?? ($this->can('control_work') && $this->mine($this->intent) && $this->mine($this->job)));
     }
 
     public function finished(): bool
@@ -177,7 +178,8 @@ class Lane extends DirectorScreen
 
     public function canDecide(): bool
     {
-        return $this->run !== [] && $this->receipt === [] && ! $this->landed();
+        return $this->run !== [] && $this->receipt === [] && ! $this->landed()
+            && (self::action($this->run, 'decide') ?? ($this->can('decide_run') && $this->mine($this->intent) && $this->mine($this->job)));
     }
 
     public function landed(): bool

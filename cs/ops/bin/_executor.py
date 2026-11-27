@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Private implementation of the gateway-owned CLI work order.
-# Run a CLI against the frozen goal and return its execution receipt.
+# Prepare an execution receipt for a gateway-owned CLI or a local gate.
 # Dest merge is parked (operator_close).
 from _yaml import load as load_yaml
 from _estate_io import DEFAULT_CHECK_WINDOW, remaining_check_time, state_dir, validate_check_window
@@ -185,17 +184,14 @@ def collect_plan(source, destination):
 
 
 def require_executor_sandbox():
-    # Host-side opt-in only; never inherited by the coding CLI.
-    if sys.platform != "darwin" and os.environ.get("CS_EXECUTOR_ALLOW_UNSANDBOXED") != "1":
-        fail("executor sandbox not available on %s (development opt-in: CS_EXECUTOR_ALLOW_UNSANDBOXED=1)" % sys.platform)
+    if sys.platform not in ("darwin", "linux"):
+        fail("executor sandbox not available on %s" % sys.platform)
 
 
 def sandbox_cmd(binary, args, ws, tmpdir, profile_path, protected=None, read_links=(), login_writes=None,
-                read_roots=(), home_reads=(), *, env=None, policy=None, caller=None, check_scratch=None):
-    from _estate_io import native_sandbox_request, render_native_sandbox
+                read_roots=(), home_reads=(), *, env=None, policy=None, caller=None, check_scratch=None, loopback_ports=()):
+    from _estate_io import linux_executor_command, native_sandbox_request, render_native_sandbox
     require_executor_sandbox()
-    if sys.platform != "darwin":
-        return [binary, *args]
     # Render against the host environment, as the Python renderer did: the child env strips
     # SSH_AUTH_SOCK, and the host's real agent socket must still get its explicit deny.
     env = os.environ if env is None else env
@@ -205,6 +201,9 @@ def sandbox_cmd(binary, args, ws, tmpdir, profile_path, protected=None, read_lin
                                      read_roots=read_roots, home_reads=home_reads, env=env, caller=caller)
     if check_scratch is not None:
         request["check_scratch"] = str(Path(check_scratch).resolve())
+    if sys.platform == "linux":
+        request["loopback_ports"] = list(loopback_ports)
+        return linux_executor_command(CODE_ROOT, policy, request, [binary, *args])
     profile_path.write_bytes(render_native_sandbox(CODE_ROOT, policy, request))
     return ["sandbox-exec", "-f", str(profile_path), binary, *args]
 
@@ -259,8 +258,9 @@ def changed_state(ws, base, paths=None):
 def main(argv=None) -> int:
     trace_started = _run_record.trace_clock()
     argv = sys.argv[1:] if argv is None else list(argv)
-    if argv != ["--gateway-owned", "--execution-only"]:
-        fail("expected gateway-owned execution")
+    local_gate = argv == ["--local-gate"]
+    if not local_gate and argv != ["--gateway-owned", "--execution-only"]:
+        fail("expected gateway-owned execution or local gate")
     receipt_path = os.environ.pop("CS_CLI_RECEIPT_PATH", None)
     reserved_id = os.environ.pop("CS_RUN_ID", None)
     execution_id = os.environ.pop("CS_EXECUTION_ID", None)
@@ -281,11 +281,18 @@ def main(argv=None) -> int:
 
     threading.Thread(target=owner_lifetime, daemon=True).start()
     name = str(a.get("executor") or "").strip()
+    if local_gate != (name == "gate"):
+        fail("gate requires local gate execution")
     template_name = name.partition(":")[0]
-    templates = json.loads(TEMPLATES.read_text())
-    tmpl = executor_template(templates, name)
-    if not tmpl:
-        fail("unknown executor %s (templates: %s)" % (name, ", ".join(sorted(templates))))
+    if local_gate:
+        tmpl = json.loads((HERE / "gate-template.json").read_text())
+        if tmpl.get("model_free") is not True or sys.platform != "darwin":
+            fail("gate requires the macOS lane-check sandbox")
+    else:
+        templates = json.loads(TEMPLATES.read_text())
+        tmpl = executor_template(templates, name)
+        if not tmpl:
+            fail("unknown executor %s (templates: %s)" % (name, ", ".join(sorted(templates))))
     require_executor_sandbox()
     task = Path(str(a.get("task") or ""))
     if not task.is_absolute():
@@ -340,6 +347,8 @@ def main(argv=None) -> int:
     else:
         spec = {}
         trial_limit = None
+    if local_gate and (spec.get("model") != "gate" or not lane_binding or a.get("agent") != "gate"):
+        fail("gate requires a gate spec, gate agent and reserved lane")
     # Refuse before setup, workspace creation, or any hosted session code runs.
     try:
         intent_fields = _run_record.spec_intent(spec)
@@ -384,6 +393,8 @@ def main(argv=None) -> int:
     check_budget = (spec_budget or {}).get("seconds") if isinstance(spec_budget, dict) else None
     if check_budget is None and job_budget:
         check_budget = job_budget.get("seconds")
+    if name == "gate" and (type(check_budget) not in (int, float) or not 0 < check_budget <= 3600):
+        fail("gate requires a seconds budget from 1 to 3600")
     limits = None
     try:
         spec_window = validate_check_window(spec.get("check_window", DEFAULT_CHECK_WINDOW))
@@ -463,8 +474,6 @@ def main(argv=None) -> int:
     if spec.get("repo_read_only") is True:
         if not spec.get("repo") or spec.get("lane"):
             fail("a read-only repo spec requires repo: and omits lane:")
-        if sys.platform != "darwin":
-            fail("read-only repo workspaces require the macOS executor sandbox")
         try:
             repo_config = _lanes.repo_config(str(spec["repo"]))
             planning_lane = spec.get("planning_lane")
@@ -484,9 +493,13 @@ def main(argv=None) -> int:
             lease = _lanes.lane_execution(cfg["path"], name_of_lane, lane_binding)
             lease.__enter__()
             atexit.register(lease.__exit__, None, None, None)
+            if name == "gate" and not _lanes.lane_path(cfg, name_of_lane).is_dir():
+                fail("gate requires an existing lane worktree")
             lane = _lanes.ensure_lane(cfg, name_of_lane)
         except _lanes.LaneError as error:
             fail("lane: %s" % error)
+    if name == "gate" and not lane:
+        fail("gate requires a repo and lane")
     run_id = reserved_id
     run_dir = state_dir(CODE_ROOT) / "runs" / run_id
     if run_dir.is_symlink() or not run_dir.is_dir() or os.environ.get("CS_TRIAL") != str(trial):
@@ -745,6 +758,9 @@ def main(argv=None) -> int:
 
     signal.signal(signal.SIGTERM, cancel_staged)
 
+    if name == "gate":
+        complete("gate", "gate")
+
     if hosted_turn:
         from _lead_host import run_hosted_lead_turn
         run_hosted_lead_turn({**globals(), **locals()})
@@ -831,13 +847,16 @@ def main(argv=None) -> int:
         fail("stage %s runtime: %s" % (name, error))
     native_links.extend(made)
     cli_env.update(native_env)
+    loopback_ports = ()
     if approval_prefix:
         approval_bridge = _lane_mcp.start(ws, cli_tmp, run_dir, name, approval_job, approval_prefix)
         atexit.register(approval_bridge.close)
         args = _lane_mcp.stage(cli_name, args, cli_env, approval_bridge.config)
+        if sys.platform == "linux":
+            loopback_ports = (approval_bridge.listener.getsockname()[1],)
     cmd = sandbox_cmd(binary, args, ws, cli_tmp, run_dir / "sandbox.sb", budget_controls if budget_broker else None,
                       read_links=native_links, login_writes=tmpl, read_roots=sandbox_read_roots,
-                      policy=sandbox_policy, caller=sandbox_caller)
+                      policy=sandbox_policy, caller=sandbox_caller, loopback_ports=loopback_ports)
 
 
     def timeout_output(value):
@@ -1126,6 +1145,14 @@ def main(argv=None) -> int:
     elif native_stop == "done" and login_refresh_status in (None, "written_back", "unchanged"):
         from _provider_limits import clear_pause
         clear_pause(state_dir(CODE_ROOT), template_name)
+    if native_stop == "done" and agent_name == "reviewer" and lane and stream_kind:
+        # Only parse the final assistant reply. Tool output and stderr are not verdicts.
+        mapper = Mapper(stream_kind)
+        for line in (cli.stdout or "").splitlines():
+            mapper.text(line)
+        reply = mapper.reply().rstrip().splitlines()
+        if reply and reply[-1].strip().casefold() in ("approve", "changes needed"):
+            row["review_verdict"] = reply[-1].strip().casefold()
     complete("task", native_stop)
 
 

@@ -256,6 +256,7 @@ new #[Layout('layouts::client')] #[Title('Backlog item')] class extends Director
         @endif
         <x-slot:actions>
             @if ($item && ! $editing)
+                @capable('edit_backlog')
                 @if (in_array($item['status'] ?? 'next', ['next', 'blocked'], true))
                     <flux:button size="sm" wire:click="setStatus('now')" data-test="start-item">{{ __('Start') }}</flux:button>
                 @endif
@@ -268,6 +269,7 @@ new #[Layout('layouts::client')] #[Title('Backlog item')] class extends Director
                 @if (($item['status'] ?? null) !== 'dropped')
                     <flux:button size="sm" variant="ghost" wire:click="setStatus('dropped')" wire:confirm="{{ __('Drop this item? It leaves the backlog and keeps its history; you can reopen it.') }}" data-test="drop-item">{{ __('Drop') }}</flux:button>
                 @endif
+                @endcapable
             @endif
             <x-client.stream-dot />
         </x-slot:actions>

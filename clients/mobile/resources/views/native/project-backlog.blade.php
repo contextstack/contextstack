@@ -12,6 +12,7 @@
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
+            @include('native.partials.signed-out')
 
             @if ($this->waitingOnYou() !== [])
                 <native:text class="text-sm font-bold text-theme-on-surface">Waiting on you</native:text>
@@ -60,10 +61,23 @@
                     @endif
                 @endif
 
-                @if (Backlog::waitsOnOwner($item))
+                @php($needsYou = \App\Native\NeedsYou::ofBacklogItem($item))
+                @php($options = \App\Native\NeedsYou::options($needsYou))
+                @if (! $this->can('edit_backlog'))
+                    <native:text class="text-sm text-theme-on-surface-variant">Your role can read this backlog; changing it is not yours on this Director.</native:text>
+                @elseif ($options !== [])
+                    <native:row class="w-full gap-2 mt-2">
+                        @foreach ($options as $option)
+                            <native:button native:key="option-{{ $option['id'] }}" label="{{ $option['label'] }}"
+                                variant="{{ $option['id'] === \App\Native\NeedsYou::default($needsYou) ? 'primary' : 'secondary' }}"
+                                @tap="choose('{{ $item['item_id'] }}', '{{ $option['id'] }}')" />
+                        @endforeach
+                    </native:row>
+                @elseif (Backlog::waitsOnOwner($item))
                     <native:button label="I've answered: clear it" variant="primary" class="w-full mt-2" @tap="clearOwnerBlocker('{{ $item['item_id'] }}')" />
                 @endif
 
+                @if ($this->can('edit_backlog'))
                 <native:row class="w-full gap-3 mt-2">
                     @if (in_array($item['status'] ?? 'next', ['next', 'blocked'], true))
                         <native:button label="Start" variant="secondary" class="flex-1" @tap="setStatus('{{ $item['item_id'] }}', 'now')" />
@@ -75,6 +89,7 @@
                         <native:button label="Reopen" variant="secondary" class="flex-1" @tap="setStatus('{{ $item['item_id'] }}', 'next')" />
                     @endif
                 </native:row>
+                @endif
             </native:column>
         @else
             <native:column class="w-full h-full items-center justify-center p-8">

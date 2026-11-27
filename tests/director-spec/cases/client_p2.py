@@ -129,7 +129,7 @@ def _(ctx):
     ctx.expect(s["schedule"]["pending_change_ids"] == [x.json["change_id"]] and s["schedule"]["enabled"] is True
                and [ch["change_id"] for ch in s["changes"]] == [x.json["change_id"]], "the schedule shows it pending", s)
     refused(ctx, c.call("POST", "schedules/%s/nope/changes" % a.name, body=body, key=new_key()), 404, "not_found", "unknown")
-    for bad in ({"expect_revision": 5, "set": {}}, {"expect_revision": 5, "set": {"cron": "* * * * *"}}, {"set": {"enabled": True}}):
+    for bad in ({"expect_revision": 5, "set": {}}, {"expect_revision": 5, "set": {"cron": "60 * * * *"}}, {"set": {"enabled": True}}):
         refused(ctx, c.call("POST", "schedules/%s/nightly/changes" % a.name, body=bad, key=new_key()), 422,
                 "invalid_request", repr(bad))
     refused(ctx, c.call("POST", "schedules/%s/nightly/changes" % a.name, body=body), 428, "idempotency_key_required", "no key")

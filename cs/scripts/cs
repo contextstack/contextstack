@@ -6,7 +6,7 @@ PY="$HOME/.contextstack/current/$KIT/.venv/bin/python3"
 [ -x "$PY" ] || PY=$(command -v python3) || { echo "cs: no ContextStack install on this machine (no ~/.contextstack/current); install with the ContextStack install script (curl | sh), or run cs update if releases are already present" >&2; exit 1; }
 exec "$PY" -I "$0" "$@"
 '''
-# Implementation detail (not in --help): start/stop use launchctl bootstrap/bootout/kickstart; releases delegate to
+# Implementation detail (not in --help): service controls use the host's user service manager; releases delegate to
 # scripts/node-install under the hood; cs init activates through node-release.
 DOC = """cs: see and control this machine's ContextStack install.
 
@@ -47,10 +47,12 @@ write install configuration and activate releases. Pairing commands print a one-
 probe (tests).
 """
 import argparse
+import functools
 import importlib.machinery
 import importlib.util
 import io
 import json
+import math
 import os
 import plistlib
 import re
@@ -197,9 +199,23 @@ def need_install():
         raise Stop(NO_INSTALL % CURRENT)
 
 
-def need_launchd():
-    if PLATFORM != "macos":
+def service_backend():
+    if PLATFORM not in ("macos", "linux"):
         raise Stop("cs: services are launchd agents; %s is not supported here yet" % PLATFORM, 2)
+    return service_module().service_backend(PLATFORM)
+
+
+def check_services():
+    backend = service_backend()
+    backend.check()
+    warning = backend.linger_warning()
+    if warning:
+        print(warning, file=sys.stderr)
+    return backend
+
+
+def linux_setup():
+    return load_script("_linux_setup", Path(__file__).resolve().parent / "_linux_setup.py")
 
 
 def read_json(path, default=None):
@@ -215,11 +231,14 @@ def load_plist(label):
         data = plistlib.loads(path.read_bytes())
     except (OSError, ValueError, plistlib.InvalidFileException):
         return path, None
-    env = data.get("EnvironmentVariables") or {}
-    for k, v in env.items():
+    remember_service_secrets(data)
+    return path, data
+
+
+def remember_service_secrets(data):
+    for k, v in (data.get("EnvironmentVariables") or {}).items():
         if re.fullmatch(SECRET_NAME, str(k)) and len(str(v)) >= 4:
             SECRETS.add(str(v))
-    return path, data
 
 
 def program(data):
@@ -233,7 +252,7 @@ def receiver():
 
 
 def state_root():
-    _, node = load_plist(NODE)
+    _, node = service_config(NODE)
     return Path(((node or {}).get("EnvironmentVariables") or {}).get("CS_STATE_ROOT") or ROOT / "state")
 
 
@@ -248,9 +267,14 @@ def load_script(name, path):
     return mod
 
 
+@functools.lru_cache(maxsize=1)
+def service_module():
+    return load_script("_node_services", Path(__file__).resolve().with_name("_node_services.py"))
+
+
 def release_bin(current, new):
     """The current release binary; no legacy names are resolved."""
-    return load_script("_node_services", Path(__file__).resolve().with_name("_node_services.py")).release_bin(current, new)
+    return service_module().release_bin(current, new)
 
 
 def node_release():
@@ -282,43 +306,40 @@ def gateway_get(path):
         code, body = curl("http://localhost" + path, unix=str(sock))
         if code:
             return code, body
-    _, gw = load_plist(GATEWAY)
+    _, gw = service_config(GATEWAY)
     port = ((gw or {}).get("EnvironmentVariables") or {}).get("CSGATEWAY_PORT") or "9200"
     return curl("http://127.0.0.1:%s%s" % (port, path))
 
 
-# ---- launchd ------------------------------------------------------------------------------------------------------
-def agent(label):
-    """What launchd says about one agent, plus the plist's own problems (never the env it prints)."""
-    path, data = load_plist(label)
+# ---- service status -----------------------------------------------------------------------------------------------
+def service_path(label, backend):
+    return AGENTS / (label + ".plist") if PLATFORM == "macos" else backend.path(label)
+
+
+def service_definition(backend, label):
+    path = service_path(label, backend)
+    data = backend.read(path)
+    if data is not None:
+        remember_service_secrets(data)
+    return path, data
+
+
+def service_config(label):
+    if PLATFORM == "linux":
+        return service_definition(service_backend(), label)
+    return load_plist(label)
+
+
+def agent(label, backend=None):
+    """The existing service status fields, populated by the host's service manager."""
+    backend = backend or service_backend()
+    path, data = service_definition(backend, label)
     view = {"label": label, "plist": str(path), "installed": data is not None, "loaded": False, "state": None,
             "pid": None, "last_exit": None, "up": False, "reason": ""}
     if data is None:
-        view["reason"] = "no plist"
+        view["reason"] = backend.missing
         return view
-    if PLATFORM != "macos":
-        view["reason"] = "launchd: not supported here yet"
-        return view
-    r = run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), label)])
-    if r.returncode == 0:
-        view["loaded"] = True
-        for line in r.stdout.splitlines():
-            if line.startswith("\t") and not line.startswith("\t\t"):
-                key, sep, value = line.strip().partition(" = ")
-                if sep and key in ("state", "pid", "last exit code"):
-                    view[{"last exit code": "last_exit"}.get(key, key)] = value.strip()
-    view["pid"] = int(view["pid"]) if str(view["pid"] or "").isdigit() else None
-    if label == NODE:  # a 60 s tick: up when loaded and its last tick did not fail
-        view["up"] = view["loaded"] and str(view["last_exit"] or "0").split(":")[0] in ("0", "(never exited)")
-    else:
-        view["up"] = view["state"] == "running"
-    problems = plist_problems(data)
-    if not view["loaded"]:
-        view["reason"] = "not loaded"
-    elif not view["up"]:
-        view["reason"] = "%s, last exit %s" % (view["state"] or "not running", view["last_exit"] or "?")
-    view["reason"] = "; ".join(x for x in [view["reason"]] + problems if x)
-    return view
+    return backend.status(label, view, data, plist_problems)
 
 
 def plist_problems(data):
@@ -336,18 +357,19 @@ def plist_problems(data):
 
 
 # ---- status -------------------------------------------------------------------------------------------------------
-def status_data():
+def status_data(backend=None):
+    backend = backend or service_backend()
     record = read_json(CONFIG / "install.json", {}) or {}
     tokens = node_env()
     data = {"installed": True, "root": str(ROOT), "platform": PLATFORM,
             "release": os.readlink(CURRENT).rsplit("/", 1)[-1],
             "releases": sorted(p.name for p in (ROOT / "releases").iterdir() if p.is_dir()),
             "gateway_impl": record.get("gateway"), "runner": record.get("runner"),
-            "services": {name: [agent(l) for l in labels
-                                  if l not in TUNNELS or (AGENTS / (l + ".plist")).is_file()] for name, labels in SERVICES.items()}}
+            "services": {name: [agent(l, backend) for l in labels
+                                  if l not in TUNNELS or service_path(l, backend).is_file()] for name, labels in SERVICES.items()}}
     code, body = gateway_get("/v1/health")
     health = read_body(body) if code == 200 else {}
-    _, gw = load_plist(GATEWAY)
+    _, gw = service_config(GATEWAY)
     data["gateway"] = {"answers": code != 0, "http": code, "status": health.get("status"),
                        "catalog_revision": health.get("catalog_revision"),
                        "models_available": health.get("models_available"),
@@ -373,7 +395,7 @@ def status_data():
     data["limits"] = limits_data()
     tunnels = []
     for label in TUNNELS:
-        if not (AGENTS / (label + ".plist")).is_file():
+        if not service_path(label, backend).is_file():
             continue
         port = tunnel_port(label)
         tunnels.append({"label": label, "port": port, "answers": curl("http://127.0.0.1:%d/v1/models" % port, timeout=2)[0] != 0})
@@ -387,7 +409,7 @@ def status_data():
 def director_data():
     """None without its plist; else its URL (the first --listen), whether it answers (no credential is sent: 401 is
     an answer), its installation ID (read-only from its database), its data dir and that dir's modes."""
-    _, data = load_plist(DIRECTOR)
+    _, data = service_config(DIRECTOR)
     if data is None:
         return None
     args = [str(a) for a in data.get("ProgramArguments") or []]
@@ -430,7 +452,7 @@ def installation_id(data_dir):
 def client_web_env(data=None):
     """(its env file, {name: value}); APP_KEY joins the redactor and is never shown."""
     if data is None:
-        data = load_plist(CLIENT_WEB)[1] or {}
+        data = service_config(CLIENT_WEB)[1] or {}
     env_file = Path((data.get("EnvironmentVariables") or {}).get("DIRECTOR_ENV_FILE") or CONFIG / "client-web/client-web.env")
     values = {}
     try:
@@ -449,7 +471,7 @@ def client_web_env(data=None):
 def client_web_data():
     """None without its plist; else its URL (php -S HOST:PORT), whether it answers /up, the Director it uses
     (DIRECTOR_URL from its env file; APP_KEY only joins the redactor), and its env file's and storage's modes."""
-    _, data = load_plist(CLIENT_WEB)
+    _, data = service_config(CLIENT_WEB)
     if data is None:
         return None
     args = [str(a) for a in data.get("ProgramArguments") or []]
@@ -467,19 +489,62 @@ def client_web_data():
 
 
 # ---- spend limits and CLI usage --------------------------------------------------------------------
-API_DEFAULT = 0  # a missing file means $0, never unlimited
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def limit_usd(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError("invalid budget amount")
+    return float(value)
+
+
+def invalid_json_constant(value):
+    raise ValueError("invalid JSON constant: " + value)
+
+
+def limit_json_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("number out of range")
+    return number
 
 
 def api_limit():
-    """(api_usd_per_day, problem) as the gateway reads config/gateway/limits.json; unreadable refuses (0)."""
+    """Return (budgets by source, problem), mirroring gateway/src/spend.rs parse_limits."""
     path = CONFIG / "gateway/limits.json"
-    if not path.exists():
-        return API_DEFAULT, None
-    doc = read_json(path)
-    value = doc.get("api_usd_per_day", 0) if isinstance(doc, dict) and set(doc) <= {"api_usd_per_day"} else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value < 0:
-        return 0, "%s is invalid: the gateway refuses every paid call" % path
-    return value, None
+    try:
+        doc = json.loads(path.read_bytes().decode("utf-8"), parse_constant=invalid_json_constant,
+                         parse_int=limit_json_number, parse_float=limit_json_number)
+        if not isinstance(doc, dict) or doc.keys() - {"sources", "api_usd_per_day"}:
+            raise ValueError("invalid limit fields")
+        sources = doc.get("sources", {})
+        if not isinstance(sources, dict):
+            raise ValueError("invalid sources")
+        limits = {}
+        for source, budget in sources.items():
+            source = source.translate(_ASCII_LOWER)
+            source.encode("utf-8")  # serde_json rejects unpaired surrogates
+            # serde_json::from_value accepts the positional representation of a struct.
+            if isinstance(budget, list) and len(budget) == 2:
+                budget = dict(zip(("usd", "period"), budget))
+            if source in limits or not isinstance(budget, dict) or budget.keys() != {"usd", "period"}:
+                raise ValueError("invalid source budget")
+            period = budget["period"]
+            if isinstance(period, dict) and len(period) == 1 and next(iter(period.values())) is None:
+                period = next(iter(period))
+            if period not in ("day", "month"):
+                raise ValueError("invalid budget period")
+            limits[source] = {"usd": limit_usd(budget["usd"]), "period": period}
+        legacy = doc.get("api_usd_per_day")
+        if legacy is not None:
+            if "*" in limits:
+                raise ValueError("duplicate shared budget")
+            limits["*"] = {"usd": limit_usd(legacy), "period": "day"}
+        return limits, None
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, ValueError, OverflowError, RecursionError):
+        return {}, "%s is invalid: the gateway refuses every paid call" % path
 
 
 def cli_runs_today(ledger):
@@ -504,17 +569,38 @@ def cli_runs_today(ledger):
 
 
 def limits_data():
-    api, api_problem = api_limit()
+    sources, api_problem = api_limit()
+    shared = sources.get("*", {})
     spend = read_json(ROOT / "gateway/spend.json", {}) or {}
-    spent = spend.get("api_usd", 0) if isinstance(spend, dict) and spend.get("day") == time.strftime("%Y-%m-%d") else 0
-    return {"api_usd_today": round(float(spent), 6) if isinstance(spent, (int, float)) else None,
-            "api_usd_per_day": api, "api_problem": api_problem,
+    spent = 0
+    if isinstance(spend, dict) and spend.get("day") == time.strftime("%Y-%m-%d"):
+        try:
+            spent = sum(limit_usd(row.get("day_usd", 0)) for row in spend.get("sources", {}).values())
+            if not spend.get("schema_version"):
+                spent += limit_usd(spend.get("api_usd") or 0)
+            spent = round(limit_usd(spent), 6)
+        except (AttributeError, ValueError, OverflowError):
+            spent = None
+    return {"api_usd_today": spent, "api_sources": sources,
+            "api_usd_per_day": shared["usd"] if shared.get("period") == "day" else 0,
+            "api_problem": api_problem,
             "cli_runs_today": cli_runs_today(state_root() / "ledger.jsonl")}
 
 
+def format_api_limits(sources):
+    return ", ".join("%s $%.2f/%s" % (source, budget["usd"], budget["period"])
+                     for source, budget in sorted(sources.items())) or "$0"
+
+
 def limits_line(m):
-    api = "API today $%.2f of $%.2f%s" % (m["api_usd_today"] or 0, m["api_usd_per_day"],
-                                          " (paid calls off unless a grant allows)" if not m["api_usd_per_day"] else "")
+    sources = m["api_sources"]
+    api = "API today $%.2f" % (m["api_usd_today"] or 0)
+    if not sources or (list(sources) == ["*"] and sources["*"]["period"] == "day"):
+        api += " of $%.2f" % m["api_usd_per_day"]
+    else:
+        api += "; API budgets " + format_api_limits(sources)
+    if not any(budget["usd"] > 0 for budget in sources.values()):
+        api += " (paid calls off unless a grant allows)"
     return "limits    %s; CLI runs today %d%s" % (api, m["cli_runs_today"],
                                                    " (%s)" % m["api_problem"] if m["api_problem"] else "")
 
@@ -548,25 +634,43 @@ def credential_mode(env):
 
 
 def last_tick():
-    """The node's last tick line (logs/node.out.log): its job_pull result and when it was written."""
-    _, node = load_plist(NODE)
+    """The node's most recent job-pull result."""
+    if PLATFORM == "linux":
+        backend = service_backend()
+        try:
+            argv = backend.journal_command((NODE, service_module().LISTEN_LABEL), 50)
+        except service_module().Refused:
+            return None
+        result = run(argv + ["--output=json"])
+        for line in reversed(result.stdout.splitlines()):
+            entry = read_body(line)
+            row = read_body(entry.get("MESSAGE", "")) if isinstance(entry.get("MESSAGE"), str) else {}
+            stamp = entry.get("__REALTIME_TIMESTAMP")
+            if "job_pull" in row and isinstance(stamp, str) and stamp.isdigit():
+                return tick_result(row, int(stamp) / 1_000_000)
+        return None
+    _, node = service_config(NODE)
     path = Path((node or {}).get("StandardOutPath") or LOGS / "node.out.log")
     for line in reversed(tail_lines(path, 50)):
         row = read_body(line)
         if row:
-            pull = row.get("job_pull") or {}
-            if pull.get("error"):
-                result = "error: %s" % pull["error"]
-            elif pull.get("skip"):
-                result = "skip: %s" % pull["skip"]
-            else:
-                result = "accepted %d, failed %d" % (len(pull.get("accepted") or []), len(pull.get("failed") or []))
-            return {"result": result, "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))}
+            return tick_result(row, path.stat().st_mtime)
     return None
 
 
+def tick_result(row, timestamp):
+    pull = row.get("job_pull") or {}
+    if pull.get("error"):
+        result = "error: %s" % pull["error"]
+    elif pull.get("skip"):
+        result = "skip: %s" % pull["skip"]
+    else:
+        result = "accepted %d, failed %d" % (len(pull.get("accepted") or []), len(pull.get("failed") or []))
+    return {"result": result, "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))}
+
+
 def tunnel_port(label):
-    _, data = load_plist(label)
+    _, data = service_config(label)
     args = [str(a) for a in (data or {}).get("ProgramArguments") or []]
     for i, a in enumerate(args[:-1]):
         if a == "-L":
@@ -656,6 +760,14 @@ def tail_lines(path, n, end=None):
 
 def cmd_logs(args):
     need_install()
+    backend = check_services()
+    if PLATFORM == "linux":
+        for label in SERVICES[args.service]:
+            service_definition(backend, label)  # register configured values with the redactor
+    return backend.logs(SERVICES[args.service], args.n, args.follow, lambda: file_logs(args))
+
+
+def file_logs(args):
     files = log_files(args.service)
     offsets = {p: (p.stat().st_size if p.is_file() else 0) for p in files}
     for p in files:
@@ -689,27 +801,23 @@ def cmd_logs(args):
 # ---- start / stop / restart ---------------------------------------------------------------------------------------
 def cmd_service(args):
     need_install()
-    need_launchd()
-    nr = node_release()
+    backend = check_services()
+    if PLATFORM == "macos":
+        node_release()  # preserve the broken-release check
     rc = 0
     for label in SERVICES[args.service]:
-        path, data = load_plist(label)
+        path, data = service_definition(backend, label)
         if data is None:
-            print("%s: no plist at %s (nothing to %s)" % (label, path, args.action))
+            print("%s: %s at %s (nothing to %s)" % (label, backend.missing, path, args.action))
             rc = 1
             continue
         try:
-            if args.action == "stop":
-                nr.unload_agent(label)
-                said = "booted out"
-            else:
-                run(["launchctl", "enable", "gui/%d/%s" % (os.getuid(), label)])
-                said = nr.load_agent(label, path, False, args.action == "restart")
-        except nr.Refused as error:
+            said = backend.control(args.action, label, path)
+        except service_module().Refused as error:
             print("%s: %s" % (label, error))
             rc = 1
             continue
-        v = agent(label)
+        v = agent(label, backend)
         print("%s: %s; now %s%s" % (label, said, "up" if v["up"] else "down", " (%s)" % v["reason"] if v["reason"] else ""))
     return rc
 
@@ -939,18 +1047,71 @@ def model_problems():
     return out
 
 
+def land_check_findings():
+    ops = Path(__file__).resolve().parents[1] / "ops/bin"
+    if not (ops / "_land_check.py").is_file():
+        return
+    lanes = load_script("_lanes", ops / "_lanes.py")
+    from _land_check import KILL_SWITCH, sandbox_readiness
+    from _land_host_probes import config_path, policy_drift, policy_repair
+
+    def info(check, detail):
+        return dict(check=check, ok=True, info=True, detail=detail, fix="")
+
+    kill_switch = KILL_SWITCH % lanes.repos_file()
+    yield info("land check owner kill switch", kill_switch)
+    yield info("land check Git configuration", "The check can read the repository's Git configuration. "
+               "Keep credentials in a credential store and out of Git config values.")
+    try:
+        probes = config_path(ROOT)
+        drift = policy_drift(probes)
+        if drift:
+            yield dict(check="land check owner probe list", ok=False, detail=f"{probes}: {drift}",
+                       fix=policy_repair())
+        else:
+            yield info("land check owner probe list", str(probes))
+    except ValueError as error:
+        yield dict(check="land check owner probe list", ok=False, detail=str(error),
+                   fix=policy_repair() if "absolute path" not in str(error)
+                   else "set CS_STATE_ROOT to an absolute path")
+    sandbox_configured = False
+    try:
+        repos = lanes.read_repos() if lanes.repos_file().exists() else {}
+        for name in sorted(repos):
+            try:
+                mode = lanes.repo_config(name, repos=repos)["land_check"]
+            except lanes.LaneError as error:
+                yield dict(check="land check repo " + name, ok=False, detail=str(error),
+                           fix="correct the entry in %s" % lanes.repos_file())
+                continue
+            sandbox_configured |= mode == "sandbox"
+            yield info("land check repo " + name, mode)
+    except lanes.LaneError as error:
+        yield dict(check="land check repos", ok=False, detail=str(error),
+                   fix="correct %s" % lanes.repos_file())
+    ready, detail = sandbox_readiness(ROOT, platform=PLATFORM)
+    if sandbox_configured and not ready:
+        yield dict(check="sandboxed land check", ok=False, detail=detail,
+                   fix="Repair the installed sandbox backend or rerun cs init")
+    else:
+        yield info("sandboxed land check", detail if ready else "not ready: " + detail)
+
+
 def doctor():
     """[(check, ok, detail, fix)] for every failure seen so far."""
     out = model_problems()
+    out.extend(land_check_findings())
     add = lambda check, ok, detail="", fix="": out.append({"check": check, "ok": ok, "detail": detail, "fix": fix})
-    m = limits_data()  # a limit above the default is a warning, never a problem (exit code unchanged)
+    sources, api_problem = api_limit()
     path = CONFIG / "gateway/limits.json"
-    if m["api_usd_per_day"] > API_DEFAULT:
+    if api_problem:
+        add("spend limits", False, api_problem, "fix or delete the file; a missing file means $0")
+    else:
+        add("spend limits", True, format_api_limits(sources))
+    if any(budget["usd"] > 0 for budget in sources.values()):
         out.append({"check": "paid API limit", "ok": False, "warn": True,
-                    "detail": "%s is $%s a day, above the default $%s" % (path, m["api_usd_per_day"], API_DEFAULT),
-                    "fix": "set api_usd_per_day to %s in %s, or delete the file" % (API_DEFAULT, path)})
-    if m["api_problem"]:
-        add("spend limits", False, m["api_problem"], "fix or delete the file; a missing file means $%d" % API_DEFAULT)
+                    "detail": "%s enables paid calls above the default $0" % path,
+                    "fix": "set budgets to $0 in %s, or delete the file" % path})
     rid = os.readlink(CURRENT).rsplit("/", 1)[-1]
     add("current release", (CURRENT / ".complete").is_file(), "current -> releases/%s" % rid,
         "cs release switch ID (cs release list)")
@@ -974,11 +1135,14 @@ def doctor():
             add("root %s" % d, False, "%s is mode %o" % (p, p.stat().st_mode & 0o777), "chmod 700 %s" % p)
         else:
             add("root %s" % d, True)
-    for p, want in ((NODE_ENV, 0o600), (ROOT / "credentials", 0o700)):  # stat only: never read
+    mode_paths = [(NODE_ENV, 0o600)]
+    if PLATFORM != "linux":
+        mode_paths.append((ROOT / "credentials", 0o700))
+    for p, want in mode_paths:  # stat only: never read
         if p.exists():
             mode = p.stat().st_mode & 0o777
             add("mode %s" % p.name, not mode & 0o077, "%s is mode %o" % (p, mode), "chmod %o %s" % (want, p))
-    if (ROOT / "credentials").is_dir() and os.access(ROOT / "credentials", os.R_OK | os.X_OK):
+    if PLATFORM != "linux" and (ROOT / "credentials").is_dir() and os.access(ROOT / "credentials", os.R_OK | os.X_OK):
         for f in sorted((ROOT / "credentials").iterdir()):  # names and modes only: a credential is never read
             mode = f.lstat().st_mode & 0o777
             if f.is_file() and mode & 0o077:
@@ -1005,6 +1169,19 @@ def doctor():
                 "cs release switch %s (cs release list; rewrites the links)" % rid)
         elif name != "cs":  # cs gets its link from node-release's LINKS
             add("link %s" % name, False, "%s is missing" % p, "cs release switch %s (cs release list)" % rid)
+    if PLATFORM == "linux":
+        setup = linux_setup()
+        out.extend(setup.sandbox_findings())
+        try:
+            service_backend().check()
+        except service_module().Refused as error:
+            add("systemd user manager", False, str(error), "log in or run loginctl enable-linger")
+        else:
+            add("systemd user manager", True)
+        _, gw = service_config(GATEWAY)
+        spec = ((gw or {}).get("EnvironmentVariables") or {}).get("CSGATEWAY_CREDENTIALS", "")
+        out.extend(setup.credential_findings(ROOT, spec))
+        return out
     if PLATFORM != "macos":
         add("launchd agents", True, "not supported here yet (%s)" % PLATFORM)
         return out
@@ -1050,7 +1227,7 @@ def doctor():
             path_env = ((data.get("EnvironmentVariables") or {}).get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin")
             add("agent PATH %s" % label, BREW in path_env.split(":"), "PATH=%s lacks %s" % (path_env, BREW),
                 refix if ours else "add %s to EnvironmentVariables PATH in %s" % (BREW, path))
-    _, gw = load_plist(GATEWAY)
+    _, gw = service_config(GATEWAY)
     if gw is not None and node:
         mode = credential_mode(gw.get("EnvironmentVariables") or {})
         try:
@@ -1088,7 +1265,11 @@ def toolchain_findings():
     toolchains = load_script("_toolchains", module)
     services = load_script("_node_services", Path(__file__).resolve().with_name("_node_services.py"))
     path = CONFIG / "toolchains.json"
-    service_path = os.environ.get("CS_SERVICE_PATH", "%s:%s" % (CURRENT / "code/.venv/bin", services.SYSTEM_PATH))
+    service_path = os.environ.get("CS_SERVICE_PATH")
+    if service_path is None:
+        default = services.LINUX_SYSTEM_PATH if PLATFORM == "linux" else services.SYSTEM_PATH
+        venv = KIT / ".venv/bin" if PLATFORM == "linux" else CURRENT / "code/.venv/bin"
+        service_path = "%s:%s" % (venv, default)
     return toolchains.doctor_findings(path) + toolchains.doctor_login_findings(path, service_path)
 
 
@@ -1097,6 +1278,9 @@ def cmd_doctor(args):
         return cmd_repin_cli(args.repin)
     need_install()
     findings = doctor() + cli_pin_findings() + toolchain_findings()
+    browser = KIT / "ops/bin/_browser_reliability.py"
+    if browser.is_file():
+        findings += load_script("_browser_doctor", browser).doctor_findings(Path.home(), state_root(), KIT)
     if NODE_ENV_ERROR:
         findings.append({"check": "node.env", "ok": False, "detail": NODE_ENV_ERROR[0],
                          "fix": "fix that line of %s (NAME=value, one per line; quote values with spaces)" % NODE_ENV})
@@ -1114,6 +1298,8 @@ def cmd_doctor(args):
                 elif summary not in printed_summaries:
                     print("info  " + summary)
                     printed_summaries.add(summary)
+            elif f["ok"] and f["check"] == "spend limits":
+                print("ok    %s: %s" % (f["check"], f["detail"]))
             elif f["ok"]:
                 print("ok    %s%s" % (f["check"], " (%s)" % f["detail"] if "not supported" in f["detail"] else ""))
             else:
@@ -1138,7 +1324,13 @@ def cmd_land(args):
     """The checkout's own lane code beside this script (an install's cs is a link into its kit)."""
     ops = Path(__file__).resolve().parents[1] / "ops/bin"
     lanes = load_script("_lanes", ops / "_lanes.py")
-    code, result = lanes.land(args.repo, args.lane, args.message, allow_agent_config=args.allow_agent_config)
+    expected = tuple(args.request_pin) if args.request_pin else None
+    code, result = lanes.land(args.repo, args.lane, args.message, allow_agent_config=args.allow_agent_config,
+                              state=state_root(), expected=expected, owner_approved=args.request_owner,
+                              host_probes=args.host_probes, yes_host_probes=args.yes_host_probes)
+    if expected:
+        print(json.dumps(result, sort_keys=True))
+        return code
     try:
         recorded = load_script("_land_record", ops / "_land_record.py").record_landing(
             result, getattr(args, "job", None), ROOT)
@@ -1159,6 +1351,9 @@ def cmd_land(args):
               file=sys.stderr)
         if result.get("output_tail"):
             print(result["output_tail"], file=sys.stderr)
+    uncovered = result.get("gate", {}).get("uncovered", [])
+    if uncovered and not args.json:
+        print("cs land: uncovered host probes: " + ", ".join(uncovered), file=sys.stderr)
     return code
 
 
@@ -1236,7 +1431,7 @@ def cmd_status(args):
         if args.json:
             print(json.dumps({"installed": False, "root": str(ROOT), "message": NO_INSTALL % CURRENT}))
         raise Stop(NO_INSTALL % CURRENT)
-    d = status_data()
+    d = status_data(check_services())
     if args.json:
         print(json.dumps(d, indent=2))
     else:
@@ -1318,8 +1513,12 @@ def main(argv=None):
     ld.add_argument("-m", "--message")
     ld.add_argument("--job", help="Director job whose run this landing records (default: newest finished job for this repo and lane)")
     ld.add_argument("--json", action="store_true")
+    ld.add_argument("--request-pin", nargs=2, help=argparse.SUPPRESS)
+    ld.add_argument("--request-owner", action="store_true", help=argparse.SUPPRESS)
     ld.add_argument("--allow-agent-config", action="store_true",
                     help="owner override: permit protected agent, hook, editor and CI configuration changes")
+    ld.add_argument("--host-probes", action="store_true", help="run the owner-listed host probes for a sandboxed land")
+    ld.add_argument("--yes-host-probes", action="store_true", help="owner confirmation for non-interactive --host-probes")
     lead = sub.add_parser("lead")
     lead_sub = lead.add_subparsers(dest="action", required=True)
     lead_create = lead_sub.add_parser("create")
@@ -1370,9 +1569,9 @@ def main(argv=None):
     client_web_env()  # and client-web's APP_KEY
     try:
         return handler(args)
-    except Stop as stop:
+    except (Stop, service_module().Refused) as stop:
         print(str(stop), file=sys.stderr)
-        return stop.code
+        return getattr(stop, "code", 1)
     finally:
         sys.stdout.flush()
         sys.stderr.flush()

@@ -1,17 +1,21 @@
 //! Director-owned action requests. Node claims are consumed before execution.
 
 use crate::access::Client;
+use crate::policy::OWNER_ONLY_APPROVAL;
 use crate::records::View;
 use crate::server::{Call, Reply, State, internal, json, refusal};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
+    fmt::Write as _,
     path::{Component, Path},
     sync::Arc,
     time::Duration,
 };
 
+pub(crate) mod browser;
 mod hard_lines;
 
 pub const SCHEMA: &str = "
@@ -27,20 +31,86 @@ CREATE INDEX IF NOT EXISTS action_approvals_status ON action_approvals(status,cr
 ";
 
 pub(crate) const VIEW: View = View {
-    select: "SELECT id, job_id, revision FROM action_approvals",
+    select: "SELECT id, job_id, revision, conversation_id FROM (SELECT * FROM action_approvals WHERE +org_id = :org_id) AS action_approvals",
     key: "id",
     order: "revision DESC",
     shape: |_, row| {
-        Ok(
-            json!({"id": row.get::<_, String>(0)?, "job_id": row.get::<_, String>(1)?,
-                  "revision": row.get::<_, i64>(2)?}),
-        )
+        let mut value = json!({"id": row.get::<_, String>(0)?, "revision": row.get::<_, i64>(2)?});
+        if let Some(conversation) = row.get::<_, Option<String>>(3)? {
+            value["conversation_id"] = json!(conversation);
+        } else {
+            value["job_id"] = json!(row.get::<_, String>(1)?);
+        }
+        Ok(value)
     },
 };
 
-const RECORD: &str = "json_patch(request,json_object('id',id,'job_id',job_id,'run_id',run_id,'status',status,
-    'created_at',created_at,'reviewer_model',reviewer_model,'verdict',verdict,'review_reason',review_reason,
+const RECORD: &str = "json_patch(json_remove(request,'$.owner_only'),json_object('id',id,'job_id',job_id,'run_id',run_id,'status',status,
+    'conversation_id',conversation_id,'created_at',created_at,'revision',revision,'reviewer_model',reviewer_model,'verdict',verdict,'review_reason',review_reason,
     'decided_by',decided_by,'decided_at',decided_at,'outcome',json(outcome),'claimed_at',claimed_at))";
+const CLIENT_RECORD: &str = "json_object('assignee_member_id',assigned_member_id,
+    'intent_id',(SELECT j.intent_id FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j
+                 WHERE j.job_id=action_approvals.job_id))";
+const LEAD_STATUS: &[&str] = &[
+    "id",
+    "job_id",
+    "intent_id",
+    "conversation_id",
+    "run_id",
+    "status",
+    "revision",
+    "verdict",
+    "outcome",
+    "kind",
+    "commit",
+    "base",
+    "target_run_id",
+];
+
+fn client_record(
+    db: &ScopedConnection,
+    mut row: Value,
+    client: &Client,
+) -> rusqlite::Result<Value> {
+    if row["kind"] == "browser_action"
+        && let Some(fields) = row.as_object_mut()
+    {
+        fields.remove("execution");
+        browser::add_warning(&mut row);
+    }
+    if client.kind == crate::access::Kind::Lead
+        && let Some(fields) = row.as_object_mut()
+    {
+        fields.retain(|key, _| LEAD_STATUS.contains(&key.as_str()));
+    }
+    crate::projections::names(db, &mut row)?;
+    let open = row["status"] == "needs_owner";
+    crate::projections::approval_actions(db, &mut row, open);
+    Ok(row)
+}
+
+fn client_detail(db: &ScopedConnection, id: &str, client: &Client) -> Reply {
+    let row = db
+        .query_row(
+            &format!(
+                "SELECT json_patch({RECORD},{CLIENT_RECORD}) FROM action_approvals
+                  WHERE +org_id=:org_id AND id=?1 AND (?2 IS NULL OR (assigned_member_id=?2 AND NOT ({OWNER_ONLY_APPROVAL})))"
+            ),
+            params![id, crate::policy::approval_filter(client)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .and_then(|row| {
+            row.map(|raw| client_record(db, serde_json::from_str(&raw).unwrap_or_default(), client))
+                .transpose()
+        });
+    match row {
+        Ok(Some(row)) => json(200, &row),
+        Ok(None) => missing(),
+        Err(error) => internal(&error),
+    }
+}
+
 // json_patch removes null fields. Clients can treat absent optional fields as null.
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(18);
 // Allow the gateway one second to return its response after its 10-second model budget.
@@ -65,9 +135,9 @@ fn conflict() -> Reply {
     )
 }
 
-pub fn expire_reviews(db: &Connection) -> rusqlite::Result<()> {
+pub fn expire_reviews(db: &ScopedConnection) -> rusqlite::Result<()> {
     let mut stmt = db.prepare_cached(
-        "SELECT id FROM action_approvals WHERE status='pending' AND created_at < ?1",
+        "SELECT id FROM action_approvals WHERE +org_id = :org_id AND status='pending' AND job_id IS NOT NULL AND created_at < ?1",
     )?;
     let expired = stmt
         .query_map([crate::util::utc_in(-20)], |row| row.get::<_, String>(0))?
@@ -76,34 +146,64 @@ pub fn expire_reviews(db: &Connection) -> rusqlite::Result<()> {
     for id in expired {
         finish_review(db, &id, &verdict)?;
     }
-    Ok(())
+    browser::expire_jobs(db)?;
+    expire_land_requests(db)
+}
+
+pub(crate) fn expire_land_requests(db: &ScopedConnection) -> rusqlite::Result<()> {
+    let tx = db.unchecked_transaction()?;
+    expire_land_in(&tx)?;
+    tx.commit()
+}
+
+fn expire_land_in(db: &ScopedConnection) -> rusqlite::Result<()> {
+    expire_open(
+        db,
+        "SELECT id FROM action_approvals WHERE +org_id=:org_id AND status='needs_owner'
+         AND json_extract(request,'$.kind')='browser_action'
+         AND (COALESCE(json_extract(request,'$.expires_at'),'') <= ?1
+              OR json_type(request,'$.values_summary') IS NOT 'array')",
+        params![crate::util::now_utc()],
+    )?;
+    expire_open(
+        db,
+        "SELECT id FROM action_approvals WHERE +org_id = :org_id AND conversation_id IS NOT NULL
+         AND ((status='pending' AND created_at < ?1)
+              OR (status='needs_owner' AND reviewed_at < ?2)
+              OR (status='approved' AND claimed_at IS NULL
+                  AND COALESCE(decided_at,reviewed_at,created_at) < ?2))",
+        params![crate::util::utc_in(-300), crate::util::utc_in(-86400)],
+    )?;
+    crate::lead_install::expire_claims(db)
 }
 
 /// Pending and `needs_owner` approvals for a job that has ended; clients drop them on the change events.
-pub fn expire_for_job(db: &Connection, job: &str) -> rusqlite::Result<usize> {
+pub fn expire_for_job(db: &ScopedConnection, job: &str) -> rusqlite::Result<usize> {
     expire_open(
         db,
         "SELECT id FROM action_approvals
-         WHERE job_id=?1 AND status IN ('pending','needs_owner')",
+         WHERE +org_id = :org_id AND job_id=?1 AND status IN ('pending','needs_owner')
+           AND json_type(request,'$.execution') IS NULL",
         params![job],
     )
 }
 
 /// At Director start: clear open approvals whose jobs are already `done` or `error`.
-pub fn expire_ended_jobs(db: &Connection) -> rusqlite::Result<usize> {
+pub fn expire_ended_jobs(db: &ScopedConnection) -> rusqlite::Result<usize> {
     let tx = db.unchecked_transaction()?;
     let changed = expire_open(
         &tx,
-        "SELECT a.id FROM action_approvals a JOIN jobs j ON j.job_id=a.job_id
-         WHERE a.status IN ('pending','needs_owner') AND j.state IN ('done','error')",
-        [],
+        "SELECT a.id FROM (SELECT * FROM action_approvals WHERE +org_id = :org_id) a JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id=a.job_id
+         WHERE a.status IN ('pending','needs_owner') AND j.state IN ('done','error')
+           AND json_type(a.request,'$.execution') IS NULL",
+        params![],
     )?;
     tx.commit()?;
     Ok(changed)
 }
 
-fn expire_open<P: rusqlite::Params>(
-    db: &Connection,
+fn expire_open<P: IntoIterator<Item: rusqlite::ToSql>>(
+    db: &ScopedConnection,
     select: &str,
     params: P,
 ) -> rusqlite::Result<usize> {
@@ -121,10 +221,12 @@ fn expire_open<P: rusqlite::Params>(
 }
 
 /// Updates in the caller's transaction (job terminal) or autocommit (unit tests / per-statement).
-fn mark_expired(db: &Connection, id: &str) -> rusqlite::Result<bool> {
+fn mark_expired(db: &ScopedConnection, id: &str) -> rusqlite::Result<bool> {
     let prior: Option<String> = db
         .query_row(
-            "SELECT status FROM action_approvals WHERE id=?1 AND status IN ('pending','needs_owner')",
+            "SELECT status FROM action_approvals WHERE +org_id = :org_id AND id=?1
+             AND (status IN ('pending','needs_owner')
+                  OR (conversation_id IS NOT NULL AND status='approved' AND claimed_at IS NULL))",
             [id],
             |row| row.get(0),
         )
@@ -134,11 +236,18 @@ fn mark_expired(db: &Connection, id: &str) -> rusqlite::Result<bool> {
     };
     let changed = db.execute(
         "UPDATE action_approvals SET status='expired',
-        review_reason=COALESCE(NULLIF(review_reason,''),'job ended'),
-        outcome=json_object('status','expired','reason','job ended'),
+        review_reason=CASE WHEN json_extract(request,'$.kind')='browser_action' THEN ?4
+                           WHEN conversation_id IS NOT NULL THEN
+                           CASE json_extract(request,'$.kind') WHEN 'install' THEN 'install request expired'
+                             WHEN 'rollback' THEN 'rollback request expired' ELSE 'The land request expired.' END
+                           ELSE COALESCE(NULLIF(review_reason,''),'job ended') END,
+        outcome=json_object('status','expired','reason',
+                            CASE WHEN json_extract(request,'$.kind')='browser_action' THEN ?4
+                            WHEN conversation_id IS NOT NULL THEN CASE json_extract(request,'$.kind') WHEN 'install' THEN 'install request expired'
+                             WHEN 'rollback' THEN 'rollback request expired' ELSE 'land request timed out' END ELSE 'job ended' END),
         decided_at=?2
-        WHERE id=?1 AND status IN ('pending','needs_owner')",
-        params![id, crate::util::now_utc()],
+        WHERE +org_id = :org_id AND id=?1 AND status=?3 AND claimed_at IS NULL",
+        params![id, crate::util::now_utc(), prior, browser::EXPIRED],
     )? > 0;
     if changed {
         touch(db, Record::ActionApproval, id)?;
@@ -149,9 +258,9 @@ fn mark_expired(db: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(changed)
 }
 
-fn record(db: &Connection, id: &str) -> rusqlite::Result<Option<Value>> {
+pub(crate) fn record(db: &ScopedConnection, id: &str) -> rusqlite::Result<Option<Value>> {
     db.query_row(
-        &format!("SELECT {RECORD} FROM action_approvals WHERE id=?1"),
+        &format!("SELECT {RECORD} FROM action_approvals WHERE +org_id = :org_id AND id=?1"),
         [id],
         |row| {
             let raw: String = row.get(0)?;
@@ -161,7 +270,7 @@ fn record(db: &Connection, id: &str) -> rusqlite::Result<Option<Value>> {
     .optional()
 }
 
-fn reply(db: &Connection, id: &str) -> Reply {
+pub(crate) fn reply(db: &ScopedConnection, id: &str) -> Reply {
     match record(db, id) {
         Ok(Some(row)) => json(200, &row),
         Ok(None) => missing(),
@@ -170,26 +279,55 @@ fn reply(db: &Connection, id: &str) -> Reply {
 }
 
 pub fn client(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Reply {
-    let db = state.store.db();
+    let mut db = state.store.db();
     match (call.method.as_str(), parts) {
+        ("GET", ["browser-action-screenshots", sha]) => browser::screenshot(state, &db, sha),
         ("GET", ["action-approvals"]) => {
             let result = (|| {
                 let mut sql = format!(
-                    "SELECT {RECORD} FROM action_approvals
-                     WHERE (?1 IS NULL OR status=?1) AND (?2 IS NULL OR job_id=?2)"
+                    "SELECT json_patch({RECORD},{CLIENT_RECORD}) FROM action_approvals
+                     WHERE +org_id = :org_id AND (?1 IS NULL OR status=?1) AND (?2 IS NULL OR job_id=?2)
+                     AND (?3 IS NULL OR assigned_member_id=?3)"
                 );
                 let mut bind = vec![
                     call.query("status").map(String::from).into(),
                     call.query("job").map(String::from).into(),
+                    crate::policy::approval_filter(client)
+                        .map(String::from)
+                        .into(),
                 ];
-                crate::lead::push_job_scope(client, "action_approvals.job_id", &mut sql, &mut bind);
+                if crate::policy::approval_filter(client).is_some() {
+                    let _ = write!(sql, " AND NOT ({OWNER_ONLY_APPROVAL})");
+                }
+                if client.kind == crate::access::Kind::Lead {
+                    sql.push_str(" AND (conversation_id = ? OR (conversation_id IS NULL");
+                    bind.push(client.conversation_id.clone().into());
+                    crate::lead::push_job_scope(
+                        client,
+                        "action_approvals.job_id",
+                        &mut sql,
+                        &mut bind,
+                    );
+                    sql.push_str("))");
+                }
+                if let Some(conversation) = call.query("conversation") {
+                    let _ = write!(
+                        sql,
+                        " AND id IN (SELECT a.id FROM (SELECT * FROM action_approvals WHERE +org_id = :org_id) a
+                         LEFT JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id=a.job_id
+                         LEFT JOIN (SELECT * FROM intents WHERE +org_id = :org_id) i ON i.intent_id=j.intent_id
+                         JOIN (SELECT * FROM conversations WHERE +org_id = :org_id) c ON {CONVERSATION_LINK}
+                         WHERE c.conversation_id = ?)"
+                    );
+                    bind.push(conversation.to_owned().into());
+                }
                 sql.push_str(
                     " ORDER BY status='needs_owner' DESC, created_at DESC, id DESC LIMIT 500",
                 );
                 db.prepare(&sql)?
-                    .query_map(rusqlite::params_from_iter(bind), |row| {
+                    .query_map(bind, |row| {
                         let raw: String = row.get(0)?;
-                        Ok(serde_json::from_str::<Value>(&raw).unwrap_or_default())
+                        client_record(&db, serde_json::from_str(&raw).unwrap_or_default(), client)
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()
             })();
@@ -198,62 +336,94 @@ pub fn client(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
                 Err(error) => internal(&error),
             }
         }
-        ("GET", ["action-approvals", id]) => match record(&db, id) {
-            Ok(Some(row)) => match crate::lead::visible(
-                &db,
-                client,
-                Record::Job,
-                row["job_id"].as_str().unwrap_or_default(),
-            ) {
-                Ok(true) => json(200, &row),
-                Ok(false) => missing(),
-                Err(error) => internal(&error),
-            },
-            Ok(None) => missing(),
-            Err(error) => internal(&error),
-        },
-        ("POST", ["action-approvals", id, "decide"]) => {
-            if !client.is_owner() {
-                return refusal(
-                    403,
-                    "owner_only",
-                    "only the owner may decide an action approval",
-                    Value::Null,
-                );
+        ("GET", ["action-approvals", id]) => client_detail(&db, id, client),
+        ("POST", ["action-approvals", id, "clear"]) => {
+            match record(&db, id) {
+                Ok(Some(row)) if row["kind"] == "browser_action" => {
+                    return browser::clear(&mut db, id, client);
+                }
+                Err(error) => return internal(&error),
+                _ => {}
             }
-            let body: Value = serde_json::from_slice(&call.body).unwrap_or_default();
-            let status = match body["decision"].as_str() {
-                Some("approve") => "approved",
-                Some("deny") => "denied",
-                _ => return bad("decision must be approve or deny"),
-            };
-            match decide(&db, id, status, &client.id) {
-                Ok(true) => reply(&db, id),
-                Ok(false) => match record(&db, id) {
-                    Ok(Some(_)) => conflict(),
-                    Ok(None) => missing(),
-                    Err(error) => internal(&error),
-                },
-                Err(error) => internal(&error),
-            }
+            crate::lead_install::clear(&mut db, id, client.member_id(), false)
+        }
+        ("POST", ["action-approvals", id, operation @ ("decide" | "answer")]) => {
+            decide_client(&mut db, call, client, id, operation)
         }
         _ => missing(),
     }
 }
 
-fn decide(db: &Connection, id: &str, status: &str, owner: &str) -> rusqlite::Result<bool> {
-    let tx = db.unchecked_transaction()?;
-    let changed = tx.execute(
+fn decide_client(
+    db: &mut ScopedConnection,
+    call: &Call,
+    client: &Client,
+    id: &str,
+    operation: &str,
+) -> Reply {
+    let body: Value = serde_json::from_slice(&call.body).unwrap_or_default();
+    if operation == "answer" && body["choice"] == "acknowledge" {
+        return crate::lead_install::clear(db, id, client.member_id(), true);
+    }
+    let (status, actor) = if operation == "answer" {
+        match body["choice"].as_str() {
+            Some("go") => ("approved", client.member_id()),
+            Some("no_go") => ("denied", client.member_id()),
+            _ => return bad("choice must be go or no_go"),
+        }
+    } else {
+        match body["decision"].as_str() {
+            Some("approve") => ("approved", client.id.as_str()),
+            Some("deny") => ("denied", client.id.as_str()),
+            _ => return bad("decision must be approve or deny"),
+        }
+    };
+    let tx = match crate::store::write_tx(db) {
+        Ok(tx) => tx,
+        Err(error) => return internal(&error),
+    };
+    if status == "approved" {
+        match record(&tx, id) {
+            Ok(Some(row)) if row["kind"] == "land" && row["commit"].is_null() => {
+                return refusal(
+                    409,
+                    "conflict",
+                    "The node could not pin a local commit and base. Request landing again after checking the lane.",
+                    Value::Null,
+                );
+            }
+            Err(error) => return internal(&error),
+            _ => {}
+        }
+    }
+    if let Err(error) = expire_land_in(&tx) {
+        return internal(&error);
+    }
+    match decide(&tx, id, status, actor).and_then(|changed| tx.commit().map(|()| changed)) {
+        Ok(true) => client_detail(db, id, client),
+        Ok(false) => match record(db, id) {
+            Ok(Some(_)) => conflict(),
+            Ok(None) => missing(),
+            Err(error) => internal(&error),
+        },
+        Err(error) => internal(&error),
+    }
+}
+
+fn decide(db: &ScopedConnection, id: &str, status: &str, owner: &str) -> rusqlite::Result<bool> {
+    let changed = db.execute(
         "UPDATE action_approvals SET status=?2,decided_by=?3,decided_at=?4,
         outcome=CASE WHEN ?2='denied' THEN json_object('status','denied') END
-        WHERE id=?1 AND status='needs_owner'",
+        WHERE +org_id = :org_id AND (id=?1 AND status='needs_owner')",
         params![id, status, owner, crate::util::now_utc()],
     )? > 0;
     if changed {
-        touch(&tx, Record::ActionApproval, id)?;
-        touch_conversations(&tx, id)?;
+        if status == "approved" {
+            browser::enqueue(db, id)?;
+        }
+        touch(db, Record::ActionApproval, id)?;
+        touch_conversations(db, id)?;
     }
-    tx.commit()?;
     Ok(changed)
 }
 
@@ -371,14 +541,18 @@ fn system_executable(path: &Path) -> bool {
     .any(|root| inside(path, Path::new(root)))
 }
 
-/// Hard lines: the action waits on the owner without a model review. See `hard_lines` and the
+/// Hard lines: the action waits on a human (an owner or the assigned admin; browser actions only on
+/// an owner) without a model review. See `hard_lines` and the
 /// "Action approval hard lines" section of `director/README.md`. In order:
 /// 1. Writing to a Git remote: any `git` or `gh` invocation that is not on the read-only list.
 /// 2. A workspace that cannot be shown to lie inside the user's home.
 /// 3. A credential, key, token or protected configuration path, by name anywhere in a path, or a
 ///    credential store under the home (after expanding `~`/`$HOME`, `..` and symlinks).
 /// 4. A path outside the user's home (system executables excepted) or containing `..`.
-fn owner_only(request: &Value, context: &Value) -> Option<String> {
+fn hard_line_reason(request: &Value, context: &Value) -> Option<String> {
+    if request["kind"] == "browser_action" {
+        return Some(browser::REASON.into());
+    }
     let argv = strings(&request["argv"]).unwrap_or_default();
     let paths = strings(&request["write_paths"]).unwrap_or_default();
     let resolved_executable = context["resolved_executable"].as_str();
@@ -617,7 +791,12 @@ async fn review(state: Arc<State>, id: String, request: Value, context: Value) {
     }
 }
 
-fn update_approval(db: &Connection, id: &str, sql: &str, value: &str) -> rusqlite::Result<bool> {
+fn update_approval(
+    db: &ScopedConnection,
+    id: &str,
+    sql: &str,
+    value: &str,
+) -> rusqlite::Result<bool> {
     let tx = db.unchecked_transaction()?;
     let changed = tx.execute(sql, params![id, value])? == 1;
     if changed {
@@ -627,11 +806,11 @@ fn update_approval(db: &Connection, id: &str, sql: &str, value: &str) -> rusqlit
     Ok(changed)
 }
 
-fn select_model(db: &Connection, id: &str, model: &str) -> rusqlite::Result<bool> {
+fn select_model(db: &ScopedConnection, id: &str, model: &str) -> rusqlite::Result<bool> {
     update_approval(
         db,
         id,
-        "UPDATE action_approvals SET reviewer_model=?2 WHERE id=?1 AND status='pending'",
+        "UPDATE action_approvals SET reviewer_model=?2 WHERE +org_id = :org_id AND (id=?1 AND status='pending')",
         model,
     )
 }
@@ -782,13 +961,13 @@ async fn review_request(
     context: &Value,
     reviewer: impl std::future::Future<Output = Verdict>,
 ) -> Verdict {
-    match owner_only(request, context) {
+    match hard_line_reason(request, context) {
         Some(reason) => no_go(&reason),
         None => reviewer.await,
     }
 }
 
-fn finish_review(db: &Connection, id: &str, verdict: &Verdict) -> rusqlite::Result<()> {
+fn finish_review(db: &ScopedConnection, id: &str, verdict: &Verdict) -> rusqlite::Result<()> {
     let tx = db.unchecked_transaction()?;
     let status = if verdict.word == "go" {
         "approved"
@@ -798,7 +977,7 @@ fn finish_review(db: &Connection, id: &str, verdict: &Verdict) -> rusqlite::Resu
     let changed = tx.execute(
         "UPDATE action_approvals SET status=?2,verdict=?3,review_reason=?4,reviewed_at=?5,
         outcome=CASE WHEN ?2='needs_owner' THEN json_object('status','waiting_on_owner') END
-        WHERE id=?1 AND status='pending'",
+        WHERE +org_id = :org_id AND (id=?1 AND status='pending')",
         params![
             id,
             status,
@@ -816,12 +995,44 @@ fn finish_review(db: &Connection, id: &str, verdict: &Verdict) -> rusqlite::Resu
     tx.commit()
 }
 
-fn submit(state: &Arc<State>, db: &Connection, body: &Value, job: &str, run: &str) -> Reply {
-    let Some(request) = normalized(body) else {
+fn submit(
+    state: &Arc<State>,
+    db: &ScopedConnection,
+    body: &Value,
+    job: &str,
+    run: &str,
+    token: &str,
+) -> Reply {
+    let browser = body["kind"] == "browser_action";
+    let request = if browser {
+        browser::request(&body["capture"], state.settings.browser_action_ttl_seconds)
+    } else {
+        normalized(body)
+    };
+    let Some(mut request) = request else {
+        if browser {
+            return bad("a native host browser capture is required");
+        }
         return bad(
             "valid argv, needs, write_paths, requesting_model and reason are required; name each localhost port as network:loopback:<port> and exclude reserved ports",
         );
     };
+    if browser {
+        let Some(image) = browser::verified_capture(body, token, job, run) else {
+            return bad("invalid or expired native host browser capture");
+        };
+        match browser::declared(&state.store, db, job, &request, &body["capture"]) {
+            Ok(Some(execution)) => request["execution"] = execution,
+            Ok(None) => return bad("the job must declare this browser action"),
+            Err(error) => return internal(&error),
+        }
+        if let Err(error) = state.store.put_browser_screenshot(
+            request["screenshot_sha"].as_str().unwrap_or_default(),
+            &image,
+        ) {
+            return internal(&error);
+        }
+    }
     let context = body["context"].clone();
     let id = match crate::util::ulid() {
         Ok(id) => id,
@@ -830,13 +1041,31 @@ fn submit(state: &Arc<State>, db: &Connection, body: &Value, job: &str, run: &st
     let encoded = request.to_string();
     let inserted = (|| -> rusqlite::Result<_> {
         let tx = db.unchecked_transaction()?;
+        let assignee = if browser {
+            crate::sponsorship::active_owner(&tx, None)?
+        } else {
+            crate::sponsorship::job_assignee(&tx, job)?
+        };
+        let reason = browser.then_some(browser::REASON);
         let inserted = tx.execute(
-            "INSERT INTO action_approvals(id,job_id,run_id,request,created_at)
-            VALUES(?1,?2,?3,?4,?5) ON CONFLICT(job_id,run_id,request) DO NOTHING",
-            params![id, job, run, encoded, crate::util::now_utc()],
+            "INSERT INTO action_approvals (org_id,id,job_id,run_id,request,created_at,assigned_member_id,
+                status,verdict,review_reason,reviewed_at,outcome)
+             SELECT :org_id,?1,?2,?3,?4,?5,?6,
+                CASE WHEN ?7 IS NULL THEN 'pending' ELSE 'needs_owner' END,
+                CASE WHEN ?7 IS NOT NULL THEN 'no_go' END,?7,
+                CASE WHEN ?7 IS NOT NULL THEN ?5 END,
+                CASE WHEN ?7 IS NOT NULL THEN json_object('status','waiting_on_owner') END
+             WHERE NOT EXISTS (
+                SELECT 1 FROM action_approvals WHERE +org_id=:org_id AND job_id=?2 AND run_id=?3
+                 AND json_remove(request,'$.followup_job_id')=json(?4))
+             ON CONFLICT(job_id,run_id,request) DO NOTHING",
+            params![id, job, run, encoded, crate::util::now_utc(), assignee, reason],
         )?;
         if inserted == 1 {
             touch(&tx, Record::ActionApproval, &id)?;
+            if browser {
+                touch_conversations(&tx, &id)?;
+            }
         }
         tx.commit()?;
         Ok(inserted)
@@ -844,11 +1073,14 @@ fn submit(state: &Arc<State>, db: &Connection, body: &Value, job: &str, run: &st
     match inserted {
         Ok(1) => {
             let answer = reply(db, &id);
-            tokio::spawn(review(Arc::clone(state), id, request, context));
+            if !browser {
+                tokio::spawn(review(Arc::clone(state), id, request, context));
+            }
             answer
         }
         Ok(_) => match db.query_row(
-            "SELECT id FROM action_approvals WHERE job_id=?1 AND run_id=?2 AND request=?3",
+            "SELECT id FROM action_approvals WHERE +org_id=:org_id AND job_id=?1 AND run_id=?2
+             AND json_remove(request,'$.followup_job_id')=json(?3)",
             params![job, run, encoded],
             |row| row.get::<_, String>(0),
         ) {
@@ -870,43 +1102,63 @@ pub fn node(state: &Arc<State>, call: &Call, node: i64, job: &str, parts: &[&str
     let db = state.store.db();
     let job_state = db
         .query_row(
-            "SELECT state FROM jobs WHERE job_id=?1 AND node_id=?2",
+            "SELECT state FROM jobs WHERE +org_id = :org_id AND job_id=?1 AND node_id=?2",
             params![job, node],
             |row| row.get::<_, String>(0),
         )
         .optional();
     match job_state {
-        Ok(Some(status)) if status == "accepted" || matches!(parts, [_, "outcome"]) => (),
+        Ok(Some(status))
+            if status == "accepted"
+                || matches!(parts, [_, "outcome"])
+                || (status == "waiting" && matches!(parts, [_, "claim"])) => {}
         Ok(Some(_)) => return conflict(),
         Ok(None) => return missing(),
         Err(error) => return internal(&error),
     }
     if parts.is_empty() {
-        return submit(state, &db, &body, job, run);
+        return submit(
+            state,
+            &db,
+            &body,
+            job,
+            run,
+            call.bearer().unwrap_or_default(),
+        );
+    }
+    if parts == ["capture"] {
+        return browser::preflight(&state.store, &db, job, &body);
     }
     let [id, op] = parts else {
         return missing();
     };
     let found = db
         .query_row(
-            "SELECT status FROM action_approvals WHERE id=?1 AND job_id=?2 AND run_id=?3",
-            params![id, job, run],
-            |row| row.get::<_, String>(0),
+            "SELECT status,request FROM action_approvals WHERE +org_id=:org_id AND id=?1
+             AND ((job_id=?2 AND run_id=?3 AND json_type(request,'$.execution') IS NULL)
+                OR (json_extract(request,'$.followup_job_id')=?2 AND ?2=?3)
+                OR (?4='poll' AND job_id=?2 AND run_id=?3))",
+            params![id, job, run, op],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional();
-    let status = match found {
+    let (status, request) = match found {
         Ok(Some(status)) => status,
         Ok(None) => return missing(),
         Err(error) => return internal(&error),
     };
+    let request: Value = serde_json::from_str(&request).unwrap_or_default();
     match *op {
         "poll" => reply(&db, id),
+        "claim" if request["kind"] == "browser_action" => {
+            browser::claim_reply(&db, id, &body, &request, call.bearer())
+        }
         "claim" if status == "approved" => match update_approval(
             &db,
             id,
             "UPDATE action_approvals
             SET claimed_at=?2,outcome=json_object('status','unknown')
-            WHERE id=?1 AND status='approved' AND claimed_at IS NULL",
+            WHERE +org_id = :org_id AND (id=?1 AND status='approved' AND claimed_at IS NULL)",
             &crate::util::now_utc(),
         ) {
             Ok(true) => reply(&db, id),
@@ -915,14 +1167,14 @@ pub fn node(state: &Arc<State>, call: &Call, node: i64, job: &str, parts: &[&str
         },
         "claim" => conflict(),
         "outcome" => {
-            let Some(exit) = body["exit_code"]
-                .as_i64()
-                .filter(|code| (-255..=255).contains(code))
-            else {
-                return bad("exit_code is required");
+            let browser = request["kind"] == "browser_action";
+            let Some(outcome) = node_outcome(&body, browser) else {
+                return bad(if browser && body.get("status").is_some() {
+                    "invalid browser submission status"
+                } else {
+                    "exit_code is required"
+                });
             };
-            let outcome =
-                json!({"status":if exit == 0 { "succeeded" } else { "failed" },"exit_code":exit});
             match record_outcome(&db, id, &outcome.to_string()) {
                 Ok(true) => reply(&db, id),
                 Ok(false) => conflict(),
@@ -933,19 +1185,57 @@ pub fn node(state: &Arc<State>, call: &Call, node: i64, job: &str, parts: &[&str
     }
 }
 
-fn record_outcome(db: &Connection, id: &str, outcome: &str) -> rusqlite::Result<bool> {
+fn node_outcome(body: &Value, browser: bool) -> Option<Value> {
+    let unknown = || {
+        json!({"status":"submission_unknown",
+        "message":"The site may have received the submission. Check the site before trying again."})
+    };
+    if browser && body.get("status").is_some() {
+        let mut outcome = match body["status"].as_str()? {
+            "submitted" => json!({"status":"submitted",
+                "message":"The site received the submission. Check the site before trying again."}),
+            "submission_unknown" => unknown(),
+            "refused" => json!({"status":"refused",
+                "message":"The browser refused the action before sending the submission."}),
+            _ => return None,
+        };
+        if outcome["status"] == "refused"
+            && let Some(reason) = body["reason"].as_str().filter(|text| {
+                text.len() <= 160 && text.bytes().all(|byte| (32..=126).contains(&byte))
+            })
+        {
+            outcome["reason"] = json!(reason);
+        }
+        return Some(outcome);
+    }
+    let exit = body["exit_code"]
+        .as_i64()
+        .filter(|code| (-255..=255).contains(code))?;
+    Some(if browser && exit != 0 {
+        unknown()
+    } else {
+        json!({"status":if exit == 0 { "succeeded" } else { "failed" },"exit_code":exit})
+    })
+}
+
+pub(crate) fn record_outcome(
+    db: &ScopedConnection,
+    id: &str,
+    outcome: &str,
+) -> rusqlite::Result<bool> {
     let tx = db.unchecked_transaction()?;
     let changed = tx.execute(
-        "UPDATE action_approvals SET outcome=?2 WHERE id=?1 AND claimed_at IS NOT NULL
-        AND json_extract(outcome,'$.status')='unknown'",
+        "UPDATE action_approvals SET outcome=?2 WHERE +org_id = :org_id AND (id=?1 AND claimed_at IS NOT NULL
+        AND json_extract(outcome,'$.status')='unknown')",
         params![id, outcome],
     )? > 0;
     let recorded = if changed {
+        browser::finish_job(&tx, id, outcome)?;
         touch(&tx, Record::ActionApproval, id)?;
         true
     } else {
         tx.prepare(
-            "SELECT 1 FROM action_approvals WHERE id=?1 AND claimed_at IS NOT NULL AND outcome=?2",
+            "SELECT 1 FROM action_approvals WHERE +org_id = :org_id AND id=?1 AND claimed_at IS NOT NULL AND outcome=?2",
         )?
         .exists(params![id, outcome])?
     };
@@ -953,31 +1243,55 @@ fn record_outcome(db: &Connection, id: &str, outcome: &str) -> rusqlite::Result<
     Ok(recorded)
 }
 
-pub fn needs_you(db: &Connection, intent: &str) -> rusqlite::Result<Vec<Value>> {
-    let mut stmt = db.prepare(
+pub(crate) fn browser_jobs(state: &State, node: i64) -> Reply {
+    match browser::jobs(&state.store.db(), node) {
+        Ok(jobs) => json(200, &json!({"jobs":jobs})),
+        Err(error) => internal(&error),
+    }
+}
+
+fn attention_choices(item: &mut Value) {
+    item["options"] = json!([{"id":"go","label":"Go"},{"id":"no_go","label":"No-go"}]);
+    item["default"] = json!("no_go");
+    item["links"] = json!({"approval":item["action_approval_id"]});
+    if item["job_id"].is_string() {
+        item["links"]["job"] = item["job_id"].clone();
+    }
+}
+
+pub fn needs_you(db: &ScopedConnection, intent: &str) -> rusqlite::Result<Vec<Value>> {
+    let (visible, member) = crate::policy::approval_read_scope(db);
+    let mut stmt = db.prepare(&format!(
         "SELECT a.id,a.job_id,a.created_at,a.reviewed_at,a.review_reason,
-        a.status,a.decided_at,a.decided_by FROM action_approvals a JOIN jobs j ON j.job_id=a.job_id
-        WHERE j.intent_id=?1 AND a.verdict='no_go' ORDER BY a.created_at,a.id",
-    )?;
-    stmt.query_map([intent], |row| {
+        a.status,a.decided_at,a.decided_by,a.assigned_member_id,a.request FROM (SELECT * FROM action_approvals WHERE +org_id = :org_id) a JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id=a.job_id
+        WHERE j.intent_id=?1 AND a.verdict='no_go' AND ?2 AND (?3 IS NULL OR (a.assigned_member_id = ?3 AND NOT ({OWNER_ONLY_APPROVAL}))) ORDER BY a.created_at,a.id",
+    ))?;
+    stmt.query_map(params![intent, visible, member], |row| {
         let status: String = row.get(5)?;
-        Ok(json!({"id":row.get::<_,String>(0)?,"action_approval_id":row.get::<_,String>(0)?,
-            "job_id":row.get::<_,String>(1)?,"raised_at":row.get::<_,Option<String>>(3)?,
-            "reason":row.get::<_,String>(4)?,"status":if status=="needs_owner" {"open"} else {"cleared"},
-            "cleared_at":row.get::<_,Option<String>>(6)?,"cleared_by":row.get::<_,Option<String>>(7)?}))
+        let mut item = json!({"id":row.get::<_,String>(0)?,"action_approval_id":row.get::<_,String>(0)?,
+            "job_id":row.get::<_,String>(1)?,"intent_id":intent,"raised_at":row.get::<_,Option<String>>(3)?,
+            "assignee_member_id":row.get::<_,Option<String>>(8)?,"reason":row.get::<_,String>(4)?,"status":if status=="needs_owner" {"open"} else {"cleared"},
+            "cleared_at":row.get::<_,Option<String>>(6)?,"cleared_by":row.get::<_,Option<String>>(7)?});
+        attention_choices(&mut item);
+        if visible && member.is_none() {
+            browser::project(&mut item, &serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default());
+        }
+        crate::projections::names(db, &mut item)?;
+        crate::projections::approval_actions(db, &mut item, status == "needs_owner");
+        Ok(item)
     })?.collect()
 }
 
 // A job can originate directly in a conversation or in an intent started by its lead.
-const CONVERSATION_LINK: &str = "(c.intent_id=j.intent_id OR c.conversation_id=i.conversation_id
+pub(crate) const CONVERSATION_LINK: &str = "(c.conversation_id=a.conversation_id OR c.intent_id=j.intent_id OR c.conversation_id=i.conversation_id
     OR c.conversation_id=i.lead_conversation_id OR c.conversation_id=i.origin_conversation_id OR EXISTS (SELECT 1 FROM turns t
-    WHERE t.job_id=j.job_id AND t.conversation_id=c.conversation_id))";
+    WHERE +org_id = :org_id AND t.job_id=j.job_id AND t.conversation_id=c.conversation_id))";
 
-fn touch_conversations(db: &Connection, approval: &str) -> rusqlite::Result<()> {
+pub(crate) fn touch_conversations(db: &ScopedConnection, approval: &str) -> rusqlite::Result<()> {
     let mut stmt = db.prepare(&format!(
-        "SELECT c.conversation_id FROM action_approvals a
-        JOIN jobs j ON j.job_id=a.job_id LEFT JOIN intents i ON i.intent_id=j.intent_id
-        JOIN conversations c ON {CONVERSATION_LINK} WHERE a.id=?1"
+        "SELECT c.conversation_id FROM (SELECT * FROM action_approvals WHERE +org_id = :org_id) a
+        LEFT JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id=a.job_id LEFT JOIN (SELECT * FROM intents WHERE +org_id = :org_id) i ON i.intent_id=j.intent_id
+        JOIN (SELECT * FROM conversations WHERE +org_id = :org_id) c ON {CONVERSATION_LINK} WHERE a.id=?1"
     ))?;
     for id in stmt.query_map([approval], |r| r.get::<_, String>(0))? {
         touch(db, Record::Conversation, &id?)?;
@@ -985,14 +1299,32 @@ fn touch_conversations(db: &Connection, approval: &str) -> rusqlite::Result<()> 
     Ok(())
 }
 
-pub fn attention(db: &Connection, conversation: &str) -> rusqlite::Result<Value> {
-    db.query_row(&format!("SELECT a.id,a.job_id,a.reviewed_at,a.review_reason FROM action_approvals a
-        JOIN jobs j ON j.job_id=a.job_id LEFT JOIN intents i ON i.intent_id=j.intent_id
-        JOIN conversations c ON {CONVERSATION_LINK} WHERE c.conversation_id=?1 AND a.status='needs_owner'
-        ORDER BY a.created_at,a.id LIMIT 1"), [conversation], |r| {
-        Ok(json!({"action_approval_id":r.get::<_,String>(0)?, "job_id":r.get::<_,String>(1)?,
+pub fn attention(db: &ScopedConnection, conversation: &str) -> rusqlite::Result<Value> {
+    let (visible, member) = crate::policy::approval_read_scope(db);
+    db.query_row(&format!("SELECT a.id,a.job_id,COALESCE(a.reviewed_at,a.created_at),
+        CASE WHEN json_extract(a.outcome,'$.waiting_jobs') IS NOT NULL
+             THEN json_extract(a.outcome,'$.reason') ELSE a.review_reason END,
+        a.assigned_member_id, COALESCE(json_extract(a.request,'$.kind'),'action'),
+        json_extract(a.outcome,'$.waiting_jobs') IS NOT NULL,a.request,j.intent_id FROM (SELECT * FROM action_approvals WHERE +org_id = :org_id) a
+        LEFT JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id=a.job_id LEFT JOIN (SELECT * FROM intents WHERE +org_id = :org_id) i ON i.intent_id=j.intent_id
+        JOIN (SELECT * FROM conversations WHERE +org_id = :org_id) c ON {CONVERSATION_LINK} WHERE c.conversation_id=?1 AND (a.status='needs_owner' OR (json_extract(a.outcome,'$.waiting_jobs') IS NOT NULL
+          AND COALESCE(json_extract(a.outcome,'$.acknowledged'),0)=0)) AND ?2 AND (?3 IS NULL OR (a.assigned_member_id = ?3 AND NOT ({OWNER_ONLY_APPROVAL})))
+        ORDER BY a.created_at,a.id LIMIT 1"), params![conversation, visible, member], |r| {
+        let mut item = json!({"action_approval_id":r.get::<_,String>(0)?, "job_id":r.get::<_,Option<String>>(1)?,
             "set_at":r.get::<_,String>(2)?, "question":r.get::<_,String>(3)?,
-            "source_kind":"action_approval"}))
+            "source_kind":"action_approval","assignee_member_id":r.get::<_,Option<String>>(4)?, "kind":r.get::<_,String>(5)?});
+        if let Some(intent) = r.get::<_, Option<String>>(8)? {
+            item["intent_id"] = json!(intent);
+        }
+        attention_choices(&mut item);
+        if visible && member.is_none() {
+            browser::project(&mut item, &serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default());
+        }
+        if r.get::<_, bool>(6)? {
+            item["options"] = json!([{"id":"acknowledge","label":"Acknowledge rollback is waiting"}]);
+            item["default"] = Value::Null;
+        }
+        Ok(item)
     }).optional().map(Option::unwrap_or_default)
 }
 
@@ -1007,7 +1339,7 @@ mod tests {
         assert!(select_model(&db, "action", "reviewer")?);
         let revision: i64 = db.query_row(
             "SELECT revision FROM action_approvals WHERE id='action'",
-            [],
+            params![],
             |row| row.get(0),
         )?;
         assert!(revision > 0);
@@ -1072,13 +1404,13 @@ mod tests {
         let store = crate::store::Store::open(&temp.path().join("director"))?;
         store
             .db()
-            .execute_batch(
+            .fixture_batch(
                 "
-            INSERT INTO nodes(id,name,token_hash,created_at) VALUES(1,'test','hash','now');
-            INSERT INTO jobs(job_id,node_id,spec,task,trials,bundle_sha256,meta,state,created_at)
-              VALUES('job',1,'s','t',1,'sha','{}','accepted','now');
-            INSERT INTO action_approvals(id,job_id,run_id,request,created_at)
-              VALUES('action','job','run','{}','now');
+            INSERT INTO nodes (org_id, id,name,token_hash,created_at) VALUES(:org_id, 1,'test','hash','now');
+            INSERT INTO jobs (org_id, job_id,node_id,spec,task,trials,bundle_sha256,meta,state,created_at)
+              VALUES(:org_id, 'job',1,'s','t',1,'sha','{}','accepted','now');
+            INSERT INTO action_approvals (org_id, id,job_id,run_id,request,created_at)
+            VALUES(:org_id, 'action','job','run','{}','now');
         ",
             )
             .map_err(|e| e.to_string())?;
@@ -1087,13 +1419,19 @@ mod tests {
 
     #[test]
     fn existing_v5_approval_can_publish_changes() -> Result<(), Box<dyn std::error::Error>> {
-        let (temp, store) = store()?;
-        store.db().execute_batch(
-            "ALTER TABLE action_approvals DROP COLUMN revision; PRAGMA user_version = 5;",
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("director");
+        let old = crate::store::legacy_fixture(&dir, 5)?;
+        old.execute_batch(
+            "INSERT INTO nodes (id,name,token_hash,created_at) VALUES (1,'test','hash','now');
+             INSERT INTO jobs (job_id,node_id,spec,task,trials,bundle_sha256,meta,state,created_at)
+               VALUES ('job',1,'s','t',1,'sha','{}','accepted','now');
+             INSERT INTO action_approvals (id,job_id,run_id,request,created_at)
+               VALUES ('action','job','run','{}','now');",
         )?;
-        drop(store);
+        drop(old);
 
-        let upgraded = crate::store::Store::open(&temp.path().join("director"))?;
+        let upgraded = crate::store::Store::open(&dir)?;
         let db = upgraded.db();
         assert_eq!(
             record(&db, "action")?.ok_or("missing approval")?["status"],
@@ -1158,10 +1496,10 @@ mod tests {
     fn hard_line(argv: Value, context: &Value) -> Option<String> {
         let mut request = action();
         request["argv"] = argv;
-        owner_only(&request, context)
+        hard_line_reason(&request, context)
     }
 
-    const PUSH: &str = "Git push requires an owner decision.";
+    const PUSH: &str = "Git push needs a human decision (an owner or the assigned admin).";
     const CREDENTIAL: &str =
         "The action references a credential, key, token, or protected configuration path.";
 
@@ -1392,7 +1730,10 @@ mod tests {
         let mut request = action();
         request["argv"] = json!(["ls", "~/.config"]);
         request["write_paths"] = json!([format!("{home}/.config")]);
-        assert_eq!(owner_only(&request, &lane()).as_deref(), Some(CREDENTIAL));
+        assert_eq!(
+            hard_line_reason(&request, &lane()).as_deref(),
+            Some(CREDENTIAL)
+        );
     }
 
     #[test]
@@ -1514,15 +1855,15 @@ mod tests {
     fn startup_sweep_expires_approvals_for_ended_jobs() -> Result<(), Box<dyn std::error::Error>> {
         let (_temp, store) = store()?;
         let db = store.db();
-        db.execute_batch(
+        db.fixture_batch(
             "
             UPDATE jobs SET state='done' WHERE job_id='job';
-            INSERT INTO jobs(job_id,node_id,spec,task,trials,bundle_sha256,meta,state,created_at)
-              VALUES('running',1,'s','t',1,'sha','{}','accepted','now');
-            INSERT INTO action_approvals(id,job_id,run_id,request,status,created_at,verdict,review_reason)
-              VALUES('owner','job','run2','{}','needs_owner','now','no_go','review said no');
-            INSERT INTO action_approvals(id,job_id,run_id,request,created_at)
-              VALUES('live','running','run3','{}','now');
+            INSERT INTO jobs (org_id, job_id,node_id,spec,task,trials,bundle_sha256,meta,state,created_at)
+              VALUES(:org_id, 'running',1,'s','t',1,'sha','{}','accepted','now');
+            INSERT INTO action_approvals (org_id, id,job_id,run_id,request,status,created_at,verdict,review_reason)
+              VALUES(:org_id, 'owner','job','run2','{}','needs_owner','now','no_go','review said no');
+            INSERT INTO action_approvals (org_id, id,job_id,run_id,request,created_at)
+            VALUES(:org_id, 'live','running','run3','{}','now');
         ",
         )?;
         assert_eq!(expire_ended_jobs(&db)?, 2);

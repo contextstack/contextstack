@@ -86,12 +86,12 @@ def response(message, tool, run_action):
     if method == "tools/list":
         return {"tools": [tool]}
     if method == "tools/call" and params.get("name") == tool["name"]:
-        # The caller supplies the command alone. Job, run, model and workspace are bound by the host.
+        # Job, run, model and workspace are bound by the host.
         arguments = params.get("arguments")
         output = io.StringIO()
         if not isinstance(arguments, dict) or set(arguments) - set(tool["inputSchema"]["properties"]):
             code = 1
-            output.write("Supply argv, needs, reason, and optional write_paths only.")
+            output.write("Supply a command request or a browser proposal.")
         else:
             try:
                 with redirect_stdout(output):

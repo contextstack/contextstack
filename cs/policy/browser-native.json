@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "sets": {
+    "google-tasks": ["https://tasks.google.com"]
+  }
+}

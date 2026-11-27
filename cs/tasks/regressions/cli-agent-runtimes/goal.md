@@ -20,8 +20,7 @@ credential stores, Director state, gateway owner/node tokens, personal secrets a
 (except `.env.example`), followed by exact staged login target allows. Keychain symlinks
 resolve to the real directory: Claude and private-home templates retain that directory
 exception for their staged login; other templates deny it. Network remains open pending
-per-template provider allowlists (BACKLOG). Non-Darwin refuses unless the host explicitly
-sets `CS_EXECUTOR_ALLOW_UNSANDBOXED=1` (development only; not forwarded to the CLI).
+per-template provider allowlists (BACKLOG). Linux launches through the native bubblewrap executor. Unsupported platforms refuse execution.
 `scripts/check` runs `tasks/regressions/cli-agent-runtimes/read-denies --darwin-probe`
 on macOS and prints a skip reason elsewhere. Run check outside the lead's sandbox:
 nested sandbox-exec is blocked there. The probe uses only

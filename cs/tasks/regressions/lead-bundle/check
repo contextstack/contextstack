@@ -46,7 +46,8 @@ def main():
     srv = mcp.get("mcpServers", {}).get("contextstack", {})
     expect(srv.get("command") == "cs" and "mcp" in srv.get("args", []) and "--credential-file" in srv.get("args", []),
            "session/mcp.json wires cs mcp --credential-file")
-    expect("--no-land" in srv.get("args", []), "the hosted lead's cs mcp withholds land_task (--no-land)", srv)
+    expect("--request-land" in srv.get("args", []) and "--no-land" not in srv.get("args", []),
+           "the hosted lead's cs mcp only requests lands through the Director (--request-land)", srv)
     import cs_mcp  # noqa: E402
 
     class _Director:
@@ -61,6 +62,27 @@ def main():
     except LookupError:
         refused = True
     expect(refused, "--no-land refuses a direct land_task call")
+    class _Recorder:
+        def __init__(self):
+            self.posts = []
+
+        def get(self, path):
+            return {"conversation_id": "c1"} if path == "me" else {}
+
+        def post(self, path, body):
+            self.posts.append((path, body))
+            return {"request": "r1"}
+
+    rec = _Recorder()
+    never = ["/nonexistent/cs-land-must-not-run"]
+    req_tools = cs_mcp.Tools(rec, None, land_command=never, request_land=True)
+    cs_mcp.handle(req_tools, {"method": "tools/call", "params": {"name": "land_task", "arguments": {"repo": "x", "lane": "y"}}})
+    expect(rec.posts == [("conversations/c1/land", {"repo": "x", "lane": "y"})],
+           "--request-land files one land request for the lead's own conversation and runs no local land", rec.posts)
+    for extra in ({"job_id": "j1"}, {"message": "m"}, {"timeout_seconds": 5}):
+        out = cs_mcp.handle(req_tools, {"method": "tools/call", "params": {"name": "land_task", "arguments": {"repo": "x", "lane": "y", **extra}}})
+        expect(out.get("isError") is True and len(rec.posts) == 1,
+               "--request-land refuses a land_task override and files nothing", (extra, out, rec.posts))
     owner = {t["name"] for t in cs_mcp.handle(cs_mcp.Tools(_Director(), None), {"method": "tools/list"})["tools"]}
     expect("land_task" in owner, "the owner's cs mcp still lists land_task")
 

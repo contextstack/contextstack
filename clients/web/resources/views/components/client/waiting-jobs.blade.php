@@ -13,7 +13,7 @@
                 @else
                     <span class="font-mono">{{ $job['job_id'] }}</span>
                 @endif
-                <flux:badge size="sm" color="amber">{{ match ($job['budget']['reason'] ?? null) { 'budget_exhausted' => __('budget used up'), 'budget_reserved' => __('room reserved for running work'), default => __('waiting') } }}</flux:badge>
+                <flux:badge size="sm" color="amber">{{ match ($job['budget']['reason'] ?? null) { 'budget_exhausted' => __('budget used up'), 'budget_reserved' => __('room reserved for running work'), 'sponsor_ineligible' => __('paused: its member can no longer run work'), default => __('waiting') } }}</flux:badge>
                 <flux:text>{{ $job['budget']['detail'] ?? '' }}</flux:text>
             </div>
         @endforeach

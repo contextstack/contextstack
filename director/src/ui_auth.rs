@@ -1,10 +1,12 @@
 //! One-time browser pairing and bounded browser sessions, separate from bearer credentials.
 //! Only hashes persist; neither codes nor cookie values are logged or returned by read APIs.
 
+use crate::access::{Client, Kind, Member};
+use crate::store::ScopedConnection;
 use crate::store::Store;
 use crate::util::{secret, sha256_hex};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 /// A link can be exchanged for five minutes.
 pub const CODE_TTL_SECONDS: i64 = 300;
@@ -18,7 +20,7 @@ pub fn issue(store: &Store) -> Result<String, String> {
     let db = store.db();
     cleanup(&db, now).map_err(|e| e.to_string())?;
     db.execute(
-        "INSERT INTO ui_codes (code_hash, expires_at) VALUES (?1, ?2)",
+        "INSERT INTO ui_codes (org_id, member_id, code_hash, expires_at) VALUES (:org_id, :member_id, ?1, ?2)",
         params![sha256_hex(code.as_bytes()), now + CODE_TTL_SECONDS],
     )
     .map_err(|e| e.to_string())?;
@@ -36,18 +38,27 @@ pub fn exchange(store: &Store, code: &str) -> Result<Option<(String, String)>, S
     let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
     cleanup(&tx, now).map_err(|e| e.to_string())?;
     let claimed = tx
-        .execute(
-            "DELETE FROM ui_codes WHERE code_hash = ?1 AND expires_at > ?2",
+        .query_row(
+            "DELETE FROM ui_codes WHERE +org_id = :org_id AND (code_hash = ?1 AND expires_at > ?2)
+             RETURNING member_id",
             params![sha256_hex(code.as_bytes()), now],
+            |row| row.get::<_, String>(0),
         )
+        .optional()
         .map_err(|e| e.to_string())?;
-    if claimed == 0 {
+    let Some(member_id) = claimed else {
         tx.commit().map_err(|e| e.to_string())?;
+        return Ok(None);
+    };
+    if !Member::load(&tx, member_id.clone())
+        .map_err(|e| e.to_string())?
+        .is_some_and(|member| member.can_authenticate())
+    {
         return Ok(None);
     }
     tx.execute(
-        "INSERT INTO ui_sessions (token_hash, expires_at) VALUES (?1, ?2)",
-        params![sha256_hex(token.as_bytes()), now + SESSION_TTL_SECONDS],
+        "INSERT INTO ui_sessions (org_id, member_id, token_hash, expires_at, id) VALUES (:org_id, ?1, ?2, ?3, ?4)",
+        params![member_id, sha256_hex(token.as_bytes()), now + SESSION_TTL_SECONDS, format!("ui_{}", crate::util::ulid()?.to_lowercase())],
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -55,21 +66,50 @@ pub fn exchange(store: &Store, code: &str) -> Result<Option<(String, String)>, S
     Ok(Some((token, csrf)))
 }
 
-/// Return the session's CSRF token when the cookie is live; never accept a bearer credential here.
-pub fn authenticate(store: &Store, token: &str) -> Result<Option<String>, String> {
+/// Resolve the current browser principal and the session's CSRF token.
+pub fn authenticate(store: &Store, token: &str) -> Result<Option<(Client, String)>, String> {
     if !crate::util::is_sha256(token) {
         return Ok(None);
     }
-    let live = store
-        .db()
+    let db = store.db();
+    let live = db
         .query_row(
-            "SELECT 1 FROM ui_sessions WHERE token_hash = ?1 AND expires_at > ?2",
+            "SELECT id, member_id FROM ui_sessions WHERE +org_id = :org_id AND token_hash = ?1 AND expires_at > ?2 AND id IS NOT NULL",
             params![sha256_hex(token.as_bytes()), Utc::now().timestamp()],
-            |_| Ok(()),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    Ok(live.map(|()| csrf_token(token)))
+    let Some((session_id, member_id)) = live else {
+        return Ok(None);
+    };
+    let Some(member) = Member::load(&db, member_id)
+        .map_err(|e| e.to_string())?
+        .filter(Member::can_authenticate)
+    else {
+        return Ok(None);
+    };
+    let actor = db
+        .query_row(
+            "SELECT id FROM credentials WHERE org_id = :org_id AND member_id = ?1
+             AND kind = 'local' AND revoked_at IS NULL ORDER BY rowid DESC LIMIT 1",
+            params![member.scope.member_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(actor) = actor else {
+        return Ok(None);
+    };
+    let client = Client {
+        id: actor,
+        kind: Kind::Browser { session_id },
+        member,
+        conversation_id: None,
+        intent_id: None,
+        node: None,
+    };
+    Ok(Some((client, csrf_token(token))))
 }
 
 /// Revoke just this browser session, including any copies of its cookie.
@@ -77,7 +117,7 @@ pub fn logout(store: &Store, token: &str) -> Result<(), String> {
     store
         .db()
         .execute(
-            "DELETE FROM ui_sessions WHERE token_hash = ?1",
+            "DELETE FROM ui_sessions WHERE +org_id = :org_id AND (token_hash = ?1)",
             params![sha256_hex(token.as_bytes())],
         )
         .map_err(|e| e.to_string())?;
@@ -89,13 +129,13 @@ fn csrf_token(token: &str) -> String {
     sha256_hex(format!("director-ui-csrf:{token}").as_bytes())
 }
 
-fn cleanup(db: &Connection, now: i64) -> rusqlite::Result<()> {
+fn cleanup(db: &ScopedConnection, now: i64) -> rusqlite::Result<()> {
     // Bound the work a request can trigger even after a long period without UI use.
     for table in ["ui_codes", "ui_sessions"] {
         db.execute(
             &format!(
-                "DELETE FROM {table} WHERE rowid IN \
-                 (SELECT rowid FROM {table} WHERE expires_at <= ?1 LIMIT 1000)"
+                "DELETE FROM {table} WHERE +org_id = :org_id AND (rowid IN \
+                 (SELECT rowid FROM {table} WHERE +org_id = :org_id AND expires_at <= ?1 LIMIT 1000))"
             ),
             params![now],
         )?;
@@ -113,14 +153,19 @@ mod tests {
     fn logout_deletes_only_the_selected_session() -> Res {
         let tmp = tempfile::tempdir()?;
         let store = Store::open(&tmp.path().join("data"))?;
+        crate::access::ensure_local_credential(&store)?;
         let (token, _) = exchange(&store, &issue(&store)?)?.ok_or("exchange refused")?;
         let (other, csrf) = exchange(&store, &issue(&store)?)?.ok_or("exchange refused")?;
         logout(&store, &token)?;
         assert!(authenticate(&store, &token)?.is_none());
-        assert_eq!(authenticate(&store, &other)?, Some(csrf));
-        let remaining: i64 = store
-            .db()
-            .query_row("SELECT COUNT(*) FROM ui_sessions", [], |r| r.get(0))?;
+        assert_eq!(
+            authenticate(&store, &other)?.map(|(_, csrf)| csrf),
+            Some(csrf)
+        );
+        let remaining: i64 =
+            store
+                .db()
+                .query_row("SELECT COUNT(*) FROM ui_sessions", params![], |r| r.get(0))?;
         assert_eq!(remaining, 1);
         Ok(())
     }
@@ -129,18 +174,26 @@ mod tests {
     fn pairing_is_one_time_and_only_hashes_are_stored() -> Res {
         let tmp = tempfile::tempdir()?;
         let store = Store::open(&tmp.path().join("data"))?;
+        crate::access::ensure_local_credential(&store)?;
         let code = issue(&store)?;
-        let hash: String = store
-            .db()
-            .query_row("SELECT code_hash FROM ui_codes", [], |r| r.get(0))?;
+        let hash: String =
+            store
+                .db()
+                .query_row("SELECT code_hash FROM ui_codes", params![], |r| r.get(0))?;
         assert_eq!(hash, sha256_hex(code.as_bytes()));
         let (token, csrf) = exchange(&store, &code)?.ok_or("exchange refused")?;
-        assert_eq!(authenticate(&store, &token)?, Some(csrf));
+        assert_eq!(
+            authenticate(&store, &token)?.map(|(_, csrf)| csrf),
+            Some(csrf)
+        );
         assert!(exchange(&store, &code)?.is_none());
         assert!(authenticate(&store, &code)?.is_none());
-        let hash: String = store
-            .db()
-            .query_row("SELECT token_hash FROM ui_sessions", [], |r| r.get(0))?;
+        let hash: String =
+            store
+                .db()
+                .query_row("SELECT token_hash FROM ui_sessions", params![], |r| {
+                    r.get(0)
+                })?;
         assert_eq!(hash, sha256_hex(token.as_bytes()));
         Ok(())
     }
@@ -149,19 +202,35 @@ mod tests {
     fn expired_codes_and_sessions_are_refused() -> Res {
         let tmp = tempfile::tempdir()?;
         let store = Store::open(&tmp.path().join("data"))?;
+        crate::access::ensure_local_credential(&store)?;
         let code = issue(&store)?;
         store
             .db()
-            .execute("UPDATE ui_codes SET expires_at = 0", [])?;
+            .execute("UPDATE ui_codes SET expires_at = 0", params![])?;
         assert!(exchange(&store, &code)?.is_none());
         let code = issue(&store)?;
         let (token, _) = exchange(&store, &code)?.ok_or("exchange refused")?;
         store
             .db()
-            .execute("UPDATE ui_sessions SET expires_at = 0", [])?;
+            .execute("UPDATE ui_sessions SET expires_at = 0", params![])?;
         assert!(authenticate(&store, &token)?.is_none());
         assert!(exchange(&store, "bad code")?.is_none());
         assert!(authenticate(&store, "bad cookie")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn null_session_id_is_unauthenticated() -> Res {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open(&tmp.path().join("data"))?;
+        crate::access::ensure_local_credential(&store)?;
+        let (token, _) = exchange(&store, &issue(&store)?)?.ok_or("exchange refused")?;
+        assert!(authenticate(&store, &token)?.is_some());
+        store.db().execute(
+            "UPDATE ui_sessions SET id = NULL WHERE +org_id = :org_id",
+            params![],
+        )?;
+        assert!(authenticate(&store, &token)?.is_none());
         Ok(())
     }
 
@@ -170,12 +239,15 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let store = Store::open(&tmp.path().join("data"))?;
         let code = issue(&store)?;
-        store.db().execute_batch(
+        store.db().raw().execute_batch(
             "CREATE TRIGGER refuse_session BEFORE INSERT ON ui_sessions
              BEGIN SELECT RAISE(ABORT, 'test storage failure'); END;",
         )?;
         assert!(exchange(&store, &code).is_err());
-        store.db().execute_batch("DROP TRIGGER refuse_session;")?;
+        store
+            .db()
+            .raw()
+            .execute_batch("DROP TRIGGER refuse_session;")?;
         assert!(exchange(&store, &code)?.is_some());
         Ok(())
     }

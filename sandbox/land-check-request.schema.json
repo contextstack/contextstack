@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Land-check profile request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version", "home", "main_checkout", "worktree", "run_tmp",
+    "cargo_target_dir", "tmpdir", "scratch", "darwin_user_temp"
+  ],
+  "properties": {
+    "version": { "const": 1 },
+    "home": { "$ref": "#/$defs/path" },
+    "main_checkout": { "$ref": "#/$defs/path" },
+    "worktree": { "$ref": "#/$defs/path" },
+    "run_tmp": { "$ref": "#/$defs/path" },
+    "cargo_target_dir": { "$ref": "#/$defs/path" },
+    "tmpdir": { "$ref": "#/$defs/path" },
+    "scratch": { "$ref": "#/$defs/path" },
+    "darwin_user_temp": { "$ref": "#/$defs/path" },
+    "cache_dirs": { "$ref": "#/$defs/paths" },
+    "toolchain_roots": { "$ref": "#/$defs/paths" },
+    "reserved_ports": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+    },
+    "ssh_auth_sock": { "anyOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] }
+  },
+  "$defs": {
+    "path": { "type": "string", "pattern": "^/" },
+    "paths": { "type": "array", "items": { "$ref": "#/$defs/path" } }
+  }
+}

@@ -31,7 +31,7 @@ if str(_SCRIPTS) not in sys.path:
 sys.path.insert(0, str(_SCRIPTS.parent / "ops/bin"))
 from _agent_discovery import AGENTS, discover_agents, probe_agent
 import _install_setup
-from _node_services import release_bin
+from _node_services import LINUX_SYSTEM_PATH, linux_user_path, release_bin
 
 FIRST_JOB = "cs-init-first-job"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")  # director-rs node names
@@ -51,6 +51,7 @@ class Init:
         self.cs, self.args = cs, args
         self.root, self.config = cs.ROOT, cs.CONFIG
         self.nr = cs.node_release()
+        self.services = cs.service_backend()
         self.data = self.nr.DIRECTOR_RS_DATA
         self.marker = self.config / "cs-init.json"
         self.pending = self.config / ".cs-init-node-token"
@@ -167,8 +168,9 @@ class Init:
         """PATH the node service runs with (not the login shell). CS_SERVICE_PATH overrides (tests)."""
         if os.environ.get("CS_SERVICE_PATH") is not None:
             return os.environ["CS_SERVICE_PATH"]
-        venv = self.cs.CURRENT / "code" / ".venv/bin"
-        return "%s:%s" % (venv, self.nr.SYSTEM_PATH)
+        venv = self.cs.KIT / ".venv/bin" if self.cs.PLATFORM == "linux" else self.cs.CURRENT / "code/.venv/bin"
+        system_path = LINUX_SYSTEM_PATH if self.cs.PLATFORM == "linux" else self.nr.SYSTEM_PATH
+        return "%s:%s" % (venv, system_path)
 
     def step_toolchains(self):
         sys.path.insert(0, str(_SCRIPTS.parent / "ops/bin"))
@@ -187,11 +189,13 @@ class Init:
             self.say("%s: %s" % (entry["name"], entry["bin"]))
 
     def agent_path(self):
-        """The PATH the gateway resolves CLIs on (its plist), else what it would be; CS_AGENT_PATH overrides (tests)."""
+        """The PATH configured for the gateway, with CS_AGENT_PATH as a test override."""
         if os.environ.get("CS_AGENT_PATH") is not None:
             return os.environ["CS_AGENT_PATH"]
-        _, gw = self.cs.load_plist(self.cs.GATEWAY)
+        _, gw = self.cs.service_config(self.cs.GATEWAY)
         path = ((gw or {}).get("EnvironmentVariables") or {}).get("PATH")
+        if self.cs.PLATFORM == "linux":
+            return path or "%s:%s" % (self.cs.KIT / ".venv/bin", linux_user_path())
         return path or "%s:%s" % (self.cs.HOME / ".local/bin", self.nr.SYSTEM_PATH)
 
     def probe(self, name, path):
@@ -377,7 +381,7 @@ class Init:
         wanted = list(self.args.api_key or [])
         if not wanted:
             return
-        _, gw = self.cs.load_plist(self.cs.GATEWAY)
+        _, gw = self.cs.service_config(self.cs.GATEWAY)
         store = ((gw or {}).get("EnvironmentVariables") or {}).get("CSGATEWAY_CREDENTIALS")
         if store == "off":
             raise self.cs.Stop("cs init: the gateway has no credential store (CSGATEWAY_CREDENTIALS=off); "
@@ -392,7 +396,7 @@ class Init:
             if r.returncode != 0:  # its prompt and its error went to the terminal (stderr)
                 raise self.cs.Stop("cs init: credentials set %s failed (exit %d)" % (provider, r.returncode))
             self.detail("api keys: %s stored in %s" % (provider, store or "~/.contextstack/credentials"))
-        self.nr.launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), self.cs.GATEWAY))  # re-reads the store
+        self.services.restart(self.cs.GATEWAY)  # re-reads the store
 
     # ---- 5. the first job -----------------------------------------------------------------------------------------
     def bundle(self, where, template, reply=REPLY, spec_id=FIRST_JOB):
@@ -656,12 +660,29 @@ class Init:
 
 def main(cs, args):
     cs.need_install()
-    refusal = _install_setup.init_setup_refusal()
+    # The public installer has a separate platform gate. An installed Linux
+    # release can set itself up through the systemd user backend.
+    refusal = _install_setup.init_setup_refusal() if cs.PLATFORM != "linux" else None
     if refusal:
         summary, alternative = refusal
         raise cs.Stop("cs init: %s %s" % (summary, alternative), 2)
-    cs.need_launchd()  # the services are launchd agents; Linux (systemd --user) is install stage 1
+    cs.check_services()
     init = Init(cs, args)
+    if cs.PLATFORM == "linux":
+        setup = cs.linux_setup()
+        for check in setup.sandbox_findings():
+            if not check["ok"]:
+                raise cs.Stop("cs init: %(check)s: %(detail)s. To fix: %(fix)s" % check)
+            if check.get("info"):
+                init.say("%(check)s: %(detail)s" % check)
+        _, gw = cs.service_config(cs.GATEWAY)
+        recorded = init.nr.load_record().get("credentials") or "file"
+        spec = init.nr.CREDENTIALS.get(recorded, recorded)
+        if init.initialised():
+            spec = ((gw or {}).get("EnvironmentVariables") or {}).get("CSGATEWAY_CREDENTIALS", "")
+        for check in setup.credential_findings(cs.ROOT, spec, create=True):
+            if not check["ok"]:
+                raise cs.Stop("cs init: %(detail)s. To fix: %(fix)s" % check)
     init.detail("cs init: %s, release %s" % (cs.ROOT, os.readlink(cs.CURRENT).rsplit("/", 1)[-1]))
     with init.stage("Checking disk encryption"):
         init.step_disk()

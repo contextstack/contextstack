@@ -172,7 +172,9 @@ new #[Layout('layouts::client')] #[Title('Source budgets')] class extends Direct
                         <flux:table.cell>{{ \App\Client\Money::dollars($row['spent']['day_usd'] ?? 0) }} / {{ \App\Client\Money::dollars($row['spent']['month_usd'] ?? 0) }}</flux:table.cell>
                         <flux:table.cell>
                             @if ($state !== 'off')
+                                @capable('manage_source_budgets')
                                 <flux:button size="xs" variant="ghost" wire:click="turnOff({{ Js::from($row['source']) }})" data-test="turn-off">{{ __('Turn off') }}</flux:button>
+                                @endcapable
                             @endif
                         </flux:table.cell>
                     </flux:table.row>
@@ -180,6 +182,7 @@ new #[Layout('layouts::client')] #[Title('Source budgets')] class extends Direct
             </flux:table.rows>
         </flux:table>
 
+        @capable('manage_source_budgets')
         <flux:card>
             <form wire:submit="setSource" class="flex flex-wrap items-end gap-3" data-test="set-source">
                 <flux:select wire:model="source" :label="__('Source')" class="w-48">
@@ -196,5 +199,6 @@ new #[Layout('layouts::client')] #[Title('Source budgets')] class extends Direct
                 <flux:button type="submit" variant="primary">{{ __('Set source budget') }}</flux:button>
             </form>
         </flux:card>
+        @endcapable
     @endif
 </section>

@@ -130,10 +130,20 @@ fn emit_matches_sandbox_cmd_for_representative_templates() -> Result<(), Box<dyn
             emitted
                 .contains(r#"(allow file-write-data (literal "/dev/null") (literal "/dev/tty"))"#)
         );
-        assert!(emitted.contains(&format!(
-            r#"(allow file-write* (subpath "{}"))"#,
-            user_tree.display()
-        )));
+        // The Darwin user tree stays writable. When the request's HOME sits inside it (as with a
+        // fixture HOME under /private/var/folders), HOME itself is carved out of that grant.
+        let home =
+            Path::new(request["home"].as_str().ok_or("missing golden home")?).canonicalize()?;
+        let tree_grant = if home.starts_with(user_tree) || user_tree.starts_with(&home) {
+            format!(
+                r#"(allow file-write* (require-all (subpath "{}") (require-not (subpath "{}"))))"#,
+                user_tree.display(),
+                home.display()
+            )
+        } else {
+            format!(r#"(allow file-write* (subpath "{}"))"#, user_tree.display())
+        };
+        assert!(emitted.contains(&tree_grant), "missing {tree_grant}");
         for (path, expected) in [
             (
                 claude.as_str(),

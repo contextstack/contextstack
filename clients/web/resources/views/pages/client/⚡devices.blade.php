@@ -1,11 +1,14 @@
 <?php
 
+use App\Client\AdvertisedUrl;
 use App\Client\Connection;
 use App\Client\ConnectionStore;
 use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Exceptions\NotConnected;
+use App\Client\Identity;
+use App\Client\MemberNames;
 use App\Client\TailscaleAddress;
 use Flux\Flux;
 use Livewire\Attributes\Layout;
@@ -15,9 +18,11 @@ use Livewire\Component;
 
 /*
  * Devices paired with this Director (CLIENT-API.md §2): issue a one-time pairing code for a phone, iPad or another
- * computer, list the paired devices, and revoke one. Any paired client may do this (a client is a client); only a lead's
- * credential gets 403 owner_only, and the page says so. This device never revokes
- * itself here: Settings forgets it.
+ * computer, list the paired devices, and revoke one. Every member pairs and revokes their own devices; the Director
+ * also lists an owner's or admin's view of other members' devices (manage_member_devices), each with its member and
+ * role. A lead's credential gets 403 owner_only, and the page says so. This device never revokes itself here (the
+ * Director refuses with 409 self_revoke): Settings forgets it. The QR shows the Director's own `contextstack://pair`
+ * link: from the owner's advertised URL when set, else from the address this desktop sends (AdvertisedUrl).
  */
 new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
 {
@@ -27,7 +32,7 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
     #[Locked]
     public array $devices = [];
 
-    /** @var array{code: string, name: string, expires_at: string}|array{} the code just issued */
+    /** @var array{code: string, name: string, expires_at: string, link: string}|array{} the code just issued */
     #[Locked]
     public array $issued = [];
 
@@ -40,6 +45,10 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
 
     #[Locked]
     public string $address = '';
+
+    /** The owner-set advertised URL when this device may read it, else null. */
+    #[Locked]
+    public ?string $advertised = null;
 
     public string $problem = '';
 
@@ -54,7 +63,8 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
         }
 
         $this->self = $connection->mode === Connection::Device ? (string) $connection->credentialId : '';
-        $this->address = $this->addressFor($connection, $tailscale);
+        $this->address = $tailscale->directorAddress($connection);
+        $this->advertised = app(AdvertisedUrl::class)->read();
         $this->load();
     }
 
@@ -66,7 +76,8 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
         ]);
 
         try {
-            $answer = $director->write('pairings', ['name' => $this->name], DirectorClient::newKey());
+            $answer = $director->issuePairing(['name' => $this->name], DirectorClient::newKey(),
+                $this->advertised === null && $this->address !== '' ? $this->address : null);
         } catch (DirectorRefused $refused) {
             $this->problem = $refused->explain();
 
@@ -77,10 +88,12 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
             return;
         }
 
+        $code = (string) ($answer->body['code'] ?? '');
         $this->issued = [
-            'code' => (string) ($answer->body['code'] ?? ''),
+            'code' => $code,
             'name' => (string) ($answer->body['name'] ?? $this->name),
             'expires_at' => (string) ($answer->body['expires_at'] ?? ''),
+            'link' => AdvertisedUrl::link('pair', $answer->body['link'] ?? null, $this->advertised ?? $this->address, $code),
         ];
         $this->name = '';
     }
@@ -96,7 +109,15 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
         try {
             $director->remove('credentials/'.rawurlencode($id), DirectorClient::newKey());
         } catch (DirectorRefused $refused) {
-            $this->problem = $refused->explain();
+            $this->problem = match (true) {
+                $refused->is('self_revoke') => __('A device cannot revoke itself. Use Forget this device in Settings.'),
+                $refused->is('protected_credential') => __('The Director\'s own local credential cannot be revoked from here.'),
+                default => $refused->explain(),
+            };
+            if (in_array($refused->status, [401, 403, 404], true)) {
+                app(Identity::class)->forget();
+                $this->load();
+            }
 
             return;
         } catch (DirectorUnavailable $unavailable) {
@@ -107,6 +128,35 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
 
         Flux::toast(variant: 'success', text: __('Revoked. That device can no longer reach the Director.'));
         $this->load();
+    }
+
+    /**
+     * Who a device belongs to: "you", or the member's name and role when this device may see them.
+     *
+     * @param  array<string, mixed>  $device
+     */
+    public function owner(array $device): ?string
+    {
+        $names = app(MemberNames::class);
+        $label = $names->label($device['member_id'] ?? null);
+        if ($label === null) {
+            return null;
+        }
+        $role = $names->role($device['member_id'] ?? null);
+
+        return $role !== null ? $label.' · '.__(ucfirst($role)) : $label;
+    }
+
+    /**
+     * Whether the device is this member's own (or the Director predates members).
+     *
+     * @param  array<string, mixed>  $device
+     */
+    public function mine(array $device): bool
+    {
+        $memberId = $device['member_id'] ?? null;
+
+        return ! is_string($memberId) || app(MemberNames::class)->label($memberId) === __('you') || app(Identity::class)->memberId() === null;
     }
 
     public function refresh(): void
@@ -136,29 +186,6 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
         usort($devices, fn (array $a, array $b): int => strcmp((string) ($b['created_at'] ?? ''), (string) ($a['created_at'] ?? '')));
         $this->devices = $devices;
     }
-
-    /**
-     * The address another device types to reach this Director: the Director's own URL when it is not loopback, else
-     * this machine's Tailscale address on the same port (the Director accepts plain HTTP over Tailscale).
-     */
-    private function addressFor(Connection $connection, TailscaleAddress $tailscale): string
-    {
-        $host = parse_url($connection->url, PHP_URL_HOST);
-
-        if (! in_array($host, ['127.0.0.1', 'localhost', '::1', '[::1]'], true)) {
-            return $connection->url;
-        }
-
-        $ip = $tailscale->ipv4();
-
-        if ($ip === null) {
-            return '';
-        }
-
-        $port = parse_url($connection->url, PHP_URL_PORT);
-
-        return 'http://'.$ip.(is_int($port) ? ':'.$port : '');
-    }
 }; ?>
 
 <div class="mx-auto flex w-full max-w-3xl flex-col gap-6">
@@ -176,11 +203,12 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
             <flux:heading size="lg" level="2">{{ __('Pair a device') }}</flux:heading>
 
             @if ($issued !== [])
+                @php($pairAddress = $issued['link'] !== '' ? \App\Client\AdvertisedUrl::address($issued['link']) : $address)
                 <div class="flex flex-col gap-3" data-test="pairing-code">
-                    @if ($address !== '')
+                    @if ($issued['link'] !== '')
                         <div class="flex flex-wrap items-center gap-6">
                             <div class="rounded-lg bg-white p-3" data-test="pairing-qr" aria-label="{{ __('Pairing QR code') }}">
-                                {!! \App\Client\QrCode::svg(\App\Client\QrCode::pairingLink($address, $issued['code'])) !!}
+                                {!! \App\Client\QrCode::svg($issued['link']) !!}
                             </div>
                             <flux:text class="max-w-xs">{{ __('On :name, open ContextStack and tap Scan pairing code, or point the Camera at this code. Or enter the address and code below.', ['name' => $issued['name']]) }}</flux:text>
                         </div>
@@ -189,7 +217,7 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
                     @endif
                     <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2">
                         <dt class="text-sm text-zinc-500">{{ __('Director address') }}</dt>
-                        <dd class="font-mono text-lg" data-test="pairing-address">{{ $address !== '' ? $address : __('this machine\'s Tailscale address, port 8780') }}</dd>
+                        <dd class="font-mono text-lg" data-test="pairing-address">{{ $pairAddress !== '' ? $pairAddress : __('this machine\'s Tailscale address, port 8780') }}</dd>
                         <dt class="text-sm text-zinc-500">{{ __('Pairing code') }}</dt>
                         <dd class="font-mono text-2xl tracking-wider select-all" data-test="pairing-code-value">{{ $issued['code'] }}</dd>
                     </dl>
@@ -206,35 +234,42 @@ new #[Layout('layouts::client')] #[Title('Devices')] class extends Component
             @endif
         </flux:card>
 
-        <div class="flex flex-col gap-2">
-            <flux:heading size="lg" level="2">{{ __('Paired devices') }}</flux:heading>
+        @php($groups = ['mine' => array_values(array_filter($devices, fn (array $device): bool => $this->mine($device))), 'others' => array_values(array_filter($devices, fn (array $device): bool => ! $this->mine($device)))])
+        @foreach ($groups as $group => $list)
+            @continue($group === 'others' && $list === [])
+            <div class="flex flex-col gap-2" data-test="devices-{{ $group }}">
+                <flux:heading size="lg" level="2">{{ $group === 'mine' ? ($groups['others'] === [] ? __('Paired devices') : __('Your devices')) : __('Other members\' devices') }}</flux:heading>
 
-            @forelse ($devices as $device)
-                <div class="flex items-center justify-between gap-4 rounded-lg border border-zinc-200 px-4 py-3 dark:border-zinc-700" wire:key="device-{{ $device['id'] }}">
-                    <div class="min-w-0">
-                        <div class="font-medium">{{ $device['name'] ?? $device['id'] }}</div>
-                        <div class="text-sm text-zinc-500">
-                            {{ __('Paired') }} <x-client.time :at="$device['created_at']" />
-                            @if (! empty($device['last_used_at']))
-                                · {{ __('last used') }} <x-client.time :at="$device['last_used_at']" />
-                            @endif
+                @forelse ($list as $device)
+                    <div class="flex items-center justify-between gap-4 rounded-lg border border-zinc-200 px-4 py-3 dark:border-zinc-700" wire:key="device-{{ $device['id'] }}">
+                        <div class="min-w-0">
+                            <div class="font-medium">{{ $device['name'] ?? $device['id'] }}</div>
+                            <div class="text-sm text-zinc-500">
+                                @if ($group === 'others' && ($who = $this->owner($device)) !== null)
+                                    <span data-test="device-member">{{ $who }}</span> ·
+                                @endif
+                                {{ __('Paired') }} <x-client.time :at="$device['created_at']" />
+                                @if (! empty($device['last_used_at']))
+                                    · {{ __('last used') }} <x-client.time :at="$device['last_used_at']" />
+                                @endif
+                            </div>
                         </div>
+                        @if ($device['id'] === $self)
+                            <flux:badge size="sm" data-test="this-device">{{ __('This device') }}</flux:badge>
+                        @elseif (! empty($device['revoked_at']))
+                            <flux:badge size="sm">{{ __('Revoked') }}</flux:badge>
+                        @else
+                            <flux:button size="sm" variant="danger" wire:click="revoke('{{ $device['id'] }}')"
+                                wire:confirm="{{ __('Revoke :name? It will no longer reach the Director until it is paired again.', ['name' => $device['name'] ?? $device['id']]) }}">
+                                {{ __('Revoke') }}
+                            </flux:button>
+                        @endif
                     </div>
-                    @if ($device['id'] === $self)
-                        <flux:badge size="sm" data-test="this-device">{{ __('This device') }}</flux:badge>
-                    @elseif (! empty($device['revoked_at']))
-                        <flux:badge size="sm">{{ __('Revoked') }}</flux:badge>
-                    @else
-                        <flux:button size="sm" variant="danger" wire:click="revoke('{{ $device['id'] }}')"
-                            wire:confirm="{{ __('Revoke :name? It will no longer reach the Director until it is paired again.', ['name' => $device['name'] ?? $device['id']]) }}">
-                            {{ __('Revoke') }}
-                        </flux:button>
-                    @endif
-                </div>
-            @empty
-                <flux:text>{{ __('No devices are paired yet.') }}</flux:text>
-            @endforelse
-        </div>
+                @empty
+                    <flux:text>{{ __('No devices are paired yet.') }}</flux:text>
+                @endforelse
+            </div>
+        @endforeach
     @endif
 
     @if ($problem !== '')

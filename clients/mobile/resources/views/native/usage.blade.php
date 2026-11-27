@@ -16,6 +16,7 @@
             @if ($problem !== '')
                 <native:text ref="problem" class="text-sm text-theme-destructive">{{ $problem }}</native:text>
             @endif
+            @include('native.partials.signed-out')
 
             @if ($loaded && $sources === [])
                 <native:text class="text-base text-theme-on-surface-variant">No runs in this period.</native:text>

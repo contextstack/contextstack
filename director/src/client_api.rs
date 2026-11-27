@@ -47,13 +47,18 @@ fn intent_route(
     }
 }
 
-const PREFIX: &str = "/api/v1/client/";
+pub(crate) const PREFIX: &str = "/api/v1/client/";
 
 /// Serve a non-node call.
 pub fn handle(state: &Arc<State>, call: &Call) -> Reply {
-    if call.path == "/api/v1/pair" && call.method == "POST" {
-        return pair_request(state, call);
-    }
+    let _mutation = if call.method == "GET" {
+        None
+    } else {
+        match state.store.lock_client_mutation() {
+            Ok(lock) => Some(lock),
+            Err(error) => return internal(&error),
+        }
+    };
     let client = match call.bearer().map(|t| access::client(&state.store, t)) {
         Some(Ok(Some(c))) => c,
         Some(Err(e)) => return internal(&e),
@@ -70,27 +75,57 @@ pub fn handle(state: &Arc<State>, call: &Call) -> Reply {
 }
 
 /// Dispatch for an already authenticated local UI session; never exposes a bearer to the browser.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client) -> Reply {
     let Some(rest) = call.path.strip_prefix(PREFIX) else {
         return not_found();
     };
     let parts: Vec<&str> = rest.split('/').collect();
-    if let Some(no) = crate::lead::guard(state, call, client, &parts) {
+    if let Err(no) = crate::policy::guard(state, call, client, &parts) {
         return no;
     }
-    let owner = client.is_owner();
+    let dispatch = || dispatch_as(state, call, client, &parts);
+    if call.method == "GET" {
+        dispatch()
+    } else {
+        crate::policy::dispatch_mutation(state, call, client, dispatch)
+    }
+}
+
+/// Owner-level org settings: the chief of staff, the peer message allowlist and the lead node.
+fn org_setting(state: &Arc<State>, call: &Call, client: &access::Client, parts: &[&str]) -> Reply {
+    match (call.method.as_str(), parts) {
+        ("GET", ["chief-of-staff"]) => crate::chief_of_staff::get(state),
+        ("PUT", ["chief-of-staff"]) => crate::chief_of_staff::put(state, call, client),
+        ("GET" | "PUT", ["peer-message-allowlist"]) => {
+            crate::peer_messages::settings(state, call, client)
+        }
+        ("GET" | "PUT", ["advertised-url"]) => crate::enrollment_origin::settings(state, call),
+        ("PUT", ["lead-node"]) => crate::lead_node::put(state, call),
+        _ => not_found(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn dispatch_as(state: &Arc<State>, call: &Call, client: &access::Client, parts: &[&str]) -> Reply {
+    let _visibility = crate::policy::enter_read_context(client);
     let node = call.query("node");
     let db = || state.store.db();
-    let found = match (call.method.as_str(), parts.as_slice()) {
-        (_, ["action-approvals", ..]) => {
-            return crate::action_approvals::client(state, call, client, &parts);
+    let found = match (call.method.as_str(), parts) {
+        (_, ["members" | "invites", ..]) => {
+            return crate::members::handle(state, call, client, parts);
         }
-        ("GET", ["chief-of-staff"]) => return crate::chief_of_staff::get(state),
-        ("PUT", ["chief-of-staff"]) => return crate::chief_of_staff::put(state, call, client),
+        (_, ["action-approvals" | "browser-action-screenshots", ..]) => {
+            return crate::action_approvals::client(state, call, client, parts);
+        }
+        ("POST", ["conversations", id, "land"]) => {
+            return crate::lead_land::request(state, call, client, id);
+        }
+        (_, ["chief-of-staff" | "peer-message-allowlist" | "advertised-url"])
+        | ("PUT", ["lead-node"]) => {
+            return org_setting(state, call, client, parts);
+        }
         ("GET", ["me"]) => Ok(me_answer(client)),
         ("GET", ["lead-node"]) => crate::lead_node::get_answer(&db()).map_err(|e| e.clone()),
-        ("PUT", ["lead-node"]) if owner => return crate::lead_node::put(state, call),
         ("GET", ["nodes"]) => list(state, Record::Node, None)
             .map(|n| json!({"nodes": n, "stale_after_seconds": records::stale_after()})),
         ("GET", ["nodes", name]) => one(state, Record::Node, name),
@@ -102,11 +137,15 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
         }
         ("GET", ["models"]) => return models_list(state),
         ("GET", ["repos"]) => crate::repos::list(state),
-        ("GET" | "POST", ["schedules" | "schedule-changes", ..] | ["runs", _, "events"]) => {
-            return step5(state, call, client, &parts, node);
+        ("DELETE" | "PATCH", ["schedules", _, _])
+        | ("GET" | "POST", ["schedules" | "schedule-changes", ..] | ["runs", _, "events"]) => {
+            return step5(state, call, client, parts, node);
         }
         ("GET", ["events"]) => {
             return crate::events::stream(state, client, call.query("conversation"));
+        }
+        ("GET", ["projects", id, "backlog.md"]) => {
+            return crate::backlog::markdown(state, client, id);
         }
         (_, ["projects", id, "backlog", rest @ ..]) => {
             return crate::backlog::handle(state, call, client, id, rest);
@@ -119,13 +158,13 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
         }
         (_, ["projects", ..] | ["usage" | "source-budgets"] | ["source-budgets", _])
         | ("PUT" | "DELETE", ["conversations", _, "budget"]) => {
-            return crate::spend::handle(state, call, client, &parts);
+            return crate::spend::handle(state, call, client, parts);
         }
         (
             "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
             ["conversations", ..] | ["turns" | "summaries", _],
         ) => {
-            return crate::conversations::handle(state, call, client, &parts);
+            return crate::conversations::handle(state, call, client, parts);
         }
         ("GET" | "PUT", ["intents", id, ..]) if parts.len() > 2 => {
             return intent_route(state, call, client, id, &parts[2..]).unwrap_or_else(not_found);
@@ -158,31 +197,10 @@ pub(crate) fn handle_as(state: &Arc<State>, call: &Call, client: &access::Client
         }
         ("GET", ["objects", sha]) => return object(state, sha),
         ("PUT", ["objects", sha]) => return upload(state, call, sha, client),
-        ("GET", ["credentials"]) if owner => access::credentials(&state.store),
-        ("POST", ["credentials", "lead"]) if owner => return mint_lead(state, call, client),
-        ("POST", ["pairings"]) if owner => return issue(state, call, client),
-        ("DELETE", ["credentials", id]) if owner => {
-            if client.kind == Kind::Device && client.id == *id {
-                return refusal(
-                    409,
-                    "self_revoke",
-                    "Use Forget this device to remove the credential locally.",
-                    Value::Null,
-                );
-            }
-            return match access::revoke_credential(&state.store, id, &client.id) {
-                Ok(()) => json(200, &json!({"id": id, "revoked": true})),
-                Err(e) => refusal(404, "not_found", &e, Value::Null),
-            };
-        }
-        ("PUT", ["lead-node"]) | ("GET" | "POST" | "DELETE", ["credentials" | "pairings", ..]) => {
-            return refusal(
-                403,
-                "owner_only",
-                "only an owner credential may do this",
-                Value::Null,
-            );
-        }
+        ("GET", ["credentials"]) => access::credentials_for(&state.store, Some(client)),
+        ("POST", ["credentials", "lead"]) => return mint_lead(state, call, client),
+        ("POST", ["pairings"]) => return crate::members::pairing(state, call, client),
+        ("DELETE", ["credentials", id]) => return crate::members::revoke(state, client, id),
         _ => return not_found(),
     };
     match found {
@@ -213,7 +231,7 @@ fn decision_of(state: &State, run_id: &str) -> Result<Value, String> {
         .store
         .db()
         .query_row(
-            "SELECT decision_id FROM decisions WHERE run_id = ?1",
+            "SELECT decision_id FROM decisions WHERE +org_id = :org_id AND run_id = ?1",
             params![run_id],
             |r| r.get::<_, String>(0),
         )
@@ -235,7 +253,7 @@ fn work_list(state: &State, node: Option<&str>, call: &Call, client: &access::Cl
         }
         let id: Option<String> = match db
             .query_row(
-                "SELECT record_id FROM writes WHERE key = ?1 AND record_kind = 'intent'",
+                "SELECT record_id FROM writes WHERE +org_id = :org_id AND key = ?1 AND record_kind = 'intent'",
                 params![dispatch],
                 |r| r.get(0),
             )
@@ -344,9 +362,9 @@ fn file(state: &State, of: &str, id: &str, raw_path: &str) -> Reply {
         return not_found();
     };
     let sql = if of == "jobs" {
-        "SELECT sha256 FROM job_files WHERE job_id = ?1 AND path = ?2"
+        "SELECT sha256 FROM job_files WHERE +org_id = :org_id AND job_id = ?1 AND path = ?2"
     } else {
-        "SELECT sha256 FROM run_files WHERE run_id = ?1 AND path = ?2"
+        "SELECT sha256 FROM run_files WHERE +org_id = :org_id AND run_id = ?1 AND path = ?2"
     };
     let found = state
         .store
@@ -372,7 +390,7 @@ fn object(state: &State, sha: &str) -> Reply {
         .store
         .db()
         .query_row(
-            "SELECT 1 FROM run_files WHERE sha256 = ?1 UNION ALL SELECT 1 FROM job_files WHERE sha256 = ?1 LIMIT 1",
+            "SELECT 1 FROM run_files WHERE +org_id = :org_id AND sha256 = ?1 UNION ALL SELECT 1 FROM job_files WHERE +org_id = :org_id AND sha256 = ?1 LIMIT 1",
             params![sha],
             |_| Ok(()),
         )
@@ -400,72 +418,70 @@ fn upload(state: &State, call: &Call, sha: &str, client: &access::Client) -> Rep
             Value::Null,
         );
     }
-    match state.store.put_object(&call.body) {
-        Ok(stored) => {
-            // Even an existing object proves possession when the caller supplied its bytes.
-            if client.kind == Kind::Lead
-                && let Err(e) = state.store.db().execute(
-                    "INSERT OR IGNORE INTO lead_objects (credential_id, sha256) VALUES (?1, ?2)",
-                    params![client.id, sha],
-                )
-            {
-                return internal(&e);
-            }
-            json(200, &json!({"sha256": sha, "stored": stored}))
-        }
+    let written = (|| -> Result<_, String> {
+        let mut db = state.store.db();
+        let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
+        let stored = state.store.put_object(&call.body)?;
+        // Even an existing object proves possession when the caller supplied its bytes.
+        tx.execute(
+            "INSERT OR IGNORE INTO lead_objects (org_id, credential_id, sha256) VALUES (:org_id, ?1, ?2)",
+            params![client.id, sha],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(stored)
+    })();
+    match written {
+        Ok(stored) => json(200, &json!({"sha256": sha, "stored": stored})),
         Err(e) => internal(&e),
     }
 }
 
-fn not_found() -> Reply {
+pub(crate) fn not_found() -> Reply {
     refusal(404, "not_found", "no such route or record", Value::Null)
 }
 
 fn me_answer(client: &access::Client) -> Value {
-    let mut me = json!({"credential_id": client.id, "owner": client.is_owner()});
+    use access::Role::{Admin, Member, Owner, Viewer};
+    let role = client.member.scope.role;
+    let capabilities = crate::policy::projection(client);
+    let assignable = match (client.kind == Kind::Lead, role) {
+        (false, Some(Owner)) => &[Owner, Admin, Member, Viewer][..],
+        (false, Some(Admin)) => &[Member, Viewer][..],
+        _ => &[],
+    };
+    let invitable: Vec<_> = assignable.iter().filter(|&&role| role != Owner).collect();
+    let mut me = json!({
+        "credential_id": client.id,
+        "owner": client.kind != Kind::Lead && role == Some(access::Role::Owner),
+        "member": {"id": client.member_id(), "display_name": client.member.display_name},
+        "role": role,
+        "capabilities": capabilities,
+        "assignable_roles": assignable,
+        "invitable_roles": invitable,
+    });
     if let Some(c) = &client.conversation_id {
         me["conversation_id"] = json!(c);
     }
     me
 }
 
-fn issue(state: &State, call: &Call, client: &access::Client) -> Reply {
-    let body: Value = serde_json::from_slice(&call.body).unwrap_or(Value::Null);
-    let Some(name) = body.get("name").and_then(Value::as_str) else {
-        return refusal(
-            422,
-            "invalid_request",
-            "name the device being paired",
-            Value::Null,
-        );
-    };
-    match access::issue_pairing(&state.store, name, &client.id) {
-        Ok((code, expires_at)) => json(
-            200,
-            &json!({"code": code, "name": name, "expires_at": expires_at}),
-        ),
-        Err(e) => refusal(422, "invalid_request", &e, Value::Null),
-    }
-}
-
-fn pair_request(state: &State, call: &Call) -> Reply {
+pub(crate) fn pair_request(state: &State, call: &Call, source: std::net::IpAddr) -> Reply {
     if let Some(Ok(Some(client))) = call.bearer().map(|t| access::client(&state.store, t))
         && client.kind == Kind::Lead
     {
         return crate::lead::denied();
     }
-    pair(state, call)
-}
 
-fn pair(state: &State, call: &Call) -> Reply {
     let body: Value = serde_json::from_slice(&call.body).unwrap_or(Value::Null);
     let code = body.get("code").and_then(Value::as_str).unwrap_or("");
-    match access::exchange_pairing(&state.store, code) {
-        Ok(Some((id, name, token))) => {
+    match access::exchange_device(&state.store, code, source) {
+        Ok(Some((id, name, token, member))) => {
             crate::logf!("paired device {name} as {id}");
-            json(
+            crate::members::enrollment_reply(
                 200,
-                &json!({"credential_id": id, "name": name, "token": token}),
+                &json!({"credential_id": id, "name": name, "token": token,
+                    "member":{"id":member.scope.member_id,"display_name":member.display_name},
+                    "role":member.scope.role}),
             )
         }
         Ok(None) => refusal(
@@ -487,6 +503,7 @@ fn step5(
     node: Option<&str>,
 ) -> Reply {
     let found = match (call.method.as_str(), parts) {
+        ("POST", ["schedules"]) => return crate::fleet::create_schedule(state, call, client),
         ("GET", ["schedules"]) => {
             list(state, Record::Schedule, node).map(|s| json!({"schedules": s}))
         }
@@ -494,7 +511,15 @@ fn step5(
             crate::fleet::schedule_detail(&state.store.db(), &format!("{n}/{id}"))
                 .map_err(|e| e.to_string())
         }
-        ("POST", ["schedules", n, id, "changes"]) => {
+        ("PATCH", ["schedules", n, id]) => {
+            return crate::sponsorship::reassign_schedule(
+                state,
+                call,
+                client,
+                &format!("{n}/{id}"),
+            );
+        }
+        ("POST", ["schedules", n, id, "changes"]) | ("DELETE", ["schedules", n, id]) => {
             return crate::fleet::request_change(state, call, client, n, id);
         }
         ("GET", ["schedule-changes", id]) => one(state, Record::ScheduleChange, id),

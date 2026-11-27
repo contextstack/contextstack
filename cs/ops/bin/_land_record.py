@@ -151,10 +151,6 @@ def newest_finished_job(jobs, repo, lane, before=None):
     return matched[0][2]
 
 
-def _newest(jobs, repo, lane):
-    return newest_finished_job(jobs, repo, lane)
-
-
 def backfill_idempotency_key(run_id, commit):
     digest = hashlib.sha256(("%s\0%s" % (run_id, commit)).encode()).hexdigest()
     return "land-backfill:%s" % digest
@@ -239,9 +235,16 @@ def _body(result, landed_by, landed_at, landing_branch=None):
         state, commit, reason = "refused", None, _refuse_reason(result)
     main = landing_branch if isinstance(landing_branch, str) and landing_branch else _landing_branch(
         result.get("repo"))
-    return {"state": state, "repo": str(result.get("repo") or ""), "lane": str(result.get("lane") or ""),
+    body = {"state": state, "repo": str(result.get("repo") or ""), "lane": str(result.get("lane") or ""),
             "main": main, "commit": commit if isinstance(commit, str) else None,
             "reason": reason, "landed_by": landed_by, "landed_at": landed_at}
+    gate = result.get("gate", {})
+    if gate.get("mode") == "sandbox" and "uncovered" in gate:
+        coverage = {"covered": gate["host_only_covered"], "uncovered": gate["uncovered"]}
+        if gate.get("host_probe_sandbox_sha256"):
+            coverage["sandbox_sha256"] = gate["host_probe_sandbox_sha256"]
+        body["host_probe_coverage"] = coverage
+    return body
 
 
 def _fail_reason(result):

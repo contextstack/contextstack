@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Client;
 
 use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorUnavailable;
+use App\Client\Identity;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -22,19 +23,26 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  * `?conversation=ID` relays only that conversation's events (CLIENT-API.md §8, `GET events?conversation=`).
  *
  * A refusal or an unreachable Director becomes one `event: director_error` frame, then the stream ends.
+ *
+ * Who this device is (Identity) is asked again once the stream ends, however it ends, and as soon as the Director says
+ * `authorization_changed` or `revoked`: the member's role or the credential changed (CLIENT-API.md §8). The browser
+ * reloads the page on those two, so every control is drawn again from the new capabilities.
  */
 class EventStreamController extends Controller
 {
-    public function __invoke(Request $request, DirectorClient $director): StreamedResponse
+    public function __invoke(Request $request, DirectorClient $director, Identity $identity): StreamedResponse
     {
         $seconds = self::seconds((int) config('client.stream_seconds'), (int) ini_get('max_execution_time'));
         $conversation = $request->query('conversation');
         $conversation = is_string($conversation) && preg_match('/^[A-Za-z0-9_.:-]{1,128}$/', $conversation) === 1 ? $conversation : null;
 
-        return response()->stream(function () use ($director, $seconds, $conversation): void {
+        return response()->stream(function () use ($director, $identity, $seconds, $conversation): void {
             $started = now();
             try {
-                $answer = $director->relayEvents(function (string $chunk): bool {
+                $answer = $director->relayEvents(function (string $chunk) use ($identity): bool {
+                    if (self::changesIdentity($chunk)) {
+                        $identity->forget();
+                    }
                     echo $chunk;
                     $this->flush();
 
@@ -44,6 +52,8 @@ class EventStreamController extends Controller
                 $this->emitError(0, 'director_unavailable', $unavailable->getMessage());
 
                 return;
+            } finally {
+                $identity->forget();
             }
 
             if ($answer['status'] === 200 && $started->diffInSeconds(now()) >= $seconds - 1 && connection_aborted() !== 1) {
@@ -76,6 +86,15 @@ class EventStreamController extends Controller
         }
 
         return max(1, $seconds);
+    }
+
+    /**
+     * Whether a relayed chunk ends this credential's standing: an `authorization_changed` change or `event: revoked`.
+     * A frame split across chunks is still caught when the stream then ends.
+     */
+    public static function changesIdentity(string $chunk): bool
+    {
+        return str_contains($chunk, '"authorization_changed"') || preg_match('/^event: ?revoked$/m', $chunk) === 1;
     }
 
     private function emitError(int $status, string $code, string $detail): void

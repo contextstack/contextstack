@@ -2,14 +2,14 @@
 //!
 //! - A **node** holds a node token (`csn_…`), issued once by `director-rs node register`.
 //! - The **local credential** (`csl_…`) is created when the data directory is first opened and kept in
-//!   `<data>/local-credential` (0600). Local and paired clients act for the Director owner.
-//! - A **device** (`csd_…`) pairs once: the owner issues a one-time code on a trusted machine, and the
+//!   `<data>/local-credential` (0600). It is bound to the bootstrap owner.
+//! - A **device** (`csd_…`) pairs once: a member issues a one-time code on a trusted machine, and the
 //!   device exchanges it at `POST /api/v1/pair`. Without a live code that endpoint creates nothing.
 //!
 //! Only SHA-256 hashes of tokens and codes are stored. Every credential can be revoked.
 //! The transport rules (who may connect at all) and the browser-origin rule are here too.
 
-use crate::store::{Store, write_private};
+use crate::store::{OrgScope, ScopedConnection, Store, write_private};
 use crate::util::{self, now_utc, sha256_hex};
 use rusqlite::{OptionalExtension, params};
 use std::net::IpAddr;
@@ -20,12 +20,14 @@ pub const PAIRING_TTL_SECONDS: i64 = 600;
 const PAIRING_MAX_FAILURES: i64 = 5;
 
 /// What a client credential is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     /// This machine's own credential: the owner.
     Local,
-    /// A paired device acting for the Director owner.
+    /// A paired device acting for its member.
     Device,
+    /// A loopback browser session.
+    Browser { session_id: String },
     /// A hosted lead bound to one conversation and its estate node.
     Lead,
 }
@@ -33,10 +35,11 @@ pub enum Kind {
 /// An authenticated client.
 #[derive(Debug, Clone)]
 pub struct Client {
-    /// The credential's id (`cred_…`).
+    /// The actor recorded on writes. Bootstrap browser sessions retain the legacy local actor.
     pub id: String,
-    /// Local, device or hosted lead.
+    /// The credential kind and, for browsers, the session ID.
     pub kind: Kind,
+    pub member: Member,
     /// The conversation a lead can read; absent for other credential kinds.
     pub conversation_id: Option<String>,
     /// The optional intent restricting a lead's work, plus its own submissions.
@@ -46,8 +49,87 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn is_owner(&self) -> bool {
-        matches!(self.kind, Kind::Local | Kind::Device)
+    pub fn member_id(&self) -> &str {
+        &self.member.scope.member_id
+    }
+
+    pub fn reload_member(&self, db: &ScopedConnection) -> rusqlite::Result<Option<Self>> {
+        Ok(Member::load(db, self.member_id().to_owned())?
+            .filter(Member::can_authenticate)
+            .map(|member| Self {
+                member,
+                ..self.clone()
+            }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Viewer,
+    Member,
+    Admin,
+    Owner,
+}
+
+impl Role {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "owner" => Some(Self::Owner),
+            "admin" => Some(Self::Admin),
+            "member" => Some(Self::Member),
+            "viewer" => Some(Self::Viewer),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub scope: OrgScope,
+    pub display_name: String,
+    pub active: bool,
+}
+
+impl Member {
+    pub fn load(db: &ScopedConnection, id: String) -> rusqlite::Result<Option<Self>> {
+        let row = db.query_row(
+            "SELECT display_name, role, status FROM members WHERE +org_id = :org_id AND id = ?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        ).optional()?;
+        let Some((display_name, role, status)) = row else {
+            return Ok(None);
+        };
+        let Some(role) = Role::parse(&role) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            scope: OrgScope {
+                org_id: db.scope().org_id.clone(),
+                member_id: id,
+                role: Some(role),
+            },
+            display_name,
+            active: status == "active",
+        }))
+    }
+
+    pub fn can_authenticate(&self) -> bool {
+        self.active
+    }
+
+    #[cfg(test)]
+    pub fn fixture() -> Self {
+        Self {
+            scope: OrgScope {
+                org_id: String::new(),
+                member_id: String::new(),
+                role: Some(Role::Owner),
+            },
+            display_name: "Owner".into(),
+            active: true,
+        }
     }
 }
 
@@ -64,7 +146,8 @@ pub fn ensure_local_credential(store: &Store) -> Result<(), String> {
         let live: Option<String> = store
             .db()
             .query_row(
-                "SELECT id FROM credentials WHERE token_hash = ?1 AND kind = 'local' AND revoked_at IS NULL",
+                "SELECT id FROM credentials WHERE +org_id = :org_id AND member_id = :member_id
+                 AND token_hash = ?1 AND kind = 'local' AND revoked_at IS NULL",
                 params![sha256_hex(text.trim().as_bytes())],
                 |r| r.get(0),
             )
@@ -75,27 +158,46 @@ pub fn ensure_local_credential(store: &Store) -> Result<(), String> {
         }
     }
     let token = util::secret("csl_")?;
-    let id = insert_credential(store, Kind::Local, "local", &token)?;
+    let db = store.db();
+    let id = insert_credential(&db, &db.scope().member_id, "local", "local", &token)?;
+    drop(db);
     write_private(&path, format!("{token}\n").as_bytes())?;
     crate::logf!("local credential {id} written to {} (0600)", path.display());
     Ok(())
 }
 
-fn insert_credential(store: &Store, kind: Kind, name: &str, token: &str) -> Result<String, String> {
+fn insert_credential(
+    db: &ScopedConnection,
+    member_id: &str,
+    kind: &str,
+    name: &str,
+    token: &str,
+) -> Result<String, String> {
     let id = format!("cred_{}", util::ulid()?.to_lowercase());
-    let kind = match kind {
-        Kind::Local => "local",
-        Kind::Device => "device",
-        Kind::Lead => return Err("lead credentials require a conversation binding".into()),
-    };
-    store
-        .db()
-        .execute(
-            "INSERT INTO credentials (id, kind, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, kind, name, sha256_hex(token.as_bytes()), now_utc()],
-        )
-        .map_err(|e| e.to_string())?;
+    db.execute(
+        "INSERT INTO credentials (org_id, member_id, id, kind, name, token_hash, created_at)
+                 VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            member_id,
+            id,
+            kind,
+            name,
+            sha256_hex(token.as_bytes()),
+            now_utc()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+pub fn mint_device(
+    db: &ScopedConnection,
+    member: &str,
+    name: &str,
+) -> Result<(String, String), String> {
+    let token = util::secret("csd_")?;
+    let id = insert_credential(db, member, "device", name, &token)?;
+    Ok((id, token))
 }
 
 /// The bearer token in an `Authorization` header value: 1–512 non-space characters.
@@ -107,34 +209,52 @@ pub fn bearer(header: Option<&str>) -> Option<&str> {
 
 /// The live client credential a token names, noting its use.
 pub fn client(store: &Store, token: &str) -> Result<Option<Client>, String> {
+    authenticate(store, token, true)
+}
+
+pub fn authenticate(
+    store: &Store,
+    token: &str,
+    note_usage: bool,
+) -> Result<Option<Client>, String> {
     let db = store.db();
     let found = db
         .query_row(
-            "SELECT id, kind, conversation_id, intent_id, node FROM credentials WHERE token_hash = ?1 AND revoked_at IS NULL",
+            "SELECT id, kind, conversation_id, intent_id, node, member_id FROM credentials WHERE +org_id = :org_id AND token_hash = ?1 AND revoked_at IS NULL",
             params![sha256_hex(token.as_bytes())],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?,
                      r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?,
-                     r.get::<_, Option<String>>(4)?)),
+                     r.get::<_, Option<String>>(4)?, r.get::<_, String>(5)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    let Some((id, kind, conversation_id, intent_id, node)) = found else {
+    let Some((id, kind, conversation_id, intent_id, node, member_id)) = found else {
         return Ok(None);
     };
     let kind = match kind.as_str() {
-        "local" => Kind::Local,
+        "local" if member_id == db.scope().member_id => Kind::Local,
         "device" => Kind::Device,
         "lead" if conversation_id.is_some() && node.is_some() => Kind::Lead,
         _ => return Ok(None),
     };
-    db.execute(
-        "UPDATE credentials SET last_used_at = ?1 WHERE id = ?2",
-        params![now_utc(), id],
-    )
-    .map_err(|e| e.to_string())?;
+    let Some(member) = Member::load(&db, member_id)
+        .map_err(|e| e.to_string())?
+        .filter(Member::can_authenticate)
+    else {
+        return Ok(None);
+    };
+    if note_usage {
+        db.execute(
+            "UPDATE credentials SET last_used_at = ?1 WHERE +org_id = :org_id AND id = ?2
+             AND revoked_at IS NULL",
+            params![now_utc(), id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(Some(Client {
         id,
         kind,
+        member,
         conversation_id,
         intent_id,
         node,
@@ -142,9 +262,23 @@ pub fn client(store: &Store, token: &str) -> Result<Option<Client>, String> {
 }
 
 /// Mint a hosted lead's token once, persisting only its hash and validated bindings.
-/// The caller must enforce the owner-only Client API boundary.
+/// The caller must enforce the route's sponsorship and target policy.
 pub fn mint_lead(
     store: &Store,
+    name: &str,
+    conversation_id: &str,
+    intent_id: Option<&str>,
+    actor: &str,
+) -> Result<serde_json::Value, String> {
+    let mut db = store.db();
+    let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
+    let credential = mint_lead_in(&tx, name, conversation_id, intent_id, actor)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(credential)
+}
+
+pub(crate) fn mint_lead_in(
+    tx: &ScopedConnection,
     name: &str,
     conversation_id: &str,
     intent_id: Option<&str>,
@@ -153,20 +287,23 @@ pub fn mint_lead(
     if !util::plain_name(name, 100) {
         return Err("the lead name must match [A-Za-z0-9][A-Za-z0-9._-]{0,99}".into());
     }
-    let db = store.db();
-    let node: String = db
+    let (node, member_id): (String, String) = tx
         .query_row(
-            "SELECT node FROM conversations WHERE conversation_id = ?1",
+            "SELECT node, COALESCE(sponsor_member_id, responsible_member_id, :member_id)
+             FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
             params![conversation_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?
         .ok_or("no such conversation")?;
+    if !crate::policy::eligible_sponsor(tx, &member_id).map_err(|e| e.to_string())? {
+        return Err("the conversation sponsor cannot delegate work".into());
+    }
     if let Some(intent) = intent_id {
-        let valid = db
+        let valid = tx
             .query_row(
-                "SELECT 1 FROM intents WHERE intent_id = ?1 AND node = ?2",
+                "SELECT 1 FROM intents WHERE +org_id = :org_id AND intent_id = ?1 AND node = ?2",
                 params![intent, node],
                 |_| Ok(()),
             )
@@ -179,10 +316,10 @@ pub fn mint_lead(
     }
     let token = util::secret("cslead_")?;
     let id = format!("cred_{}", util::ulid()?.to_lowercase());
-    db.execute(
-        "INSERT INTO credentials (id, kind, name, token_hash, created_at, conversation_id, intent_id, node, created_by)
-         VALUES (?1, 'lead', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, name, sha256_hex(token.as_bytes()), now_utc(), conversation_id, intent_id, node, actor],
+    tx.execute(
+        "INSERT INTO credentials (org_id, member_id, id, kind, name, token_hash, created_at, conversation_id, intent_id, node, created_by)
+         VALUES (:org_id, ?9, ?1, 'lead', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, name, sha256_hex(token.as_bytes()), now_utc(), conversation_id, intent_id, node, actor, member_id],
     ).map_err(|e| e.to_string())?;
     Ok(
         serde_json::json!({"credential_id": id, "kind": "lead", "name": name, "token": token,
@@ -190,25 +327,40 @@ pub fn mint_lead(
     )
 }
 
-/// The live node a token names (its row id and name), recording that it was heard from.
-pub fn node(store: &Store, token: &str) -> Result<Option<(i64, String)>, String> {
+/// Machine authority is independent of the member who registered the node.
+pub struct NodePrincipal {
+    pub id: i64,
+    pub name: String,
+    pub registered_by: Member,
+}
+
+/// The live node a token names, recording that it was heard from.
+pub fn node(store: &Store, token: &str) -> Result<Option<NodePrincipal>, String> {
     let db = store.db();
-    let found: Option<(i64, String)> = db
+    let found: Option<(i64, String, String)> = db
         .query_row(
-            "SELECT id, name FROM nodes WHERE token_hash = ?1 AND revoked_at IS NULL",
+            "SELECT id, name, COALESCE(registered_by, :member_id) FROM nodes WHERE +org_id = :org_id AND token_hash = ?1 AND revoked_at IS NULL",
             params![sha256_hex(token.as_bytes())],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if let Some((id, _)) = &found {
-        db.execute(
-            "UPDATE nodes SET last_seen_at = ?1 WHERE id = ?2",
-            params![now_utc(), id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(found)
+    let Some((id, name, member_id)) = found else {
+        return Ok(None);
+    };
+    let Some(registered_by) = Member::load(&db, member_id).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    db.execute(
+        "UPDATE nodes SET last_seen_at = ?1 WHERE +org_id = :org_id AND (id = ?2)",
+        params![now_utc(), id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Some(NodePrincipal {
+        id,
+        name,
+        registered_by,
+    }))
 }
 
 /// Register a node: its token, returned once, and only the hash kept.
@@ -220,7 +372,7 @@ pub fn register_node(store: &Store, name: &str) -> Result<String, String> {
     let inserted = store
         .db()
         .execute(
-            "INSERT OR IGNORE INTO nodes (name, token_hash, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO nodes (org_id, registered_by, name, token_hash, created_at) VALUES (:org_id, :member_id, ?1, ?2, ?3)",
             params![name, sha256_hex(token.as_bytes()), now_utc()],
         )
         .map_err(|e| e.to_string())?;
@@ -238,7 +390,7 @@ pub fn revoke_node(store: &Store, name: &str) -> Result<(), String> {
     let changed = store
         .db()
         .execute(
-            "UPDATE nodes SET revoked_at = ?1 WHERE name = ?2 AND revoked_at IS NULL",
+            "UPDATE nodes SET revoked_at = ?1 WHERE +org_id = :org_id AND (name = ?2 AND revoked_at IS NULL)",
             params![now_utc(), name],
         )
         .map_err(|e| e.to_string())?;
@@ -257,15 +409,18 @@ pub fn revoke_credential(store: &Store, id: &str, actor: &str) -> Result<(), Str
         let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
         let now = now_utc();
         let kind: String = tx.query_row(
-            "UPDATE credentials SET revoked_at = ?1, revoked_by = ?3 WHERE id = ?2 AND revoked_at IS NULL
-             RETURNING kind",
+            "UPDATE credentials SET revoked_at = ?1, revoked_by = ?3 WHERE +org_id = :org_id AND (id = ?2 AND revoked_at IS NULL
+             ) RETURNING kind",
             params![now, id, actor],
             |row| row.get(0),
         ).optional().map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no live credential {id}"))?;
+        if kind == "device" {
+            void_device_pairings(&tx, id, &now).map_err(|e| e.to_string())?;
+        }
         // The running Director also publishes changes written by the host CLI.
         tx.execute(
-            "INSERT INTO changes (kind, record_id, at) VALUES ('credential_revoked', ?1, ?2)",
+            "INSERT INTO changes (org_id, kind, record_id, at) VALUES (:org_id, 'credential_revoked', ?1, ?2)",
             params![id, now],
         )
         .map_err(|e| e.to_string())?;
@@ -278,128 +433,247 @@ pub fn revoke_credential(store: &Store, id: &str, actor: &str) -> Result<(), Str
     Ok(())
 }
 
+/// The pairing row records the issuing credential. `pairing_issuers` records its member.
+pub fn void_device_pairings(db: &ScopedConnection, id: &str, now: &str) -> rusqlite::Result<()> {
+    db.execute(
+        "UPDATE pairings SET expires_at=?2 WHERE +org_id=:org_id AND used_at IS NULL
+         AND issued_by=?1 AND expires_at>?2",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
 /// Every client credential, for the owner: no hashes.
 pub fn credentials(store: &Store) -> Result<serde_json::Value, String> {
+    credentials_for(store, None)
+}
+
+pub fn credentials_for(
+    store: &Store,
+    client: Option<&Client>,
+) -> Result<serde_json::Value, String> {
+    let member = client.map(Client::member_id);
+    let actor = client.map(|c| c.id.as_str());
+    let role = client
+        .and_then(|c| c.member.scope.role)
+        .unwrap_or(Role::Owner);
     let db = store.db();
     let mut stmt = db
-        .prepare("SELECT id, kind, name, created_at, last_used_at, revoked_at, conversation_id, intent_id, node, created_by, revoked_by FROM credentials ORDER BY rowid")
+        .prepare("SELECT c.id, kind, name, created_at, last_used_at, revoked_at, conversation_id, intent_id, node, created_by, revoked_by,c.member_id
+          FROM (SELECT rowid, * FROM credentials WHERE +org_id = :org_id) c
+          JOIN (SELECT id, role FROM members WHERE +org_id = :org_id) m ON m.id=c.member_id
+          WHERE (?1 OR
+           (c.kind='device' AND c.member_id=?3) OR
+           (?2 AND m.role IN ('member','viewer') AND c.kind IN ('device','lead')) OR
+           (c.kind='lead' AND (c.created_by=?4 OR EXISTS (
+             SELECT 1 FROM credentials a WHERE +org_id = :org_id AND a.id=c.created_by AND a.member_id=?3))))
+          ORDER BY c.rowid")
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(serde_json::json!({
-                "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?,
-                "name": r.get::<_, String>(2)?, "created_at": r.get::<_, String>(3)?,
-                "last_used_at": r.get::<_, Option<String>>(4)?,
-                "revoked_at": r.get::<_, Option<String>>(5)?,
-                "conversation_id": r.get::<_, Option<String>>(6)?,
-                "intent_id": r.get::<_, Option<String>>(7)?,
-                "node": r.get::<_, Option<String>>(8)?,
-                "created_by": r.get::<_, Option<String>>(9)?,
-                "revoked_by": r.get::<_, Option<String>>(10)?,
-            }))
-        })
+        .query_map(
+            params![role == Role::Owner, role == Role::Admin, member, actor],
+            |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?,
+                    "name": r.get::<_, String>(2)?, "created_at": r.get::<_, String>(3)?,
+                    "last_used_at": r.get::<_, Option<String>>(4)?,
+                    "revoked_at": r.get::<_, Option<String>>(5)?,
+                    "conversation_id": r.get::<_, Option<String>>(6)?,
+                    "intent_id": r.get::<_, Option<String>>(7)?,
+                    "node": r.get::<_, Option<String>>(8)?,
+                    "created_by": r.get::<_, Option<String>>(9)?,
+                    "revoked_by": r.get::<_, Option<String>>(10)?,
+                    "member_id": r.get::<_, String>(11)?,
+                }))
+            },
+        )
         .map_err(|e| e.to_string())?;
     let credentials = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
     let mut stmt = db
-        .prepare("SELECT name, issued_by, created_at, expires_at, used_at, credential_id FROM pairings ORDER BY rowid")
+        .prepare(
+            "SELECT name, issued_by, created_at, expires_at, used_at, credential_id,p.member_id
+          FROM (SELECT rowid, * FROM pairings WHERE +org_id = :org_id) p
+          JOIN (SELECT id, role FROM members WHERE +org_id = :org_id) m ON m.id=p.member_id
+          WHERE (?1 OR p.member_id=?3 OR (?2 AND m.role IN ('member','viewer')))
+          ORDER BY p.rowid",
+        )
         .map_err(|e| e.to_string())?;
     let pairings = stmt
-        .query_map([], |r| {
-            Ok(serde_json::json!({
-                "name": r.get::<_, String>(0)?,
-                "issued_by": r.get::<_, Option<String>>(1)?,
-                "issued_at": r.get::<_, String>(2)?,
-                "expires_at": r.get::<_, String>(3)?,
-                "used_at": r.get::<_, Option<String>>(4)?,
-                "credential_id": r.get::<_, Option<String>>(5)?,
-            }))
-        })
+        .query_map(
+            params![role == Role::Owner, role == Role::Admin, member],
+            |r| {
+                Ok(serde_json::json!({
+                    "name": r.get::<_, String>(0)?,
+                    "issued_by": r.get::<_, Option<String>>(1)?,
+                    "issued_at": r.get::<_, String>(2)?,
+                    "expires_at": r.get::<_, String>(3)?,
+                    "used_at": r.get::<_, Option<String>>(4)?,
+                    "credential_id": r.get::<_, Option<String>>(5)?,
+                    "member_id": r.get::<_, String>(6)?,
+                }))
+            },
+        )
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({"credentials": credentials, "pairings": pairings}))
 }
 
-/// Issue a one-time pairing code for a device the owner names. Returns `(code, expires_at)`.
-pub fn issue_pairing(store: &Store, name: &str, actor: &str) -> Result<(String, String), String> {
+/// Issue a self-pairing from the host or from an already resolved member.
+pub fn issue_pairing(
+    store: &Store,
+    name: &str,
+    actor: &str,
+    member: Option<&Member>,
+) -> Result<(String, String), String> {
+    let mut db = store.db();
+    let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
+    let issuer = member.map_or(tx.scope().member_id.as_str(), |m| {
+        m.scope.member_id.as_str()
+    });
+    let result = insert_pairing(
+        &tx,
+        name,
+        actor,
+        issuer,
+        issuer,
+        member.is_none_or(|m| m.scope.role == Some(Role::Owner)),
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+pub fn insert_pairing(
+    db: &ScopedConnection,
+    name: &str,
+    actor: &str,
+    issuer: &str,
+    target: &str,
+    reset: bool,
+) -> Result<(String, String), String> {
     if !util::plain_name(name, 100) {
         return Err("the device name must match [A-Za-z0-9][A-Za-z0-9._-]{0,99}".into());
     }
     let code = util::pairing_code()?;
+    let hash = sha256_hex(util::canonical_code(&code).as_bytes());
     let expires = util::utc_in(PAIRING_TTL_SECONDS);
-    let db = store.db();
     db.execute(
-        "INSERT INTO pairings (code_hash, name, created_at, expires_at, issued_by) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            sha256_hex(util::canonical_code(&code).as_bytes()),
-            name,
-            now_utc(),
-            expires,
-            actor,
-        ],
+        "INSERT INTO pairings (org_id,member_id,code_hash,name,created_at,expires_at,issued_by)
+         VALUES (:org_id,?1,?2,?3,?4,?5,?6)",
+        params![target, hash, name, now_utc(), expires, actor],
     )
-    .and_then(|_| db.execute("DELETE FROM meta WHERE key = 'pairing_failures'", []))
     .map_err(|e| e.to_string())?;
+    db.execute(
+        "INSERT INTO pairing_issuers (org_id,code_hash,issuer_member_id) VALUES (:org_id,?1,?2)",
+        params![hash, issuer],
+    )
+    .map_err(|e| e.to_string())?;
+    if reset {
+        db.execute(
+            "DELETE FROM org_settings WHERE +org_id = :org_id AND (key = 'pairing_failures' OR key GLOB 'pairing_failures:*')",
+            params![],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok((code, expires))
 }
 
 /// Exchange a pairing code for a device token: `Ok(Some((credential_id, name, token)))`, or `Ok(None)`
 /// when the code is unknown, used or expired. Too many failures void every outstanding code.
+#[cfg(test)]
 pub fn exchange_pairing(
     store: &Store,
     code: &str,
 ) -> Result<Option<(String, String, String)>, String> {
+    Ok(
+        exchange_device(store, code, std::net::Ipv4Addr::LOCALHOST.into())?
+            .map(|(id, name, token, _)| (id, name, token)),
+    )
+}
+
+pub fn exchange_device(
+    store: &Store,
+    code: &str,
+    source: std::net::IpAddr,
+) -> Result<Option<(String, String, String, Member)>, String> {
+    let bucket = format!("pairing_failures:{}", source.to_canonical());
     let hash = sha256_hex(util::canonical_code(code).as_bytes());
     let now = now_utc();
-    let name: Option<String> = {
-        let db = store.db();
-        let claimed = db
-            .execute(
-                "UPDATE pairings SET used_at = ?1 WHERE code_hash = ?2 AND used_at IS NULL AND expires_at > ?1",
+    let mut db = store.db();
+    let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
+    let claimed: Option<(String, String)> = tx
+            .query_row(
+                "UPDATE pairings SET used_at = ?1 WHERE +org_id = :org_id AND (code_hash = ?2 AND used_at IS NULL AND expires_at > ?1)
+                 RETURNING name, member_id",
                 params![now, hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
+            .optional()
             .map_err(|e| e.to_string())?;
-        if claimed == 0 {
-            let failures: i64 = db
-                .query_row(
-                    "INSERT INTO meta (key, value) VALUES ('pairing_failures', '1')
-                     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1 RETURNING value",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .map_err(|e| e.to_string())?
-                .parse()
-                .unwrap_or(PAIRING_MAX_FAILURES);
-            if failures >= PAIRING_MAX_FAILURES {
-                db.execute(
-                    "UPDATE pairings SET expires_at = ?1 WHERE used_at IS NULL AND expires_at > ?1",
+    let Some((name, member_id)) = claimed else {
+        tx.execute(
+            "DELETE FROM org_settings WHERE +org_id=:org_id AND key GLOB 'pairing_failures:*'
+             AND json_extract(value,'$.expires')<=?1",
+            [&now],
+        )
+        .map_err(|e| e.to_string())?;
+        let failures: i64 = tx.query_row(
+            "INSERT INTO org_settings (org_id,key,value) VALUES (:org_id,?1,json_object('expires',?2,'count',1))
+             ON CONFLICT(org_id,key) DO UPDATE SET value=json_set(value,'$.count',json_extract(value,'$.count')+1)
+             WHERE +org_settings.org_id=:org_id RETURNING json_extract(value,'$.count')",
+            params![bucket, util::utc_in(PAIRING_TTL_SECONDS)], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if failures >= PAIRING_MAX_FAILURES {
+            tx.execute(
+                    "UPDATE pairings SET expires_at = ?1 WHERE +org_id = :org_id AND (used_at IS NULL AND expires_at > ?1)",
                     params![now],
                 )
                 .map_err(|e| e.to_string())?;
-                crate::logf!("pairing: {failures} failed codes; every outstanding code voided");
-            }
-            return Ok(None);
+            crate::logf!("pairing: {failures} failed codes; every outstanding code voided");
         }
-        db.query_row(
-            "SELECT name FROM pairings WHERE code_hash = ?1",
-            params![hash],
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(None);
+    };
+    let Some(member) = Member::load(&tx, member_id.clone())
+        .map_err(|e| e.to_string())?
+        .filter(Member::can_authenticate)
+    else {
+        return Ok(None);
+    };
+    let issuer: Option<String> = tx
+        .query_row(
+            "SELECT issuer_member_id FROM pairing_issuers WHERE +org_id=:org_id AND code_hash=?1",
+            [&hash],
             |r| r.get(0),
         )
         .optional()
-        .map_err(|e| e.to_string())?
-    };
-    let Some(name) = name else { return Ok(None) };
-    let token = util::secret("csd_")?;
-    let id = insert_credential(store, Kind::Device, &name, &token)?;
-    store
-        .db()
-        .execute(
-            "UPDATE pairings SET credential_id = ?1 WHERE code_hash = ?2",
-            params![id, hash],
-        )
         .map_err(|e| e.to_string())?;
-    Ok(Some((id, name, token)))
+    // Existing codes predate issuer bindings and were issued as self-pairings.
+    let issuer = issuer.as_deref().unwrap_or(&member_id);
+    let authority = crate::members::active_role(&tx, issuer).map_err(|e| e.to_string())?;
+    if !authority.is_some_and(|role| {
+        issuer == member_id
+            || member
+                .scope
+                .role
+                .is_some_and(|target| crate::members::manages(role, target))
+    }) {
+        return Ok(None);
+    }
+    let (id, token) = mint_device(&tx, &member_id, &name)?;
+    tx.execute(
+        "UPDATE pairings SET credential_id = ?1 WHERE +org_id = :org_id AND (code_hash = ?2)",
+        params![id, hash],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM org_settings WHERE +org_id=:org_id AND key=?1",
+        [bucket],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(Some((id, name, token, member)))
 }
 
 /// Whether a connection from `ip` may be served at all. Loopback always; another machine only over
@@ -443,15 +717,15 @@ mod tests {
         let dir = tmp.path().join("data");
         let store = Store::open(&dir)?;
         store.db().execute(
-            "INSERT INTO conversations (conversation_id, node, spec, spec_version, model,
+            "INSERT INTO conversations (org_id, conversation_id, node, spec, spec_version, model,
              instructions_tokens, tools, created_by, created_at)
-             VALUES ('conv_test', 'estate', 'lead', '1', 'test', 10, 1, 'owner', 'now')",
-            [],
+             VALUES (:org_id, 'conv_test', 'estate', 'lead', '1', 'test', 10, 1, 'owner', 'now')",
+            params![],
         )?;
         for (id, node) in [("intent_here", "estate"), ("intent_other", "other")] {
             store.db().execute(
-                "INSERT INTO intents (intent_id, node, spec, task, trials, meta, bundle_sha256,
-                 created_by, created_at) VALUES (?1, ?2, 's', 't', 1, '{}', 'sha', 'owner', 'now')",
+                "INSERT INTO intents (org_id, intent_id, node, spec, task, trials, meta, bundle_sha256,
+                 created_by, created_at) VALUES (:org_id, ?1, ?2, 's', 't', 1, '{}', 'sha', 'owner', 'now')",
                 params![id, node],
             )?;
         }
@@ -505,8 +779,8 @@ mod tests {
         let store = Store::open(&tmp.path().join("data"))?;
         for kind in ["future", "lead"] {
             store.db().execute(
-                "INSERT INTO credentials (id, kind, name, token_hash, created_at)
-                 VALUES (?1, ?1, 'test', ?2, 'now')",
+                "INSERT INTO credentials (org_id, member_id, id, kind, name, token_hash, created_at)
+                 VALUES (:org_id, :member_id, ?1, ?1, 'test', ?2, 'now')",
                 params![kind, sha256_hex(kind.as_bytes())],
             )?;
             assert!(client(&store, kind)?.is_none());
@@ -580,7 +854,7 @@ mod tests {
             exchange_pairing(&store, "AAAAA-AAAAA")?.is_none(),
             "no code, nothing"
         );
-        let (code, _) = issue_pairing(&store, "phone", "cred_test")?;
+        let (code, _) = issue_pairing(&store, "phone", "cred_test", None)?;
         let (id, name, token) = exchange_pairing(&store, &code.to_lowercase())?.ok_or("paired")?;
         assert_eq!(name, "phone");
         assert!(token.starts_with("csd_"));
@@ -589,7 +863,7 @@ mod tests {
         revoke_credential(&store, &id, "cred_test")?;
         assert!(client(&store, &token)?.is_none(), "revoked");
 
-        let (code, _) = issue_pairing(&store, "laptop", "cred_test")?;
+        let (code, _) = issue_pairing(&store, "laptop", "cred_test", None)?;
         for _ in 0..PAIRING_MAX_FAILURES {
             assert!(exchange_pairing(&store, "ZZZZZ-ZZZZZ")?.is_none());
         }
@@ -597,6 +871,33 @@ mod tests {
             exchange_pairing(&store, &code)?.is_none(),
             "voided by guessing"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pairing_failures_expire_and_success_resets_the_source() -> Res {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open(&tmp.path().join("data"))?;
+        let member = store.db().scope().member_id.clone();
+        let other: std::net::IpAddr = "192.0.2.2".parse()?;
+        let code = |name| insert_pairing(&store.db(), name, "owner", &member, &member, false);
+        for _ in 1..PAIRING_MAX_FAILURES {
+            assert!(exchange_device(&store, "wrong", other)?.is_none());
+        }
+        store.db().execute(
+            "UPDATE org_settings SET value=json_set(value,'$.expires','2000-01-01')
+             WHERE +org_id=:org_id AND key='pairing_failures:192.0.2.2'",
+            rusqlite::params![],
+        )?;
+        let (first, _) = code("first")?;
+        assert!(exchange_device(&store, "wrong", other)?.is_none());
+        assert!(exchange_device(&store, &first, other)?.is_some());
+        for _ in 1..PAIRING_MAX_FAILURES {
+            assert!(exchange_device(&store, "wrong", other)?.is_none());
+        }
+        let (second, _) = code("second")?;
+        assert!(exchange_pairing(&store, "wrong")?.is_none());
+        assert!(exchange_device(&store, &second, other)?.is_some());
         Ok(())
     }
 

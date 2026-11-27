@@ -2,15 +2,18 @@
 
 use App\Http\Middleware\RequireDirectorConnection;
 use App\Http\Middleware\RequireUnlock;
+use App\NativeComponents\BrowserScreenshot;
 use App\NativeComponents\Budgets;
 use App\NativeComponents\Connect;
 use App\NativeComponents\Conversation;
 use App\NativeComponents\Conversations;
 use App\NativeComponents\Devices;
+use App\NativeComponents\Invite;
 use App\NativeComponents\Lane;
 use App\NativeComponents\Lanes;
 use App\NativeComponents\Locked;
 use App\NativeComponents\Machines;
+use App\NativeComponents\Members;
 use App\NativeComponents\NewConversation;
 use App\NativeComponents\NewLane;
 use App\NativeComponents\ProjectBacklog;
@@ -24,6 +27,7 @@ use Illuminate\Support\Facades\Route;
 Route::middleware(RequireUnlock::class)->group(function (): void {
     Route::native('/connect', Connect::class);
     Route::native('/pair', Connect::class);
+    Route::native('/invite', Invite::class);
 });
 
 Route::middleware(RequireDirectorConnection::class)->group(function (): void {
@@ -42,7 +46,9 @@ Route::middleware([RequireDirectorConnection::class, RequireUnlock::class])->gro
     Route::native('/conversations/{id}', Conversation::class);
     Route::native('/settings', Settings::class);
     Route::native('/devices', Devices::class);
+    Route::native('/members', Members::class);
     Route::native('/machines', Machines::class);
     Route::native('/usage', Usage::class);
     Route::native('/budgets', Budgets::class);
+    Route::native('/browser-screenshots/{id}', BrowserScreenshot::class);
 });

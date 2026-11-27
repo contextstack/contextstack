@@ -1,4 +1,4 @@
-//! Project and conversation budgets applied to jobs (the rule is in `budget.rs`).
+//! Project, conversation and schedule budgets applied to jobs (the rule is in `budget.rs`).
 //!
 //! Every job made since step 7 has a row in `job_budgets`, created in the transaction that creates the job:
 //!
@@ -19,19 +19,23 @@
 use crate::budget::{self, Micros, Place, Room, Scope};
 use crate::jobs::{BundleFile, bundle_sha};
 use crate::scopes::room;
+use crate::store::ScopedConnection;
 use crate::store::{Record, Store, touch};
 use crate::turns::{Res, db_err};
 use crate::util::now_utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-/// The budgets a job falls under: its project's and its conversation's.
+/// The budgets a job falls under: its project's, its conversation's and its schedule's.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct JobScope {
     /// The project of its intent or conversation.
     pub project: Option<String>,
     /// The conversation whose turn or summary it carries.
     pub conversation: Option<String>,
+    /// The node and schedule ID of a scheduled firing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
 }
 
 impl JobScope {
@@ -44,11 +48,15 @@ impl JobScope {
             kind: "conversation",
             id: id.clone(),
         });
-        project.chain(conversation).collect()
+        let schedule = self.schedule.iter().map(|id| Scope {
+            kind: "schedule",
+            id: id.clone(),
+        });
+        project.chain(conversation).chain(schedule).collect()
     }
 }
 
-fn rooms(db: &Connection, js: &JobScope) -> Res<Vec<Room>> {
+fn rooms(db: &ScopedConnection, js: &JobScope) -> Res<Vec<Room>> {
     let mut out = Vec::new();
     for scope in js.scopes() {
         if let Some(r) = room(db, &scope).map_err(db_err)? {
@@ -85,7 +93,7 @@ impl Placed {
 /// a spec that is a YAML mapping.
 pub fn place_new(
     store: &Store,
-    db: &Connection,
+    db: &ScopedConnection,
     scope: &JobScope,
     spec: &str,
     trials: u32,
@@ -115,7 +123,7 @@ pub fn place_new(
 }
 
 /// Record a new job's place, in the transaction that recorded the job.
-pub fn record(db: &Connection, job_id: &str, p: &Placed) -> Res<()> {
+pub fn record(db: &ScopedConnection, job_id: &str, p: &Placed) -> Res<()> {
     let now = now_utc();
     let (state, reserved, reason, detail) = match &p.place {
         Place::Free => ("free", 0, None, None),
@@ -123,9 +131,9 @@ pub fn record(db: &Connection, job_id: &str, p: &Placed) -> Res<()> {
         Place::Wait(w) => ("waiting", 0, Some(w.reason), Some(w.detail.clone())),
     };
     db.execute(
-        "INSERT INTO job_budgets (job_id, project_id, conversation_id, state, ceiling_micros, trials, reserved_micros,
+        "INSERT INTO job_budgets (org_id, job_id, project_id, conversation_id, state, ceiling_micros, trials, reserved_micros,
                                   reason, detail, created_at, reserved_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![job_id, p.scope.project, p.scope.conversation, state, p.ceiling, p.trials, reserved, reason,
                 detail, now, (state == "held").then_some(&now)],
     )
@@ -133,24 +141,36 @@ pub fn record(db: &Connection, job_id: &str, p: &Placed) -> Res<()> {
     touch_scopes(db, &p.scope)
 }
 
-fn touch_scopes(db: &Connection, scope: &JobScope) -> Res<()> {
+fn touch_scopes(db: &ScopedConnection, scope: &JobScope) -> Res<()> {
     if let Some(p) = &scope.project {
         touch(db, Record::Project, p).map_err(db_err)?;
     }
     if let Some(c) = &scope.conversation {
         touch(db, Record::Conversation, c).map_err(db_err)?;
     }
+    if let Some(s) = &scope.schedule
+        && crate::scopes::budget_of(db, "schedule", s)
+            .map_err(db_err)?
+            .is_some()
+    {
+        touch(db, Record::Schedule, s).map_err(db_err)?;
+    }
     Ok(())
 }
 
-fn scope_of(db: &Connection, job_id: &str) -> Res<JobScope> {
+fn scope_of(db: &ScopedConnection, job_id: &str) -> Res<JobScope> {
     db.query_row(
-        "SELECT project_id, conversation_id FROM job_budgets WHERE job_id = ?1",
+        "SELECT b.project_id, b.conversation_id, n.name || '/' || json_extract(j.meta, '$.schedule_id')
+         FROM (SELECT * FROM job_budgets WHERE +org_id = :org_id) b
+         JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = b.job_id
+         JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id
+         WHERE b.job_id = ?1",
         params![job_id],
         |r| {
             Ok(JobScope {
                 project: r.get(0)?,
                 conversation: r.get(1)?,
+                schedule: r.get(2)?,
             })
         },
     )
@@ -159,9 +179,10 @@ fn scope_of(db: &Connection, job_id: &str) -> Res<JobScope> {
 
 /// The runs linked to a job: the run its end names, runs that sent live events for it, and runs whose report
 /// names it (`run_finalized` with `job_id`, one per trial).
-const LINKED: &str = "SELECT run_id FROM jobs WHERE job_id = ?1 AND run_id IS NOT NULL
-                      UNION SELECT run_id FROM live_runs WHERE job_id = ?1
-                      UNION SELECT run_id FROM runs WHERE job_id = ?1";
+const LINKED: &str =
+    "SELECT run_id FROM jobs WHERE +org_id = :org_id AND job_id = ?1 AND run_id IS NOT NULL
+                      UNION SELECT run_id FROM live_runs WHERE +org_id = :org_id AND job_id = ?1
+                      UNION SELECT run_id FROM runs WHERE +org_id = :org_id AND job_id = ?1";
 
 /// What is known of a job's spending.
 #[derive(Debug)]
@@ -178,17 +199,17 @@ struct Known {
     unknown: bool,
 }
 
-fn known(db: &Connection, job_id: &str) -> Res<Known> {
+fn known(db: &ScopedConnection, job_id: &str) -> Res<Known> {
     let (state, named): (String, Option<String>) = db
         .query_row(
-            "SELECT state, run_id FROM jobs WHERE job_id = ?1",
+            "SELECT state, run_id FROM jobs WHERE +org_id = :org_id AND job_id = ?1",
             params![job_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(db_err)?;
     let mut stmt = db
         .prepare_cached(&format!(
-            "SELECT usage FROM runs WHERE run_id IN ({LINKED})"
+            "SELECT usage FROM runs WHERE +org_id = :org_id AND run_id IN ({LINKED})"
         ))
         .map_err(db_err)?;
     let usages: Vec<String> = stmt
@@ -198,9 +219,11 @@ fn known(db: &Connection, job_id: &str) -> Res<Known> {
         .map_err(db_err)?;
     let pending = match named {
         Some(run) => db
-            .query_row("SELECT 1 FROM runs WHERE run_id = ?1", params![run], |_| {
-                Ok(())
-            })
+            .query_row(
+                "SELECT 1 FROM runs WHERE +org_id = :org_id AND run_id = ?1",
+                params![run],
+                |_| Ok(()),
+            )
             .optional()
             .map_err(db_err)?
             .is_none(),
@@ -247,10 +270,10 @@ fn charge(k: &Known, reserved: Micros, closing: bool) -> Option<(Micros, &'stati
 /// named run has reported. A settled job is corrected whenever more becomes known (a late or another trial's
 /// report): its charge is recomputed whole, never added to, so nothing is released twice. `Ok(true)` when the row
 /// changed.
-pub fn settle(db: &Connection, job_id: &str, by: Option<&str>) -> Res<bool> {
+pub fn settle(db: &ScopedConnection, job_id: &str, by: Option<&str>) -> Res<bool> {
     let found: Option<(String, Micros, Option<Micros>, Option<String>)> = db
         .query_row(
-            "SELECT state, reserved_micros, charged_micros, charge_basis FROM job_budgets WHERE job_id = ?1",
+            "SELECT state, reserved_micros, charged_micros, charge_basis FROM job_budgets WHERE +org_id = :org_id AND job_id = ?1",
             params![job_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
@@ -271,7 +294,7 @@ pub fn settle(db: &Connection, job_id: &str, by: Option<&str>) -> Res<bool> {
             db.execute(
                 "UPDATE job_budgets SET state = 'settled', charged_micros = ?1, charge_basis = ?2, settled_at = ?3,
                                         settled_by = ?4, reason = NULL, detail = NULL
-                 WHERE job_id = ?5",
+                 WHERE +org_id = :org_id AND (job_id = ?5)",
                 params![c, b, now, by, job_id],
             )
             .map_err(db_err)?
@@ -286,7 +309,7 @@ pub fn settle(db: &Connection, job_id: &str, by: Option<&str>) -> Res<bool> {
             }
             // The charge stays in the period it was first counted in (`settled_at`).
             db.execute(
-                "UPDATE job_budgets SET charged_micros = ?1, charge_basis = ?2, corrected_at = ?3 WHERE job_id = ?4",
+                "UPDATE job_budgets SET charged_micros = ?1, charge_basis = ?2, corrected_at = ?3 WHERE +org_id = :org_id AND (job_id = ?4)",
                 params![c, b, now, job_id],
             )
             .map_err(db_err)?
@@ -301,11 +324,11 @@ pub fn settle(db: &Connection, job_id: &str, by: Option<&str>) -> Res<bool> {
 }
 
 /// A waiting job that is cancelled ends at once: it never reached its node and costs nothing.
-pub fn cancel_waiting(db: &Connection, job_id: &str) -> Res<bool> {
+pub fn cancel_waiting(db: &ScopedConnection, job_id: &str) -> Res<bool> {
     let waiting = db
         .execute(
             "UPDATE jobs SET state = 'error', finished_at = ?1, terminal_row = ?2, error = ?3
-             WHERE job_id = ?4 AND state = 'waiting'",
+             WHERE +org_id = :org_id AND (job_id = ?4 AND state = 'waiting')",
             params![
                 now_utc(),
                 json!({"state": "cancelled", "detail": "cancelled while it waited for budget"})
@@ -319,7 +342,7 @@ pub fn cancel_waiting(db: &Connection, job_id: &str) -> Res<bool> {
     if waiting {
         db.execute(
             "UPDATE job_budgets SET state = 'settled', charged_micros = 0, charge_basis = 'never_ran',
-                                    settled_at = ?1, reason = NULL, detail = NULL WHERE job_id = ?2",
+                                    settled_at = ?1, reason = NULL, detail = NULL WHERE +org_id = :org_id AND (job_id = ?2)",
             params![now_utc(), job_id],
         )
         .map_err(db_err)?;
@@ -338,45 +361,60 @@ type Held = (
     String,
     Option<String>,
     Option<String>,
+    Option<Micros>,
 );
 
 /// Offer waiting jobs, oldest first, while their budgets have room. Returns how many were offered.
-pub fn release(store: &Store, db: &Connection) -> Res<usize> {
+pub fn release(store: &Store, db: &ScopedConnection) -> Res<usize> {
     let mut stmt = db
         .prepare_cached(
-            "SELECT b.job_id, b.project_id, b.conversation_id, b.ceiling_micros, b.trials, j.spec, b.reason, b.detail
-             FROM job_budgets b JOIN jobs j ON j.job_id = b.job_id
-             WHERE b.state = 'waiting' AND j.state = 'waiting' ORDER BY j.rowid",
+            "SELECT b.job_id, b.project_id, b.conversation_id, b.ceiling_micros, b.trials, j.spec, b.reason, b.detail,
+                    n.name || '/' || json_extract(j.meta, '$.schedule_id'),
+                    CASE WHEN b.state IN ('held', 'free') THEN b.reserved_micros END
+             FROM (SELECT * FROM job_budgets WHERE +org_id = :org_id) b
+             JOIN (SELECT rowid AS rowid, * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = b.job_id
+             JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id
+             WHERE j.state = 'waiting'
+               AND (b.state = 'waiting' OR (b.state IN ('held', 'free') AND b.reason = 'sponsor_ineligible'))
+             ORDER BY j.rowid",
         )
         .map_err(db_err)?;
     let held: Vec<Held> = stmt
-        .query_map([], |r| {
+        .query_map(params![], |r| {
             Ok((
                 r.get(0)?,
                 JobScope {
                     project: r.get(1)?,
                     conversation: r.get(2)?,
+                    schedule: r.get(8)?,
                 },
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(9)?,
             ))
         })
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
     let mut offered = 0;
-    for (job_id, scope, ceiling, trials, spec, reason, detail) in held {
+    for (job_id, scope, ceiling, trials, spec, reason, detail, reserved) in held {
         // One row that cannot be offered (its spec cannot carry a reservation, say) is logged and left waiting;
         // it never stops the others, the sweep, a budget change or the Director starting.
         let one = || -> Res<bool> {
+            if let Some(reserved) = reserved {
+                return offer_job(store, db, &job_id, &spec, trials, reserved);
+            }
             match budget::place(ceiling, &rooms(db, &scope)?) {
                 Place::Wait(w) => {
-                    if reason.as_deref() != Some(w.reason) || detail.as_ref() != Some(&w.detail) {
+                    if !sponsorship_hold(db, &job_id, &scope)?
+                        && (reason.as_deref() != Some(w.reason)
+                            || detail.as_ref() != Some(&w.detail))
+                    {
                         db.execute(
-                            "UPDATE job_budgets SET reason = ?1, detail = ?2 WHERE job_id = ?3",
+                            "UPDATE job_budgets SET reason = ?1, detail = ?2 WHERE +org_id = :org_id AND (job_id = ?3)",
                             params![w.reason, w.detail, job_id],
                         )
                         .map_err(db_err)?;
@@ -404,8 +442,12 @@ pub fn release(store: &Store, db: &Connection) -> Res<usize> {
 }
 
 /// Run `f` under a named savepoint, rolling back only its own changes when it fails.
-pub(crate) fn savepoint<T>(db: &Connection, name: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
-    db.execute_batch(&format!("SAVEPOINT {name}"))
+pub(crate) fn savepoint<T>(
+    db: &ScopedConnection,
+    name: &str,
+    f: impl FnOnce() -> Res<T>,
+) -> Res<T> {
+    db.savepoint_sql(&format!("SAVEPOINT {name}"))
         .map_err(db_err)?;
     let done = f();
     let end = if done.is_ok() {
@@ -413,8 +455,34 @@ pub(crate) fn savepoint<T>(db: &Connection, name: &str, f: impl FnOnce() -> Res<
     } else {
         format!("ROLLBACK TO {name}; RELEASE {name}")
     };
-    db.execute_batch(&end).map_err(db_err)?;
+    db.savepoint_sql(&end).map_err(db_err)?;
     done
+}
+
+fn sponsorship_hold(db: &ScopedConnection, job_id: &str, scope: &JobScope) -> Res<bool> {
+    let conversation_blocked = match &scope.conversation {
+        Some(id) => !crate::sponsorship::can_dispatch(db, id).map_err(db_err)?,
+        None => false,
+    };
+    let schedule_blocked = match &scope.schedule {
+        Some(id) => !crate::sponsorship::schedule_can_fire(db, id).map_err(db_err)?,
+        None => false,
+    };
+    if !conversation_blocked && !schedule_blocked {
+        return Ok(false);
+    }
+    let changed = db
+        .execute(
+            "UPDATE job_budgets SET reason = 'sponsor_ineligible',
+                detail = 'sponsor ineligible, waiting for reassignment or restored eligibility'
+         WHERE +org_id = :org_id AND job_id = ?1 AND reason IS NOT 'sponsor_ineligible'",
+            [job_id],
+        )
+        .map_err(db_err)?;
+    if changed != 0 {
+        touch(db, Record::Job, job_id).map_err(db_err)?;
+    }
+    Ok(true)
 }
 
 /// A waiting job's budget allows it: its spec carries the amount reserved (none when its budget was removed
@@ -422,18 +490,33 @@ pub(crate) fn savepoint<T>(db: &Connection, name: &str, f: impl FnOnce() -> Res<
 /// still counts against its budgets, and waits for executor fit (`capabilities::offer_waiting`).
 pub fn offer_job(
     store: &Store,
-    db: &Connection,
+    db: &ScopedConnection,
     job_id: &str,
     spec: &str,
     trials: u32,
     reserved: Micros,
 ) -> Res<bool> {
+    let browser_followup = db
+        .query_row(
+            "SELECT json_extract(meta,'$.kind') IS 'browser_action' FROM jobs
+             WHERE +org_id=:org_id AND job_id=?1",
+            [job_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_err)?;
+    if browser_followup {
+        return Ok(false);
+    }
+    let scope = scope_of(db, job_id)?;
+    if sponsorship_hold(db, job_id, &scope)? {
+        return Ok(false);
+    }
     let mut files = crate::jobs::bundle_of_job(db, job_id).map_err(db_err)?;
     if reserved > 0 {
         rewrite(store, &mut files, spec, budget::per_run(reserved, trials))?;
         let file = files.iter().find(|f| f.path == spec).ok_or("no spec")?;
         db.execute(
-            "UPDATE job_files SET sha256 = ?1, bytes = ?2 WHERE job_id = ?3 AND path = ?4",
+            "UPDATE job_files SET sha256 = ?1, bytes = ?2 WHERE +org_id = :org_id AND (job_id = ?3 AND path = ?4)",
             params![
                 file.sha256,
                 i64::try_from(file.bytes).unwrap_or(i64::MAX),
@@ -445,7 +528,7 @@ pub fn offer_job(
     }
     let (node_id, node_name): (i64, String) = db
         .query_row(
-            "SELECT n.id, n.name FROM jobs j JOIN nodes n ON n.id = j.node_id WHERE j.job_id = ?1",
+            "SELECT n.id, n.name FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id WHERE j.job_id = ?1",
             params![job_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -455,19 +538,19 @@ pub fn offer_job(
     let wait = crate::capabilities::capability_wait(store, db, node_id, &files, spec, &node_name);
     db.execute(
         "UPDATE job_budgets SET state = ?1, reserved_micros = ?2, reserved_at = ?3, reason = ?4, detail = ?5
-         WHERE job_id = ?6",
+         WHERE +org_id = :org_id AND (job_id = ?6)",
         params![state, reserved, now, wait.as_ref().map(|w| w.reason), wait.as_ref().map(|w| &w.detail), job_id],
     )
     .map_err(db_err)?;
     if wait.is_none() {
         db.execute(
-            "UPDATE jobs SET state = 'offered', bundle_sha256 = ?1, offered_at = ?3 WHERE job_id = ?2 AND state = 'waiting'",
+            "UPDATE jobs SET state = 'offered', bundle_sha256 = ?1, offered_at = ?3 WHERE +org_id = :org_id AND (job_id = ?2 AND state = 'waiting')",
             params![bundle_sha(&files), job_id, now],
         )
         .map_err(db_err)?;
     } else {
         db.execute(
-            "UPDATE jobs SET bundle_sha256 = ?1 WHERE job_id = ?2",
+            "UPDATE jobs SET bundle_sha256 = ?1 WHERE +org_id = :org_id AND (job_id = ?2)",
             params![bundle_sha(&files), job_id],
         )
         .map_err(db_err)?;
@@ -484,8 +567,8 @@ pub fn offer_job(
 }
 
 /// Run `f` under a savepoint: a failure is logged and rolled back on its own, never failing the caller.
-fn guarded(db: &Connection, what: &str, f: impl FnOnce() -> Res<()>) {
-    if db.execute_batch("SAVEPOINT budgets").is_err() {
+fn guarded(db: &ScopedConnection, what: &str, f: impl FnOnce() -> Res<()>) {
+    if db.savepoint_sql("SAVEPOINT budgets").is_err() {
         return;
     }
     let done = f();
@@ -497,12 +580,12 @@ fn guarded(db: &Connection, what: &str, f: impl FnOnce() -> Res<()>) {
     } else {
         "ROLLBACK TO budgets; RELEASE budgets"
     };
-    let _ = db.execute_batch(end);
+    let _ = db.savepoint_sql(end);
 }
 
 /// After an acked envelope: the job it ends, or every job its run is linked to, settles or is corrected. A job
 /// that ended with its named run's report still on its way is closed at once (`terminal`).
-pub fn after_envelope(db: &Connection, job_terminal: bool, subject: &str) {
+pub fn after_envelope(db: &ScopedConnection, job_terminal: bool, subject: &str) {
     guarded(db, subject, || {
         if job_terminal {
             settle(db, subject, Some("terminal"))?;
@@ -510,8 +593,8 @@ pub fn after_envelope(db: &Connection, job_terminal: bool, subject: &str) {
         }
         let mut stmt = db
             .prepare_cached(
-                "SELECT job_id FROM runs WHERE run_id = ?1 AND job_id IS NOT NULL
-                 UNION SELECT job_id FROM jobs WHERE run_id = ?1 UNION SELECT job_id FROM live_runs WHERE run_id = ?1",
+                "SELECT job_id FROM runs WHERE +org_id = :org_id AND run_id = ?1 AND job_id IS NOT NULL
+                 UNION SELECT job_id FROM jobs WHERE +org_id = :org_id AND run_id = ?1 UNION SELECT job_id FROM live_runs WHERE +org_id = :org_id AND run_id = ?1",
             )
             .map_err(db_err)?;
         let jobs: Vec<String> = stmt
@@ -529,7 +612,7 @@ pub fn after_envelope(db: &Connection, job_terminal: bool, subject: &str) {
 /// A cancel of a job was applied on its node (`stopped` or `already_finished`): its reservation closes. A job with
 /// no live run that the node stops (still `offered`, or `accepted` with no run / live events / report) is over: it
 /// ends `error` with terminal `cancelled` and costs $0. An accepted job with run evidence waits for `job_terminal`.
-pub fn after_cancel(db: &Connection, job_id: &str, outcome: &str) {
+pub fn after_cancel(db: &ScopedConnection, job_id: &str, outcome: &str) {
     guarded(db, job_id, || {
         // A node that finds nothing running answers `already_finished`; with no run evidence it ends the same way.
         if outcome == "stopped" || outcome == "already_finished" {
@@ -555,23 +638,23 @@ pub fn after_cancel(db: &Connection, job_id: &str, outcome: &str) {
 
 /// The terminal path after a cancel is applied: end a no-run job when that applies, settle its reservation, offer
 /// waiting work. Shared by a newly applied control, a second `POST …/cancel`, and the startup orphan sweep.
-pub fn on_cancel_applied(store: &Store, db: &Connection, job_id: &str, outcome: &str) {
+pub fn on_cancel_applied(store: &Store, db: &ScopedConnection, job_id: &str, outcome: &str) {
     after_cancel(db, job_id, outcome);
     crate::settle::after_envelope(store, db, true, job_id);
     release_logged(store, db, job_id);
 }
 
 /// An applied cancel (`stopped`) on a still-open job with no run evidence: the outcome string, else `None`.
-fn orphan_applied_cancel_outcome(db: &Connection, job_id: &str) -> Res<Option<String>> {
+fn orphan_applied_cancel_outcome(db: &ScopedConnection, job_id: &str) -> Res<Option<String>> {
     db.query_row(
-        "SELECT k.outcome FROM jobs j
-         JOIN cancels c ON c.job_id = j.job_id
-         JOIN controls k ON k.control_id = c.control_id
+        "SELECT k.outcome FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j
+         JOIN (SELECT * FROM cancels WHERE +org_id = :org_id) c ON c.job_id = j.job_id
+         JOIN (SELECT * FROM controls WHERE +org_id = :org_id) k ON k.control_id = c.control_id
          WHERE j.job_id = ?1 AND j.state IN ('offered', 'accepted')
            AND k.state = 'applied' AND k.outcome IN ('stopped', 'already_finished')
            AND j.run_id IS NULL
-           AND NOT EXISTS (SELECT 1 FROM live_runs WHERE job_id = j.job_id)
-           AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = j.job_id)",
+           AND NOT EXISTS (SELECT 1 FROM live_runs WHERE +org_id = :org_id AND job_id = j.job_id)
+           AND NOT EXISTS (SELECT 1 FROM runs WHERE +org_id = :org_id AND job_id = j.job_id)",
         params![job_id],
         |r| r.get(0),
     )
@@ -582,14 +665,18 @@ fn orphan_applied_cancel_outcome(db: &Connection, job_id: &str) -> Res<Option<St
 /// Finish a non-terminal job whose cancel is already applied and that has no run evidence (the live gap when a
 /// cancel was applied before the Director ended such jobs). Same terminal path as a newly applied cancel.
 /// Returns whether the job was ended.
-pub fn finish_orphan_applied_cancel(store: &Store, db: &Connection, job_id: &str) -> Res<bool> {
+pub fn finish_orphan_applied_cancel(
+    store: &Store,
+    db: &ScopedConnection,
+    job_id: &str,
+) -> Res<bool> {
     let Some(outcome) = orphan_applied_cancel_outcome(db, job_id)? else {
         return Ok(false);
     };
     on_cancel_applied(store, db, job_id, &outcome);
     let ended: bool = db
         .query_row(
-            "SELECT state = 'error' FROM jobs WHERE job_id = ?1",
+            "SELECT state = 'error' FROM jobs WHERE +org_id = :org_id AND job_id = ?1",
             params![job_id],
             |r| r.get(0),
         )
@@ -602,18 +689,18 @@ pub fn sweep_orphan_applied_cancels(store: &Store) -> Res<usize> {
     let mut db = store.db();
     let mut stmt = db
         .prepare(
-            "SELECT j.job_id FROM jobs j
-             JOIN cancels c ON c.job_id = j.job_id
-             JOIN controls k ON k.control_id = c.control_id
+            "SELECT j.job_id FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j
+             JOIN (SELECT * FROM cancels WHERE +org_id = :org_id) c ON c.job_id = j.job_id
+             JOIN (SELECT * FROM controls WHERE +org_id = :org_id) k ON k.control_id = c.control_id
              WHERE j.state IN ('offered', 'accepted')
                AND k.state = 'applied' AND k.outcome IN ('stopped', 'already_finished')
                AND j.run_id IS NULL
-               AND NOT EXISTS (SELECT 1 FROM live_runs WHERE job_id = j.job_id)
-               AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = j.job_id)",
+               AND NOT EXISTS (SELECT 1 FROM live_runs WHERE +org_id = :org_id AND job_id = j.job_id)
+               AND NOT EXISTS (SELECT 1 FROM runs WHERE +org_id = :org_id AND job_id = j.job_id)",
         )
         .map_err(db_err)?;
     let jobs: Vec<String> = stmt
-        .query_map([], |r| r.get(0))
+        .query_map(params![], |r| r.get(0))
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
@@ -636,7 +723,7 @@ pub fn sweep_orphan_applied_cancels(store: &Store) -> Res<usize> {
 /// End a job that a cancel stopped before any run existed (`offered`, or `accepted` with no named run,
 /// live events, or reported run). An accepted job that already has run evidence waits for `job_terminal`.
 fn finish_cancel_without_run(
-    db: &Connection,
+    db: &ScopedConnection,
     job_id: &str,
     state: &str,
     detail: &str,
@@ -644,9 +731,9 @@ fn finish_cancel_without_run(
     Ok(db
         .execute(
             "UPDATE jobs SET state = 'error', finished_at = ?1, terminal_row = ?2, error = ?3
-             WHERE job_id = ?4 AND state = ?5 AND run_id IS NULL
-               AND NOT EXISTS (SELECT 1 FROM live_runs WHERE job_id = ?4)
-               AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = ?4)",
+             WHERE +org_id = :org_id AND (job_id = ?4 AND state = ?5 AND run_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM live_runs WHERE +org_id = :org_id AND job_id = ?4)
+               AND NOT EXISTS (SELECT 1 FROM runs WHERE +org_id = :org_id AND job_id = ?4))",
             params![
                 now_utc(),
                 json!({"state": "cancelled", "detail": detail}).to_string(),
@@ -687,7 +774,7 @@ pub fn sweep(store: &Store, bounds: Bounds) -> Res<usize> {
         .prepare_cached(
             "SELECT b.job_id, CASE WHEN COALESCE(n.last_seen_at, '') <= ?1 AND b.reserved_at <= ?1 THEN 'node_stale'
                                    ELSE 'timeout' END
-             FROM job_budgets b JOIN jobs j ON j.job_id = b.job_id JOIN nodes n ON n.id = j.node_id
+             FROM (SELECT * FROM job_budgets WHERE +org_id = :org_id) b JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = b.job_id JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id
              WHERE b.state = 'held' AND j.state <> 'waiting'
                AND ((COALESCE(n.last_seen_at, '') <= ?1 AND b.reserved_at <= ?1)
                                          OR b.reserved_at <= ?2)",
@@ -716,7 +803,7 @@ pub fn sweep(store: &Store, bounds: Bounds) -> Res<usize> {
 }
 
 /// Offer what now fits, logging rather than failing.
-pub fn release_logged(store: &Store, db: &Connection, what: &str) {
+pub fn release_logged(store: &Store, db: &ScopedConnection, what: &str) {
     guarded(db, what, || release(store, db).map(|_| ()));
 }
 
@@ -727,12 +814,12 @@ pub fn reconcile(store: &Store) -> Res<(usize, usize)> {
     let tx = crate::store::write_tx(&mut db).map_err(db_err)?;
     let mut stmt = tx
         .prepare(
-            "SELECT b.job_id FROM job_budgets b JOIN jobs j ON j.job_id = b.job_id
+            "SELECT b.job_id FROM (SELECT * FROM job_budgets WHERE +org_id = :org_id) b JOIN (SELECT * FROM jobs WHERE +org_id = :org_id) j ON j.job_id = b.job_id
              WHERE b.state IN ('free', 'held') AND j.state IN ('done', 'error')",
         )
         .map_err(db_err)?;
     let open: Vec<String> = stmt
-        .query_map([], |r| r.get(0))
+        .query_map(params![], |r| r.get(0))
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
@@ -760,7 +847,7 @@ mod tests {
         let store = Store::open(&dir.join("data"))?;
         crate::access::register_node(&store, "node-a")?;
         store.db().execute(
-            "INSERT INTO projects (project_id, name, created_by, created_at) VALUES ('p1', 'p', 'cred', ?1)",
+            "INSERT INTO projects (org_id, project_id, name, created_by, created_at) VALUES (:org_id, 'p1', 'p', 'cred', ?1)",
             params![now_utc()],
         )?;
         Ok(store)
@@ -800,6 +887,7 @@ mod tests {
         .under(JobScope {
             project: Some("p1".into()),
             conversation: None,
+            schedule: None,
         });
         Ok(plan.insert(store, &db, None)?)
     }
@@ -817,7 +905,7 @@ mod tests {
         let usage = json!({"input_tokens": 1, "output_tokens": 1, "est_usd": 9, "est_basis": "rate",
                            "charged_usd": charged, "source": {"class": "api", "model": "m"}});
         db.execute(
-            "INSERT INTO runs (run_id, node_id, usage, received_at) VALUES (?1, 1, ?2, ?3)",
+            "INSERT INTO runs (org_id, run_id, node_id, usage, received_at) VALUES (:org_id, ?1, 1, ?2, ?3)",
             params![format!("run-{job}"), usage.to_string(), now_utc()],
         )?;
         db.execute(
@@ -939,7 +1027,7 @@ mod tests {
         assert_eq!(state(&store, &a)?.1, "held", "still held after a reopen");
         let db = store.db();
         db.execute(
-            "INSERT INTO runs (run_id, node_id, usage, received_at) VALUES ('r', 1, ?1, ?2)",
+            "INSERT INTO runs (org_id, run_id, node_id, usage, received_at) VALUES (:org_id, 'r', 1, ?1, ?2)",
             params![
                 json!({"charged_usd": null, "source": {"class": "api", "model": "m"}}).to_string(),
                 now_utc()
@@ -986,7 +1074,7 @@ mod tests {
     fn run_report(store: &Store, run: &str, job: Option<&str>, charged: f64) -> R {
         let usage = json!({"charged_usd": charged, "source": {"class": "api", "model": "m"}});
         store.db().execute(
-            "INSERT INTO runs (run_id, node_id, usage, received_at, job_id) VALUES (?1, 1, ?2, ?3, ?4)",
+            "INSERT INTO runs (org_id, run_id, node_id, usage, received_at, job_id) VALUES (:org_id, ?1, 1, ?2, ?3, ?4)",
             params![run, usage.to_string(), now_utc(), job],
         )?;
         Ok(())
@@ -1196,8 +1284,8 @@ mod tests {
             params![now_utc(), c],
         )?;
         store.db().execute(
-            "INSERT INTO live_runs (run_id, node_id, job_id, confirmed, first_at, last_at)
-             VALUES ('live-run', 1, ?1, 1, ?2, ?2)",
+            "INSERT INTO live_runs (org_id, run_id, node_id, job_id, confirmed, first_at, last_at)
+             VALUES (:org_id, 'live-run', 1, ?1, 1, ?2, ?2)",
             params![c, now_utc()],
         )?;
         after_cancel(&store.db(), &c, "stopped");
@@ -1214,8 +1302,8 @@ mod tests {
     fn plant_orphan_applied_cancel(store: &Store, job_id: &str) -> R {
         let now = now_utc();
         store.db().execute(
-            "INSERT INTO controls (control_id, node_id, kind, body, state, outcome, detail, issued_at, settled_at)
-             VALUES (?1, 1, 'cancel', ?2, 'applied', 'stopped', 'stopped', ?3, ?3)",
+            "INSERT INTO controls (org_id, control_id, node_id, kind, body, state, outcome, detail, issued_at, settled_at)
+             VALUES (:org_id, ?1, 1, 'cancel', ?2, 'applied', 'stopped', 'stopped', ?3, ?3)",
             params![
                 format!("ctl-{job_id}"),
                 json!({"job_id": job_id}).to_string(),
@@ -1223,8 +1311,8 @@ mod tests {
             ],
         )?;
         store.db().execute(
-            "INSERT INTO cancels (cancel_id, job_id, state, requested_by, requested_at, control_id)
-             VALUES (?1, ?2, 'requested', 'cred', ?3, ?4)",
+            "INSERT INTO cancels (org_id, cancel_id, job_id, state, requested_by, requested_at, control_id)
+             VALUES (:org_id, ?1, ?2, 'requested', 'cred', ?3, ?4)",
             params![
                 format!("can-{job_id}"),
                 job_id,
@@ -1286,8 +1374,8 @@ mod tests {
         )?;
         plant_orphan_applied_cancel(&store, &b)?;
         store.db().execute(
-            "INSERT INTO live_runs (run_id, node_id, job_id, confirmed, first_at, last_at)
-             VALUES ('live-orphan', 1, ?1, 1, ?2, ?2)",
+            "INSERT INTO live_runs (org_id, run_id, node_id, job_id, confirmed, first_at, last_at)
+             VALUES (:org_id, 'live-orphan', 1, ?1, 1, ?2, ?2)",
             params![b, now_utc()],
         )?;
         assert_eq!(sweep_orphan_applied_cancels(&store)?, 0);
@@ -1372,7 +1460,7 @@ mod tests {
         // The sweep does not presume a charge for a job that never reached its node.
         store.db().execute(
             "UPDATE job_budgets SET reserved_at = '2000-01-01T00:00:00Z'",
-            [],
+            params![],
         )?;
         assert_eq!(sweep(&store, Bounds::default())?, 0);
         // Once the node can run it, it is offered with its reservation; the other still waits for budget.

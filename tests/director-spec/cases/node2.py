@@ -146,6 +146,7 @@ def _(ctx):
     rig = p2(ctx.rig)
     client = rig.tmp.parent / (rig.tmp.name + "-code") / "ops/bin"  # its code root lies outside the state root
     shutil.copytree(rig.client, client, ignore=shutil.ignore_patterns("__pycache__"))
+    (client.parents[1] / "scripts").symlink_to(rig.client.parents[1] / "scripts", target_is_directory=True)
     pids = rig.tmp / "tick-pids"
     (client / "tick").write_text("import os\nopen(%r, 'a').write('%%d\\n' %% os.getpid())\n" % str(pids))
     rig.listen(dispatch=True, client=client)

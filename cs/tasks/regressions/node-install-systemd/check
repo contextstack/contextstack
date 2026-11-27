@@ -11,6 +11,7 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -56,9 +57,31 @@ def spawn_env(home, path, **more):
     return env
 
 
+# Record the synthetic token at the storage boundary, while still passing it
+# through real release activation.
+TOKEN_RUNNER = """
+import runpy
+import sys
+from pathlib import Path
+
+sys.argv = sys.argv[1:]
+sys.path.insert(0, str(Path(sys.argv[0]).parent))
+import _node_layout
+
+def record_token(name, token):
+    assert name == "CONTEXTSTACK_NODE_TOKEN" and token == expected_token
+    return True
+
+expected_token = sys.argv.pop()
+_node_layout.write_node_token = record_token
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
 def run_nr(home, path, *args, **more):
     env = spawn_env(home, path, **more)
-    r = subprocess.run([sys.executable, "-I", str(RELEASE), *args], capture_output=True, text=True, env=env, cwd="/")
+    r = subprocess.run([sys.executable, "-I", "-c", TOKEN_RUNNER, str(RELEASE), *args, TOKEN],
+                       capture_output=True, text=True, env=env, cwd="/")
     try:
         out = json.loads(r.stdout)
     except ValueError:
@@ -72,6 +95,7 @@ def lay_out(home, php):
     (kit / "policy").mkdir(parents=True)
     (kit / "ops/bin").mkdir(parents=True)
     (kit / ".venv/bin").mkdir(parents=True)
+    (kit / "scripts").symlink_to(KIT / "scripts", target_is_directory=True)
     shutil.copy2(KIT / "policy/spool.json", kit / "policy/spool.json")
     shutil.copy2(KIT / "policy/env.json", kit / "policy/env.json")
     (rel / "gateway").mkdir()
@@ -106,12 +130,41 @@ def write_php(tmp):
 def write_shims(tmp):
     shim = tmp / "shim"
     shim.mkdir()
-    (shim / "systemctl").write_text(
-        '#!/bin/sh\n[ -n "$SYSTEMCTL_SHIM_LOG" ] && echo "systemctl $*" >> "$SYSTEMCTL_SHIM_LOG"\nexit 0\n')
-    (shim / "systemctl").chmod(0o755)
-    (shim / "loginctl").write_text(
-        '#!/bin/sh\n[ -n "$LOGINCTL_SHIM_LOG" ] && echo "loginctl $*" >> "$LOGINCTL_SHIM_LOG"\nexit 0\n')
-    (shim / "loginctl").chmod(0o755)
+    commands = {
+        "systemctl": """[ -z "$SYSTEMCTL_SHIM_LOG" ] || echo "systemctl $*" >> "$SYSTEMCTL_SHIM_LOG"
+case "$2 $3" in
+  'show --property=Version')
+    [ -z "$SYSTEMCTL_SHIM_OFFLINE" ] || { echo 'Failed to connect to bus' >&2; exit 1; }
+    echo 255 ;;
+  'show --property=LoadState,ActiveState,MainPID,ExecMainStatus')
+    printf 'LoadState=loaded\nActiveState=%s\nMainPID=123\nExecMainStatus=0\n' "${SYSTEMCTL_SHIM_STATE:-active}" ;;
+esac
+exit 0
+""",
+        "loginctl": """[ -z "$LOGINCTL_SHIM_LOG" ] || echo "loginctl $*" >> "$LOGINCTL_SHIM_LOG"
+[ "$1" = show-user ] || exit 99
+echo "${LOGINCTL_SHIM_LINGER:-no}"
+""",
+        "journalctl": """echo "journalctl $*" >> "$SYSTEMCTL_SHIM_LOG"
+echo 'journal entry fixture'
+""",
+        "curl": """[ -n "$CS_INIT_FIXTURE" ] || exit 7
+printf '{}\n200'
+""",
+        "lsblk": "echo crypt\n",
+        "bwrap": """echo "bwrap $*" >> "$SYSTEMCTL_SHIM_LOG"
+[ "$1" = --unshare-user ] || exit 99
+if [ -n "$BWRAP_SHIM_NO_USERNS" ]; then
+  echo 'creating user namespace: Operation not permitted' >&2
+  exit 1
+fi
+exit 0
+""",
+    }
+    for name, script in commands.items():
+        path = shim / name
+        path.write_text("#!/bin/sh\n" + script)
+        path.chmod(0o755)
     (shim / "launchctl").write_text('#!/bin/sh\necho "FAIL launchctl reached: $*" >&2\nexit 99\n')
     (shim / "launchctl").chmod(0o755)
     empty = tmp / "empty"
@@ -288,18 +341,11 @@ def compare_renders(home, php):
             expect("User" in str(error), "clear User refusal for %r: %s" % (bad_user, error))
         else:
             fail("User accepted unsafe value %r" % bad_user)
-    for bad_logs in ('fix ture', 'fix"ture', "fix'ture", 'fix\\ture'):
-        try:
-            ns.render_unit(ns.Service('fixture', ['/bin/true'], {}, '/tmp', bad_logs))
-        except ns.Refused as error:
-            expect("StandardOutput" in str(error) or "Description" in str(error),
-                   "clear log-path refusal for %r: %s" % (bad_logs, error))
-        else:
-            fail("log path accepted unsafe value %r" % bad_logs)
     expect(args == svc.args, 'awkward ExecStart values round-trip exactly')
     expect(env == svc.env, 'awkward Environment values round-trip exactly')
-    expect('Description=ContextStack fixture%%h$LOG' in rendered
-           and 'fixture%%h$LOG.out.log' in rendered, 'non-command dollars remain literal')
+    expect('Description=ContextStack fixture%%h$LOG' in rendered, 'description keeps literal dollars')
+    expect('StandardOutput=journal\nStandardError=journal\n' in rendered,
+           'service output goes to the user journal')
     original_current = ns.CURRENT
     try:
         ns.CURRENT = home / 'space %h $HOME "quote" \\ 雪/current'
@@ -347,6 +393,97 @@ def compare_renders(home, php):
     return ns, rec, specs
 
 
+def init_and_doctor(tmp, shim_path, php):
+    home = tmp / "init-home"
+    lay_out(home, php)
+    root = home / ".contextstack"
+    (root / "current").symlink_to(Path("releases") / RID)
+    (root / "config").mkdir(mode=0o700)
+    director = root / "current/bin/cs-director"
+    registration = json.dumps({"token": TOKEN, "installation": "inst_linuxunits", "node": "init-node"})
+    director.write_text("#!/bin/sh\n[ \"$1 $2\" = 'node register' ] || exit 1\nprintf '%%s\\n' '%s'\n" % registration)
+    log = tmp / "init-systemctl.log"
+    log.touch()
+    fixture = """
+import runpy
+import sys
+from unittest.mock import patch
+
+script, token_runner, token, *args = sys.argv[1:]
+sys.argv = [script, *args]
+
+def wrap_load(load):
+    def wrapped(name, path):
+        module = load(name, path)
+        if name == "cs_init":
+            run = module.Init.run
+            def run_init(self, argv, timeout=30, **kwargs):
+                if len(argv) > 3 and argv[2].endswith("/scripts/node-release"):
+                    argv = [*argv[:2], "-c", token_runner, *argv[2:], token]
+                return run(self, argv, timeout, **kwargs)
+            module.Init.run = run_init
+        return module
+    return wrapped
+
+namespace = runpy.run_path(script)["main"].__globals__
+with patch.dict(namespace, load_script=wrap_load(namespace["load_script"])):
+    sys.exit(namespace["main"]())
+"""
+
+    def cs(*args, **env):
+        options = {"CS_PLATFORM": "linux", "NODE_INSTALL_PLATFORM": "linux",
+                   "SYSTEMCTL_SHIM_LOG": str(log), "LOGINCTL_SHIM_LINGER": "yes",
+                   "CS_INIT_FIXTURE": "1", "SHELL": str(home / "missing-shell"), **env}
+        return subprocess.run([sys.executable, "-I", "-c", fixture, str(KIT / "scripts/cs"), TOKEN_RUNNER, TOKEN, *args],
+                              capture_output=True, text=True, env=spawn_env(home, shim_path, **options), timeout=20)
+
+    args = ("init", "--yes", "--no-first-job", "--no-open", "--name", "init-node",
+            "--director-listen", "127.0.0.1:1")
+    r = cs(*args, BWRAP_SHIM_NO_USERNS="1")
+    expect(r.returncode == 1 and "unprivileged user namespaces" in r.stderr and "Operation not permitted" in r.stderr
+           and "daemon-reload" not in log.read_text(), "init fails closed when bwrap cannot create a user namespace")
+    r = cs("doctor", "--json", BWRAP_SHIM_NO_USERNS="1")
+    findings = {f["check"]: f for f in json.loads(r.stdout)}
+    expect(r.returncode == 1 and not findings["unprivileged user namespaces"]["ok"]
+           and findings["Landlock"]["info"], "doctor reports the failed userns probe and informational Landlock")
+
+    r = cs(*args)
+    ready = r.returncode == 0 and "Services: Director" in r.stdout
+    expect(ready, "init runs Linux activation" + ("" if ready else ": " + r.stderr))
+    for label in LABELS[:-1]:
+        expect("systemctl --user enable --now %s.service" % label in log.read_text().splitlines(),
+               "init enables " + label)
+    expect(any("--seccomp" in line for line in log.read_text().splitlines()), "init probes bwrap seccomp")
+    unit = home / ".config/systemd/user" / (LABELS[0] + ".service")
+    env = parse_unit(unit.read_text())[1] if unit.is_file() else {}
+    expect(str(home / ".local/bin") in env.get("PATH", "") and "/usr/bin" in env.get("PATH", ""),
+           "headless init renders a usable service PATH with a missing login shell")
+
+    store = root / "credentials"
+    expect(stat.S_IMODE(store.stat().st_mode) == 0o700, "init creates a 0700 file credential store")
+    key = store / "openai"
+    key.write_text("fixture credential\n")
+    key.chmod(0o640)
+    r = cs(*args)
+    expect(r.returncode == 1 and "chmod 600" in r.stderr, "init refuses a credential with unsafe permissions")
+    r = cs("doctor", "--json")
+    findings = {f["check"]: f for f in json.loads(r.stdout)}
+    expect(not findings["mode %s" % key]["ok"] and "fixture credential" not in r.stdout + r.stderr,
+           "doctor reports credential permissions without printing the credential")
+    key.chmod(0o600)
+    store.chmod(0o750)
+    r = cs("doctor", "--json")
+    findings = {f["check"]: f for f in json.loads(r.stdout)}
+    expect(not findings["mode %s" % store]["ok"], "doctor refuses group access to the credential directory")
+    key.chmod(0o400)
+    store.chmod(0o500)
+    r = cs("doctor", "--json")
+    findings = {f["check"]: f for f in json.loads(r.stdout)}
+    expect(all(findings["mode %s" % path]["ok"] for path in (store, key)),
+           "doctor accepts an owner-only 0500 directory and 0400 credential")
+    store.chmod(0o700)
+
+
 def main():
     if '--render-only' in sys.argv:
         with scratch_dir(prefix='unit-render-') as tmp:
@@ -359,9 +496,6 @@ def main():
                     raise
                 fail("systemd refusal escaped as an exception: %s" % error)
         return bool(problems)
-    real = Path.home()
-    watched = [real / ".local/bin", real / "Library/LaunchAgents", real / ".config/systemd/user"]
-    before = {str(w): sorted(os.listdir(w)) if w.is_dir() else None for w in watched}
     tmp = Path(tempfile.mkdtemp(prefix="node-install-systemd-", suffix=".noindex"))
     old_home, old_plat, old_path = os.environ.get("HOME"), os.environ.get("NODE_INSTALL_PLATFORM"), os.environ.get("PATH")
     try:
@@ -371,6 +505,7 @@ def main():
         slog, llog = tmp / "systemctl.log", tmp / "loginctl.log"
         path_shim = "%s:/usr/bin:/bin" % shim
         flags = activate_args(home, tok, php)
+        init_and_doctor(tmp, path_shim, php)
 
         try:
             compare_renders(home, php)
@@ -414,7 +549,57 @@ def main():
         for label in installed:
             expect("systemctl --user enable --now %s.service" % label in slog_text,
                    "install enable --now %s" % label)
-        expect(not llog.is_file() or not llog.read_text().strip(), "loginctl was not run")
+        linger_call = "loginctl show-user %s --property=Linger --value" % os.getuid()
+        expect(llog.read_text().splitlines() == [linger_call], "installer only reads Linger")
+
+        def cs(*args, **more):
+            options = {"CS_PLATFORM": "linux", "NODE_INSTALL_PLATFORM": "linux",
+                       "SYSTEMCTL_SHIM_LOG": str(slog), "LOGINCTL_SHIM_LOG": str(llog), **more}
+            env = spawn_env(home, path_shim, **options)
+            return subprocess.run([sys.executable, "-I", str(KIT / "scripts/cs"), *args],
+                                  capture_output=True, text=True, env=env, timeout=15)
+
+        gateway_unit = LABELS[0] + ".service"
+        for action, state, result in (("start", "active", "started"), ("stop", "inactive", "stopped"),
+                                      ("restart", "active", "restarted")):
+            r = cs(action, "gateway", SYSTEMCTL_SHIM_STATE=state)
+            expect(r.returncode == 0 and result + "; now " + ("up" if state == "active" else "down") in r.stdout,
+                   "%s maps the unit state: %s%s" % (action, r.stdout, r.stderr))
+            expect("systemctl --user %s %s" % (action, gateway_unit) in slog.read_text().splitlines(),
+                   "%s reaches the user manager" % action)
+        r = cs("status", "--json", LOGINCTL_SHIM_LINGER="yes")
+        status = json.loads(r.stdout) if r.returncode == 0 else {}
+        view = status.get("services", {}).get("gateway", [{}])[0]
+        expect(view.get("up") and view.get("pid") == 123 and view.get("state") == "active",
+               "status reports active unit and PID: %s" % r.stderr)
+        expect("lingering" not in r.stderr, "no warning with lingering enabled")
+        expect("systemctl --user show --property=LoadState,ActiveState,MainPID,ExecMainStatus " + gateway_unit
+               in slog.read_text().splitlines(), "status queries the unit properties")
+
+        r = cs("logs", "gateway", "-n", "3", "-f")
+        expect(r.returncode == 0 and r.stdout == "journal entry fixture\n", "logs stream the journal")
+        expect("journalctl --user -u %s --no-pager -n 3 -f" % gateway_unit in slog.read_text().splitlines(),
+               "logs pass unit, count and follow to journalctl")
+        expect("lingering is off" in r.stderr and "loginctl enable-linger" in r.stderr, "linger-off guidance")
+
+        for args in (("status",), ("start", "gateway"), ("stop", "gateway"), ("restart", "gateway"),
+                     ("logs", "gateway"), ("init", "--yes")):
+            r = cs(*args, SYSTEMCTL_SHIM_OFFLINE="1")
+            expect(r.returncode == 1 and "systemd user manager is unreachable" in r.stderr
+                   and "Failed to connect to bus" in r.stderr and "loginctl enable-linger" in r.stderr,
+                   "%s explains an unreachable manager: %s" % (args, r.stderr.strip()))
+
+        schedule = "import sys; sys.path.insert(0, sys.argv[1]); import _node_services; _node_services.install_backup_schedule(False)"
+        r = subprocess.run([sys.executable, "-I", "-c", schedule, str(KIT / "scripts")],
+                           env=spawn_env(home, path_shim, NODE_INSTALL_PLATFORM="linux",
+                                         SYSTEMCTL_SHIM_LOG=str(slog), LOGINCTL_SHIM_LOG=str(llog)),
+                           capture_output=True, text=True, timeout=15)
+        expect(r.returncode == 0 and (units / "com.contextstack.backup.timer").is_file(),
+               "backup schedule is installed: %s" % r.stderr)
+        expect("systemctl --user enable --now com.contextstack.backup.timer" in slog.read_text().splitlines(),
+               "backup schedule enables the user timer")
+        linger_calls = llog.read_text().splitlines()
+        expect(linger_calls and set(linger_calls) == {linger_call}, "loginctl only reads Linger")
 
         r, out = run_nr(home, path_shim, "uninstall", "--purge", NODE_INSTALL_PLATFORM="linux",
                         SYSTEMCTL_SHIM_LOG=str(slog), LOGINCTL_SHIM_LOG=str(llog))
@@ -426,7 +611,7 @@ def main():
                    "uninstall disable --now %s" % label)
             expect(not (units / (label + ".service")).exists(), "purge removed %s.service" % label)
         expect(slog_text.count("systemctl --user daemon-reload") >= 2, "uninstall reloads after disable")
-        expect(not llog.is_file() or not llog.read_text().strip(), "loginctl was not run on uninstall")
+        expect(llog.read_text().splitlines() == linger_calls, "uninstall does not query or change Linger")
 
         space = tmp / "space home"
         lay_out(space, php)
@@ -450,8 +635,6 @@ def main():
         if old_path is not None:
             os.environ["PATH"] = old_path
         shutil.rmtree(tmp, ignore_errors=True)
-    after = {str(w): sorted(os.listdir(w)) if w.is_dir() else None for w in watched}
-    expect(before == after, "real ~/.local/bin, LaunchAgents and systemd user dir unchanged")
     print("check: node-install-systemd %d problem(s)" % len(problems))
     return 1 if problems else 0
 

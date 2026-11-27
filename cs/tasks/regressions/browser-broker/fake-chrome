@@ -36,6 +36,7 @@ if os.environ.get("FAKE_CHROME_NO_SANDBOX") and "--no-sandbox" not in sys.argv:
           file=sys.stderr, flush=True)
     sys.exit(1)
 targets, nav, buf, rid, url_of = ["INITIAL"], None, b"", 0, {}
+contexts = {}
 while True:
     chunk = os.read(3, 1 << 20)
     if not chunk:
@@ -53,7 +54,18 @@ while True:
             result = {"targetInfos": [{"targetId": t, "type": "page", "url": url_of.get(t, "about:blank")} for t in targets]}
         elif method == "Target.createTarget":
             targets.append("T%d" % len(targets))
+            if "browserContextId" in p:
+                contexts[p["browserContextId"]].append(targets[-1])
             result = {"targetId": targets[-1]}
+        elif method == "Target.createBrowserContext":
+            context = str(mid)
+            contexts[context] = []
+            result = {"browserContextId": context}
+        elif method == "Target.disposeBrowserContext":
+            for target in contexts.pop(p["browserContextId"]):
+                targets.remove(target)
+            if "POPUP" in targets:
+                targets.remove("POPUP")
         elif method == "Target.attachToTarget":
             result = {"sessionId": "S-" + p["targetId"]}
         elif method == "Target.closeTarget":
@@ -94,7 +106,11 @@ while True:
             continue
         elif method == "Runtime.evaluate":
             title, text = PAGES.get(url_of.get("page-text-" + sid[2:], ""), ("Not found", "404 page\n"))
-            result = {"result": {"type": "string", "value": json.dumps({"title": title, "text": text})}}
+            value = ([{"text": "Example", "href": "https://example.com/"}]
+                     if "querySelectorAll" in p["expression"] else {"title": title, "text": text})
+            result = {"result": {"type": "string", "value": json.dumps(value)}}
+        elif method == "Page.captureSnapshot":
+            result = {"data": "fixture mhtml archive"}
         elif method == "Browser.close":
             send({"id": mid, "result": {}})
             sys.exit(0)

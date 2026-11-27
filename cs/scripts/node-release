@@ -23,7 +23,7 @@ Run by scripts/node-install under a release's own interpreter; a person types `n
   Linux: ~/.config/systemd/user/com.contextstack.<service>.service for the same five (command, env, cwd from
                           _node_services; Restart=on-failure, WantedBy=default.target). systemctl --user daemon-reload
                           and enable --now; uninstall disable --now. Refuse if systemctl --user is unavailable.
-                          Linger is not enabled; the JSON notes loginctl enable-linger. NODE_INSTALL_PLATFORM
+                          When lingering is off, the JSON notes loginctl enable-linger. NODE_INSTALL_PLATFORM
                           overrides the host (tests). Never embed secrets in a unit or plist.
   The Laravel director's agents (--serve-director) are retired (2026-11-11): a record that still names
                           serve_director refuses every activation; uninstall still removes those plists when they are ours.
@@ -69,7 +69,8 @@ must report its supported schema. An automatic rollback restores a matching pre-
 Env NODE_INSTALL_USER_PATH replaces the login-shell PATH probe (tests).
 """
 import argparse
-from contextlib import nullcontext
+import fcntl
+from contextlib import ExitStack, contextmanager, nullcontext
 import json
 import os
 import re
@@ -88,15 +89,15 @@ from _node_layout import (  # noqa: E402
     check_config, check_director_schema, client_web_php, complete, current_id, derive_models, director_db_schema,
     director_rs_listen, director_supported_schema, director_url, install_lock,
     setup_path, remove_path, restart_window, kit, load_record, migrate_churn_dirs, ours, pick_link_dir, plan_links, private_listen,
-    DIRECTOR_DB, prune_bundles, read_node_token, restore_director_db, seed_client_web, seed_config, snapshot_director_db,
+    DIRECTOR_DB, RESTART_INTAKE_FD, active_jobs, prune_bundles, read_node_token, restore_director_db, seed_client_web, seed_config, snapshot_director_db,
     switch_current, write_atomic, write_node_token,
 )
 from _node_services import (  # noqa: E402
     ALL_LABELS, BACKUP_LABEL, CLIENT_WEB, CLIENT_WEB_ENV, CLIENT_WEB_LABEL, CLIENT_WEB_STATE, CONFIG, CREDENTIALS, CURRENT,
     DIRECTOR_RS_DATA, DIRECTOR_RS_LABEL, DIRECTOR_RS_LISTEN, GATEWAY_BIN, GATEWAY_LABEL, HOME, LARAVEL_LABELS,
-    LINGER_NOTE, LISTEN_LABEL, NODE_LABEL, ROOT, RUNNER_BIN, SYSTEM_PATH, Refused, agent_path, agent_specs, agent_suffix,
-    backup_timer, backup_timer_path, host_platform, launchctl, load_agent, need_systemctl, our_agent, plan_agents, reload_units, render_agent,
-    release_bin, unload_agent,
+    LISTEN_LABEL, NODE_LABEL, ROOT, RUNNER_BIN, SYSTEM_PATH, Refused, agent_path, agent_specs,
+    backup_timer, backup_timer_path, host_platform, load_agent, our_agent, plan_agents, reload_units, render_agent,
+    release_bin, service_backend, unload_agent,
 )
 
 # Re-exports cs and cs_init load from this module (SourceFileLoader).
@@ -112,8 +113,48 @@ def is_node():
 
 
 
+ROLLBACK_WAIT_TIMEOUT = 600
+
+
 class SmokeFailed(Refused):
+    def __init__(self, reason, report=None):
+        super().__init__(reason)
+        self.report = report
+
+
+class RollbackWaiting(Refused):
+    def __init__(self, jobs):
+        super().__init__(f"failed release is live; rollback waiting on {jobs} jobs")
+        self.jobs = jobs
+
+
+class SwitchTimedOut(Refused):
     pass
+
+
+def rollback_hold():
+    return ROOT / "state/release-rollback-pending"
+
+
+@contextmanager
+def rollback_window(load, hosted):
+    if not hosted:
+        with restart_window(load, {"force": True}):
+            yield
+        return
+    deadline = time.monotonic() + ROLLBACK_WAIT_TIMEOUT
+    with ExitStack() as stack:
+        while time.monotonic() < deadline:
+            try:
+                stack.enter_context(restart_window(load, {"no_wait": True, "bounded": True}))
+                break
+            except DrainRefused:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(2, remaining))
+        else:
+            raise RollbackWaiting(len(active_jobs()))
+        yield
 
 
 def save_record(rec):
@@ -126,7 +167,8 @@ def rollback_target(rec, current):
                  if h != current and h not in failed and complete(h)), None)
 
 
-def rollback_failed_activation(before, rid, original, trial, load, snapshot, error, *, restart_held=False):
+def rollback_failed_activation(before, rid, original, trial, load, snapshot, error, *,
+                               restart_held=False, hosted=False):
     """Restore the previous release and record a failed trial."""
     record = {"history": [], "failed_releases": [], "previous": None, **original}
     if isinstance(error, SmokeFailed):
@@ -144,7 +186,17 @@ def rollback_failed_activation(before, rid, original, trial, load, snapshot, err
     if before == rid:
         save_record(record)
         raise Refused(str(error)) from error
-    with nullcontext() if restart_held else restart_window(load, {"force": True}):
+    if hosted and isinstance(error, SmokeFailed):
+        write_atomic(rollback_hold(), (rid + "\n").encode(), 0o600)
+        save_record({**trial, "failed_releases": record["failed_releases"], "previous": before})
+    try:
+        restore_failed_trial(before, rid, trial, load, snapshot, error, restart_held, hosted, record)
+    except RollbackWaiting as waiting:
+        raise waiting from error
+
+
+def restore_failed_trial(before, rid, trial, load, snapshot, error, restart_held, hosted, record):
+    with nullcontext() if restart_held else rollback_window(load, hosted):
         director_stopped = False
         try:
             if not complete(before):
@@ -153,7 +205,7 @@ def rollback_failed_activation(before, rid, original, trial, load, snapshot, err
                 raise Refused(f"release {before} previously failed smoke")
             if current_id() != rid:
                 raise Refused("current changed since the trial started")
-            if snapshot is None:
+            if snapshot is None or (hosted and director_db_schema() == director_db_schema(snapshot)):
                 check_director_schema(before)
             else:
                 supported = director_supported_schema(before)
@@ -171,7 +223,9 @@ def rollback_failed_activation(before, rid, original, trial, load, snapshot, err
                     load_agent(DIRECTOR_RS_LABEL, agent_path(DIRECTOR_RS_LABEL), False, True)
                 save_record({**trial, **{key: record.get(key) for key in ("failed_releases", "history", "previous")}})
             raise Refused(f"{error}; automatic rollback refused: {rollback_error}; "
-                          f"current is {current_id()}") from rollback_error
+                          f"current is {current_id()}") from error
+    if hosted and isinstance(error, SmokeFailed):
+        rollback_hold().unlink(missing_ok=True)
     raise Refused("%s; old release %s is back (failed release %s retained%s)"
                   % (error, before, rid, "; director database restored" if snapshot else "")) from error
 
@@ -232,12 +286,25 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
     if not complete(rid):
         raise Refused("release %s is not installed (no %s)" % (rid, RELEASES / rid / ".complete"))
     expected_before = current_id()
+    hosted = bool(opts.get("hosted_trial")) or os.environ.get("CS_HOSTED_RELEASE") == "1"
+    if opts.get("hosted_trial"):
+        scripts = RELEASES / rid / kit(rid)
+        if not load or not opts.get("smoke") or not (scripts / "scripts/cs_smoke.py").is_file():
+            raise Refused("hosted installation requires a smoke-capable release")
+        intake = scripts / "ops/bin/_node_intake.py"
+        if not intake.is_file() or "release-rollback-pending" not in intake.read_text():
+            raise Refused("hosted installation requires a release that honors the rollback intake hold")
+    expected_schema = os.environ.get("CS_HOSTED_RELEASE_SCHEMA")
+    if expected_schema is not None and rollback_record is None:
+        if str(director_supported_schema(rid)) != expected_schema:
+            raise Refused("release Director schema differs from the approved schema")
     from _node_rename import migrate_config
     migrate_config(CONFIG)
     original = load_record() if rollback_record is None else rollback_record
     rec = {**DEFAULTS, **original}
     rec.update({k: v for k, v in opts.items() if v not in (None, [])
-                and k not in ("adopt", "director_token_from", "from_bundle", "wait", "no_wait", "force", "yes", "smoke", "retain")})
+                and k not in ("adopt", "director_token_from", "from_bundle", "wait", "no_wait", "force", "yes", "smoke",
+                              "retain", "hosted_trial")})
     if rec["gateway"] not in GATEWAY_BIN or rec["runner"] not in ("go", "rust"):
         raise Refused("unknown selection: gateway %r, runner %r" % (rec["gateway"], rec["runner"]))
     for what, bins, rust in (("runner", RUNNER_BIN, "cs-harness"), ("gateway", GATEWAY_BIN, "cs-gateway")):
@@ -252,6 +319,8 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
     rec["credentials"] = rec.get("credentials") or ("off" if node else "file")
     if rec["credentials"] not in CREDENTIALS:
         raise Refused("unknown --credentials %r" % rec["credentials"])
+    if host_platform() == "linux" and rec["credentials"] == "keychain":
+        raise Refused("--credentials keychain needs macOS; select --credentials file on Linux")
     if rec.get("serve_director"):
         raise Refused("config/install.json records serve_director (the Laravel director, retired 2026-11-11; this release "
                       "cannot serve it). Fix, then rerun: boot out and delete %s/{%s}.plist (launchctl bootout gui/%d/LABEL) "
@@ -293,8 +362,12 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
         rec["installation"] = inst or rec.get("installation")
     specs = agent_specs(rec, code, node=node, serve_rs=serve_rs, serve_cw=serve_cw)
     adopted = plan_agents([s.label for s in specs], opts.get("adopt") or [])
-    if load and host_platform() == "linux":
-        need_systemctl()
+    backend = service_backend()
+    if load:
+        backend.check()
+    deadline = os.environ.get("CS_HOSTED_RELEASE_DEADLINE") if hosted and not restart_held else None
+    if deadline is not None:
+        opts = {**opts, "bounded": True}
     activated = False
     snapshot = None
     try:
@@ -312,12 +385,25 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
                 token_changed = write_node_token(rec["token_env"], token) if token else None
                 switched = rollback_record is not None or (expected_before is not None and expected_before != rid)
                 if load and serve_rs and expected_before != rid and rollback_record is None and DIRECTOR_DB.is_file():
+                    if hosted and (CONFIG / "backup.json").is_file():
+                        backup_timeout = 300 if deadline is None else min(300, float(deadline) - time.monotonic())
+                        if backup_timeout <= 0:
+                            raise SwitchTimedOut("Release switch timed out before the off-machine backup.")
+                        try:
+                            subprocess.run([sys.executable, "-I", str(Path(_SCRIPTS) / "cs"), "backup", "run"],
+                                           check=True, capture_output=True, timeout=backup_timeout)
+                        except (OSError, subprocess.SubprocessError) as error:
+                            if deadline is not None and time.monotonic() >= float(deadline):
+                                raise SwitchTimedOut("Release switch timed out during the off-machine backup.") from error
+                            raise Refused("configured off-machine pre-upgrade backup failed") from error
                     if our_agent(agent_path(DIRECTOR_RS_LABEL)):
                         unload_agent(DIRECTOR_RS_LABEL, require_stopped=True)
                         director_stopped = True
                     check_director_schema(rid)
-                    snapshot = snapshot_director_db(rid)
+                    snapshot = snapshot_director_db(rid, checked=hosted)
                 before = recheck_current(expected_before, rid)
+                if deadline is not None and time.monotonic() >= float(deadline):
+                    raise SwitchTimedOut("Release switch timed out before activation.")
                 switch_current(rid)
                 activated = True
                 models_changed = derive_models(rid)
@@ -342,8 +428,7 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
                     keep_dir = CONFIG / "replaced-agents"
                     keep_dir.mkdir(mode=0o700, exist_ok=True)
                     src = agent_path(label)
-                    shutil.copy2(src, keep_dir / ("%s%s.%s" % (label, agent_suffix(), time.strftime("%Y%m%d-%H%M%S"))))
-                linux = host_platform() == "linux"
+                    shutil.copy2(src, keep_dir / ("%s.%s" % (src.name, time.strftime("%Y%m%d-%H%M%S"))))
                 for label, svc in wanted.items():
                     path = agent_path(label)
                     changed = write_atomic(path, render_agent(svc))
@@ -354,8 +439,7 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
                     for label in report:
                         report[label]["launchd"] = "not loaded (--no-load)"
                 else:
-                    if linux:
-                        reload_units()
+                    reload_units()
                     for label, info in report.items():
                         info["launchd"] = load_agent(label, Path(info["path"]), info["changed"], info["restart"])
             except Exception as error:
@@ -366,7 +450,13 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
                 if rollback_record is not None:
                     raise
                 activated = False
-                rollback_failed_activation(before, rid, original, rec, load, snapshot, error, restart_held=True)
+                rollback_failed_activation(before, rid, original, rec, load, snapshot, error,
+                                           restart_held=True, hosted=hosted)
+        # The regular smoke submits real jobs. Resume intake after activation;
+        # the red-smoke path freezes it again before waiting for rollback.
+        inherited_intake = os.environ.pop(RESTART_INTAKE_FD, None) if not restart_held else None
+        if inherited_intake is not None:
+            fcntl.flock(int(inherited_intake), fcntl.LOCK_UN)
         for info in report.values():
             info.pop("restart", None)
         # Trial only what can be trialled: services not loaded (--no-load) cannot be, nor a release without cs smoke.
@@ -378,7 +468,28 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
                                         "smoke", "--json"], capture_output=True, text=True, timeout=300)
             except (OSError, subprocess.TimeoutExpired) as error:
                 smoke = subprocess.CompletedProcess([], 1, "", str(error))
-            result, warnings = smoke_warnings(smoke, rec)
+            if opts.get("hosted_trial"):
+                try:
+                    result = json.loads(smoke.stdout)
+                    if (not isinstance(result, dict) or type(result.get("ok")) is not bool
+                            or not isinstance(result.get("checks", []), list)):
+                        raise ValueError("invalid smoke report")
+                except ValueError:
+                    result = {"ok": False, "checks": [{"name": "smoke", "ok": False,
+                                                       "reason": (smoke.stderr or smoke.stdout)[-500:] or "invalid smoke report"}]}
+                if smoke.returncode or result.get("ok") is not True:
+                    result["ok"] = False
+                    failures = [f"{check.get('name', 'smoke')}: {check.get('reason') or 'failed'}"
+                                for check in result.get("checks", []) if isinstance(check, dict) and not check.get("ok")]
+                    reason = "hosted post-install smoke failed"
+                    if not failures:
+                        failure = "smoke command reported failure without a failed check"
+                        result.setdefault("checks", []).append({"name": "smoke", "ok": False, "reason": failure})
+                        failures = [failure]
+                    raise SmokeFailed(reason + ": " + "; ".join(failures), result)
+                warnings = []
+            else:
+                result, warnings = smoke_warnings(smoke, rec)
             rec["failed_releases"] = [h for h in rec.get("failed_releases", []) if h != rid]
         failed = rec.get("failed_releases", [])
         history = [h for h in rec.get("history", []) if h != rid and h not in failed]
@@ -402,7 +513,10 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
     except Exception as error:
         if not activated or rollback_record is not None:
             raise
-        rollback_failed_activation(before, rid, original, rec, load, snapshot, error)
+        rollback_failed_activation(before, rid, original, rec, load, snapshot, error,
+                                   hosted=hosted)
+    if switched and rollback_hold().is_file() and rollback_hold().read_text().strip() != rid:
+        rollback_hold().unlink()
     out = {"ok": True, "warnings": [], "release": rid, "previous": before, "root": str(ROOT), "node": is_node(), "kit": code,
            "runner": rec["runner"], "gateway": rec["gateway"], "credentials": rec["credentials"],
            "drain": drain,
@@ -417,9 +531,10 @@ def activate(rid, opts, load=True, *, rollback_record=None, restart_held=False):
            "verify": {"errors": v.get("errors"), "missing_host_runtimes": sorted(v.get("missing_host_runtimes", {}))}}
     if opts.get("smoke") and load and (RELEASES / rid / code / "scripts/cs_smoke.py").is_file():
         out.update(smoke=result, warnings=warnings)
-    if linux:
-        out["linger"] = LINGER_NOTE
-        print("node-install: %s" % LINGER_NOTE, file=sys.stderr)
+    warning = backend.linger_warning() if load else None
+    if warning:
+        out["linger"] = warning
+        print("node-install: %s" % warning, file=sys.stderr)
     return out
 
 
@@ -439,8 +554,9 @@ def uninstall(purge, load=True, purge_secrets=False):
                       "columns cannot be read without it. Back it up, then pass --purge-secrets to delete it too."
                       % DIRECTOR_ENV)
     linux = host_platform() == "linux"
-    if load and linux:
-        need_systemctl()
+    backend = service_backend()
+    if load:
+        backend.check()
     labels = (BACKUP_LABEL, LISTEN_LABEL, NODE_LABEL, GATEWAY_LABEL) + LARAVEL_LABELS + (DIRECTOR_RS_LABEL, CLIENT_WEB_LABEL)
     for label in labels:
         path = agent_path(label)
@@ -454,8 +570,8 @@ def uninstall(purge, load=True, purge_secrets=False):
         if timer.is_file() and timer.read_bytes() == backup_timer():
             timer.unlink()
             removed.append(str(timer))
-    if load and linux and removed:
-        reload_units()
+    if load and removed:
+        backend.reload()
     remove_path()
     if rec.get("link_dir"):
         for name in list(LINKS) + list(RETIRED_LINKS):
@@ -517,6 +633,7 @@ def main():
     a.add_argument("--keep", type=int)
     a.add_argument("--from-bundle", help="bundle directory this install unpacked; retention never removes it")
     a.add_argument("--no-smoke", action="store_true", help="skip the real-job release trial")
+    a.add_argument("--hosted-trial", action="store_true", help=argparse.SUPPRESS)
     a.add_argument("--no-load", action="store_true")
     s = sub.add_parser("switch")
     s.add_argument("release")
@@ -551,7 +668,18 @@ def main():
         print(json.dumps({"ok": False, "reason": error.reason}))
         return 2
     except Refused as error:
-        print(json.dumps({"ok": False, "refused": str(error)}))
+        result = {"ok": False, "refused": str(error)}
+        cause = error
+        while cause:
+            if isinstance(cause, SmokeFailed):
+                result["smoke"] = cause.report
+                break
+            cause = cause.__cause__
+        if isinstance(error, RollbackWaiting):
+            result["waiting_jobs"] = error.jobs
+        if isinstance(error, SwitchTimedOut):
+            result["timed_out"] = True
+        print(json.dumps(result))
         return 1
 
 
@@ -567,7 +695,8 @@ def run_command(args):
                 "serve_director_rs": args.serve_director_rs, "director_rs_listen": args.director_rs_listen,
                 "director_token_from": args.director_token_from,
                 "serve_client_web": args.serve_client_web, "client_web_php": args.php,
-                "wait": args.wait, "no_wait": args.no_wait, "force": args.force, "smoke": not args.no_smoke}
+                "wait": args.wait, "no_wait": args.no_wait, "force": args.force, "smoke": not args.no_smoke,
+                "hosted_trial": args.hosted_trial, "retain": args.hosted_trial}
         out = activate(args.release, opts, not args.no_load)
     elif args.cmd == "switch":
         out = activate(args.release, {"wait": args.wait, "no_wait": args.no_wait, "force": args.force}, not args.no_load)

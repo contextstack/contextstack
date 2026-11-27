@@ -255,12 +255,12 @@ class HostTests(unittest.TestCase):
         self.host.watch_job('job', lane='lane')
         self.host._wake.watch_job.assert_called_once_with('job', lane='lane')
 
-    def test_mcp_config_ignores_workspace_commands_and_pins_host_command_no_land_max_wait(self):
+    def test_mcp_config_ignores_workspace_commands_and_pins_host_command_request_land_max_wait(self):
         for name in ('session/mcp.json', 'mcp.json', '.mcp.json'):
             self.write(name, {'mcpServers': {'evil': {'command': '/evil'}}})
         config = m.build_mcp_config(self.ws, self.cred, {'node': 'node', 'director': 'http://director.invalid'})
         self.assertEqual(config, {'mcpServers': {'contextstack': {'command': sys.executable, 'args': [
-            str(m.HERE.parents[1] / 'scripts/cs'), 'mcp', '--no-land', '--max-wait', '30',
+            str(m.HERE.parents[1] / 'scripts/cs'), 'mcp', '--request-land', '--max-wait', '30',
             '--credential-file', str(self.cred), '--node', 'node', '--director', 'http://director.invalid']}}})
         self.assertEqual(len(m.build_mcp_config(self.ws, self.cred)['mcpServers']), 1)
 
@@ -700,12 +700,16 @@ class HostTests(unittest.TestCase):
     def test_sandbox_policy_requires_both_development_flags_and_refuses_unsupported_platform(self):
         self.sandbox.stop()
         with patch.object(m.sys, 'platform', 'linux'):
+            self.assertTrue(m.require_host_sandbox(True))
+            with self.assertRaisesRegex(SystemExit, 'require executor confinement'):
+                m.require_host_sandbox(False)
+        with patch.object(m.sys, 'platform', 'unsupported'):
             with self.assertRaisesRegex(SystemExit, 'sandbox unavailable'):
                 m.require_host_sandbox(True)
-        with self.assertRaisesRegex(SystemExit, 'requires both'):
+        with patch.object(m.sys, 'platform', 'darwin'), self.assertRaisesRegex(SystemExit, 'requires both'):
             m.require_host_sandbox(False)
         with patch.dict(os.environ, {'LEAD_HOST_NO_SANDBOX': '1', 'CS_EXECUTOR_ALLOW_UNSANDBOXED': '1'}), \
-             patch('sys.stderr', new_callable=io.StringIO):
+             patch('sys.stderr', new_callable=io.StringIO), patch.object(m.sys, 'platform', 'darwin'):
             self.assertFalse(m.require_host_sandbox(False))
         with patch.object(m.sys, 'platform', 'darwin'):
             self.assertTrue(m.require_host_sandbox(True))

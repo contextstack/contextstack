@@ -159,6 +159,8 @@ def take(client, offered, state):
             fcntl.flock(intake, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             return [], [], []
+        if (state / "release-rollback-pending").exists():
+            return [], [], []
         return _take(client, offered, state)
 
 

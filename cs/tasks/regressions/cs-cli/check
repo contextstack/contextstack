@@ -226,6 +226,12 @@ def part_install(tmp, uv, managed):
         expect(all("%s (needed by %s)" % (requirement, tool) in details
                    for requirement, (tool, _) in extras.items()),
                "doctor JSON keeps each optional runtime and its dependent tool")
+        browser = {f["check"]: f for f in json.loads(result.stdout) if f["check"].startswith("browser ")}
+        # No scheduled browser task: browser state is reported as information, never as a problem.
+        expect(set(browser) == {"browser native host", "browser extension"}
+               and all(f["ok"] and f.get("info") and "no scheduled browser tasks" in f["detail"]
+                       for f in browser.values()),
+               "doctor reports browser setup as information when no schedule uses the browser")
     finally:
         verify.write_bytes(saved)
 
@@ -453,8 +459,6 @@ def part_install(tmp, uv, managed):
     r, f = doctor(home, shim)
     expect((f.get("filevault") or {}).get("ok") is True and "mode credentials/openai" not in f,
            "doctor: FileVault on and 0600 files raise nothing")
-    part_limits(home, root, shim)
-
     (shim / "calls.log").write_text("")
     r1, r2, r3 = cs(home, shim, "stop", "gateway"), cs(home, shim, "start", "gateway"), cs(home, shim, "restart", "gateway")
     calls = (shim / "calls.log").read_text()
@@ -467,12 +471,17 @@ def part_install(tmp, uv, managed):
     r = cs(home, shim, "restart", "tunnels")
     expect(r.returncode == 0 and r.stdout.count("restarted") == 2, "restart tunnels: both tunnel agents")
 
-    r = cs(home, shim, "start", "gateway", platform="linux")
-    expect(r.returncode == 2 and "not supported here yet" in r.stderr and "Traceback" not in r.stderr, "linux: start says not supported here yet")
-    r = cs(home, shim, "status", platform="linux")
-    expect(r.returncode == 0 and "not supported here yet" in r.stdout and "Traceback" not in r.stderr, "linux: status degrades, no crash")
+    systemctl = shim / "bin/systemctl"
+    systemctl.write_text("#!/bin/sh\necho 'Failed to connect to bus' >&2\nexit 1\n")
+    systemctl.chmod(0o755)
+    for args in (("start", "gateway"), ("status",)):
+        r = cs(home, shim, *args, platform="linux")
+        expect(r.returncode == 1 and "systemd user manager is unreachable" in r.stderr and "Traceback" not in r.stderr,
+               "linux: %s explains an unreachable user manager" % args[0])
     r = cs(home, shim, "doctor", platform="linux")
-    expect("not supported here yet" in r.stdout and "Traceback" not in r.stderr, "linux: doctor skips launchd checks, no crash")
+    expect("FAIL  systemd user manager" in r.stdout and "loginctl enable-linger" in r.stdout
+           and "info  Landlock:" in r.stdout and "launchd" not in r.stdout,
+           "linux: doctor checks the user manager and reports Landlock")
 
     empty = tmp / "home-empty"
     empty.mkdir()
@@ -488,12 +497,22 @@ def part_install(tmp, uv, managed):
     expect("security" not in calls and not [l for l in calls.splitlines() if TOKEN in l], "never security, never the token in a call")
 
 
-def part_limits(home, root, shim):
-    """The paid-API daily limit in status (text and --json); above the default warns. Today's CLI runs are a
-    count with no limit (ADR 0018: the 50-calls-a-day cap is gone); a leftover cli_calls_per_day is ignored."""
+def part_limits(tmp):
+    """Run doctor and status against a fake release and the gateway's limit fixtures."""
+    home, shim = tmp / "home", tmp / "shim"
+    root = home / ".contextstack"
+    release = root / "releases" / A
+    release.mkdir(parents=True)
+    (root / "current").symlink_to(release)
+    (release / ".complete").touch()
+    for folder in ("config/gateway/providers.d", "config/policy", "state", "logs", "workspaces", "gateway"):
+        (root / folder).mkdir(mode=0o700, parents=True)
+    write_shims(shim)
+    (shim / "http.json").write_text("[]")
     r = cs(home, shim, "status", "--json")
     m = (json.loads(r.stdout) if r.returncode == 0 else {}).get("limits")
-    expect(m == {"api_usd_today": 0, "api_usd_per_day": 0, "api_problem": None, "cli_runs_today": 0},
+    expect(m == {"api_usd_today": 0, "api_usd_per_day": 0, "api_sources": {},
+                 "api_problem": None, "cli_runs_today": 0},
            "status --json: no limit files mean $0, and no CLI limit: %s" % m)
     r = cs(home, shim, "status")
     expect("API today $0.00 of $0.00" in r.stdout and "CLI runs today 0" in r.stdout and " of 50" not in r.stdout,
@@ -510,7 +529,9 @@ def part_limits(home, root, shim):
         f.write(json.dumps({"ts": "2000-01-01T00:00:00Z", "cli_invoked": True}) + "\n")
     r = cs(home, shim, "status", "--json")
     m = (json.loads(r.stdout) if r.returncode == 0 else {}).get("limits") or {}
-    expect(m == {"api_usd_today": 0.0123, "api_usd_per_day": 2.5, "api_problem": None, "cli_runs_today": 2},
+    expect(m == {"api_usd_today": 0.0123, "api_usd_per_day": 2.5,
+                 "api_sources": {"*": {"usd": 2.5, "period": "day"}},
+                 "api_problem": None, "cli_runs_today": 2},
            "status --json: today's spend from the gateway counter, today's CLI runs from the ledger: %s" % m)
     r = cs(home, shim, "status")
     expect("API today $0.01 of $2.50" in r.stdout and "CLI runs today 2" in r.stdout and "CLI calls" not in r.stdout,
@@ -525,12 +546,42 @@ def part_limits(home, root, shim):
            % (sorted(warn), last))
     (root / "config/policy/limits.json").write_text("{bad")
     r, f = doctor(home, shim)
-    expect(f and "spend limits" not in f and not f["paid API limit"].get("ok", True),
+    expect(f.get("spend limits", {}).get("ok") and "paid API limit" in f,
            "doctor: policy/limits.json is no longer read, even unreadable: %s" % f.get("spend limits"))
-    (root / "config/gateway/limits.json").write_text("{bad")
-    r, f = doctor(home, shim)
-    expect(not (f.get("spend limits") or {}).get("ok", True), "doctor: an unreadable limit file is a problem: %s" % f.get("spend limits"))
-    for p in ("config/gateway/limits.json", "config/policy/limits.json", "gateway/spend.json"):
+    path = root / "config/gateway/limits.json"
+    fixtures = json.loads((CODE_ROOT.parent / "gateway/tests/fixtures/spend-limits.json").read_text())
+    for name, body, expected in fixtures:
+        if body is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(body)
+        _, findings = doctor(home, shim)
+        finding = findings.get("spend limits", {})
+        expect(finding.get("ok") is (expected is not None), "doctor: %s: %s" % (name, finding))
+        r = cs(home, shim, "status", "--json")
+        limits = (json.loads(r.stdout) if r.returncode == 0 else {}).get("limits", {})
+        expect(limits.get("api_sources") == (expected or {})
+               and ("api_problem" in limits and bool(limits["api_problem"]) is (expected is None)),
+               "status --json: %s: %s" % (name, limits))
+
+    path.write_text(fixtures[2][1])
+    (root / "gateway/spend.json").write_text(json.dumps({
+        "schema_version": "csgateway.spend.v2", "day": time.strftime("%Y-%m-%d"),
+        "sources": {"openai": {"day_usd": 0.02}, "anthropic": {"day_usd": 0.03}},
+    }))
+    text = cs(home, shim, "doctor").stdout
+    expect("ok    spend limits: anthropic $5.00/month, openai $0.20/day" in text,
+           "doctor: shows each source and period")
+    text = cs(home, shim, "status").stdout
+    expect("API today $0.05; API budgets anthropic $5.00/month, openai $0.20/day" in text,
+           "status: shows current spend and each source budget")
+    path.unlink()
+    path.mkdir()
+    _, findings = doctor(home, shim)
+    expect(findings.get("spend limits", {}).get("ok") is False,
+           "doctor: a directory in place of the limit file is invalid")
+    path.rmdir()
+    for p in ("config/policy/limits.json", "gateway/spend.json"):
         (root / p).unlink()
 
 
@@ -730,12 +781,12 @@ def part_init_agent():
         (root / "current").symlink_to("releases/fixture")
         agents = root / "agents"
         agents.mkdir()
-        with patch.multiple(cs_mod, ROOT=root, CURRENT=root / "current", CONFIG=root / "config", AGENTS=agents,
+        with patch.multiple(cs_mod, ROOT=root, CURRENT=root / "current", CONFIG=root / "config", AGENTS=agents, PLATFORM="macos",
                             read_json=lambda *a: {}, node_env=lambda: {}, gateway_get=lambda *a: (0, ""),
                             load_plist=lambda *a: (None, None), credential_mode=lambda *a: "none",
                             receiver=lambda: {}, read_text=lambda *a: "", last_tick=lambda: {},
                             state_root=lambda: root, director_data=lambda: {}, client_web_data=lambda: {},
-                            limits_data=lambda: {}, agent=lambda label: {"label": label},
+                            limits_data=lambda: {}, agent=lambda label, backend: {"label": label},
                             curl=lambda *a, **kw: (0, "")):
             for present in ((), cs_mod.TUNNELS[:1], cs_mod.TUNNELS):
                 for label in cs_mod.TUNNELS:
@@ -843,6 +894,8 @@ def main():
     part_hermetic_scope()
     part_device()
     part_init_agent()
+    with tempfile.TemporaryDirectory(prefix="cs-cli-limits-") as tmp:
+        part_limits(Path(tmp))
     uv, managed = _bundle.host_python()
     if uv is None:
         print("SKIP cs-cli: %s" % managed)

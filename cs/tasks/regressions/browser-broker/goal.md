@@ -1,3 +1,6 @@
+---
+host_only: Exercises live Unix listeners, process cleanup, and the platform sandbox.
+---
 # browser-broker
 
 The `browser` profile cannot

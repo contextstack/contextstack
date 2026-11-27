@@ -5,10 +5,11 @@
 use crate::access::Client;
 use crate::control;
 use crate::server::{Call, Reply, State, internal, json, refusal};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::util::{self, now_utc};
 use crate::work::{self, No};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
 /// The most schedules, firings or active jobs in one report.
@@ -25,13 +26,13 @@ const FIRING_STATES: [&str; 6] = [
 
 /// Record the protocol version a node spoke, when it changed.
 pub fn note_protocol(
-    db: &Connection,
+    db: &ScopedConnection,
     node_id: i64,
     name: &str,
     version: u32,
 ) -> rusqlite::Result<()> {
     let changed = db.execute(
-        "UPDATE nodes SET protocol = ?1 WHERE id = ?2 AND protocol IS NOT ?1",
+        "UPDATE nodes SET protocol = ?1 WHERE +org_id = :org_id AND (id = ?2 AND protocol IS NOT ?1)",
         params![version, node_id],
     )?;
     if changed > 0 {
@@ -243,6 +244,12 @@ fn status_body(body: &[u8]) -> Result<Value, String> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut reported = json!({"templates": templates, "preferred": opt_text(caps, "preferred", 100)?, "harness": harness});
+        if let Some(gate) = caps.get("gate") {
+            reported["gate"] = json!(
+                gate.as_bool()
+                    .ok_or("agent_capabilities.gate must be a boolean")?
+            );
+        }
         if caps.contains_key("harness_models") {
             let models = list(caps, "harness_models")?;
             if models
@@ -282,7 +289,7 @@ pub fn post_status(state: &State, call: &Call, node_id: i64, name: &str) -> Repl
     let done = (|| -> rusqlite::Result<()> {
         let tx = crate::store::write_tx(&mut db)?;
         tx.execute(
-            "UPDATE nodes SET status = ?1, status_at = ?2 WHERE id = ?3",
+            "UPDATE nodes SET status = ?1, status_at = ?2 WHERE +org_id = :org_id AND (id = ?3)",
             params![status.to_string(), stamp, node_id],
         )?;
         touch(&tx, Record::Node, name)?;
@@ -420,7 +427,7 @@ fn schedules_body(body: &[u8]) -> Result<Reported, String> {
 /// Store one report: schedules replace the node's set (missing ones are marked removed); firings are kept by id.
 /// A schedule's record changes only when what it shows changed.
 fn record_schedules(
-    tx: &Connection,
+    tx: &ScopedConnection,
     node_id: i64,
     node: &str,
     report: &Reported,
@@ -431,33 +438,36 @@ fn record_schedules(
         let k = key(id);
         let before: Option<(i64, String, Option<String>)> = tx
             .query_row(
-                "SELECT schedule_revision, body, removed_at FROM schedules WHERE schedule_key = ?1",
+                "SELECT schedule_revision, body, removed_at FROM schedules WHERE +org_id = :org_id AND schedule_key = ?1",
                 params![k],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         let text = body.to_string();
-        if before.is_some_and(|(r, b, gone)| r == *revision && b == text && gone.is_none()) {
+        let deleted = body["definition"]["deleted"] == true;
+        if before.is_some_and(|(r, b, gone)| {
+            r > *revision || (r == *revision && b == text && gone.is_some() == deleted)
+        }) {
             continue;
         }
         tx.execute(
-            "INSERT INTO schedules (schedule_key, node_id, schedule_id, schedule_revision, body, reported_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO schedules (org_id, schedule_key, node_id, schedule_id, schedule_revision, body, reported_at, removed_at, responsible_member_id)
+             VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, :member_id)
              ON CONFLICT(schedule_key) DO UPDATE SET schedule_revision = excluded.schedule_revision,
-               body = excluded.body, reported_at = excluded.reported_at, removed_at = NULL",
-            params![k, node_id, id, revision, text, stamp],
+               body = excluded.body, reported_at = excluded.reported_at, removed_at = excluded.removed_at WHERE +schedules.org_id = :org_id",
+            params![k, node_id, id, revision, text, stamp, deleted.then_some(stamp)],
         )?;
         touch(tx, Record::Schedule, &k)?;
     }
     let listed: Vec<String> = report.0.iter().map(|s| key(&s.0)).collect();
     let mut stmt =
-        tx.prepare("SELECT schedule_key FROM schedules WHERE node_id = ?1 AND removed_at IS NULL")?;
+        tx.prepare("SELECT schedule_key FROM schedules WHERE +org_id = :org_id AND node_id = ?1 AND removed_at IS NULL AND schedule_revision > 0")?;
     let held: Vec<String> = stmt
         .query_map(params![node_id], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     for k in held.iter().filter(|k| !listed.contains(k)) {
         tx.execute(
-            "UPDATE schedules SET removed_at = ?1, reported_at = ?1 WHERE schedule_key = ?2",
+            "UPDATE schedules SET removed_at = ?1, reported_at = ?1 WHERE +org_id = :org_id AND (schedule_key = ?2)",
             params![stamp, k],
         )?;
         touch(tx, Record::Schedule, k)?;
@@ -466,7 +476,7 @@ fn record_schedules(
         let text = body.to_string();
         let same = tx
             .query_row(
-                "SELECT 1 FROM firings WHERE node_id = ?1 AND firing_id = ?2 AND body = ?3",
+                "SELECT 1 FROM firings WHERE +org_id = :org_id AND node_id = ?1 AND firing_id = ?2 AND body = ?3",
                 params![node_id, id, text],
                 |_| Ok(()),
             )
@@ -476,16 +486,16 @@ fn record_schedules(
             continue;
         }
         tx.execute(
-            "INSERT INTO firings (node_id, firing_id, schedule_id, body, recorded_at, reported_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO firings (org_id, node_id, firing_id, schedule_id, body, recorded_at, reported_at)
+             VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(node_id, firing_id) DO UPDATE SET schedule_id = excluded.schedule_id, body = excluded.body,
-               recorded_at = excluded.recorded_at, reported_at = excluded.reported_at",
+               recorded_at = excluded.recorded_at, reported_at = excluded.reported_at WHERE +firings.org_id = :org_id",
             params![node_id, id, schedule_id, text, recorded_at, stamp],
         )?;
         let k = key(schedule_id);
         if tx
             .query_row(
-                "SELECT 1 FROM schedules WHERE schedule_key = ?1",
+                "SELECT 1 FROM schedules WHERE +org_id = :org_id AND schedule_key = ?1",
                 params![k],
                 |_| Ok(()),
             )
@@ -533,10 +543,17 @@ fn change_body(m: &Map<String, Value>) -> Result<Value, No> {
     if set.is_empty() {
         return Err(No::invalid("set changes something: enabled and/or missed"));
     }
+    validate_set(set)?;
+    Ok(json!({"expect_revision": expect, "set": set}))
+}
+
+fn validate_set(set: &Map<String, Value>) -> Result<(), No> {
     for (k, v) in set {
         let ok = match k.as_str() {
             "enabled" => v.is_boolean(),
             "missed" => matches!(v.as_str(), Some("skip" | "catch_up")),
+            "cron" => v.as_str().is_some_and(crate::schedule_fields::cron),
+            "timezone" => v.as_str().is_some_and(crate::schedule_fields::timezone),
             _ => false,
         };
         if !ok {
@@ -545,7 +562,7 @@ fn change_body(m: &Map<String, Value>) -> Result<Value, No> {
             )));
         }
     }
-    Ok(json!({"expect_revision": expect, "set": set}))
+    Ok(())
 }
 
 /// `POST schedules/{node}/{schedule_id}/changes`: a change request, sent to the node as a control message
@@ -561,21 +578,35 @@ pub fn request_change(
         (Ok(k), Ok(m)) => (k, m),
         (Err(r), _) | (_, Err(r)) => return r.reply(),
     };
-    let want = match change_body(&m) {
+    let parsed = if call.method == "DELETE" {
+        let mut deleting = m;
+        deleting.insert("set".into(), json!({"enabled": false}));
+        change_body(&deleting).map(|mut want| {
+            want["kind"] = json!("delete");
+            want
+        })
+    } else {
+        change_body(&m)
+    };
+    let want = match parsed {
         Ok(w) => w,
         Err(r) => return r.reply(),
     };
     let schedule_key = format!("{node}/{schedule_id}");
     let sha = work::content("schedule_change", &schedule_key, &want);
     let mut db = state.store.db();
-    match work::prior(&db, &key, &sha) {
-        Ok(Some((kind, id))) => return work::render(&db, 200, kind, &id, true),
+    let tx = match crate::store::write_tx(&mut db) {
+        Ok(tx) => tx,
+        Err(e) => return internal(&e),
+    };
+    match work::scoped_prior(&tx, &key, &sha, client) {
+        Ok(Some((kind, id))) => return work::render(&tx, 200, kind, &id, true),
         Ok(None) => {}
         Err(r) => return r.reply(),
     }
-    let found = db
+    let found = tx
         .query_row(
-            "SELECT node_id, schedule_revision FROM schedules WHERE schedule_key = ?1 AND removed_at IS NULL",
+            "SELECT node_id, schedule_revision FROM schedules WHERE +org_id = :org_id AND schedule_key = ?1 AND removed_at IS NULL AND schedule_revision > 0",
             params![schedule_key],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )
@@ -586,7 +617,7 @@ pub fn request_change(
         Err(e) => return internal(&e),
     };
     if Some(current) != want["expect_revision"].as_i64() {
-        let now = crate::records::one(&db, Record::Schedule, &schedule_key)
+        let now = crate::records::one(&tx, Record::Schedule, &schedule_key)
             .ok()
             .flatten();
         return refusal(
@@ -597,39 +628,174 @@ pub fn request_change(
         );
     }
     let made = (|| -> Result<String, String> {
-        let change_id = format!("sch_{}", util::ulid()?.to_lowercase());
-        let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
-        let message = json!({"schedule_id": schedule_id, "expect_revision": want["expect_revision"],
-                             "set": want["set"]});
-        let control_id = control::issue(&tx, node_id, "schedule_change", &message)?;
-        tx.execute(
-            "INSERT INTO schedule_changes (change_id, schedule_key, control_id, expect_revision, change,
-                                           requested_by, requested_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![change_id, schedule_key, control_id, want["expect_revision"].as_i64(),
-                    want["set"].to_string(), client.id, now_utc()],
-        )
-        .map_err(|e| e.to_string())?;
-        touch(&tx, Record::ScheduleChange, &change_id).map_err(|e| e.to_string())?;
-        touch(&tx, Record::Schedule, &schedule_key).map_err(|e| e.to_string())?;
-        work::remember(&tx, &key, &sha, Record::ScheduleChange, &change_id, client)
+        let id = queue_change(&tx, node_id, &schedule_key, schedule_id, want, client)?;
+        work::remember(&tx, &key, &sha, Record::ScheduleChange, &id, client)
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(change_id)
+        Ok(id)
     })();
+    change_reply(&db, made)
+}
+
+fn change_reply(db: &ScopedConnection, made: Result<String, String>) -> Reply {
     match made {
-        Ok(id) => work::render(&db, 202, Record::ScheduleChange, &id, false),
+        Ok(id) => work::render(db, 202, Record::ScheduleChange, &id, false),
         Err(e) => internal(&e),
     }
 }
 
+fn queue_change(
+    tx: &ScopedConnection,
+    node_id: i64,
+    schedule_key: &str,
+    schedule_id: &str,
+    mut message: Value,
+    client: &Client,
+) -> Result<String, String> {
+    let change_id = format!("sch_{}", util::ulid()?.to_lowercase());
+    message["schedule_id"] = json!(schedule_id);
+    let control_id = control::issue(tx, node_id, "schedule_change", &message)?;
+    tx.execute(
+        "INSERT INTO schedule_changes (org_id, change_id, schedule_key, control_id, expect_revision, change,
+                                       requested_by, requested_at)
+         VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![change_id, schedule_key, control_id, message["expect_revision"].as_i64(),
+                message["set"].to_string(), client.id, now_utc()],
+    )
+    .map_err(|e| e.to_string())?;
+    touch(tx, Record::ScheduleChange, &change_id).map_err(|e| e.to_string())?;
+    touch(tx, Record::Schedule, schedule_key).map_err(|e| e.to_string())?;
+    Ok(change_id)
+}
+
+type CreateSchedule = (
+    String,
+    Value,
+    Option<(crate::budget::Micros, crate::budget::Period)>,
+);
+
+fn create_body(m: &Map<String, Value>) -> Result<CreateSchedule, No> {
+    let text = |k| m.get(k).and_then(Value::as_str);
+    let node = text("node")
+        .filter(|n| util::plain_name(n, 128))
+        .ok_or_else(|| No::invalid("node must name the target node"))?;
+    let name = text("name")
+        .filter(|n| !n.trim().is_empty() && n.len() <= 200)
+        .ok_or_else(|| No::invalid("name must contain 1 to 200 bytes"))?;
+    let task = text("task")
+        .filter(|p| util::plain_path(p) && p.len() <= 500)
+        .ok_or_else(|| No::invalid("task must be a relative path"))?;
+    let target = match (text("spec"), text("agent")) {
+        (Some(spec), None)
+            if util::plain_path(spec) && !spec.starts_with('-') && spec.len() <= 500 =>
+        {
+            ("spec", spec)
+        }
+        (None, Some(agent)) if util::plain_name(agent, 128) => ("agent", agent),
+        _ => return Err(No::invalid("provide a spec path or an agent profile")),
+    };
+    let mut fields = Map::from_iter([
+        ("cron".into(), m.get("cron").cloned().unwrap_or_default()),
+        (
+            "timezone".into(),
+            m.get("timezone").cloned().unwrap_or_default(),
+        ),
+        (
+            "missed".into(),
+            m.get("missed").cloned().unwrap_or_else(|| json!("skip")),
+        ),
+    ]);
+    validate_set(&fields)?;
+    fields.extend([
+        ("name".into(), json!(name)),
+        ("task".into(), json!(task)),
+        ("enabled".into(), json!(true)),
+    ]);
+    let mut set = Value::Object(fields);
+    set[target.0] = json!(target.1);
+    if let Some(grant) = m.get("grant") {
+        let grant = grant
+            .as_str()
+            .filter(|g| util::plain_name(g, 128))
+            .ok_or_else(|| No::invalid("grant must be a grant id"))?;
+        set["grant"] = json!(grant);
+    }
+    let budget = match m.get("budget") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(b)) => Some(crate::spend::parse_budget(b)?),
+        Some(_) => return Err(No::invalid("budget must be {usd, period}")),
+    };
+    Ok((node.into(), set, budget))
+}
+
+/// Record the request and queue a revision-zero create atomically.
+pub fn create_schedule(state: &State, call: &Call, client: &Client) -> Reply {
+    let (key, (node, set, budget)) = match (
+        work::key(call),
+        work::body(call).and_then(|m| create_body(&m)),
+    ) {
+        (Ok(key), Ok(body)) => (key, body),
+        (Err(r), _) | (_, Err(r)) => return r.reply(),
+    };
+    let sha = work::content(
+        "schedule_create",
+        &node,
+        &json!({"set": set, "budget": budget.map(|(u, p)| (u, p.name()))}),
+    );
+    let mut db = state.store.db();
+    let tx = match crate::store::write_tx(&mut db) {
+        Ok(tx) => tx,
+        Err(e) => return internal(&e),
+    };
+    match work::scoped_prior(&tx, &key, &sha, client) {
+        Ok(Some((kind, id))) => return work::render(&tx, 200, kind, &id, true),
+        Ok(None) => {}
+        Err(r) => return r.reply(),
+    }
+    let node_id: i64 = match tx
+        .query_row(
+            "SELECT id FROM nodes WHERE +org_id = :org_id AND name = ?1 AND revoked_at IS NULL",
+            params![node],
+            |r| r.get(0),
+        )
+        .optional()
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => return refusal(404, "not_found", "no such active node", Value::Null),
+        Err(e) => return internal(&e),
+    };
+    let made = (|| -> Result<String, String> {
+        let sid = format!("sched_{}", util::ulid()?.to_lowercase());
+        let schedule_key = format!("{node}/{sid}");
+        let pending = json!({"enabled": false, "cron": set["cron"], "timezone": set["timezone"],
+            "spec": set["spec"], "task": set["task"], "missed": set["missed"], "next_at": null,
+            "definition": {"director_managed": true, "name": set["name"]}});
+
+        tx.execute(
+            "INSERT INTO schedules (org_id, schedule_key, node_id, schedule_id, schedule_revision, body, reported_at, responsible_member_id)
+             VALUES (:org_id, ?1, ?2, ?3, 0, ?4, ?5, ?6)",
+            params![schedule_key, node_id, sid, pending.to_string(), now_utc(), client.member_id()],
+        ).map_err(|e| e.to_string())?;
+        if let Some((usd, period)) = budget {
+            crate::scopes::set(&tx, "schedule", &schedule_key, usd, period, &client.id)?;
+        }
+        let message = json!({"kind": "create", "expect_revision": 0, "node": node, "set": set});
+        let id = queue_change(&tx, node_id, &schedule_key, &sid, message, client)?;
+        work::remember(&tx, &key, &sha, Record::ScheduleChange, &id, client)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    })();
+    change_reply(&db, made)
+}
+
 /// `GET schedules/{node}/{schedule_id}`: the schedule, its latest 100 firings and its changes.
-pub fn schedule_detail(db: &Connection, schedule_key: &str) -> rusqlite::Result<Value> {
+pub fn schedule_detail(db: &ScopedConnection, schedule_key: &str) -> rusqlite::Result<Value> {
     let Some(schedule) = crate::records::one(db, Record::Schedule, schedule_key)? else {
         return Ok(Value::Null);
     };
     let mut stmt = db.prepare(
-        "SELECT f.body, f.reported_at FROM firings f JOIN schedules s
+        "SELECT f.body, f.reported_at FROM (SELECT rowid AS rowid, * FROM firings WHERE +org_id = :org_id) f JOIN (SELECT rowid AS rowid, * FROM schedules WHERE +org_id = :org_id) s
            ON s.node_id = f.node_id AND s.schedule_id = f.schedule_id
          WHERE s.schedule_key = ?1 ORDER BY f.recorded_at DESC, f.rowid DESC LIMIT 100",
     )?;
@@ -682,6 +848,13 @@ mod tests {
         assert!(change_body(&m(r#"{"expect_revision":2,"set":{"enabled":false}}"#)).is_ok());
         assert!(
             change_body(&m(
+                r#"{"expect_revision":2,"set":{"cron":"0 2 * * *","timezone":"UTC"}}"#
+            ))
+            .is_ok()
+        );
+
+        assert!(
+            change_body(&m(
                 r#"{"expect_revision":2,"set":{"missed":"catch_up","enabled":true}}"#
             ))
             .is_ok()
@@ -689,7 +862,7 @@ mod tests {
         for bad in [
             r#"{"set":{"enabled":false}}"#,
             r#"{"expect_revision":2,"set":{}}"#,
-            r#"{"expect_revision":2,"set":{"cron":"* * * * *"}}"#,
+            r#"{"expect_revision":2,"set":{"cron":"invalid"}}"#,
             r#"{"expect_revision":2,"set":{"missed":"later"}}"#,
         ] {
             assert!(change_body(&m(bad)).is_err(), "{bad}");

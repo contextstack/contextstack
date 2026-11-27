@@ -28,6 +28,10 @@ final class TurnWaiting
                 : __('Waiting for :node to pick this up…', ['node' => $node]);
         }
 
+        if ($reason === 'held' && ($waiting['detail'] ?? null) === 'sponsor_ineligible') {
+            return __('Paused: the member responsible for this conversation can no longer run work. An owner or admin can adopt it to resume.');
+        }
+
         if ($reason === 'held') {
             $detail = is_string($waiting['detail'] ?? null) && $waiting['detail'] !== '' ? $waiting['detail'] : __('the Director is holding this job');
 

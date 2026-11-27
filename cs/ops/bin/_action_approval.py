@@ -126,12 +126,13 @@ def loopback_ports(needs):
     return sorted(ports)
 
 
-def reserved_loopback_ports(root):
-    config = roots(root)["config"]
+def reserved_loopback_ports(root, env=None):
+    env = os.environ if env is None else env
+    config = roots(root, env)["config"]
     settings = node_env(config / "node.env")
     reserved = {8780, 9200}
     for key in ("CS_RESERVED_LOOPBACK_PORTS", "CSGATEWAY_PORT"):
-        for source in (settings, os.environ):
+        for source in (settings, env):
             reserved.update(int(port) for port in source.get(key, "").split(",") if port.strip())
 
     def read_config(path):
@@ -142,11 +143,11 @@ def reserved_loopback_ports(root):
 
     install = read_config(config / "install.json")
     receiver = read_config(config / "policy/spool.json").get("receiver")
-    urls = [install.get("director"), *(source.get("DIRECTOR_GATEWAY") for source in (settings, os.environ))]
+    urls = [install.get("director"), *(source.get("DIRECTOR_GATEWAY") for source in (settings, env))]
     if isinstance(receiver, dict) and receiver.get("kind") == "director":
         urls.append(receiver.get("url"))
     listeners = [*(install.get("director_rs_listen") or []), install.get("serve_client_web")]
-    for source in (settings, os.environ):
+    for source in (settings, env):
         listeners.extend(source.get("DIRECTOR_LISTEN", "").split(","))
     urls.extend(f"http://{addr.strip()}" for addr in listeners if addr and addr.strip())
     for url in filter(None, urls):
@@ -214,6 +215,14 @@ def execute(record, request, prefix, env, repo_view, workspace, root):
 
 
 def request_action(root, run_dir, model, repo_view, request, *, job, workspace, prefix):
+    if not job or not all(ch.isascii() and (ch.isalnum() or ch in "-_") for ch in job):
+        raise ValueError("A Director job is required.")
+    if isinstance(request, dict) and set(request) == {"browser"}:
+        from _browser_action_jobs import propose
+
+        record = propose(director_client(root), job, run_dir.name, request["browser"])
+        print(json.dumps({key: record[key] for key in ("id", "status")}), flush=True)
+        return 0
     if not isinstance(request, dict) or set(request) - {"argv", "needs", "reason", "write_paths"}:
         raise ValueError("Provide only argv, needs, reason, and optional write_paths.")
     argv, needs, reason = (request.get(key) for key in ("argv", "needs", "reason"))
@@ -235,11 +244,9 @@ def request_action(root, run_dir, model, repo_view, request, *, job, workspace, 
     if job_tmp.resolve() != job_tmp:
         raise ValueError("The job tmp directory must not be a symlink.")
     env.update(TMPDIR=str(job_tmp), TMP=str(job_tmp), TEMP=str(job_tmp))
-    # Freeze the exact canonical write targets before the owner sees them.
+    # Freeze the exact canonical write targets before anyone reviews them.
     paths = [str(Path(path).resolve()) for path in paths]
     client = director_client(root)
-    if not job or not all(ch.isascii() and (ch.isalnum() or ch in "-_") for ch in job):
-        raise ValueError("A Director job is required.")
     run = {"run_id": run_dir.name}
     action = dict(argv=argv, needs=sorted(set(needs)), reason=reason.strip(), write_paths=sorted(set(paths)),
                   requesting_model=model)
@@ -257,9 +264,9 @@ def request_action(root, run_dir, model, repo_view, request, *, job, workspace, 
     if status != "approved":
         print(json.dumps(observation(record)), flush=True)
         if status == "needs_owner":
-            print("This action is waiting on the owner. Continue without it if possible.")
+            print("This action is waiting for a human decision. Continue without it if possible.")
         elif status == "denied":
-            print("The owner denied this action. Continue without it.")
+            print("This action was denied. Continue without it.")
         else:
             print("The Director has not finished reviewing this action. Continue without it if possible.")
         return 0

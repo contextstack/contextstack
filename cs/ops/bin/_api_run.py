@@ -148,10 +148,51 @@ def launch_cli(code_root, runner, order):
             payload = json.loads(order)
             if not isinstance(payload, dict):
                 raise ValueError("CLI work order must be an object")
+            if payload.get("executor") == "gate":
+                return _launch_gate(code_root, payload, locks)
             return _launch_cli(code_root, runner, payload, locks)
     except (OSError, ValueError) as error:
         print(f"executor: {error}", file=sys.stderr)
         return 1
+
+
+def _launch_gate(code_root, order, locks):
+    from uuid import uuid4
+
+    if sys.platform != "darwin":
+        raise ValueError("gate requires the macOS lane-check sandbox")
+    root = runs_dir(code_root)
+    job_id = os.environ.get("CS_JOB_ID") or "local-" + uuid4().hex
+    if Path(job_id).name == job_id and (root.parent / "node/cancelled" / job_id).is_file():
+        return 1
+    binding = reserve_cli_lane(code_root, order, locks)
+    if not binding:
+        raise ValueError("gate requires a repo and lane")
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    run_dir = root / (stamp + "-gate-" + uuid4().hex)
+    run_dir.mkdir(mode=0o700)
+    channel = run_dir / ".gate-receipt"
+    env = dict(os.environ, CS_JOB_ID=job_id, CS_RUN_ID=run_dir.name, CS_EXECUTION_ID=uuid4().hex,
+               CS_CLI_RECEIPT_PATH=str(channel), CS_TRIAL=str(order.get("trial") or 1))
+    with channel.open("x+", encoding="utf-8") as receipt_file:
+        with subprocess.Popen([sys.executable, str(code_root / "ops/bin/_executor.py"), "--local-gate"],
+                              cwd=code_root, env=env, stdin=subprocess.PIPE,
+                              start_new_session=True, text=True) as child:
+            try:
+                child.stdin.write(json.dumps(order) + "\n")
+                child.stdin.flush()
+                if child.wait():
+                    return 1
+            finally:
+                # EOF tells the executor to stop if its launcher is interrupted.
+                child.stdin.close()
+        receipt_file.seek(0)
+        receipt = json.load(receipt_file)
+    finished = subprocess.run([str(code_root / "ops/bin/machine-finish")], cwd=code_root,
+                              input=json.dumps({"run_dir": str(run_dir), "receipt": receipt, "lane_binding": binding}),
+                              env=env, text=True)
+    return finished.returncode if finished.returncode in (0, 1, 3) else 3
 
 
 def _launch_cli(code_root, runner, order, locks):

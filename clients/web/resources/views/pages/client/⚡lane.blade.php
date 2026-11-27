@@ -447,15 +447,18 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends ApprovalsPa
                     @else
                         <x-client.needs-action :heading="__('Approve or reject')" data-test="lane-decision">
                             <flux:textarea wire:model="decisionNote" :aria-label="__('Note on the decision (optional)')" :placeholder="__('Note (optional)')" rows="1" resize="vertical" />
+                            @allowed($run, 'decide', 'decide_run')
                             <div class="flex gap-2">
                                 <flux:button size="sm" variant="primary" icon="check" wire:click="approve">{{ __('Approve') }}</flux:button>
                                 <flux:button size="sm" variant="danger" icon="x-mark" wire:click="reject">{{ __('Reject') }}</flux:button>
                             </div>
+                            @endallowed
                         </x-client.needs-action>
                     @endif
                 @endif
 
-                @if ($showLand)
+                {{-- Landing runs on the Director's own machine as its owner (the land capability); others see the lane's state only. --}}
+                @if ($showLand && app(\App\Client\Identity::class)->can('land'))
                     <x-client.needs-action :heading="__('Land on main')" data-test="lane-land">
                         @if (is_array($landRecord))
                             <flux:callout :variant="($landRecord['state'] ?? null) === 'refused' ? 'warning' : 'danger'" icon="exclamation-triangle" data-test="land-problem" data-state="{{ $landRecord['state'] ?? '' }}">
@@ -574,10 +577,12 @@ new #[Layout('layouts::client')] #[Title('Task lane')] class extends ApprovalsPa
                     @php($cancel = $this->held('cancel', $cancelId) ?? $job['cancel'])
                     <p class="text-sm" data-test="cancel" data-state="{{ $cancel['state'] }}">{{ __('Cancel') }}: {{ $cancel['state'] }}</p>
                 @elseif (! in_array($job['state'], ['done', 'error'], true))
+                    @allowed($job, 'cancel', 'control_work')
                     <form wire:submit="requestCancel" class="space-y-2">
                         <flux:input size="sm" wire:model="cancelReason" :aria-label="__('Reason for cancelling (optional)')" :placeholder="__('Reason (optional)')" />
                         <flux:button size="sm" type="submit" variant="danger" icon="stop">{{ __('Cancel') }}</flux:button>
                     </form>
+                    @endallowed
                 @endif
             </aside>
         </div>

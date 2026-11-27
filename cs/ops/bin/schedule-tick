@@ -76,6 +76,18 @@ def weekly_review(row):
     return row.get("command") == "review-weekly"
 
 
+def price_watch(row):
+    return row.get("command") == "price-watch"
+
+
+def google_tasks(row):
+    return row.get("spec") == "specs/google-tasks.json" and row.get("task") == "tasks/google-tasks"
+
+
+def host_schedule(row):
+    return weekly_review(row) or price_watch(row) or google_tasks(row)
+
+
 def cron_matches(expression, local):
     parts = expression.split()
     if len(parts) != 5:
@@ -292,11 +304,13 @@ def attempt_state(schedule, slot, history, dispatch, scheduled_dispatch, now):
             return "failed"
         if is_config_void(latest):
             return "failed"
-        attempted_at = parse_time(attempts[-1].get("ts"))
+        attempted_at = parse_time(attempts[-1].get("ts") if attempts else latest.get("ts"))
         backoff = int(schedule.get("retry_after_minutes", 5))
         if attempted_at and now < attempted_at + timedelta(minutes=backoff):
             return "retry_backoff"
         return "retryable"
+    if latest and price_watch(schedule) and latest.get("state") == "error":
+        return "nonretryable"
     if latest and latest.get("state") in TERMINAL:
         return "failed"
     return "claimed"
@@ -392,7 +406,12 @@ def node_dispatch(schedule, slot):
         argv = None
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
         raise NodeDispatchUnavailable("CS_DIRECTOR_DISPATCH is not a JSON argv")
-    argv = argv + [schedule["node"], schedule["spec"], "--schedule=" + schedule["id"], "--slot=" + slot]
+    argv = argv + [schedule["node"]]
+    if "spec" in schedule:
+        argv.append(schedule["spec"])
+    else:
+        argv.append("--agent=" + schedule["agent"])
+    argv += ["--schedule=" + schedule["id"], "--slot=" + slot]
     if schedule.get("task"):
         argv.append("--task=" + schedule["task"])
     if schedule.get("grant"):
@@ -411,7 +430,7 @@ def late(row, slot, now):
     return now - slot > timedelta(minutes=grace)
 
 
-def record_dispatch_terminal(path, schedule, verdict, state, stop, code, note=""):
+def record_dispatch_terminal(path, schedule, verdict, state, stop, code, note="", *, slot=None, now=None, details=None):
     """A review delivery's terminal, on the dispatch shelf repeated_failure reads.
 
     Other schedules get this row from the job (enqueue's id, then tick's terminal): id, state,
@@ -423,16 +442,84 @@ def record_dispatch_terminal(path, schedule, verdict, state, stop, code, note=""
     """
     job = str(time.time_ns())
     terminal = {
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ts": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         "id": job, "job": job, "state": state, "pid": 0, "code": code, "origin": "dispatch",
         "verdict": verdict, "stop": stop, "schedule_id": schedule["id"],
         "lane": schedule.get("lane") or "host",
     }
+    if details:
+        terminal.update(details)
     if note:
         terminal["note"] = note
+    if slot:
+        terminal["schedule_slot"] = slot
     path.parent.mkdir(parents=True, exist_ok=True)
     append_jsonl(path, terminal, sort_keys=False, compact=False, sync=True, encoding="utf-8")
     return terminal
+
+
+def run_watch(state, dispatch_path, row, slot, now):
+    from _price_watch import WatchError, deliver_price_watch
+
+    try:
+        delivered = deliver_price_watch(CODE_ROOT, state, row, slot)
+    except WatchError as error:
+        verdict = "void" if error.kind == "retryable" else "fail"
+        terminal = record_dispatch_terminal(dispatch_path, row, verdict, "error", error.kind, 1, str(error),
+                                            slot=slot, now=now)
+        return terminal["job"], {"error_kind": error.kind, "retryable": verdict == "void"}
+    if delivered["kind"] == "layout_changed":
+        terminal = record_dispatch_terminal(dispatch_path, row, "fail", "error", "layout_changed", 1,
+                                            slot=slot, now=now)
+        return terminal["job"], {"error_kind": "layout_changed", "retryable": False,
+                                 "evidence": delivered["evidence"]}
+    terminal = record_dispatch_terminal(dispatch_path, row, "pass", "done", "done", 0, slot=slot, now=now)
+    return terminal["job"], {"evidence": delivered["evidence"]}
+
+
+def run_google_tasks(state, dispatch_path, row, slot, now, history):
+    from _browser_reliability import BrowserFailure, NEEDS_YOU
+    from _google_tasks import run
+    from _review_schedule import _attention_ids
+
+    try:
+        details = run(CODE_ROOT, state, row, slot)
+    except (OSError, ValueError, RuntimeError) as error:
+        failure = error if isinstance(error, BrowserFailure) else BrowserFailure("unknown")
+        details = failure.details()
+        if failure.kind in NEEDS_YOU:
+            details["kind"] = "needs_you"
+            last_success = next((item["slot"] for item in reversed(history)
+                                 if item.get("id") == row["id"] and item.get("evidence")), "first")
+            # Keep one item for this remedy until the schedule succeeds again.
+            alert = f"{row['id']}:browser:{failure.kind}:{last_success}"
+            attention = state / "attention.jsonl"
+            if alert not in _attention_ids(attention):
+                append_jsonl(attention, {"event": "attention", "id": alert, "kind": "needs_you",
+                                       "question": failure.fix, "schedule_id": row["id"], "slot": slot,
+                                       "ts": now.isoformat(), **failure.details()},
+                             sort_keys=True, compact=False, sync=True, encoding="utf-8")
+        terminal = record_dispatch_terminal(dispatch_path, row, "fail", "error", failure.kind,
+                                            1, failure.fix, slot=slot, now=now, details=details)
+    else:
+        terminal = record_dispatch_terminal(dispatch_path, row, "pass", "done", "done", 0, slot=slot, now=now)
+    return terminal["job"], details
+
+
+def record_browser_result(schedules, row, job, slot, details, now):
+    from _browser_reliability import PAUSE
+
+    updated = {key: value for key, value in row.items() if key != "_catch_up"}
+    if row.get("ts"):
+        updated.setdefault("enabled_at", row["ts"])
+    updated.update(event="schedule_updated", ts=now.isoformat(), actor_id="ops:schedule-tick",
+                   actor_kind="automated", last_result={"job": job, "slot": slot, **details})
+    if details.get("error_kind") in PAUSE:
+        updated.update(enabled=False, hold="browser:" + details["error_kind"])
+    elif details.get("evidence") and str(updated.get("hold", "")).startswith("browser:"):
+        updated.update(enabled=True)
+        updated.pop("hold")
+    append_jsonl(schedules, updated, sort_keys=True, compact=False, sync=True, encoding="utf-8")
 
 
 def record_firing(fires, row, slot, now, revision):
@@ -462,20 +549,20 @@ def main():
     schedules = Path(args.get("schedules") or DEFAULT_SCHEDULES)
     fires = Path(args.get("fires") or DEFAULT_FIRES)
     dispatch_path = Path(args.get("dispatch") or DEFAULT_DISPATCH)
-    rows = schedule_rows(schedules)
-    schedules_by_id = validate_dependencies(rows)
-    retry_failed = args.get("retry_failed", [])
-    if (not isinstance(retry_failed, list) or len(retry_failed) != len(set(retry_failed)) or
-            any(not isinstance(value, str) or value not in schedules_by_id
-                for value in retry_failed)):
-        raise ValueError("retry_failed must be a unique array of known schedule ids")
-    retry_failed = set(retry_failed)
     if args.get("missed_default") not in (None, "skip", "catch_up"):
         raise ValueError("missed_default is skip or catch_up")
     lock = Path(args.get("lock") or LOCK)
     lock.parent.mkdir(parents=True, exist_ok=True)
     with lock.open("a") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        rows = schedule_rows(schedules)
+        schedules_by_id = validate_dependencies(rows)
+        retry_failed = args.get("retry_failed", [])
+        if (not isinstance(retry_failed, list) or len(retry_failed) != len(set(retry_failed)) or
+                any(not isinstance(value, str) or value not in schedules_by_id
+                    for value in retry_failed)):
+            raise ValueError("retry_failed must be a unique array of known schedule ids")
+        retry_failed = set(retry_failed)
         history = read_jsonl(fires)
         revisions = {}
         for raw in read_jsonl(schedules) if schedules.is_file() else []:
@@ -489,10 +576,12 @@ def main():
         due = []
         deferred = []
         for row in rows:
-            if not row.get("enabled", False):
+            browser_retry = (google_tasks(row) and row["id"] in retry_failed
+                             and str(row.get("hold", "")).startswith("browser:"))
+            if (not row.get("enabled", False) and not browser_retry) or row.get("deleted"):
                 continue
             failure = repeated_failure(row, dispatch_history)
-            if failure:
+            if failure and not browser_retry and not (price_watch(row) and failure == "repeated_terminal_failure:layout_changed"):
                 row.update(event="schedule_updated", enabled=False, hold=failure,
                            ts=now.isoformat(), actor_id="ops:schedule-tick", actor_kind="automated")
                 append_jsonl(schedules, row, sort_keys=True, compact=False, sync=True, encoding="utf-8")
@@ -519,8 +608,9 @@ def main():
                     continue
                 state = "retryable"
             policy = row.get("missed") or args.get("missed_default")
-            if state == "unseen" and policy and late(dict(row, missed=policy), slot, now) and not any(
-                    h.get("id") == row["id"] and h.get("slot") == rendered for h in history):  # deferred = seen, not missed
+            if (state == "unseen" and policy and not browser_retry
+                    and late(dict(row, missed=policy), slot, now)
+                    and not any(h.get("id") == row["id"] and h.get("slot") == rendered for h in history)):
                 if policy != "catch_up":
                     deferred.append({"id": row["id"], "slot": rendered, "reason": "missed"})
                     continue
@@ -535,9 +625,9 @@ def main():
             if state not in {"unseen", "retryable"}:
                 continue
             due.append((row, rendered))
-        ready = local_model_ready(args) if any(not weekly_review(row) for row, _slot in due) else True
+        ready = local_model_ready(args) if any(not host_schedule(row) for row, _slot in due) else True
         for row, rendered in due:
-            if not weekly_review(row) and spec_uses_local_coder(row) and not ready and not row.get("node"):  # a node runs its own model
+            if not host_schedule(row) and spec_uses_local_coder(row) and not ready and not row.get("node"):
                 deferred.append({"id": row["id"], "slot": rendered,
                                  "reason": "local_coder_unavailable"})
                 continue
@@ -547,7 +637,19 @@ def main():
                 deferred.append(waiting)
                 continue
             job = "dry-run"
-            if weekly_review(row):
+            details = {}
+            if price_watch(row):
+                if not args.get("dry_run", False):
+                    try:
+                        job, details = run_watch(schedules.parent, dispatch_path, row, rendered, now)
+                    except (OSError, ValueError, RuntimeError) as error:
+                        deferred.append({"id": row["id"], "slot": rendered, "reason": "watch_delivery_failed: %s" % error})
+                        continue
+            elif google_tasks(row):
+                if not args.get("dry_run", False):
+                    job, details = run_google_tasks(schedules.parent, dispatch_path, row, rendered, now, history)
+                    record_browser_result(schedules, row, job, rendered, details, now)
+            elif weekly_review(row):
                 # Deliver first. The firing is recorded only after the report exists, so a crash
                 # between the two still leaves one file (deliver_weekly is idempotent per local date).
                 # The dispatch terminal is the same record other schedules leave when a firing fails:
@@ -579,9 +681,12 @@ def main():
                 job = enqueue(row, rendered, prepared)
             event = {"ts": now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
                      "id": row["id"], "slot": rendered, "job": job,
-                     "lane": row.get("lane", "shadow")}
+                     "lane": row.get("lane", "shadow"), **details}
             if row.get("_catch_up"):
                 event["catch_up"] = True
+            if (price_watch(row) or google_tasks(row)) and args.get("dry_run", False):
+                admitted.append(event)
+                continue
             fires.parent.mkdir(parents=True, exist_ok=True)
             append_jsonl(fires, event, sort_keys=True, compact=False,
                          sync=False, encoding='utf-8')

@@ -2,7 +2,7 @@
   "mcpServers": {
     "contextstack": {
       "command": "cs",
-      "args": ["mcp", "--no-land", "--credential-file", "CREDENTIAL_FILE"]
+      "args": ["mcp", "--request-land", "--credential-file", "CREDENTIAL_FILE"]
     }
   }
 }

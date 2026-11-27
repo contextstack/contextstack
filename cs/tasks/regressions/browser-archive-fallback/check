@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import json
-import os
 import subprocess
-import tempfile
 from pathlib import Path
 import sys
 
@@ -14,25 +12,23 @@ ROOT = Path(__file__).resolve().parents[3]
 tool = ROOT / "tools/bin/browser_fetch"
 assert tool.is_file()
 with scratch_dir(prefix="browser-archive-fallback-") as raw:
-    root = Path(raw); fake = root / "browse"
-    fake.write_text("""#!/bin/sh
-set -eu
-case "$2" in
-  goto) echo "Navigated to $3 (200)" ;;
-  wait) echo "Page loaded" ;;
-  url) echo "https://93.184.216.34/source" ;;
-  js) case "$3" in *querySelectorAll*) printf '[{"text":"Detail","href":"https://93.184.216.34/detail"}]' > "$5" ;; *) printf 'Rendered evidence.\\n' > "$5" ;; esac; echo written ;;
-  archive) if [ "$CS_ARCHIVE_MODE" = fail ]; then exit 9; else : > "$3"; echo archived; fi ;;
-  *) exit 2 ;;
-esac
+    root = Path(raw)
+    fake = root / "broker"
+    fake.write_text("""#!/usr/bin/env python3
+import hashlib, json, os, sys
+request = json.load(sys.stdin)
+assert request["archive"] and request["links"]
+text = "Rendered evidence.\\n"
+print(json.dumps({"ok": True, "status": 200, "final_url": request["url"], "text": text,
+                  "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                  "links": [{"text":"Detail","href":"https://93.184.216.34/detail"}],
+                  "archive_omitted": os.environ["CS_ARCHIVE_REASON"]}))
 """)
     fake.chmod(0o755)
-    for mode, expected in (("fail", "capture_failed"), ("empty", "empty_or_exceeds_limit")):
-        workspace = root / mode; workspace.mkdir()
-        state = root / (mode + "-state"); state.mkdir()
-        env = {**hermetic_env(), "CS_BROWSE": str(fake), "CS_BROWSER_STATE": str(state),
-               "CS_BROWSER_ENGINE": "chrome", "CS_BROWSER_VISIBILITY": "headed",
-               "CS_ARCHIVE_MODE": mode}
+    for expected in ("capture_failed", "empty_or_exceeds_limit"):
+        workspace = root / expected
+        workspace.mkdir()
+        env = {**hermetic_env(), "CS_BROWSER_BROKER_EXEC": str(fake), "CS_ARCHIVE_REASON": expected}
         payload = json.dumps({"url": "https://93.184.216.34/source", "archive": True, "links": True})
         result = subprocess.run([str(tool)], input=payload, text=True, cwd=workspace,
                                 env=env, capture_output=True)

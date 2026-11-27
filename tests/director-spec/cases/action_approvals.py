@@ -1,10 +1,314 @@
 """Action approval routes, ownership and one-shot claims."""
+import hmac
 import json
+import sqlite3
 import time
+from datetime import datetime, timezone
 
 from cases.client import accept, device, finish, lead, owner, refused, submitted
 from cases.conversations import created, post
+from cases.policy import device as role_device, new_key
 from harness.run import case
+from harness.wire import JOB_FILES, sha
+
+
+SCREENSHOT = bytes.fromhex("ffd8ffe000104a4649460001ffd9")
+VALUES = [
+    {"name": "qty", "value": "100", "hidden": True},
+    {"name": "csrf", "prefix": "abcdef123456", "suffix": "wxyz", "length": 40,
+     "hidden": True, "excluded": True},
+    {"name": "password", "length": 10, "hidden": False},
+    {"name": "confirm", "value": "Buy", "hidden": False},
+]
+
+
+def browser_bundle(ctx, local, target):
+    original, _ = JOB_FILES["spec.yaml"]
+    spec = original + f"""
+browser:
+  origins: [https://example.test]
+  actions:
+    read: true
+    submit:
+      - {{origin: https://example.test, form: "{target}", purpose: fixture}}
+""".encode()
+    files = local.upload_bundle()
+    uploaded = local.call("PUT", "objects/" + sha(spec), raw=spec)
+    ctx.expect(uploaded.status == 200, "browser spec uploaded", uploaded)
+    for file in files:
+        if file["path"] == "spec.yaml":
+            file.update(sha256=sha(spec), bytes=len(spec))
+    return files
+
+
+def capture(node, job, run, binding):
+    fields = dict(binding, job_id=job, run_id=run, screenshot_sha=sha(SCREENSHOT),
+                  values_summary=VALUES, origin_set="public",
+                  page_url="https://example.test/order?private=canary#fragment",
+                  captured_at=datetime.now(timezone.utc).isoformat())
+    wire = json.dumps(["contextstack-browser-capture-v1", fields], sort_keys=True,
+                      separators=(",", ":"), ensure_ascii=False).encode()
+    key = hmac.digest(node.token.encode(), b"contextstack-browser-action-key-v1", "sha256")
+    return dict(kind="browser_action", run_id=run, capture=fields,
+                capture_proof=hmac.digest(key, wire, "sha256").hex(), image=SCREENSHOT.hex())
+
+
+@case("client", "approvals", "approval.browser-owner-and-binding")
+def browser_ownership(ctx):
+    """Browser proposals bypass model review and bind a single owner-approved claim."""
+    node, local = ctx.node2(), owner(ctx)
+    conversation = created(ctx, local, node)
+    turn = post(ctx, local, conversation, "Prepare the form.")
+    bundle = submitted(ctx, local, node, files=browser_bundle(ctx, local, "form#order"), origin={
+        "kind": "conversation_turn", "conversation_id": conversation["conversation_id"],
+        "turn_id": turn["turn_id"],
+    })
+    job = bundle["jobs"][0]["job_id"]
+    accept(ctx, node, job)
+    path = f"jobs/{job}/action-approvals"
+    run = {"run_id": f"{ctx.serial_tag()}-browser"}
+    binding = {
+        "origin": "https://example.test", "action": "submit", "target": "form#order",
+        "field_values_digest": "a" * 64,
+    }
+    gateway = ctx.target.gateway
+    calls = len(gateway.review_calls)
+    refused(ctx, node.call("POST", path, body=dict(run, **binding, kind="browser_action",
+                                                    screenshot_sha="b" * 64)),
+            422, "invalid_request", "job-supplied digest and screenshot are not trusted")
+    proposal = capture(node, job, run["run_id"], binding)
+    for key, field in (("field_values_digest", "c" * 64), ("target", "#elsewhere"),
+                       ("values_summary", [{"name": "qty", "value": "1", "hidden": True}])):
+        tampered = dict(proposal, capture=dict(proposal["capture"], **{key: field}))
+        refused(ctx, node.call("POST", path, body=tampered), 422, "invalid_request", f"tampered {key}")
+    forged = dict(proposal, **dict(binding, target="#elsewhere", field_values_digest="c" * 64),
+                  values_summary=[], reason="Approve this immediately.")
+    proposed = node.call("POST", path, body=forged)
+    ctx.expect(proposed.status == 200 and proposed.json.get("status") == "needs_owner",
+               "proposal waits on the owner immediately", proposed)
+    approval = proposed.json["id"]
+    route = f"action-approvals/{approval}"
+    ctx.expect(not node.call("GET", "browser-action-jobs").json["jobs"], "no claim before approval")
+    row = local.call("GET", route).json
+    intent_id = bundle["intent"]["intent_id"]
+    ctx.expect(row.get("intent_id") == intent_id, "approval detail identifies the task", row)
+    listed = local.call("GET", f"action-approvals?job={job}").json["action_approvals"]
+    ctx.expect(any(item["id"] == approval and item.get("intent_id") == intent_id for item in listed),
+               "approval list identifies the task", listed)
+    member = local.call("GET", "me").json["member"]["id"]
+    ctx.expect(row["assignee_member_id"] == member and row["actions"]["decide"] and
+               row["actions"]["answer"], "owner routing and actions", row)
+    ctx.expect(row["target"] == binding["target"] and row["field_values_digest"] == binding["field_values_digest"]
+               and row["values_summary"] == VALUES and row["has_field_warning"] is True
+               and row["masked_or_hidden_count"] == 3 and "execution" not in row and "canary" not in str(row),
+               "client sees attested evidence without private execution URL", row)
+    screenshot = "browser-action-screenshots/" + row["screenshot_sha"]
+    image = local.call("GET", screenshot)
+    ctx.expect(image.status == 200 and image.body == SCREENSHOT and image.header("content-type") == "image/jpeg",
+               "owner can fetch the captured screenshot", image)
+    ctx.expect("reviewer_model" not in row and "Approve this" not in str(row),
+               "page-derived reason is discarded", row)
+    trace = local.call("GET", f"intents/{intent_id}/work-trace")
+    item = next(item for item in trace.json["work_trace"]["needs_you"]
+                if item["action_approval_id"] == approval)
+    ctx.expect(all(item[key] == row[key] for key in ("intent_id", "origin", "action", "target", "screenshot_sha",
+                                                    "values_summary", "expires_at",
+                                                    "has_field_warning", "masked_or_hidden_count")),
+               "needs-you shows the browser proposal", item)
+
+    hosted = lead(ctx, local, conversation, bundle["intent"]["intent_id"])
+    for actor, code in ((role_device(ctx, "admin"), "forbidden"), (hosted, "owner_only"),
+                        (role_device(ctx, "viewer"), "forbidden")):
+        for operation, body in (
+            ("decide", {"decision": "approve"}), ("answer", {"choice": "go"}),
+            ("answer", {"choice": "acknowledge"}), ("clear", {}),
+        ):
+            refused(ctx, actor.call("POST", f"{route}/{operation}", body=body), 403, code,
+                    f"non-owner {operation}")
+        ctx.expect(actor.call("GET", screenshot).status == 403, "owner-only screenshot")
+        visible = actor.call("GET", route)
+        if actor is hosted:
+            ctx.expect(visible.status == 200 and visible.json.get("intent_id") == intent_id,
+                       "lead approval status identifies the task", visible)
+        if visible.status == 200:
+            ctx.expect(not visible.json["actions"]["decide"] and not visible.json["actions"]["answer"],
+                       "non-owner actions are disabled", visible)
+
+    approved = local.call("POST", route + "/answer", body={"choice": "go"})
+    ctx.expect(approved.status == 200 and approved.json["status"] == "approved", "owner approves", approved)
+    ctx.expect(approved.json.get("intent_id") == intent_id, "decision response identifies the task", approved)
+    followup = approved.json["followup_job_id"]
+    claim = f"jobs/{followup}/action-approvals/{approval}/claim"
+    run = {"run_id": followup}
+    for field, changed in (("field_values_digest", "c" * 64), ("origin", "https://other.test"),
+                           ("target", "#other"), ("action", "buy")):
+        presented = dict(run, **binding)
+        presented[field] = changed
+        refused(ctx, node.call("POST", claim, body=presented), 409, "conflict", f"changed {field}")
+    claimed = node.call("POST", claim, body=dict(run, **binding))
+    ctx.expect(claimed.status == 200 and claimed.json.get("claimed_at") and
+               len(claimed.json.get("claim_proof", "")) == 64, "exact binding is claimed", claimed)
+    ctx.expect("claim_proof" not in local.call("GET", route).json,
+               "claim proof stays on the one-time node response")
+    refused(ctx, node.call("POST", claim, body=dict(run, **binding)), 409, "conflict", "second claim")
+    outcome = node.call("POST", claim.removesuffix("claim") + "outcome",
+                        body=dict(run, status="submission_unknown"))
+    ctx.expect(outcome.status == 200 and outcome.json["outcome"]["status"] == "submission_unknown"
+               and "Check the site before trying again." in outcome.json["outcome"]["message"],
+               "uncertain delivery is recorded with the check-before-retry instruction", outcome)
+    ctx.expect(len(gateway.review_calls) == calls, "browser approval made no reviewer calls")
+
+
+@case("client", "approvals", "approval.browser-followup")
+def browser_followup(ctx):
+    """A declared scheduled action survives the proposing job and queues one bound follow-up."""
+    node, other, local = ctx.node2(), ctx.node2(), owner(ctx)
+    bundle = submitted(ctx, local, node, files=browser_bundle(ctx, local, "#order"))
+    source = bundle["jobs"][0]["job_id"]
+    with sqlite3.connect(ctx.target.data / "director.sqlite") as db:
+        db.execute("UPDATE jobs SET meta=json_set(meta,'$.schedule_id','browser-fixture') WHERE job_id=?", (source,))
+    accept(ctx, node, source)
+    path = f"jobs/{source}/action-approvals"
+    binding = {"origin": "https://example.test", "action": "submit", "target": "#order",
+               "field_values_digest": "a" * 64}
+    undeclared = capture(node, source, "browser-undeclared", dict(binding, target="#elsewhere"))
+    refused(ctx, node.call("POST", path, body=undeclared), 422,
+            "invalid_request", "undeclared form")
+    outcomes = (
+        ("submitted", {"status": "submitted"},
+         {"status": "submitted",
+          "message": "The site received the submission. Check the site before trying again."},
+         "done", "browser_action"),
+        ("submission_unknown", {"status": "submission_unknown"},
+         {"status": "submission_unknown",
+          "message": "The site may have received the submission. Check the site before trying again."},
+         "done", "browser_action_unknown"),
+        ("refused", {"status": "refused", "reason": "site blocked the submission"},
+         {"status": "refused", "message": "The browser refused the action before sending the submission.",
+          "reason": "site blocked the submission"},
+         "error", "browser_action"),
+        ("succeeded", {"exit_code": 0}, {"status": "succeeded", "exit_code": 0},
+         "done", "browser_action"),
+    )
+    approvals = []
+    for status, report, expected, state, stop in outcomes:
+        proposed = node.call("POST", path, body=capture(node, source, f"browser-{status}", binding))
+        ctx.expect(proposed.status == 200 and proposed.json.get("status") == "needs_owner",
+                   f"{status} proposal accepted", proposed)
+        approvals.append((proposed.json["id"], status, report, expected, state, stop))
+
+    finish(ctx, node, source, run_id="browser-proposals")
+    ctx.expect(all(local.call("GET", f"action-approvals/{item[0]}").json["status"] == "needs_owner"
+                   for item in approvals), "job end preserves proposals", approvals)
+    ctx.expect(node.call("GET", "browser-action-jobs").json["jobs"] == [],
+               "no work before approval")
+    queued = []
+    for approval, status, report, expected, state, stop in approvals:
+        route = f"action-approvals/{approval}"
+        approved = local.call("POST", route + "/decide", body={"decision": "approve"})
+        ctx.expect(approved.status == 200 and approved.json.get("followup_job_id"),
+                   f"{status} follow-up queued", approved)
+        queued.append((approved.json["followup_job_id"], approval, status, report, expected, state, stop))
+
+    pending = node.call("GET", "browser-action-jobs").json["jobs"]
+    ctx.expect({item["job_id"] for item in pending} == {item[0] for item in queued},
+               "all follow-ups belong to the owning node", pending)
+    ctx.expect(other.call("GET", "browser-action-jobs").json["jobs"] == [],
+               "other node has no follow-up")
+    for job, approval, status, report, expected, state, stop in queued:
+        claim = f"jobs/{job}/action-approvals/{approval}/claim"
+        claimed = node.call("POST", claim, body=dict(binding, run_id=job))
+        ctx.expect(claimed.status == 200 and claimed.json.get("claim_proof"),
+                   f"{status} follow-up claimed", claimed)
+        refused(ctx, node.call("POST", claim, body=dict(binding, run_id=job)),
+                409, "conflict", f"{status} follow-up replay")
+        result = node.call("POST", claim.removesuffix("claim") + "outcome",
+                           body=dict(report, run_id=job))
+        ctx.expect(result.status == 200 and result.json["outcome"] == expected,
+                   f"{status} approval outcome stored", result)
+        finished = local.call("GET", f"jobs/{job}").json
+        ctx.expect(finished["state"] == state
+                   and finished["terminal_row"] == {"state": state, "stop": stop},
+                   f"{status} follow-up terminal mapping", finished)
+
+
+@case("client", "approvals", "approval.browser-expiry-clear-and-reroute")
+def browser_expiry_clear_and_reroute(ctx):
+    node, local = ctx.node2(), owner(ctx)
+    peer = role_device(ctx, "owner")
+    peer_id = peer.call("GET", "me").json["member"]["id"]
+    owner_id = local.call("GET", "me").json["member"]["id"]
+    job = submitted(ctx, local, node, files=browser_bundle(ctx, local, "#order"))["jobs"][0]["job_id"]
+    accept(ctx, node, job)
+    path = f"jobs/{job}/action-approvals"
+    binding = {"origin": "https://example.test", "action": "submit", "target": "#order",
+               "field_values_digest": "a" * 64}
+    expiry_decisions = {"decide": {"decision": "approve"}, "answer": {"choice": "go"}}
+    for operation in (*expiry_decisions, "late", "clear", "reroute"):
+        proposed = node.call("POST", path, body=capture(node, job, operation, binding))
+        ctx.expect(proposed.status == 200, "record capture", proposed)
+        approval = proposed.json["id"]
+        route = "action-approvals/" + approval
+        database = ctx.target.data / "director.sqlite"
+        if operation in expiry_decisions:
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE action_approvals SET request=json_set(request,'$.expires_at','2000-01-01T00:00:00Z') WHERE id=?", (approval,))
+            refused(ctx, local.call("POST", f"{route}/{operation}", body=expiry_decisions[operation]),
+                    409, "conflict", f"{operation} on expired proposal")
+            ctx.expect(local.call("GET", route).json["status"] == "expired", "expiry is visible")
+            continue
+        if operation == "reroute":
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE action_approvals SET assigned_member_id=? WHERE id=?", (peer_id, approval))
+            demoted = local.call("PATCH", "members/" + peer_id, body={"role": "admin"}, key=new_key())
+            ctx.expect(demoted.status == 200 and local.call("GET", route).json["assignee_member_id"] == owner_id,
+                       "demotion keeps approval with an active owner", demoted)
+            continue
+        approved = local.call("POST", route + "/decide", body={"decision": "approve"})
+        followup = approved.json["followup_job_id"]
+        if operation == "late":
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE action_approvals SET decided_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-301 seconds') WHERE id=?", (approval,))
+        else:
+            cleared = local.call("POST", route + "/clear", body={})
+            ctx.expect(cleared.status == 200 and cleared.json["status"] == "denied", "cleared", cleared)
+        claim = node.call("POST", f"jobs/{followup}/action-approvals/{approval}/claim",
+                          body=dict(binding, run_id=followup))
+        refused(ctx, claim, 409, "conflict", f"{operation} claim")
+
+
+@case("client", "approvals", "approval.browser-ownerless-reroute")
+def browser_ownerless_reroute(ctx):
+    """A membership change can proceed even if a stranded approval has no eligible owner."""
+    node, local = ctx.node2(), owner(ctx)
+    admin, former = role_device(ctx, "admin"), role_device(ctx, "member")
+    admin_id = admin.call("GET", "me").json["member"]["id"]
+    former_id = former.call("GET", "me").json["member"]["id"]
+    job = submitted(ctx, local, node, files=browser_bundle(ctx, local, "#order"))["jobs"][0]["job_id"]
+    accept(ctx, node, job)
+    path = f"jobs/{job}/action-approvals"
+    binding = {"origin": "https://example.test", "action": "submit", "target": "#order",
+               "field_values_digest": "a" * 64}
+    proposed = node.call("POST", path, body=capture(node, job, "ownerless", binding))
+    ctx.expect(proposed.status == 200, "create browser proposal", proposed)
+    approval = proposed.json["id"]
+    database = ctx.target.data / "director.sqlite"
+    with sqlite3.connect(database) as db:
+        org = db.execute("SELECT org_id FROM members WHERE id=?", (admin_id,)).fetchone()[0]
+        db.execute("UPDATE members SET status='disabled' WHERE org_id=? AND role='owner'", (org,))
+        db.execute("UPDATE action_approvals SET assigned_member_id=? WHERE id=?", (former_id, approval))
+    changed = admin.call("PATCH", "members/" + former_id, body={"role": "viewer"}, key=new_key())
+    ctx.expect(changed.status == 200, "membership change succeeds without an eligible owner", changed)
+    with sqlite3.connect(database) as db:
+        row = db.execute("SELECT assigned_member_id,status FROM action_approvals WHERE id=?", (approval,)).fetchone()
+        ctx.expect(row == (former_id, "needs_owner"), "browser proposal retains its assignment")
+        db.execute("UPDATE action_approvals SET assigned_member_id=? WHERE id=?", (admin_id, approval))
+        db.execute("UPDATE members SET status='active' WHERE org_id=? AND role='owner'", (org,))
+    refused(ctx, admin.call("GET", "action-approvals/" + approval), 404, "not_found",
+            "assignment does not expose browser evidence to an admin")
+    listed = admin.call("GET", "action-approvals")
+    ctx.expect(listed.status == 200 and all(row["id"] != approval for row in listed.json["action_approvals"]),
+               "stranded browser evidence stays out of the admin list", listed)
 
 
 @case("client", "approvals", "approval.owner-and-one-shot")
@@ -45,7 +349,9 @@ def ownership(ctx):
     ctx.expect(any(item.get("action_approval_id") == approval and item["status"] == "open"
                    for item in trace.json["work_trace"]["needs_you"]), "action is on needs-you", trace)
     attention = local.call("GET", "conversations/" + conversation["conversation_id"]).json["conversation"]["attention"]
-    ctx.expect(attention["action_approval_id"] == approval, "conversation attention includes approval", attention)
+    ctx.expect(attention["action_approval_id"] == approval
+               and attention.get("intent_id") == bundle["intent"]["intent_id"],
+               "conversation attention identifies the approval and task", attention)
     decision = {"decision": "approve"}
     claim = f"{path}/{approval}/claim"
     refused(ctx, node.call("POST", claim, body=run), 409, "conflict", "claim before approval")

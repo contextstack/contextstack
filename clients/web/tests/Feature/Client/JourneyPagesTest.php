@@ -48,6 +48,7 @@ function fakeIntent(array $jobs, array $runs = [], array $more = []): void
         director('usage*') => Http::response(['total' => ['runs' => count($runs), 'charged_usd' => 0.0123, 'kinds' => []]]),
         ...$more,
     ]);
+    fakeDirectorBackground();
 }
 
 it('submits an intent: uploads the bundle files, lists them, and opens the recorded intent', function () {
@@ -56,6 +57,7 @@ it('submits an intent: uploads the bundle files, lists them, and opens the recor
         director('objects/*') => Http::response(['stored' => true]),
         director('intents') => Http::response(['intent' => intentRecord(), 'jobs' => [jobRecord(['state' => 'offered'])], 'runs' => []], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.intent-create')
         ->assertSet('node', 'laptop')
@@ -86,6 +88,7 @@ it('leaves the check to the Director when the form has none', function () {
         director('objects/*') => Http::response(['stored' => true]),
         director('intents') => Http::response(['intent' => intentRecord(), 'jobs' => [jobRecord(['state' => 'offered'])], 'runs' => []], 201),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.intent-create')->set('goal', "Say hello.\n")
         ->call('submit')->assertHasNoErrors()->assertRedirect(route('intents.show', 'int_1'));
@@ -109,6 +112,7 @@ it('keeps the key when the answer is lost, so submitting again replays the same 
 
         return Http::response(['intent' => intentRecord(), 'jobs' => [], 'runs' => []], 200, ['Idempotent-Replayed' => 'true']);
     });
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.intent-create')->set('goal', 'Say hello.');
     $key = $page->get('submitKey');
@@ -126,6 +130,7 @@ it('shows the recorded intent and takes a new key when the key named a different
         director('intents') => Http::response(['error' => 'Conflict', 'code' => 'idempotency_conflict', 'detail' => 'different request',
             'record' => ['kind' => 'intent', 'id' => 'int_9']], 409),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.intent-create')->set('goal', 'Say hello.');
     $key = $page->get('submitKey');
@@ -140,6 +145,7 @@ it('shows the Director\'s reason for an unusable intent', function () {
         director('objects/*') => Http::response(['stored' => true]),
         director('intents') => Http::response(['error' => 'Unprocessable', 'code' => 'invalid_request', 'detail' => 'tasks/hello/goal.md is not in the bundle'], 422),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.intent-create')->set('goal', 'x')->call('submit')->assertSee('tasks/hello/goal.md is not in the bundle');
 });
@@ -154,6 +160,7 @@ it('shows the intent, its job, its runs with usage, and never an estimated price
 
 it('answers 404 for an intent the Director does not know', function () {
     Http::fake([director('intents/nope') => Http::response(['error' => 'Not Found', 'code' => 'not_found', 'detail' => 'no such intent'], 404)]);
+    fakeDirectorBackground();
 
     $this->get(route('intents.show', 'nope'))->assertNotFound();
 });
@@ -203,6 +210,7 @@ it('requests cancel with a key and shows it as stopping until the node reports a
         director('jobs/job_1/cancel') => Http::response($requested, 202),
         director('cancels/can_1') => Http::response($requested),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.intent', ['intent' => 'int_1']);
     $key = $page->get('cancelKey');
@@ -273,6 +281,7 @@ it('shows a run\'s evidence and usage, and approves its result with a key, showi
             'decided_by' => 'cred_local', 'decided_by_name' => 'local', 'decided_at' => '2026-11-10T10:02:00Z', 'revision' => 40,
             'scope' => 'run_result', 'authorises' => []], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.run', ['run' => 'run_1'])
         ->assertSee('transcript.md')->assertSee('1,200')->assertSee('$0.0123')->assertDontSeeText('0.0045');
@@ -291,6 +300,7 @@ it('shows the decision on record when the run was already decided from another d
         director('runs/run_1/decision') => Http::response(['error' => 'Conflict', 'code' => 'already_decided', 'detail' => 'decided',
             'decision' => ['decision_id' => 'dec_7', 'decision' => 'reject', 'decided_by_name' => 'phone', 'decided_at' => '2026-11-10T10:03:00Z', 'authorises' => []]], 409),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.run', ['run' => 'run_1'])->call('approve')
         ->assertSee('already decided')->assertSee('Rejected')->assertSee('dec_7')->assertSee('phone');
@@ -298,6 +308,7 @@ it('shows the decision on record when the run was already decided from another d
 
 it('refuses to show a file the run does not list', function () {
     Http::fake([director('runs/run_1') => Http::response(runRecord())]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.run', ['run' => 'run_1'])->call('showFile', '../secret')->assertStatus(404);
 });
@@ -307,6 +318,7 @@ it('lists the fleet, showing a node never heard from as stale, never stopped', f
         ['name' => 'laptop', 'stale' => false, 'listening' => true, 'protocol' => 2, 'open_jobs' => 1, 'last_seen_at' => '2026-11-10T10:00:00Z', 'status' => null, 'revoked_at' => null, 'revision' => 3],
         ['name' => 'workstation', 'stale' => true, 'listening' => false, 'protocol' => null, 'open_jobs' => 0, 'last_seen_at' => null, 'status' => null, 'revoked_at' => null, 'revision' => 2],
     ]])]);
+    fakeDirectorBackground();
 
     $this->get(route('fleet'))->assertOk()->assertSee('listening')->assertSee('stale')->assertDontSee('stopped');
 });
@@ -326,4 +338,12 @@ it('reads only the Director, never this app\'s database', function () {
 
 it('makes a fresh key for every user action', function () {
     expect(DirectorClient::newKey())->toMatch('/^[A-Za-z0-9.:_-]{1,128}$/')->not->toBe(DirectorClient::newKey());
+});
+
+it('lets a run\'s decide action hide Approve and Reject from a role that could', function () {
+    meOnDirector(meAs('owner'));
+    Http::fake([director('runs/run_1') => Http::response(runRecord(['actions' => ['decide' => false]]))]);
+    fakeDirectorBackground();
+
+    Livewire::test('pages::client.run', ['run' => 'run_1'])->assertSeeHtml('data-test="decision"')->assertDontSee('Reject');
 });

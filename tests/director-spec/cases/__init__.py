@@ -11,3 +11,5 @@ from cases import action_approvals  # noqa: F401,E402
 from cases import decision_log  # noqa: F401,E402
 from cases import backlog  # noqa: F401,E402
 from cases import planning  # noqa: F401,E402
+from cases import policy  # noqa: F401,E402
+from cases import peer_messages  # noqa: F401,E402

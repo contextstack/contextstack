@@ -48,12 +48,15 @@ from _node_env import node_env
 NODE_SETTINGS = node_env()
 
 from _director_client import PROTOCOL, Client, DirectorUnreachable, receiver_config  # noqa: E402
+from _browser_action_jobs import poll as poll_browser_actions  # noqa: E402
 from _dispatch import TERMINAL, qid  # noqa: E402
 from _estate_io import append_jsonl, pid_live, read_jsonl  # noqa: E402
 from _repos import inventory as repo_inventory  # noqa: E402
 from _node_control import handle, prepare, read_json, report_pending, write_json  # noqa: E402
 from _node_events import live_runs, send as send_events  # noqa: E402
 from _node_intake import take  # noqa: E402
+from _lead_land import poll as poll_land  # noqa: E402
+from _lead_install import poll as poll_release  # noqa: E402
 from _node_schedules import digest, report as schedules_report  # noqa: E402
 from _node_spool import cancelled, spool_job_terminal  # noqa: E402
 from _node_restart import NODE_RESTART_REASON, ORPHANED_RUNNING_STOP, orphan_error  # noqa: E402
@@ -269,6 +272,34 @@ class Listener:
                 self.inflight.discard(message.get("control_id"))
 
     # ---- status, events, outcomes ----
+    def land_loop(self):
+        while not self.stop.wait(5):
+            if self.dispatch and self.speaks2():
+                try:
+                    poll_land(self.client, self.state, self.code, self.config)
+                except DirectorUnreachable as error:
+                    if error.status not in (404, 409):
+                        say(event="error", what="land requests", detail=str(error)[:300])
+
+    def release_loop(self):
+        # Keep release inspection and service submission off the work and duties loops.
+        while not self.stop.wait(5):
+            if self.dispatch and self.speaks2():
+                try:
+                    poll_release(self.client, self.state, self.code, self.config)
+                except DirectorUnreachable as error:
+                    if error.status not in (404, 409):
+                        say(event="error", what="release requests", status=error.status)
+
+    def browser_action_loop(self):
+        while not self.stop.wait(5):
+            if self.dispatch and self.speaks2():
+                try:
+                    poll_browser_actions(self.client)
+                except DirectorUnreachable as error:
+                    if error.status not in (404, 409):
+                        say(event="error", what="browser action jobs", status=error.status)
+
     def duties_loop(self, now=None):
         now = time.time if now is None else now
         sent_status, status_at, outcomes_at = None, 0.0, 0.0
@@ -368,7 +399,9 @@ def main(config_root=None, env=None):
         say(event="recovered_orphans", count=len(recovered), jobs=recovered)
     signal.signal(signal.SIGTERM, lambda *_: listener.stop.set())
     say(event="listening", director=receiver_config(receiver)["url"], pid=os.getpid())
-    for name, loop in (("work", listener.work_loop), ("schedules", listener.schedules_loop)):
+    for name, loop in (("work", listener.work_loop), ("schedules", listener.schedules_loop),
+                       ("land", listener.land_loop), ("release", listener.release_loop),
+                       ("browser actions", listener.browser_action_loop)):
         threading.Thread(target=listener.guard, args=(name, loop), daemon=True).start()
     seconds = args.get("seconds") if isinstance(args, dict) else None
     if seconds:

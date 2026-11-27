@@ -806,8 +806,8 @@ def main():
         expect("evil" not in trusted_config.get("mcpServers", {}), "MCP config ignores attacker workspace contents")
         args = _lead_host.build_mcp_config(b, cred_file, {"node": "workstation", "director": "http://127.0.0.1:8780"})["mcpServers"]["contextstack"]["args"]
         expect(args[args.index("--node") + 1] == "workstation" and args[args.index("--director") + 1] == "http://127.0.0.1:8780"
-               and "--no-land" in args and str(cred_file) in args,
-               "the lead's cs mcp names its node and Director and keeps --no-land", args)
+               and "--request-land" in args and "--no-land" not in args and str(cred_file) in args,
+               "the lead's cs mcp names its node and Director and only requests lands (--request-land)", args)
         expect(args[args.index("--max-wait") + 1] == "30", "the lead's wait_tasks is capped below its turn deadline", args)
         # 2026-11-12: a 300 s wait_tasks outlived the lead's 300 s turn. A capped wait returns early with a note.
         sys.path.insert(0, str(KIT / "scripts"))

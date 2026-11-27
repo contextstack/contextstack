@@ -7,6 +7,9 @@ use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorRefused;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Client\Exceptions\NotConnected;
+use App\Client\Identity;
+use App\Client\InviteLink;
+use App\Client\TailscaleAddress;
 use Flux\Flux;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Locked;
@@ -17,7 +20,11 @@ use Livewire\Component;
  * client-web's settings: this device's connection to its Director (CLIENT-API.md §2). The Director URL; pairing
  * with a one-time code from `cs device pair NAME` (the device token is kept in this device's settings file, never
  * shown); on the Director's own machine, its local credential file; and this device's identity as the Director
- * sees it (`GET me`). There is no account and no login (outline decision 7).
+ * sees it (`GET me`): the member it acts for and that member's role. An invited person joins here too, with the
+ * invite code (or the whole `contextstack://invite` link) an owner or admin gave them: the Director answers with a
+ * device token just as pairing does, kept the same way. There is no account and no login (outline decision 7).
+ * An owner (manage_org_settings) sets the Director's advertised URL here: the address every invite and pairing link
+ * names (`GET`/`PUT advertised-url`). Unset, this machine's Tailscale address is offered as a suggestion.
  */
 new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
 {
@@ -26,6 +33,13 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
     public string $code = '';
 
     public string $problem = '';
+
+    /** An invite code, or the whole contextstack://invite link. Cleared once used; never kept anywhere else. */
+    public string $inviteCode = '';
+
+    public string $inviteDevice = '';
+
+    public string $inviteProblem = '';
 
     /** @var array<string, mixed> */
     public array $me = [];
@@ -46,6 +60,22 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
     public string $homeChoice = '';
 
     public string $homeProblem = '';
+
+    /** Whether the advertised-URL card shows: an owner on a Director that has the setting. */
+    #[Locked]
+    public bool $advertisedShown = false;
+
+    /** The advertised URL the Director holds, '' when unset. */
+    #[Locked]
+    public string $advertised = '';
+
+    /** This machine's address for other devices, offered when nothing is advertised ('' when unknown). */
+    #[Locked]
+    public string $advertisedSuggestion = '';
+
+    public string $advertisedInput = '';
+
+    public string $advertisedProblem = '';
 
     /** The chief-of-staff slot (ChiefOfStaff::slot, held by the Director): on or off, and its name. */
     public bool $chiefOfStaff = false;
@@ -110,6 +140,57 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
         Flux::toast(variant: 'success', text: __('New conversations that run tasks will live on :node.', ['node' => $this->home['node']]));
     }
 
+    public function saveAdvertised(DirectorClient $director): void
+    {
+        $this->advertisedInput = trim($this->advertisedInput);
+        $this->validate(['advertisedInput' => ['required', 'url:http,https', 'max:500']]);
+        $this->writeAdvertised($director, $this->advertisedInput);
+    }
+
+    public function useSuggestedAddress(DirectorClient $director): void
+    {
+        if ($this->advertisedSuggestion === '') {
+            return;
+        }
+
+        $this->advertisedInput = $this->advertisedSuggestion;
+        $this->writeAdvertised($director, $this->advertisedSuggestion);
+    }
+
+    public function clearAdvertised(DirectorClient $director): void
+    {
+        $this->writeAdvertised($director, null);
+    }
+
+    private function writeAdvertised(DirectorClient $director, ?string $url): void
+    {
+        $this->advertisedProblem = '';
+        if (! $this->advertisedShown) {
+            return;
+        }
+
+        try {
+            $answer = $director->replace('advertised-url', ['url' => $url]);
+        } catch (DirectorRefused $refused) {
+            $this->advertisedProblem = $refused->status === 422
+                ? __('The Director did not accept that address (:why). Use an origin such as https://director.example.ts.net, with no path.', ['why' => $refused->detail])
+                : $refused->explain();
+
+            return;
+        } catch (DirectorUnavailable $unavailable) {
+            $this->advertisedProblem = $unavailable->getMessage();
+
+            return;
+        }
+
+        $this->advertised = is_string($answer['url'] ?? null) ? $answer['url'] : '';
+        $this->advertisedInput = $this->advertised;
+        $this->loadSuggestion();
+        Flux::toast(variant: 'success', text: $this->advertised !== ''
+            ? __('Invite and pairing links now name :url.', ['url' => $this->advertised])
+            : __('Cleared. Invite and pairing links name the address the issuing device uses.'));
+    }
+
     public function mount(ConnectionStore $connections, ChiefOfStaff $chief): void
     {
         ['enabled' => $this->chiefOfStaff, 'name' => $this->chiefOfStaffName] = $chief->slot();
@@ -144,6 +225,49 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
         $this->check();
     }
 
+    /**
+     * Join the Director as an invited member: `POST /api/v1/invites/accept`, then keep the device token like a pairing.
+     */
+    public function acceptInvite(ConnectionStore $connections): void
+    {
+        $this->inviteProblem = '';
+        $link = InviteLink::parse($this->inviteCode);
+        if ($link !== null) {
+            $this->url = $link['url'];
+            $this->inviteCode = $link['code'];
+        }
+
+        $this->validate([
+            'url' => ['required', 'url:http,https', 'max:500'],
+            'inviteCode' => ['required', 'string', 'max:128'],
+            'inviteDevice' => ['required', 'string', 'max:100', 'regex:/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/'],
+        ], [
+            'inviteDevice.regex' => __('Use letters, numbers, dots, dashes or underscores, starting with a letter or number (for example office-mac).'),
+        ]);
+
+        try {
+            $joined = DirectorClient::acceptInvite($this->url, $this->inviteCode, $this->inviteDevice, (int) config('client.timeout'));
+        } catch (DirectorRefused $refused) {
+            $this->inviteProblem = match (true) {
+                $refused->is('invite_refused') => __('That invite was not accepted. It may be mistyped, already used, cancelled or past its 24 hours. Ask whoever invited you for a new one.'),
+                $refused->status === 429 => __('Too many tries. Wait :seconds and try again.', ['seconds' => trans_choice(':count second|:count seconds', (int) ($refused->body['retry_after'] ?? 60))]),
+                default => $refused->explain(),
+            };
+
+            return;
+        } catch (DirectorUnavailable $unavailable) {
+            $this->inviteProblem = $unavailable->getMessage();
+
+            return;
+        }
+
+        $connections->saveDevice($this->url, $joined['token'], $joined['credential_id'], $joined['name']);
+        $this->inviteCode = '';
+        $this->inviteDevice = '';
+        $this->check();
+        Flux::toast(variant: 'success', text: __('Joined as :name.', ['name' => (string) ($joined['member']['display_name'] ?? $joined['name'])]));
+    }
+
     public function useLocal(ConnectionStore $connections): void
     {
         $this->validate(['url' => ['required', 'url:http,https', 'max:500']]);
@@ -153,6 +277,7 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
 
     public function forget(ConnectionStore $connections): void
     {
+        app(Identity::class)->forget();
         $connections->forget();
         $this->url = $connections->url();
         $this->check();
@@ -167,10 +292,22 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
         }
     }
 
+    /**
+     * Whether `me` advertises a capability; a Director from before teams answers with `owner` only.
+     */
+    public function meCan(string $capability): bool
+    {
+        $capabilities = $this->me['capabilities'] ?? null;
+
+        return is_array($capabilities) ? in_array($capability, $capabilities, true) : (bool) ($this->me['owner'] ?? false);
+    }
+
     private function check(): void
     {
         $this->me = [];
         $this->problem = '';
+        // A new connection, or this page asking again: who this device is gets asked again everywhere.
+        app(Identity::class)->forget();
 
         if ($this->connection() === null) {
             return;
@@ -185,6 +322,41 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
         }
 
         $this->loadHome();
+        $this->loadAdvertised();
+    }
+
+    private function loadAdvertised(): void
+    {
+        $this->advertisedShown = false;
+        $this->advertised = '';
+        $this->advertisedSuggestion = '';
+        $this->advertisedProblem = '';
+        if ($this->me === [] || ! is_array($this->me['capabilities'] ?? null) || ! $this->meCan('manage_org_settings')) {
+            return;
+        }
+
+        try {
+            $answer = app(DirectorClient::class)->find('advertised-url');
+        } catch (DirectorRefused|DirectorUnavailable) {
+            return;
+        }
+        if ($answer === null) {
+            // A Director from before the setting.
+            return;
+        }
+
+        $this->advertisedShown = true;
+        $this->advertised = is_string($answer['url'] ?? null) ? $answer['url'] : '';
+        $this->advertisedInput = $this->advertised;
+        $this->loadSuggestion();
+    }
+
+    private function loadSuggestion(): void
+    {
+        $connection = $this->connection();
+        $this->advertisedSuggestion = $this->advertised === '' && $connection !== null
+            ? app(TailscaleAddress::class)->directorAddress($connection)
+            : '';
     }
 
     private function loadHome(): void
@@ -203,7 +375,7 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
             }
             $this->home = ['node' => $home['node'], 'source' => (string) ($home['source'] ?? '')];
             $this->homeChoice = $home['node'];
-            if ($this->me['owner'] ?? false) {
+            if ($this->meCan('manage_org_settings')) {
                 $nodes = (array) ($director->get('nodes')['nodes'] ?? []);
                 $this->machines = array_values(array_map(fn (array $node): string => (string) $node['name'],
                     array_filter($nodes, fn ($node): bool => is_array($node) && is_string($node['name'] ?? null) && ($node['revoked_at'] ?? null) === null)));
@@ -246,11 +418,19 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
                 @endif
             </flux:text>
             @if ($me !== [])
+                @if (is_string($me['member']['display_name'] ?? null) && is_string($me['role'] ?? null))
+                    <flux:text data-test="device-member">
+                        {{ __('Signed in as') }} <span class="font-medium">{{ $me['member']['display_name'] }}</span>
+                        · <span data-test="device-role">{{ __(ucfirst($me['role'])) }}</span>
+                    </flux:text>
+                @endif
                 <flux:text data-test="device-identity">
                     {{ __('This device') }}: <span class="font-mono">{{ $me['credential_id'] ?? '?' }}</span>
-                    {{ ($me['owner'] ?? false) ? __('(owner: may pair and revoke devices)') : __('(not the owner)') }}
+                    @if (! is_array($me['capabilities'] ?? null))
+                        {{ ($me['owner'] ?? false) ? __('(owner: may pair and revoke devices)') : __('(not the owner)') }}
+                    @endif
                 </flux:text>
-                <flux:badge color="green" data-test="connected">{{ ($me['owner'] ?? false) ? __('Connected as owner') : __('Connected') }}</flux:badge>
+                <flux:badge color="green" data-test="connected">{{ is_string($me['role'] ?? null) ? __('Connected as :role', ['role' => __($me['role'])]) : (($me['owner'] ?? false) ? __('Connected as owner') : __('Connected')) }}</flux:badge>
             @endif
             <div>
                 <flux:button size="sm" variant="ghost" wire:click="forget">{{ $connection->mode === \App\Client\Connection::Device ? __('Forget this device') : __('Forget this connection') }}</flux:button>
@@ -284,6 +464,7 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
         </flux:card>
     @endif
 
+    @if (! is_array($me['capabilities'] ?? null) || $this->meCan('manage_org_settings'))
     <flux:card class="space-y-3" data-test="chief-of-staff">
         <div>
             <flux:heading size="lg">{{ __('Chief of staff') }}</flux:heading>
@@ -300,6 +481,50 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
             @endif
         </form>
     </flux:card>
+    @endif
+
+    @if ($advertisedShown)
+        <flux:card class="space-y-3" data-test="advertised-url">
+            <div>
+                <flux:heading size="lg">{{ __('Director address for other devices') }}</flux:heading>
+                <flux:text class="mt-1">{{ __('The address every invite and pairing link names, such as https://director.example.ts.net. Unset, each link names the address of the device that issued it.') }}</flux:text>
+            </div>
+            <flux:text data-test="advertised-url-current">
+                {{ __('Now') }}:
+                @if ($advertised !== '')
+                    <span class="font-mono">{{ $advertised }}</span>
+                @else
+                    {{ __('not set') }}
+                @endif
+            </flux:text>
+            <form wire:submit="saveAdvertised" class="flex flex-wrap items-end gap-2">
+                <flux:input wire:model="advertisedInput" :label="__('Address')" placeholder="https://director.example.ts.net" class="max-w-sm" data-test="advertised-url-input" />
+                <flux:button type="submit" size="sm" data-test="advertised-url-save">{{ __('Save') }}</flux:button>
+                @if ($advertised !== '')
+                    <flux:button size="sm" variant="ghost" wire:click="clearAdvertised" data-test="advertised-url-clear">{{ __('Clear') }}</flux:button>
+                @endif
+            </form>
+            @if ($advertised === '' && $advertisedSuggestion !== '')
+                <div class="flex flex-wrap items-center gap-2" data-test="advertised-url-suggestion">
+                    <flux:text>{{ __('This machine is reachable at') }} <span class="font-mono">{{ $advertisedSuggestion }}</span></flux:text>
+                    <flux:button size="sm" wire:click="useSuggestedAddress" data-test="advertised-url-use-suggestion">{{ __('Use this address') }}</flux:button>
+                </div>
+            @endif
+            @if ($advertisedProblem !== '')
+                <flux:text class="text-red-600 dark:text-red-400" data-test="advertised-url-problem">{{ $advertisedProblem }}</flux:text>
+            @endif
+        </flux:card>
+    @endif
+
+    @if ($me !== [] && $this->meCan('manage_org_settings') && is_array($me['capabilities'] ?? null))
+        <flux:card class="flex items-center justify-between gap-3" data-test="peer-messages-link">
+            <div>
+                <flux:heading size="lg">{{ __('Messages between conversations') }}</flux:heading>
+                <flux:text class="mt-1">{{ __('Choose which conversations may send each other briefs. Off until you allow a direction.') }}</flux:text>
+            </div>
+            <flux:button size="sm" :href="route('peer-messages')" wire:navigate>{{ __('Choose') }}</flux:button>
+        </flux:card>
+    @endif
 
     @if ($problem !== '')
         <flux:callout variant="danger" icon="exclamation-triangle" data-test="problem">
@@ -315,6 +540,19 @@ new #[Layout('layouts::client')] #[Title('Settings')] class extends Component
             <flux:input wire:model="code" :label="__('Pairing code')" autocomplete="off" />
             <flux:button type="submit" variant="primary">{{ __('Pair') }}</flux:button>
         </form>
+    </flux:card>
+
+    <flux:card class="space-y-4" data-test="accept-invite">
+        <flux:heading size="lg">{{ __('Join with an invite') }}</flux:heading>
+        <flux:text>{{ __('Someone who runs this Director invited you. Paste the invite link, or enter the Director URL above and the invite code, and name this device.') }}</flux:text>
+        <form wire:submit="acceptInvite" class="space-y-4">
+            <flux:input wire:model="inviteCode" :label="__('Invite code or link')" autocomplete="off" data-test="invite-code" />
+            <flux:input wire:model="inviteDevice" :label="__('Name for this device')" placeholder="office-mac" />
+            <flux:button type="submit" variant="primary">{{ __('Join') }}</flux:button>
+        </form>
+        @if ($inviteProblem !== '')
+            <flux:text class="text-red-600 dark:text-red-400" data-test="invite-problem">{{ $inviteProblem }}</flux:text>
+        @endif
     </flux:card>
 
     <flux:card class="space-y-4">

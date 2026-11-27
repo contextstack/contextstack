@@ -29,25 +29,49 @@ class DirectorClient
     }
 
     /**
-     * POST /api/v1/pair: exchange a one-time code for this device's token. Needs no credential.
+     * POST /api/v1/pair: exchange a one-time code for this device's token. Needs no credential. A Director with teams
+     * also names the member and role; `me` is read after saving the token either way.
      *
      * @return array{credential_id: string, name: string, token: string}
      */
     public static function pair(string $url, string $code, int $timeout = 15): array
     {
+        return self::enroll($url, '/api/v1/pair', ['code' => trim($code)], 200, $timeout);
+    }
+
+    /**
+     * POST /api/v1/invites/accept: join the Director as the invited member with a one-time invite code, and get this
+     * device's token (the same shape as pairing). Needs no credential. A used, expired or revoked code is 403
+     * `invite_refused`; too many tries are 429 with Retry-After.
+     *
+     * @return array{credential_id: string, name: string, token: string}
+     */
+    public static function acceptInvite(string $url, string $code, string $name, int $timeout = 15): array
+    {
+        return self::enroll($url, '/api/v1/invites/accept', ['code' => trim($code), 'name' => $name], 201, $timeout);
+    }
+
+    /**
+     * An anonymous exchange of a one-time code for a device token. The code travels only in the body.
+     *
+     * @param  array<string, string>  $body
+     * @return array{credential_id: string, name: string, token: string}
+     */
+    private static function enroll(string $url, string $path, array $body, int $status, int $timeout): array
+    {
         try {
-            $response = Http::acceptJson()->timeout($timeout)->post(rtrim($url, '/').'/api/v1/pair', ['code' => trim($code)]);
+            $response = Http::acceptJson()->timeout($timeout)->post(rtrim($url, '/').$path, $body);
         } catch (ConnectionException $exception) {
             throw new DirectorUnavailable('The Director at '.$url.' could not be reached: '.$exception->getMessage(), 0, $exception);
         }
 
-        $body = self::decode($response);
+        $decoded = self::decode($response);
 
-        if ($response->status() !== 200 || ! is_string($body['token'] ?? null) || ! is_string($body['credential_id'] ?? null)) {
-            throw self::refusal($response, $body);
+        if ($response->status() !== $status || ! is_string($decoded['token'] ?? null) || ! is_string($decoded['credential_id'] ?? null)) {
+            throw self::refusal($response, $decoded);
         }
 
-        return ['credential_id' => $body['credential_id'], 'name' => Json::string($body['name'] ?? null), 'token' => $body['token']];
+        return ['credential_id' => $decoded['credential_id'], 'name' => Json::string($decoded['name'] ?? null), 'token' => $decoded['token']];
     }
 
     /**
@@ -64,6 +88,36 @@ class DirectorClient
         }
 
         return $body;
+    }
+
+    /**
+     * A binary read (GET browser-action-screenshots/{sha}): the body as bytes when the Director answers 200 with the
+     * expected media type and at most `$maxBytes`, read off the stream so a larger body is never held whole. Anything
+     * else is a refusal: a JSON error body keeps its code, a wrong type or an oversized body is `unexpected_answer`.
+     */
+    public function bytes(string $path, string $mediaType, int $maxBytes): string
+    {
+        $response = $this->send(fn (PendingRequest $request) => $request->accept($mediaType)->withOptions(['stream' => true])->get($this->url($path)));
+        if ($response->status() !== 200) {
+            throw self::refusal($response, self::decode($response));
+        }
+        $type = strtolower(trim(explode(';', $response->header('Content-Type'))[0]));
+        $declared = $response->header('Content-Length');
+        if ($type !== $mediaType || ($declared !== '' && (int) $declared > $maxBytes)) {
+            throw new DirectorRefused(200, 'unexpected_answer', 'The Director answered with something other than the expected '.$mediaType.' of at most '.$maxBytes.' bytes.', []);
+        }
+
+        $stream = $response->toPsrResponse()->getBody();
+        $bytes = '';
+        while (! $stream->eof() && strlen($bytes) <= $maxBytes) {
+            $bytes .= $stream->read(min(65536, $maxBytes + 1 - strlen($bytes)));
+        }
+        $stream->close();
+        if (strlen($bytes) > $maxBytes) {
+            throw new DirectorRefused(200, 'unexpected_answer', 'The Director answered with more than '.$maxBytes.' bytes.', []);
+        }
+
+        return $bytes;
     }
 
     /**
@@ -196,6 +250,9 @@ class DirectorClient
      */
     private static function refusal(Response $response, array $body): DirectorRefused
     {
+        if ($response->status() === 429) {
+            $body['retry_after'] = $response->header('Retry-After');
+        }
         if ($response->status() >= 500 && ! isset($body['code'])) {
             return new DirectorRefused($response->status(), 'director_error', 'The Director answered '.$response->status().'.', $body);
         }

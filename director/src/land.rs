@@ -3,10 +3,11 @@
 use crate::live;
 use crate::records;
 use crate::server::{Call, Reply, State, internal, refusal};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::util::{self, now_utc};
 use crate::work::{self, No};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
 fn opt_text(m: &Map<String, Value>, field: &str, max: usize) -> Result<Option<String>, No> {
@@ -56,22 +57,53 @@ pub fn parse_body(m: &Map<String, Value>) -> Result<Value, No> {
             ));
         }
     }
-    Ok(
-        json!({"state": state, "repo": repo, "lane": lane, "main": main, "commit": commit,
-              "reason": reason, "landed_by": landed_by}),
-    )
+    let mut body = json!({"state": state, "repo": repo, "lane": lane, "main": main, "commit": commit,
+                          "reason": reason, "landed_by": landed_by});
+    if let Some(coverage) = m.get("host_probe_coverage") {
+        let valid = coverage.as_object().is_some_and(|obj| {
+            obj.len()
+                == if obj.contains_key("sandbox_sha256") {
+                    3
+                } else {
+                    2
+                }
+                && obj.get("sandbox_sha256").is_none_or(|digest| {
+                    digest.as_str().is_some_and(|sha| {
+                        sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                })
+                && ["covered", "uncovered"].iter().all(|field| {
+                    obj.get(*field)
+                        .and_then(Value::as_array)
+                        .is_some_and(|names| {
+                            names.len() <= 256
+                                && names.iter().all(|name| {
+                                    name.as_str()
+                                        .is_some_and(|name| !name.is_empty() && name.len() <= 256)
+                                })
+                        })
+                })
+        });
+        if !valid {
+            return Err(No::invalid(
+                "host_probe_coverage requires covered and uncovered name lists and accepts a sandbox SHA-256",
+            ));
+        }
+        body["host_probe_coverage"] = coverage.clone();
+    }
+    Ok(body)
 }
 
 fn run_owner(
-    db: &Connection,
+    db: &ScopedConnection,
     node_id: i64,
     run_id: &str,
 ) -> rusqlite::Result<Option<(String, Option<String>)>> {
     db.query_row(
-        "SELECT COALESCE(r.job_id, (SELECT job_id FROM jobs WHERE run_id = r.run_id LIMIT 1)),
-                (SELECT intent_id FROM jobs WHERE job_id = COALESCE(r.job_id,
-                 (SELECT job_id FROM jobs WHERE run_id = r.run_id LIMIT 1)))
-         FROM runs r WHERE r.run_id = ?1 AND r.node_id = ?2",
+        "SELECT COALESCE(r.job_id, (SELECT job_id FROM jobs WHERE +org_id = :org_id AND run_id = r.run_id LIMIT 1)),
+                (SELECT intent_id FROM jobs WHERE +org_id = :org_id AND job_id = COALESCE(r.job_id,
+                 (SELECT job_id FROM jobs WHERE +org_id = :org_id AND run_id = r.run_id LIMIT 1)))
+         FROM runs r WHERE +org_id = :org_id AND r.run_id = ?1 AND r.node_id = ?2",
         params![run_id, node_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
@@ -87,10 +119,10 @@ struct OpenLand {
     attempts: String,
 }
 
-fn open_land(db: &Connection, run_id: &str) -> rusqlite::Result<Option<OpenLand>> {
+fn open_land(db: &ScopedConnection, run_id: &str) -> rusqlite::Result<Option<OpenLand>> {
     db.query_row(
         "SELECT land_id, state, reason, landed_at, attempts FROM lands
-         WHERE run_id = ?1 AND current = 1",
+         WHERE +org_id = :org_id AND run_id = ?1 AND current = 1",
         params![run_id],
         |r| {
             Ok(OpenLand {
@@ -114,7 +146,8 @@ fn next_attempts(
     land_id: &str,
     time: &str,
 ) -> String {
-    let mut list: Vec<Value> = serde_json::from_str(previous).unwrap_or_default();
+    let (attempts, _) = decode_attempts(previous);
+    let mut list = attempts.as_array().cloned().unwrap_or_default();
     list.push(json!({
         "state": state,
         "reason": reason,
@@ -122,6 +155,20 @@ fn next_attempts(
         "time": time,
     }));
     serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+}
+
+// The existing attempts JSON stores a bare array on older records.
+pub(crate) fn decode_attempts(raw: &str) -> (Value, Option<Value>) {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) if value.is_array() => (value, None),
+        Ok(Value::Object(mut data)) => (
+            data.remove("attempts")
+                .filter(Value::is_array)
+                .unwrap_or_else(|| json!([])),
+            data.remove("host_probe_coverage"),
+        ),
+        _ => (json!([]), None),
+    }
 }
 
 fn text<'a>(body: &'a Value, field: &str) -> &'a str {
@@ -141,21 +188,29 @@ struct Incoming<'a> {
 
 /// Insert the current land row. The earlier row stays, no longer current, so a replay of its
 /// idempotency key still renders the original response.
-fn write_land(db: &mut Connection, land: &Incoming<'_>) -> Result<String, String> {
+fn write_land(db: &mut ScopedConnection, land: &Incoming<'_>) -> Result<String, String> {
     let id = format!("lnd_{}", util::ulid()?.to_lowercase());
     let at = now_utc();
     let tx = crate::store::write_tx(db).map_err(|e| e.to_string())?;
     if let Some(old) = land.supersede {
         tx.execute(
-            "UPDATE lands SET current = 0 WHERE land_id = ?1",
+            "UPDATE lands SET current = 0 WHERE +org_id = :org_id AND (land_id = ?1)",
             params![old],
         )
         .map_err(|e| e.to_string())?;
     }
+    let attempts = match land.body.get("host_probe_coverage") {
+        Some(coverage) => json!({
+            "attempts": decode_attempts(land.attempts).0,
+            "host_probe_coverage": coverage,
+        })
+        .to_string(),
+        None => land.attempts.to_owned(),
+    };
     tx.execute(
-        "INSERT INTO lands (land_id, run_id, state, repo, lane, main, \"commit\", reason, landed_by,
+        "INSERT INTO lands (org_id, land_id, run_id, state, repo, lane, main, \"commit\", reason, landed_by,
                             landed_at, attempts, current)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+         VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
         params![
             id,
             land.run_id,
@@ -167,7 +222,7 @@ fn write_land(db: &mut Connection, land: &Incoming<'_>) -> Result<String, String
             land.body.get("reason").and_then(Value::as_str),
             text(land.body, "landed_by"),
             at,
-            land.attempts,
+            attempts,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -312,6 +367,31 @@ mod tests {
         assert_eq!(b["state"], "landed");
         assert_eq!(b["commit"], "abc");
         assert!(b["reason"].is_null());
+        assert!(b.get("host_probe_coverage").is_none());
+    }
+
+    #[test]
+    fn sandbox_land_carries_probe_coverage() {
+        let mut m = land_body(&json!({
+            "state": "refused", "repo": "ctx", "lane": "probe", "main": "main",
+            "reason": "needs owner host probes", "landed_by": "owner",
+            "host_probe_coverage": {"covered": ["probe-a"], "uncovered": ["probe-b"]},
+        }));
+        let Ok(body) = parse_body(&m) else {
+            panic!("expected valid probe coverage");
+        };
+        assert_eq!(body["host_probe_coverage"], m["host_probe_coverage"]);
+        m["host_probe_coverage"]["sandbox_sha256"] = json!("a".repeat(64));
+        assert_eq!(
+            parse_body(&m)
+                .ok()
+                .map(|body| body["host_probe_coverage"].clone()),
+            Some(m["host_probe_coverage"].clone()),
+        );
+        m["host_probe_coverage"]["sandbox_sha256"] = json!("invalid");
+        assert!(parse_body(&m).is_err());
+        m.insert("host_probe_coverage".into(), json!({"covered": true}));
+        assert!(parse_body(&m).is_err());
     }
 
     #[test]

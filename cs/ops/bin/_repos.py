@@ -9,7 +9,7 @@ from pathlib import Path
 from _estate_io import write_atomic
 
 NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
-DEFAULT_GATE = "no extra gate command; the repo's own commit hooks run when landing"
+DEFAULT_GATE = "no extra gate command; land checks use sandbox mode by default"
 
 
 def repos_file():

@@ -38,7 +38,11 @@ Route::middleware(RequireDirectorConnection::class)->group(function (): void {
     Route::livewire('projects/{project}/backlog', 'pages::client.backlog')->name('backlog.index');
     Route::livewire('projects/{project}/backlog/{item}', 'pages::client.backlog-item')->name('backlog.show');
     Route::livewire('approvals', 'pages::client.approvals')->name('approvals');
+    Route::get('browser-action-screenshots/{sha}', [EvidenceController::class, 'browserScreenshot'])->where('sha', '[0-9a-f]{64}')->name('approvals.browser-screenshot');
     Route::livewire('devices', 'pages::client.devices')->name('devices');
+    Route::livewire('members', 'pages::client.members')->name('members');
+    Route::livewire('peer-messages', 'pages::client.peer-messages')->name('peer-messages');
+    Route::livewire('schedules', 'pages::client.schedules')->name('schedules');
     Route::livewire('usage', 'pages::client.usage')->name('usage');
     Route::livewire('sources', 'pages::client.sources')->name('sources');
     Route::get('stream', EventStreamController::class)->name('stream');

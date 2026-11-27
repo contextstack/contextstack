@@ -43,16 +43,25 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _watch_config import PREFIX, load_watch, watch_directory  # noqa: E402
+
 CODE_ROOT = Path(__file__).resolve().parents[2]
 STATE = Path.home() / ".contextstack"
 MAX_REQUEST = 64 * 1024
 MAX_TEXT = 5 * 1024 * 1024
+MAX_ARCHIVE = 20 * 1024 * 1024
+MAX_LINK_BYTES = 5 * 1024 * 1024
 LOAD_TIMEOUT = 45
 NO_SANDBOX = "No usable sandbox"  # Chrome's fatal message when it cannot build its sandbox
 PAGE_JS = "JSON.stringify({title: document.title, text: document.body ? document.body.innerText : ''})"
 
-
 class BrokerError(RuntimeError):
+    pass
+
+
+class BrokerTimeout(BrokerError):
     pass
 
 
@@ -72,7 +81,7 @@ def origin(url):
 def load_config(path):
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     sets = cfg.get("sets") if isinstance(cfg, dict) else None
-    if cfg.get("version") != 1 or not isinstance(sets, dict) or not sets:
+    if not isinstance(sets, dict) or not sets or cfg.get("version") != 1:
         raise BrokerError("%s: want {version: 1, chrome, sets: {name: [origins]}}" % path)
     for name, origins in sets.items():
         if not name or not all(c.islower() or c.isdigit() or c == "-" for c in name):
@@ -80,6 +89,17 @@ def load_config(path):
         if not isinstance(origins, list) or not origins or any(
                 not isinstance(o, str) or not o.startswith("https://") or origin(o) != o for o in origins):
             raise BrokerError("set %s: want https origins (scheme://host, no path), got %r" % (name, origins))
+    sets.pop("google-tasks", None)  # Native host only.
+    if type(cfg.get("price_watches", False)) is not bool:
+        raise BrokerError("price_watches must be a boolean")
+    if cfg.get("price_watches"):
+        if any(name.startswith(PREFIX) for name in sets):
+            raise BrokerError("static sets cannot use the reserved price-watch- prefix")
+        for watch in sorted(watch_directory().glob("*.json")):
+            try:
+                sets[PREFIX + watch.stem] = [load_watch(watch.stem)["origin"]]
+            except (OSError, ValueError) as error:
+                print("browser-broker: skipping watch %s: %s" % (watch.name, error), file=sys.stderr)
     return cfg
 
 
@@ -106,7 +126,7 @@ class CDP:
         while b"\0" not in self.buf:
             left = deadline - time.monotonic()
             if left <= 0 or not select.select([self.r], [], [], left)[0]:
-                raise BrokerError("chrome did not answer in time")
+                raise BrokerTimeout("chrome did not answer in time")
             chunk = os.read(self.r, 1 << 20)
             if not chunk:
                 raise BrokerError("chrome closed the debugging pipe")
@@ -125,6 +145,8 @@ class CDP:
                 if "error" in msg:
                     raise BrokerError("%s" % msg["error"].get("message", msg["error"]))
                 return msg.get("result", {})
+            elif self.on_event:
+                self.on_event(msg)
         return None
 
     def call(self, method, params=None, session=None, timeout=30):
@@ -148,7 +170,17 @@ class Broker:
             if row["verb"] != "open":
                 raise BrokerError("unknown verb %r; the only verb is open" % (row["verb"],))
             with self.lock:
-                result = self.open(set_name, url, state)
+                selector = request.get("selector")
+                if selector is not None and (
+                        not set_name.startswith(PREFIX) or not isinstance(selector, str)
+                        or not 1 <= len(selector) <= 4096):
+                    raise BrokerError("selector is available to price watches only")
+                archive, links = request.get("archive", False), request.get("links", False)
+                if not isinstance(archive, bool) or not isinstance(links, bool):
+                    raise BrokerError("archive and links must be booleans")
+                if (archive or links) and set_name != "public":
+                    raise BrokerError("archives and link maps are available to the public set only")
+                result = self.open(set_name, url, state, selector, archive=archive, links=links)
             row.update(ok=True, final_url=result["final_url"], status=result["status"],
                        navigations=result["navigations"], blocked=result["blocked"],
                        bytes=result["bytes"], sha256=result["sha256"])
@@ -156,67 +188,166 @@ class Broker:
         except (BrokerError, ValueError, OSError) as error:
             row.update(ok=False, error=str(error), navigations=state["navigations"], blocked=state["blocked"])
             reply = {"ok": False, "error": str(error), "navigations": state["navigations"], "blocked": state["blocked"]}
+            if isinstance(error, BrokerTimeout):
+                reply["error_kind"] = "timeout"
         row["ms"] = int((time.monotonic() - started) * 1000)
         self.log(row)
         return reply
 
-    def open(self, set_name, url, state):
+    def open(self, set_name, url, state, selector=None, *, archive=False, links=False):
         allowed = set(self.sets[set_name])
+        if isinstance(url, str) and origin(url) == "https://tasks.google.com":
+            raise BrokerError("Google Tasks requires the Chrome extension and native host")
+        allowed.discard("https://tasks.google.com")
+        watch = set_name.startswith(PREFIX)
         if not isinstance(url, str) or not url.startswith("https://") or origin(url) not in allowed:
             raise BrokerError("origin of %r is not in set %s" % (url, set_name))
         cdp = self.cdp
-        before = self.pages()
-        target = cdp.call("Target.createTarget", {"url": "about:blank"})["targetId"]
+        isolated = watch or set_name == "public"
+        before = set() if isolated else self.pages()
+        context = target = None
         try:
+            params = {"url": "about:blank"}
+            if isolated:
+                context = cdp.call("Target.createBrowserContext", {"disposeOnDetach": True})["browserContextId"]
+                params["browserContextId"] = context
+            target = cdp.call("Target.createTarget", params)["targetId"]
             sid = cdp.call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
 
+            patterns = [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]
+            auto_attach = {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True}
+            frame_attach = dict(auto_attach, filter=[{"type": "iframe"}, {"exclude": True}])
+            child_sessions = set()
+            guards = {}
+
+            def guard(method, params, session, callback=None):
+                command = cdp.send(method, params, session)
+                guards[command] = callback
+
             def on_event(msg):
-                if msg.get("sessionId") != sid:
+                if "id" in msg:
+                    if msg["id"] in guards:
+                        callback = guards.pop(msg["id"])
+                        if "error" in msg:
+                            raise BrokerError("could not guard an attached Chrome target")
+                        if callback:
+                            callback()
                     return
+                session = msg.get("sessionId")
                 method, p = msg.get("method"), msg.get("params", {})
-                if method == "Fetch.requestPaused":
+                if method == "Target.attachedToTarget":
+                    info, child = p["targetInfo"], p["sessionId"]
+                    if info["type"] == "page" and p.get("waitingForDebugger") and info["targetId"] != target:
+                        guard("Target.closeTarget", {"targetId": info["targetId"]}, None)
+                    elif info["type"] == "iframe" and (session == sid or session in child_sessions):
+                        child_sessions.add(child)
+
+                        def resume():
+                            guard("Runtime.runIfWaitingForDebugger", {}, child)
+
+                        def attach_children():
+                            guard("Target.setAutoAttach", frame_attach, child, resume)
+
+                        guard("Fetch.enable", {"patterns": patterns}, child, attach_children)
+                elif method == "Fetch.requestPaused" and (session == sid or session in child_sessions):
                     req_url = p.get("request", {}).get("url", "")
                     ok = origin(req_url) in allowed and req_url.startswith("https://")
                     state["navigations" if ok else "blocked"].append(req_url)
                     if ok:
-                        cdp.send("Fetch.continueRequest", {"requestId": p["requestId"]}, sid)
+                        cdp.send("Fetch.continueRequest", {"requestId": p["requestId"]}, session)
                     else:
-                        cdp.send("Fetch.failRequest", {"requestId": p["requestId"], "errorReason": "BlockedByClient"}, sid)
-                elif method == "Network.responseReceived" and p.get("type") == "Document":
+                        cdp.send("Fetch.failRequest", {"requestId": p["requestId"], "errorReason": "BlockedByClient"}, session)
+                elif session == sid and method == "Network.responseReceived" and p.get("type") == "Document":
                     state["docs"][p.get("loaderId")] = p.get("response", {}).get("status")
-                elif method == "Page.loadEventFired":
+                elif session == sid and method == "Page.loadEventFired":
                     state["loaded"] = True
 
             cdp.on_event = on_event
-            patterns = [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]
+            cdp.call("Target.setAutoAttach", dict(auto_attach, filter=[{"type": "page"}, {"exclude": True}]))
+            cdp.call("Target.setAutoAttach", frame_attach, sid)
             cdp.call("Fetch.enable", {"patterns": patterns}, sid)
             cdp.call("Network.enable", {}, sid)
             cdp.call("Page.enable", {}, sid)
             nav = cdp.call("Page.navigate", {"url": url}, sid, timeout=LOAD_TIMEOUT)
-            if nav.get("errorText"):
-                raise BrokerError("navigation failed: %s (blocked: %s)" % (nav["errorText"], state["blocked"]))
-            cdp.pump(time.monotonic() + LOAD_TIMEOUT, until=lambda: state["loaded"])
+            error_text = nav.get("errorText")
+            loader = nav.get("loaderId")
+
+            def upstream_error():
+                status = state["docs"].get(loader)
+                return watch and isinstance(status, (int, float)) and 500 <= status < 600
+
+            if error_text and not upstream_error():
+                if error_text in ("net::ERR_TIMED_OUT", "net::ERR_CONNECTION_TIMED_OUT"):
+                    raise BrokerTimeout("navigation timed out")
+                raise BrokerError("navigation failed: %s (blocked: %s)" % (error_text, state["blocked"]))
+            cdp.pump(time.monotonic() + LOAD_TIMEOUT, until=lambda: state["loaded"] or upstream_error())
+            if upstream_error():
+                return {"set": set_name, "requested_url": url, "status": state["docs"][loader], "text": "",
+                        "sha256": hashlib.sha256(b"").hexdigest(),
+                        "navigations": state["navigations"], "blocked": state["blocked"]}
             final_url = cdp.call("Target.getTargetInfo", {"targetId": target})["targetInfo"]["url"]
             if origin(final_url) not in allowed:
                 raise BrokerError("final URL %r left set %s" % (final_url, set_name))
-            page = cdp.call("Runtime.evaluate", {"expression": PAGE_JS, "returnByValue": True}, sid)
+            expression = PAGE_JS
+            if selector is not None:
+                expression = """(() => {
+                    const node = document.querySelector(%s);
+                    return JSON.stringify({
+                        title: document.title,
+                        text: document.body ? document.body.innerText : '',
+                        selected: node ? (node.innerText ?? node.textContent) : null
+                    });
+                })()""" % json.dumps(selector)
+            page = cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True}, sid)
+            if page.get("exceptionDetails"):
+                raise BrokerError("cannot evaluate watch selector")
             value = json.loads(page.get("result", {}).get("value") or "{}")
             text = str(value.get("text") or "")
             raw = text.encode("utf-8")
-            if len(raw) > MAX_TEXT:
+            selected = value.get("selected") if selector is not None else None
+            if len(raw) + len((selected or "").encode("utf-8")) > MAX_TEXT:
                 raise BrokerError("page text exceeds %d bytes" % MAX_TEXT)
+            artifacts = {}
+            if links:
+                expression = """JSON.stringify(Array.from(document.querySelectorAll('a[href]'))
+                    .slice(0, 20000).map(a => ({
+                        text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 500),
+                        href: a.href
+                    })))"""
+                page = cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True}, sid)
+                link_data = page.get("result", {}).get("value")
+                if not isinstance(link_data, str) or len(link_data.encode("utf-8")) > MAX_LINK_BYTES:
+                    raise BrokerError("rendered link map is unavailable or exceeds the size limit")
+                artifacts["links"] = json.loads(link_data)
+            if archive:
+                try:
+                    data = cdp.call("Page.captureSnapshot", {"format": "mhtml"}, sid)["data"]
+                    if 0 < len(data.encode("utf-8")) <= MAX_ARCHIVE:
+                        artifacts["archive"] = data
+                    else:
+                        artifacts["archive_omitted"] = "empty_or_exceeds_limit"
+                except (BrokerError, KeyError):
+                    artifacts["archive_omitted"] = "capture_failed"
+            cdp.pump(time.monotonic() + 10, until=lambda: not guards)
             return {"set": set_name, "requested_url": url, "final_url": final_url,
-                    "status": state["docs"].get(nav.get("loaderId")), "title": str(value.get("title") or ""),
+                    "status": state["docs"].get(loader), "title": str(value.get("title") or ""),
                     "text": text, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
-                    "navigations": state["navigations"], "blocked": state["blocked"]}
+                    "navigations": state["navigations"], "blocked": state["blocked"],
+                    **({"selected": selected} if selector is not None else {}), **artifacts}
         finally:
-            cdp.on_event = None
             # Our tab, and any window a page opened meanwhile: nothing it loaded outlives the request.
             try:
-                for stray in {target} | (self.pages() - before):
-                    cdp.call("Target.closeTarget", {"targetId": stray}, timeout=10)
+                if context:
+                    cdp.call("Target.disposeBrowserContext", {"browserContextId": context}, timeout=10)
+                elif target:
+                    for stray in {target} | (self.pages() - before):
+                        cdp.call("Target.closeTarget", {"targetId": stray}, timeout=10)
             except BrokerError:
                 pass
+            finally:
+                cdp.on_event = None
+                cdp.call("Target.setAutoAttach", {"autoAttach": False, "waitForDebuggerOnStart": False,
+                                                 "flatten": True}, timeout=10)
 
     def pages(self):
         infos = self.cdp.call("Target.getTargets").get("targetInfos", [])
@@ -279,7 +410,7 @@ class Handler(socketserver.StreamRequestHandler):
             self.server.broker.log({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                     "set": self.server.set_name, "verb": None, "ok": False,
                                     "error": reply["error"], "ms": 0})
-        self.wfile.write(json.dumps(reply, sort_keys=True).encode() + b"\n")
+        self.wfile.write(json.dumps(reply, sort_keys=True, ensure_ascii=False).encode() + b"\n")
 
 
 def find_chrome(entry):
@@ -438,7 +569,7 @@ def main():
     s.add_argument("--allow-no-chrome-sandbox", action="store_true",
                    help="if this host blocks Chrome's own sandbox, run Chrome with --no-sandbox (never the default)")
     s.add_argument("--config", default=str(CODE_ROOT / "policy/browser.json"))
-    s.add_argument("--root", default=str(STATE / "browser"))
+    s.add_argument("--root", default=str(STATE / "public-browser"))
     s.add_argument("--chrome")
     args = parser.parse_args()
     try:

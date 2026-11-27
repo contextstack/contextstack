@@ -11,6 +11,210 @@ def pin_lead_node(o, node):
 
 
 C = "client"
+
+
+@case(C, "lead-conversation", "land-policy-and-one-use")
+def _(ctx):
+    import json
+    import sqlite3
+    import subprocess
+    import sys
+    from contextlib import closing
+    from pathlib import Path
+
+    from cases.client import accept, finish, lead, refused, submitted
+    from cases.policy import device
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "cs/ops/bin"))
+    try:
+        from _gate_job import run_steps, step
+    finally:
+        sys.path.pop(0)
+
+    node, other, local = ctx.node2(), ctx.node2(), owner(ctx)
+    pin_lead_node(local, node)
+
+    def project(name):
+        return local.call("POST", "projects", body={"name": name}, key=new_key()).json["project"]["project_id"]
+
+    own_project, other_project = project("landing"), project("other landing")
+    member = device(ctx, "member")
+    conv = member.call("POST", "conversations", body={
+        "node": node.name, "spec": "hosted-lead", "model": "claude-code-sonnet", "project_id": own_project,
+    }, key=new_key()).json["conversation"]
+    database = ctx.target.data / "director.sqlite"
+    sponsor = member.call("GET", "me").json["member"]["id"]
+    with closing(sqlite3.connect(database)) as db:
+        org, = db.execute("SELECT org_id FROM conversations WHERE conversation_id=?",
+                          (conv["conversation_id"],)).fetchone()
+    hosted = lead(ctx, local, conv)
+    route = "conversations/" + conv["conversation_id"] + "/land"
+    commit, base = "1" * 40, "2" * 40
+
+    def done(lane, run_id, *, role=None, artifact=None, project_id=own_project, actor=local,
+             reviewed=commit, review_verdict="approve", verdict="pass"):
+        meta = {"repo": "fixture", "lane": lane}
+        if role:
+            meta["agent"] = role
+        job = submitted(ctx, actor, node, project_id=project_id, meta=meta)["jobs"][0]["job_id"]
+        accept(ctx, node, job)
+        row = {"base_sha": reviewed, "verdict": verdict, "lane": {
+            "repo": "fixture", "lane": lane, "path": lane, "branch": "lane/" + lane,
+            "base": "main", "dirty_at_start": False,
+        }}
+        if role == "gate":
+            row["model"] = "gate"
+        elif role == "reviewer":
+            row["review_verdict"] = review_verdict
+        finish(ctx, node, job, run_id=run_id, files=artifact, row_fields=row)
+
+    def gate_receipt(*, red=False, host_only=False, inconsistent=False):
+        steps = [step("fixture check", ["fixture-check"])]
+        if host_only:
+            steps.append(step("host check", ["fixture-host"], host_only=True))
+        gate = run_steps(steps, lambda item, _: subprocess.CompletedProcess(
+            item["command"], int(red), stdout="", stderr=""), timeout=30)
+        if inconsistent:
+            gate["complete"] = True  # The policy must also check uncovered independently.
+        return {"gate.json": (json.dumps(gate) + "\n").encode()}
+
+    done("other-project", "land-other", project_id=other_project)
+    refused(ctx, hosted.call("POST", route, body={"repo": "fixture", "lane": "other-project"}),
+            404, "land_lane_not_found", "lead cannot request a foreign project's lane")
+
+    scenarios = ("green", "incomplete", "uncovered", "no-reviewer", "protected", "tracing",
+                 "stale-review", "stale-gate", "latest-red", "lead-review", "member-review", "latest-review-red")
+    for lane in scenarios:
+        done(lane, "land-writer-" + lane, actor=hosted)
+        done(lane, "land-gate-" + lane, role="gate", actor=hosted,
+             artifact=gate_receipt(host_only=lane in ("incomplete", "uncovered"),
+                                   inconsistent=lane == "uncovered"),
+             reviewed=base if lane == "stale-gate" else commit)
+        if lane == "latest-red":
+            done(lane, "land-gate-red", role="gate",
+                 artifact=gate_receipt(red=True), verdict="fail")
+        if lane != "no-reviewer":
+            done(lane, "land-review-" + lane, role="reviewer",
+                 reviewed=base if lane == "stale-review" else commit,
+                 actor={"lead-review": hosted, "member-review": member}.get(lane, local))
+        if lane == "latest-review-red":
+            done(lane, "land-review-red", role="reviewer", review_verdict="changes needed")
+        body = {"repo": "fixture", "lane": lane}
+        request = hosted.call("POST", route, body=body)
+        ctx.expect(request.status == 200 and request.json["kind"] == "land"
+                   and request.json["status"] == "pending"
+                   and "job_id" not in request.json and "run_id" not in request.json,
+                   "land recorded as a conversation approval", request)
+        approval = request.json["id"]
+        with closing(sqlite3.connect(database)) as db:
+            attribution = db.execute(
+                "SELECT org_id, requested_by_member_id FROM land_requests WHERE approval_id=?", (approval,),
+            ).fetchall()
+        ctx.expect(attribution == [(org, sponsor)], "the request records the lead's sponsoring member")
+        ctx.expect(hosted.call("POST", route, body=body).json["id"] == approval,
+                   "repeat request is coalesced", request)
+        offers = node.call("GET", "land-requests")
+        ctx.expect(any(r["id"] == approval for r in offers.json["land_requests"]), "node sees request", offers)
+        path = "land-requests/" + approval
+        evidence = {"commit": commit, "base": base, "protected": lane == "protected", "tracing": lane == "tracing"}
+        refused(ctx, other.call("POST", path + "/inspect", body=evidence), 404, "land_lane_not_found",
+                "different node cannot submit inspection")
+        decision = node.call("POST", path + "/inspect", body=evidence)
+        expected = "approved" if lane == "green" else "needs_owner"
+        ctx.expect(decision.status == 200 and decision.json["status"] == expected, lane + " policy", decision)
+        if expected == "needs_owner":
+            attention = local.call("GET", "conversations/" + conv["conversation_id"]).json["conversation"]["attention"]
+            ctx.expect(attention["action_approval_id"] == approval, "owner sees Needs you", attention)
+            refused(ctx, node.call("POST", path + "/claim", body={}), 409, "conflict", "owner has not approved")
+            chosen = local.call("POST", "action-approvals/" + approval + "/decide", body={"decision": "approve"})
+            ctx.expect(chosen.json["status"] == "approved" and chosen.json["decided_by"], "owner approved", chosen)
+        claim = node.call("POST", path + "/claim", body={})
+        ctx.expect(claim.status == 200 and claim.json["claimed_at"]
+                   and claim.json["target_run_id"] == "land-writer-" + lane,
+                   "claim authorizes only the recorded lane/run", claim)
+        refused(ctx, node.call("POST", path + "/claim", body={}), 409, "conflict", "claim consumed")
+        if lane == "green":
+            busy = {"status": "busy", "claim_revision": claim.json["revision"]}
+            released = node.call("POST", path + "/outcome", body=busy)
+            ctx.expect(released.status == 200 and not released.json.get("claimed_at"),
+                       "preflight contention releases the claim", released)
+            reclaimed = node.call("POST", path + "/claim", body={})
+            ctx.expect(reclaimed.status == 200 and reclaimed.json["revision"] > claim.json["revision"],
+                       "the same approval can be retried", reclaimed)
+            replayed = node.call("POST", path + "/outcome", body=busy)
+            ctx.expect(replayed.status == 200 and replayed.json.get("claimed_at"),
+                       "replaying old contention leaves the new claim intact", replayed)
+            run_id = claim.json["target_run_id"]
+            failed = dict(state="failed", repo="fixture", lane=lane, main="main", landed_by="hosted-lead",
+                          commit=None, reason="fixture flake")
+            landed = dict(failed, state="landed", commit=commit, reason=None)
+            ctx.expect(node.land(run_id, failed, new_key()).status == 201, "first attempt recorded")
+            result = node.land(run_id, landed, new_key())
+            ctx.expect(result.status == 201 and result.json["attempts"][0]["state"] == "failed",
+                       "retry preserves the first attempt on the run", result)
+            finished = node.call("POST", path + "/outcome",
+                                 body={"status": "succeeded", "attempts": [failed, landed]})
+            ctx.expect(finished.status == 200 and finished.json["outcome"]["status"] == "succeeded",
+                       "node recorded its outcome", finished)
+            ctx.expect(hosted.call("POST", route, body=body).json["id"] == approval,
+                       "completed request is still one use", finished)
+
+    lane = "stale"
+    done(lane, "land-writer-stale")
+    body = {"repo": "fixture", "lane": lane}
+
+    def request():
+        result = hosted.call("POST", route, body=body)
+        ctx.expect(result.status == 200 and result.json["status"] == "pending", "a fresh inspection", result)
+        return result.json["id"]
+
+    unavailable = request()
+    result = node.call("POST", "land-requests/" + unavailable + "/unavailable", body={})
+    ctx.expect(result.status == 200 and result.json["outcome"]["status"] == "unavailable",
+               "an unpinned request ends without owner attention", result)
+    refused(ctx, local.call("POST", "action-approvals/" + unavailable + "/decide", body={"decision": "approve"}),
+            409, "conflict", "an unavailable request cannot be approved")
+    pending = request()
+    ctx.expect(pending != unavailable, "unavailable request does not block a fresh inspection")
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("UPDATE action_approvals SET created_at='2000-01-01' WHERE id=?", (pending,))
+    waiting = request()
+    ctx.expect(waiting != pending, "stale pending request does not block a fresh inspection")
+    result = node.call("POST", "land-requests/" + waiting + "/inspect",
+                       body={"commit": commit, "base": base, "protected": False, "tracing": False})
+    ctx.expect(result.json["status"] == "needs_owner", "inspection is waiting for the owner", result)
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("UPDATE action_approvals SET reviewed_at='2000-01-01' WHERE id=?", (waiting,))
+    fresh = request()
+    ctx.expect(fresh != waiting, "stale owner request does not block a fresh inspection")
+    evidence = {"commit": commit, "base": base, "protected": False, "tracing": False}
+    path = "land-requests/" + fresh
+    node.call("POST", path + "/inspect", body=evidence)
+    local.call("POST", "action-approvals/" + fresh + "/decide", body={"decision": "approve"})
+    claim = node.call("POST", path + "/claim", body={})
+    ctx.expect(claim.status == 200, "owner approval permits a claim", claim)
+    failure = node.call("POST", path + "/outcome", body={
+        "status": "failed", "attempts": [{"state": "refused", "reason": "main base changed"}],
+    })
+    ctx.expect(failure.status == 200, "refused landing is recorded", failure)
+    retry = request()
+    ctx.expect(retry != fresh, "refused landing does not block a fresh request")
+    inspected = node.call("POST", "land-requests/" + retry + "/inspect", body=evidence)
+    ctx.expect(inspected.json["status"] == "needs_owner", "retries after failure need owner approval", inspected)
+
+@case(C, "lead-conversation", "land-rejects-unknown-lane")
+def _(ctx):
+    n, o = ctx.node2(), owner(ctx)
+    pin_lead_node(o, n)
+    conv = o.call("POST", "conversations", body={
+        "node": n.name, "spec": "hosted-lead", "model": "claude-code-sonnet",
+    }, key=new_key("lead-land")).json["conversation"]
+    result = o.call("POST", "conversations/%s/land" % conv["conversation_id"],
+                    body={"repo": "unknown", "lane": "unknown"})
+    ctx.expect(result.status == 404 and result.json.get("code") == "land_lane_not_found",
+               "unknown lane cannot be requested", result)
+
+
 @case(C, "lead-conversation", "lead-bundle-less-create-and-marker")
 def _(ctx):
     """POST conversations with spec hosted-lead needs no client bundle; Director installs it; reads carry lead."""

@@ -194,6 +194,7 @@ new #[Layout('layouts::client')] #[Title('New task')] class extends Component
         </flux:callout>
     @endif
 
+    @capable('start_work')
     <form wire:submit="submit" class="space-y-6">
         <div class="grid gap-4 sm:grid-cols-2">
             <flux:select wire:model="node" :label="__('Machine')">
@@ -227,4 +228,9 @@ new #[Layout('layouts::client')] #[Title('New task')] class extends Component
 
         <flux:button type="submit" variant="primary">{{ __('Submit') }}</flux:button>
     </form>
+    @else
+        <flux:callout icon="information-circle" data-test="cannot-start">
+            <flux:callout.text>{{ __('Your role can read work here but not start new tasks. An owner, admin or member can.') }}</flux:callout.text>
+        </flux:callout>
+    @endcapable
 </section>

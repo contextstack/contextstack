@@ -294,6 +294,7 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
                     <p class="text-xs leading-5 text-zinc-500">{{ __('Dollars of actual pay-as-you-go spending, on top of the gateway\'s source budgets. A job is given what its spec states or what is left, whichever is less; with nothing left it waits.') }}</p>
                     <x-client.budget :budget="$project['budget'] ?? null" />
                     <x-client.waiting-jobs :jobs="$this->waitingJobs()" />
+                    @capable('manage_director_budgets')
                     <form wire:submit="setBudget" class="flex flex-wrap items-end gap-2">
                         <flux:input size="sm" wire:model="budget.usd" :label="__('Dollars')" type="number" step="0.01" min="0" class="w-24" />
                         <flux:select size="sm" wire:model="budget.period" :label="__('Per')" class="w-28">
@@ -306,6 +307,7 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
                             <flux:button size="sm" type="button" variant="ghost" wire:click="clearBudget" data-test="clear-budget">{{ __('Clear budget') }}</flux:button>
                         @endif
                     </form>
+                    @endcapable
                 </x-client.section>
 
                 @if ($heartbeat !== null)
@@ -322,6 +324,7 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
                         @if ($this->leadConversations() === [])
                             <p class="text-sm text-zinc-500">{{ __('Start a hosted lead conversation in this project to give the heartbeat somewhere to run.') }}</p>
                         @else
+                            @capable('edit_projects')
                             <form wire:submit="saveHeartbeat" class="flex flex-wrap items-end gap-2">
                                 <flux:input size="sm" wire:model="heartbeatMinutes" :label="__('Every (minutes)')" type="number" min="1" class="w-28" data-test="heartbeat-minutes" />
                                 <flux:select size="sm" wire:model="heartbeatConversation" :label="__('Lead')" class="min-w-0 flex-1" data-test="heartbeat-conversation">
@@ -334,6 +337,7 @@ new #[Layout('layouts::client')] #[Title('Project')] class extends DirectorPage
                                     <flux:button size="sm" type="button" variant="ghost" wire:click="stopHeartbeat" data-test="stop-heartbeat">{{ __('Turn off') }}</flux:button>
                                 @endif
                             </form>
+                            @endcapable
                         @endif
                         @error('heartbeatMinutes') <flux:text class="text-sm text-red-600">{{ $message }}</flux:text> @enderror
                         @error('heartbeatConversation') <flux:text class="text-sm text-red-600">{{ $message }}</flux:text> @enderror

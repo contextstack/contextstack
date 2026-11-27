@@ -279,3 +279,23 @@ test('a large backlog is applied in bounded batches, in order', async () => {
     assert.deepEqual(batches.at(-1)[2], [{ run_id: 'r', seq: 1 }]);
     page.destroy();
 });
+
+test('authorization_changed and revoked load the page again instead of applying the change', async () => {
+    for (const frame of ['event: change\ndata: {"kind":"authorization_changed","id":"mem_1","revision":9}', 'event: revoked\ndata: {}']) {
+        const server = fakeServer();
+        let reloads = 0;
+        const stream = new SharedStream('/stream-auth', server.open, () => reloads++);
+        const page = scope();
+        stream.join(page);
+        await tick();
+        server.push('event: hello\ndata: {}');
+        await tick();
+        await tick();
+        server.push(frame);
+        await tick();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.equal(reloads, 1);
+        assert.ok(!page.calls.some(([method]) => method === 'applyStream'));
+        stream.stop();
+    }
+});

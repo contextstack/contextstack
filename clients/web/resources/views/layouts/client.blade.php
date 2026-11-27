@@ -71,9 +71,15 @@
                             <x-client.rail-link :href="route('approvals')" icon="shield-check" :label="__('Approvals')" data-test="nav-approvals" />
                             <div class="my-1.5 h-px w-6 bg-black/10 dark:bg-white/10"></div>
                             <x-client.rail-link :href="route('fleet')" icon="server-stack" :label="__('Machines')" />
+                            <x-client.rail-link :href="route('schedules')" icon="clock" :label="__('Schedules')" data-test="nav-schedules" />
                             <x-client.rail-link :href="route('usage')" icon="chart-bar" :label="__('Usage')" />
-                            <x-client.rail-link :href="route('sources')" icon="banknotes" :label="__('Source budgets')" />
+                            @capable('read_source_budgets')
+                                <x-client.rail-link :href="route('sources')" icon="banknotes" :label="__('Source budgets')" />
+                            @endcapable
                             <div class="flex-1"></div>
+                            @capable('manage_members')
+                                <x-client.rail-link :href="route('members')" icon="user-group" :label="__('Members')" data-test="nav-members" />
+                            @endcapable
                             <x-client.rail-link :href="route('devices')" icon="device-phone-mobile" :label="__('Devices')" data-test="nav-devices" />
                             <x-client.rail-link :href="route('connect')" icon="cog-6-tooth" :label="__('Settings')" />
                         </nav>
@@ -102,8 +108,21 @@
                     </flux:button>
                     <span class="text-[15px] font-semibold tracking-tight">ContextStack</span>
                 </div>
+                @php($identity = app(\App\Client\Identity::class))
+                {{-- A 401 (a revoked device or a disabled member): nothing protected stays on screen; Settings reconnects or forgets this device. --}}
+                <div x-data="{ signedOut: @js($identity->unauthenticated()) }" x-on:cs-signed-out.window="signedOut = true"
+                     x-show="signedOut" x-cloak class="shrink-0 px-4 pt-4 md:px-8" data-test="signed-out">
+                    <flux:callout variant="danger" icon="lock-closed">
+                        <flux:callout.text>{{ __('The Director no longer accepts this device\'s credential. It may have been revoked or its member disabled.') }}</flux:callout.text>
+                        <x-slot name="actions">
+                            <flux:button size="sm" :href="route('connect')">{{ __('Reconnect or forget this device') }}</flux:button>
+                        </x-slot>
+                    </flux:callout>
+                </div>
                 <div class="min-h-0 flex-1 overflow-y-auto px-4 py-6 md:px-8 has-[[data-full-bleed]]:overflow-hidden has-[[data-full-bleed]]:p-0">
-                    {{ $slot }}
+                    @if (! $identity->unauthenticated() || request()->routeIs('connect'))
+                        {{ $slot }}
+                    @endif
                 </div>
             </main>
         </div>

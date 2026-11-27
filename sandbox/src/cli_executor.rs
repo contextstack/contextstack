@@ -59,6 +59,10 @@ pub struct ExecutorRequest {
     #[serde(default)]
     pub sockets_allow: Vec<PathBuf>,
     #[serde(default)]
+    pub loopback_ports: Vec<u16>,
+    #[serde(default)]
+    pub reserved_ports: Vec<u16>,
+    #[serde(default)]
     pub login_writes: Vec<LoginWriteEntry>,
     #[serde(default)]
     pub protected: Option<PathBuf>,
@@ -186,6 +190,8 @@ impl ExecutorRequest {
                     .toolchains
                     .as_ref()
                     .is_some_and(|v| *v != Toolchains::default())
+                || !self.loopback_ports.is_empty()
+                || !self.reserved_ports.is_empty()
                 || self.has_caller_inputs()
                 || self.has_future_inputs()
             {
@@ -974,9 +980,7 @@ fn darwin_user_temp_tree() -> Option<PathBuf> {
     (temp.ends_with("T") && relative.components().count() == 2).then(|| tree.to_path_buf())
 }
 
-fn native_scratch_rules(request: &ExecutorRequest) -> Result<Vec<String>, Failure> {
-    let mut rules =
-        vec![r#"(allow file-write-data (literal "/dev/null") (literal "/dev/tty"))"#.to_owned()];
+pub(crate) fn cli_scratch(request: &ExecutorRequest, prefix: &Path) -> Option<PathBuf> {
     // Match the launcher from the selected template before resolving its symlinks.
     let launcher = request
         .executable
@@ -985,23 +989,50 @@ fn native_scratch_rules(request: &ExecutorRequest) -> Result<Vec<String>, Failur
         .and_then(std::ffi::OsStr::to_str);
     match launcher {
         Some("claude") => {
-            let root = format!("/private/tmp/claude-{}", rustix::process::getuid().as_raw());
-            rules.push(allow_write_subpath(Path::new(&root))?);
+            Some(prefix.join(format!("claude-{}", rustix::process::getuid().as_raw())))
         }
-        Some("cursor-agent") => {
-            rules.push(allow_write_subpath(Path::new("/private/tmp/.cursor"))?);
-        }
-        _ => {}
+        Some("cursor-agent") => Some(prefix.join(".cursor")),
+        _ => None,
     }
-    #[cfg(target_os = "macos")]
-    if let Some(tree) = darwin_user_temp_tree() {
-        rules.push(allow_write_subpath(&tree)?);
+}
+
+fn native_scratch_rules(
+    request: &ExecutorRequest,
+    darwin_scratch: Option<PathBuf>,
+) -> Result<Vec<String>, Failure> {
+    let mut rules =
+        vec![r#"(allow file-write-data (literal "/dev/null") (literal "/dev/tty"))"#.to_owned()];
+    if let Some(root) = cli_scratch(request, Path::new("/private/tmp")) {
+        rules.push(allow_write_subpath(&root)?);
+    }
+    if let Some(tree) = darwin_scratch {
+        let home = crate::sbpl::resolve(&request.home)?;
+        if home.starts_with(&tree) || tree.starts_with(&home) {
+            rules.push(format!(
+                "(allow file-write* (require-all (subpath {}) (require-not (subpath {}))))",
+                crate::sbpl::quote(&tree)?,
+                crate::sbpl::quote(&home)?
+            ));
+        } else {
+            rules.push(allow_write_subpath(&tree)?);
+        }
     }
     Ok(rules)
 }
 
 /// The full Seatbelt text for one executor run.
 pub fn seatbelt_profile(request: &ExecutorRequest) -> Result<String, Failure> {
+    #[cfg(target_os = "macos")]
+    let scratch = darwin_user_temp_tree();
+    #[cfg(not(target_os = "macos"))]
+    let scratch = None;
+    executor_profile(request, scratch)
+}
+
+pub(crate) fn executor_profile(
+    request: &ExecutorRequest,
+    darwin_scratch: Option<PathBuf>,
+) -> Result<String, Failure> {
     request.validate()?;
     if matches!(request.variant, Some(Variant::Muse | Variant::Adapter)) {
         return variants::muse_profile(request);
@@ -1021,7 +1052,7 @@ pub fn seatbelt_profile(request: &ExecutorRequest) -> Result<String, Failure> {
         allow_write_subpath(&workspace)?,
         allow_write_subpath(&tmpdir)?,
     ];
-    lines.extend(native_scratch_rules(request)?);
+    lines.extend(native_scratch_rules(request, darwin_scratch)?);
     lines.extend([
         deny_write_subpath(&request.home.join(".claude"))?,
         deny_write_subpath(&request.home.join(".codex"))?,
@@ -1059,6 +1090,12 @@ pub fn seatbelt_profile(request: &ExecutorRequest) -> Result<String, Failure> {
         lines.extend(variants::lead_suffix(request, lead)?);
     }
     Ok(format!("{}\n", lines.join("\n")))
+}
+
+/// Ordered rules shared with Seatbelt, excluding the host's Darwin scratch tree.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn linux_policy_profile(request: &ExecutorRequest) -> Result<String, Failure> {
+    executor_profile(request, None)
 }
 
 #[path = "cli_executor_variants.rs"]

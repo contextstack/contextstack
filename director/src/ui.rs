@@ -1,11 +1,11 @@
 //! Embedded newcomer UI and its loopback-only, cookie-authenticated Client API adapter (ADR 0022).
-use crate::access::{Client, Kind};
+use crate::access::Client;
+use crate::policy::{self, ui_route};
 use crate::server::{Call, Peer, Reply, State, bytes, internal, json, refusal};
 use crate::settings::{Args, DEFAULT_LISTEN};
 use crate::store::Store;
 use bytes::Bytes;
 use hyper::HeaderMap;
-use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -144,11 +144,28 @@ pub fn handle(state: &Arc<State>, call: &Call, peer: Peer) -> Reply {
     let Some(token) = cookie(call) else {
         return denied(401, "ui_login_required");
     };
-    let csrf = match crate::ui_auth::authenticate(&state.store, token) {
-        Ok(Some(csrf)) => csrf,
+    let _mutation = if call.method == "GET" {
+        None
+    } else {
+        match state.store.lock_client_mutation() {
+            Ok(lock) => Some(lock),
+            Err(error) => return internal(&error),
+        }
+    };
+    let (client, csrf) = match crate::ui_auth::authenticate(&state.store, token) {
+        Ok(Some(session)) => session,
         Ok(None) => return denied(401, "ui_login_required"),
         Err(e) => return internal(&e),
     };
+    if let Some(cap) = policy::ui_session_route(&call.method, &call.path)
+        && !policy::allows(
+            &client,
+            cap,
+            policy::Target::Org(&state.store.db().scope().org_id),
+        )
+    {
+        return policy::denied();
+    }
     if call.method == "GET" && call.path == "/ui/session" {
         return json(200, &json!({"csrf": csrf}));
     }
@@ -174,36 +191,21 @@ pub fn handle(state: &Arc<State>, call: &Call, peer: Peer) -> Reply {
     let Some(rest) = call.path.strip_prefix("/ui/api/") else {
         return denied(404, "not_found");
     };
-    if !allowed(&call.method, rest) {
+    if !ui_route(&call.method, rest) {
         return denied(404, "not_found");
     }
-    forward(state, call, rest, token)
+    forward(state, call, rest, token, &client)
 }
 
-fn forward(state: &Arc<State>, call: &Call, rest: &str, token: &str) -> Reply {
-    // Resolve the current owner's identity internally. Neither credential file nor bearer token is
-    // read into this adapter, and only the small allowlist above is available to a browser session.
-    let id: Result<Option<String>, _> = state.store.db().query_row(
-        "SELECT id FROM credentials WHERE kind = 'local' AND revoked_at IS NULL ORDER BY rowid DESC LIMIT 1",
-        [], |r| r.get(0),
-    ).optional();
-    let id = match id {
-        Ok(Some(id)) => id,
-        Ok(None) => return denied(401, "ui_login_required"),
-        Err(e) => return internal(&e),
-    };
-    let client = Client {
-        id,
-        kind: Kind::Local,
-        conversation_id: None,
-        intent_id: None,
-        node: None,
-    };
+fn forward(state: &Arc<State>, call: &Call, rest: &str, token: &str, client: &Client) -> Reply {
     if rest == "events" {
         let Some(conversation) = event_conversation(&call.query) else {
             return denied(400, "conversation_scope_required");
         };
-        return crate::events::browser_stream(state, &client, conversation, token);
+        if let Err(no) = crate::policy::guard(state, call, client, &["events"]) {
+            return no;
+        }
+        return crate::events::browser_stream(state, client, conversation, token);
     }
     let forwarded = Call {
         method: call.method.clone(),
@@ -212,25 +214,13 @@ fn forward(state: &Arc<State>, call: &Call, rest: &str, token: &str) -> Reply {
         headers: call.headers.clone(),
         body: call.body.clone(),
     };
-    crate::client_api::handle_as(state, &forwarded, &client)
+    crate::client_api::handle_as(state, &forwarded, client)
 }
 
 // UI streams have exactly one scope; other keys and duplicate scopes fail closed.
 fn event_conversation(query: &str) -> Option<&str> {
     let (key, value) = query.split_once('=')?;
     (key == "conversation" && !value.is_empty() && !value.contains(['&', '='])).then_some(value)
-}
-
-fn allowed(method: &str, path: &str) -> bool {
-    let parts: Vec<_> = path.split('/').collect();
-    matches!(
-        (method, parts.as_slice()),
-        (
-            "GET",
-            ["nodes" | "jobs" | "conversations" | "models" | "events"]
-                | ["conversations", _, "thread"]
-        ) | ("POST", ["conversations"] | ["conversations", _, "turns"])
-    )
 }
 
 fn cookie(call: &Call) -> Option<&str> {
@@ -338,7 +328,7 @@ mod tests {
 
     #[test]
     fn browser_adapter_requires_one_conversation_scope() {
-        assert!(allowed("GET", "events"));
+        assert!(ui_route("GET", "events"));
         assert_eq!(event_conversation("conversation=c1"), Some("c1"));
         for query in [
             "",
@@ -382,12 +372,12 @@ mod tests {
 
     #[test]
     fn browser_adapter_only_exposes_first_slice() {
-        assert!(allowed("GET", "conversations"));
-        assert!(allowed("POST", "conversations"));
-        assert!(allowed("GET", "models"));
-        assert!(allowed("POST", "conversations/c1/turns"));
-        assert!(!allowed("POST", "pairings"));
-        assert!(!allowed("DELETE", "credentials/owner"));
-        assert!(!allowed("GET", "objects/hash"));
+        assert!(ui_route("GET", "conversations"));
+        assert!(ui_route("POST", "conversations"));
+        assert!(ui_route("GET", "models"));
+        assert!(ui_route("POST", "conversations/c1/turns"));
+        assert!(!ui_route("POST", "pairings"));
+        assert!(!ui_route("DELETE", "credentials/owner"));
+        assert!(!ui_route("GET", "objects/hash"));
     }
 }

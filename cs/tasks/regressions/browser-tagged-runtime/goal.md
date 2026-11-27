@@ -1,2 +1,1 @@
-Prove browser_fetch uses the tagged Playwright runtime when the host cache is
-absent.
+Model browser_fetch uses the public broker even when legacy gstack and Playwright settings are present.

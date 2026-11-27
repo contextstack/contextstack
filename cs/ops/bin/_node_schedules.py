@@ -18,7 +18,9 @@ import json
 import re
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from _browser_reliability import ERRORS
 from _dispatch import TERMINAL, qid
 from _estate_io import append_jsonl, read_jsonl
 
@@ -56,25 +58,65 @@ class schedule_lock:
         self.f.close()
 
 
+def valid_change(kind, sid, expect, want):
+    if not isinstance(sid, str) or not PLAIN.fullmatch(sid) or type(expect) is not int:
+        return False
+    if not isinstance(want, dict) or not want:
+        return False
+    if kind == "delete":
+        return expect > 0 and want == {"enabled": False} and want["enabled"] is False
+    fields = {"enabled", "missed", "cron", "timezone"}
+    if kind == "create":
+        if expect != 0 or not fields | {"name", "task"} <= want.keys():
+            return False
+        if len(want.keys() & {"spec", "agent"}) != 1:
+            return False
+        for key in want.keys() - fields:
+            if key not in {"name", "task", "spec", "agent", "grant"} or not isinstance(want[key], str) or not want[key]:
+                return False
+    elif kind != "edit" or expect < 1 or want.keys() - fields:
+        return False
+    if "enabled" in want and type(want["enabled"]) is not bool:
+        return False
+    if "missed" in want and want["missed"] not in ("skip", "catch_up"):
+        return False
+    if "cron" in want and (not isinstance(want["cron"], str) or len(want["cron"].split()) != 5):
+        return False
+    if "timezone" in want and want["timezone"] != "local":
+        try:
+            ZoneInfo(want["timezone"])
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            return False
+    return True
+
+
 def change(state, body, cid):
     """(state, outcome, detail, result) for a schedule_change."""
     sid, expect, want = body.get("schedule_id"), body.get("expect_revision"), body.get("set")
-    if not isinstance(want, dict) or not want or set(want) - {"enabled", "missed"} \
-            or ("enabled" in want and not isinstance(want["enabled"], bool)) \
-            or ("missed" in want and want["missed"] not in ("skip", "catch_up")) \
-            or not isinstance(expect, int) or isinstance(expect, bool):
-        return "refused", "refused", "set must hold enabled (boolean) and/or missed (skip | catch_up)", None
+    kind = body.get("kind", "edit")
+    node = body.get("node")
+    if not valid_change(kind, sid, expect, want) or (
+            kind == "create" and (not isinstance(node, str) or not PLAIN.fullmatch(node))):
+        detail = ("set must hold enabled (boolean) and/or missed (skip | catch_up)"
+                  if "kind" not in body else "invalid schedule change")
+        return "refused", "refused", detail, None
     with schedule_lock(state):
         mine = [r for r in rows(state) if r["id"] == sid]
-        if not mine:
+        done = next((i for i, row in enumerate(mine, 1) if row.get("control_id") == cid), None)
+        if done is not None:
+            return "applied", "applied", "applied earlier", {"revision": done}
+        if kind != "create" and (not mine or mine[-1].get("deleted")):
             return "refused", "unknown_schedule", "no schedule %r on this node" % (sid,), None
-        done = [i for i, r in enumerate(mine) if r.get("control_id") == cid]
-        if done:  # applied before a restart: report it, never apply it again
-            return "applied", "applied", "applied earlier", {"revision": done[0] + 1}
         if len(mine) != expect:
             return "refused", "revision_mismatch", "schedule %s is at revision %d, not %d" % (sid, len(mine), expect), None
-        row = {**mine[-1], **want, "event": "schedule_updated", "ts": now(), "actor_id": "director:control",
+        prior = mine[-1] if mine else {"id": sid, "director_managed": True}
+        if not mine:
+            prior["node"] = node
+        event = {"create": "schedule_created", "edit": "schedule_updated", "delete": "schedule_deleted"}[kind]
+        row = {**prior, **want, "event": event, "ts": now(), "actor_id": "director:control",
                "actor_kind": "automated", "control_id": cid}
+        if kind == "delete":
+            row["deleted"] = True
         append_jsonl(Path(state) / "schedules.jsonl", row, sort_keys=True, compact=False, sync=True, encoding="utf-8")
     return "applied", "applied", "set %s" % json.dumps(want, sort_keys=True), {"revision": expect + 1}
 
@@ -121,6 +163,12 @@ def firings(state, all_rows):
             f["job_id"], f["run_id"] = str(r["job"]), row.get("run_id")
             f["state"] = {"done": "done", None: "started", "pending": "started", "running": "started"}.get(
                 row.get("state"), "error")
+            kind = r.get("error_kind")
+            if isinstance(kind, str) and kind in ERRORS:
+                message, fix = ERRORS[kind]
+                f["detail"] = f"{kind}. {message} {fix}"
+            else:
+                f.pop("detail", None)
             if r.get("catch_up"):
                 f["catch_up"] = True
     out = []

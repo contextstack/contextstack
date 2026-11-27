@@ -30,7 +30,8 @@ def land_record(ctx):
     n, c, got, job_id, run_id = ready_run(ctx)
     intent_id = got["intent"]["intent_id"]
     key = new_key("land")
-    body = land_body("landed", commit="cafebabe")
+    coverage = {"covered": ["probe-a"], "uncovered": ["probe-b"]}
+    body = land_body("landed", commit="cafebabe", host_probe_coverage=coverage)
     s = c.stream()
     try:
         s.until(lambda name, _d: name == "hello")
@@ -44,6 +45,8 @@ def land_record(ctx):
         ctx.expect((run.get("land") or {}).get("land_id") == r["land_id"], "run carries land", run)
         ctx.expect((run.get("land") or {}).get("attempts") == [], "run land has no earlier attempt", run)
         ctx.expect(job.get("land_state") == "landed" and (job.get("land") or {}).get("state") == "landed", "job", job)
+        for land in (r, run.get("land") or {}, job.get("land") or {}):
+            ctx.expect(land.get("host_probe_coverage") == coverage, "land carries host probe coverage", land)
         view = c.call("GET", "intents/" + intent_id).json
         j = next(j for j in view["jobs"] if j["job_id"] == job_id)
         ctx.expect(j.get("land_state") == "landed", "intent bundle job", j)
@@ -68,7 +71,7 @@ def land_record(ctx):
     try:
         s2.until(lambda name, _d: name == "hello")
         fail_key = new_key("lf")
-        failed_body = land_body("failed", reason="regressions failed")
+        failed_body = land_body("failed", reason="regressions failed", host_probe_coverage=coverage)
         f = n2.land(run2, failed_body, fail_key)
         ctx.expect(f.status == 201 and f.json["state"] == "failed" and f.json.get("attempts") == [], "failed", f)
         ev_f, _ = s2.until(
@@ -80,6 +83,7 @@ def land_record(ctx):
         g = n2.land(run2, landed_body, ok_key)
         ctx.expect(g.status == 201 and g.json["state"] == "landed" and g.json["land_id"] != f.json["land_id"],
                    "landed after failed", g)
+        ctx.expect("host_probe_coverage" not in g.json, "coverage belongs to the original attempt", g)
         attempt = g.json.get("attempts") or []
         ctx.expect(len(attempt) == 1 and attempt[0].get("state") == "failed"
                    and attempt[0].get("reason") == "regressions failed"
@@ -100,7 +104,8 @@ def land_record(ctx):
         replay_fail = n2.land(run2, failed_body, fail_key)
         ctx.expect(replay_fail.status == 200 and replay_fail.headers.get("idempotent-replayed") == "true"
                    and replay_fail.json["state"] == "failed" and replay_fail.json["land_id"] == f.json["land_id"]
-                   and replay_fail.json.get("attempts") == [],
+                   and replay_fail.json.get("attempts") == []
+                   and replay_fail.json.get("host_probe_coverage") == coverage,
                    "failed key still answers the original record", replay_fail)
         replay_ok = n2.land(run2, landed_body, ok_key)
         ctx.expect(replay_ok.status == 200 and replay_ok.headers.get("idempotent-replayed") == "true"

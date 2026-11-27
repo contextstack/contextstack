@@ -109,7 +109,7 @@ def _candidate_links(source, target, frozen):
             dest.symlink_to(entry)
 
 
-def _link_release_binaries(workspace, root):
+def _link_release_binaries(workspace, root, sandbox_binary=None):
     runtime = sandbox_runtime_code_root().parent
     release = root / "target/release"
     release.mkdir(parents=True)
@@ -122,6 +122,8 @@ def _link_release_binaries(workspace, root):
         if candidate.is_file() and os.access(candidate, os.X_OK):
             if installed is None or candidate.stat().st_mtime_ns > installed.stat().st_mtime_ns:
                 chosen = candidate
+        if name == "cs-sandbox" and sandbox_binary is not None:
+            chosen = sandbox_binary
         if chosen is not None:
             chosen = chosen.resolve()
             (release / name).symlink_to(chosen)
@@ -130,7 +132,7 @@ def _link_release_binaries(workspace, root):
 
 
 @contextmanager
-def frozen_grader(source, base_sha, scratch, *, workspace=None, lane=None):
+def frozen_grader(source, base_sha, scratch, *, workspace=None, lane=None, run_host_only=False, sandbox_binary=None):
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_sha):
         raise ValueError("invalid grader base commit")
     workspace = workspace or source
@@ -164,7 +166,13 @@ def frozen_grader(source, base_sha, scratch, *, workspace=None, lane=None):
                 for member in contents:
                     if not (member.isdir() or member.isfile()) or ".." in Path(member.name).parts or Path(member.name).is_absolute():
                         raise ValueError(f"invalid grader archive entry: {member.name}")
-                    contents.extract(member, root, filter="data")
+                    if hasattr(tarfile, "data_filter"):
+                        contents.extract(member, root, filter="data")
+                    else:
+                        # Checkout CLIs may fall back to a Python older than the installed pin.
+                        contents.extract(member, root, set_attrs=False)
+                        if member.isfile() and member.mode & 0o100:
+                            (root / member.name).chmod(0o700)
             archive.unlink()
         (root / REGRESSIONS).mkdir(parents=True, exist_ok=True)
         (root / SCRIPTS).mkdir(parents=True, exist_ok=True)
@@ -188,10 +196,12 @@ def frozen_grader(source, base_sha, scratch, *, workspace=None, lane=None):
                 if not reason:
                     raise ValueError(f"empty host_only reason in {goal}")
                 host_only[name] = reason
+                if run_host_only:
+                    continue
                 check = goal.parent / "check"
                 check.chmod(0o700)
                 check.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(skip_message(name, reason)) + "\n")
-        binaries = _link_release_binaries(workspace, root)
+        binaries = _link_release_binaries(workspace, root, sandbox_binary)
         _candidate_links(workspace, root, root / REGRESSIONS)
         directories = [root]
         for path in root.rglob("*"):

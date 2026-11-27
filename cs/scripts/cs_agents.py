@@ -64,10 +64,14 @@ def harness_model(model):
 
 
 def known_models():
+    ops = kit_dir() / "ops/bin"
     try:
-        return set(json.loads((kit_dir() / "ops/bin/executor-templates.json").read_text()))
+        models = set(json.loads((ops / "executor-templates.json").read_text()))
     except (OSError, ValueError):
         return None  # no templates file beside this code root: the node is the judge
+    if (ops / "gate-template.json").is_file():
+        models.add("gate")
+    return models
 
 
 def scalar(text, where):

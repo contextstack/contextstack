@@ -270,12 +270,17 @@ def part_host_binaries(tmp):
     if r.returncode != 0:
         return fail("host-target build_binaries + stage with no go on PATH: exit %s\n%s" % (r.returncode, r.stderr[-1500:]))
     rep = json.loads(r.stdout)
-    built = ["cs-gateway", "cs-harness", "cs-sandbox", "cs-tools"]
+    built = ["browser-host", "cs-gateway", "cs-harness", "cs-sandbox", "cs-tools"]
     want = sorted(built)
     shipped = sorted(os.listdir(out / "release/bin"))
     expect(rep["built"] == built and shipped == want and all(b["bundled"] for b in rep["binaries"])
            and not called.exists() and "csgateway" not in shipped and "cs-go" not in shipped,
            "host bundle with no go on PATH: bin/ holds %s, no csgateway (Go) or cs-go, go never called" % shipped)
+    release = out / "release"
+    expect(all((release / path).is_file() for path in ("cs/policy/browser-native.json",
+            "chrome-extension/manifest.json", "chrome-extension/form-action.mjs",
+            "chrome-extension/permissions.js")),
+           "host bundle includes the owner Chrome policy and extension")
 
 
 
@@ -328,7 +333,7 @@ def part_export(tmp):
     K = CODE_ROOT.name  # the code root in the commit (cs)
     x.mkdir()
     arch = subprocess.run(["git", "-C", str(CODE_ROOT.parent), "archive", "HEAD", K + "/scripts", K + "/ops", K + "/tools",
-                           K + "/policy", K + "/.python-version", *load_node_bundle().TRACE_FILES],
+                           K + "/policy", K + "/.python-version", "gateway/models.json", *load_node_bundle().TRACE_FILES],
                           capture_output=True, check=True).stdout
     subprocess.run(["tar", "-x", "-C", str(x)], input=arch, check=True, env={**hermetic_env()})
     shutil.copy2(CODE_ROOT / "scripts/node-bundle", x / K / "scripts/node-bundle")  # this checkout's version under test

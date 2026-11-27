@@ -24,12 +24,81 @@ final class ActionApprovals
             if (! is_string($part)) {
                 return '<not a string: '.get_debug_type($part).'>';
             }
-            $part = (string) preg_replace_callback('/\p{C}/u', fn (array $m): string => sprintf('\\u{%04X}', mb_ord($m[0])), $part);
+            $part = self::visible($part);
 
             return $part !== '' && preg_match('/^[A-Za-z0-9_@%+=:,.\/-]+$/', $part) === 1
                 ? $part
                 : "'".str_replace("'", "'\\''", $part)."'";
         }, array_values($argv)));
+    }
+
+    /**
+     * Text with every character a person cannot see or that reorders text (control characters, bidi overrides,
+     * zero-width marks) replaced by a visible \u{…} escape.
+     */
+    public static function visible(string $text): string
+    {
+        return (string) preg_replace_callback('/\p{C}/u', fn (array $m): string => sprintf('\\u{%04X}', mb_ord($m[0])), $text);
+    }
+
+    /**
+     * A hosted land approval (CLIENT-API.md "Hosted land approvals"): it names a repo, lane and pinned commit
+     * instead of a job and run.
+     *
+     * @param  array<string, mixed>  $approval
+     */
+    public static function isLand(array $approval): bool
+    {
+        return ($approval['kind'] ?? null) === 'land';
+    }
+
+    /**
+     * What the list shows for it: the land's repo and lane, or the command.
+     *
+     * @param  array<string, mixed>  $approval
+     */
+    public static function headline(array $approval): string
+    {
+        if (ReleaseApprovals::isRelease($approval)) {
+            return ReleaseApprovals::headline($approval);
+        }
+        if (BrowserActions::is($approval)) {
+            return BrowserActions::headline($approval);
+        }
+        if (! self::isLand($approval)) {
+            return self::command($approval);
+        }
+
+        return 'Land '.trim(Json::string($approval['repo'] ?? null).' · '.Json::string($approval['lane'] ?? null), ' ·');
+    }
+
+    /**
+     * Whether a decision can be offered on its state: it waits on a person, and a land has its commit pinned (the
+     * Director refuses to approve a land without one); a release has its commit and target hash pinned; a browser
+     * action's window has not ended.
+     *
+     * @param  array<string, mixed>  $approval
+     */
+    public static function decidable(array $approval): bool
+    {
+        return ($approval['status'] ?? null) === 'needs_owner'
+            && (! self::isLand($approval) || Json::string($approval['commit'] ?? null) !== '')
+            && (! ReleaseApprovals::isRelease($approval) || ReleaseApprovals::pinned($approval))
+            && (! BrowserActions::is($approval) || ! BrowserActions::ended($approval));
+    }
+
+    /**
+     * A land's path flag in words; a flag the inspection has not set yet says so.
+     *
+     * @param  array<string, mixed>  $approval
+     */
+    public static function flag(array $approval, string $flag): string
+    {
+        return match ($approval[$flag] ?? null) {
+            true => 'Yes',
+            false => 'No',
+            default => 'Not inspected yet',
+        };
     }
 
     /**
@@ -66,7 +135,7 @@ final class ActionApprovals
             'needs_owner' => 'Needs you',
             'denied' => 'Denied',
             'expired' => 'Expired: its job ended before it was decided',
-            'approved' => ($approval['decided_by'] ?? null) !== null ? 'Approved by you' : 'Approved by the reviewer',
+            'approved' => ($approval['decided_by'] ?? null) !== null ? 'Approved by a person' : 'Approved by the reviewer',
             default => Json::string($approval['status'] ?? null, 'Unknown'),
         };
     }

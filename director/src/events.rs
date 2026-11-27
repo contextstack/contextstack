@@ -36,6 +36,7 @@ enum Msg {
     Changes(Arc<Vec<Value>>),
     /// A credential was revoked: its streams end.
     Revoked(String),
+    AuthorizationChanged(String, i64),
     /// Live events of runs, as recorded (CLIENT-API.md §8.1).
     RunEvents(Arc<Vec<Value>>),
     /// A run's land record was set (CLIENT-API.md §8.2).
@@ -80,7 +81,7 @@ impl Hub {
             .unwrap_or_else(PoisonError::into_inner);
         let db = store.db();
         let rows: Result<Vec<(i64, String, String)>, _> = db
-            .prepare_cached("SELECT seq, kind, record_id FROM changes WHERE seq > ?1 ORDER BY seq")
+            .prepare_cached("SELECT seq, kind, record_id FROM changes WHERE +org_id = :org_id AND seq > ?1 ORDER BY seq")
             .and_then(|mut stmt| {
                 stmt.query_map(params![*published], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -101,6 +102,10 @@ impl Hub {
         for (seq, kind, id) in rows.iter().rev() {
             if kind == "credential_revoked" {
                 self.revoked(id);
+                continue;
+            }
+            if kind == "authorization_changed" {
+                let _ = self.tx.send(Msg::AuthorizationChanged(id.clone(), *seq));
                 continue;
             }
             if kind == "chief_of_staff" {
@@ -176,18 +181,24 @@ fn frame(event: &str, id: Option<&Value>, data: &Value) -> Bytes {
     Bytes::from(format!("{id}event: {event}\ndata: {data}\n\n"))
 }
 
-fn live(store: &Store, credential: &str) -> bool {
-    store
-        .db()
+fn live(store: &Store, client: &Client) -> bool {
+    let db = store.db();
+    db
         .query_row(
-            "SELECT 1 FROM credentials WHERE id = ?1 AND revoked_at IS NULL",
-            params![credential],
-            |_| Ok(()),
+            "SELECT member_id FROM credentials WHERE +org_id = :org_id AND id = ?1 AND revoked_at IS NULL",
+            params![client.id],
+            |row| row.get(0),
         )
-        .is_ok()
+        .and_then(|member| crate::access::Member::load(&db, member))
+        .is_ok_and(|member| member.is_some_and(|member| member.can_authenticate() && member.scope.role == client.member.scope.role && member.scope.member_id == client.member_id()))
 }
 
 fn visible(store: &Store, client: &Client, event: &Value, change: bool) -> bool {
+    if change && event["kind"] == "action_approval" {
+        return event["id"].as_str().is_some_and(|id| {
+            crate::policy::approval_visible(&store.db(), client, id).unwrap_or(false)
+        });
+    }
     if client.kind != Kind::Lead {
         return true;
     }
@@ -203,6 +214,28 @@ fn visible(store: &Store, client: &Client, event: &Value, change: bool) -> bool 
         return false;
     };
     crate::lead::visible(&store.db(), client, kind, id).unwrap_or(false)
+}
+
+fn change_frame(store: &Store, client: &Client, event: &Value) -> Bytes {
+    let kind = event["kind"].as_str().and_then(Record::named);
+    if let Some(kind @ (Record::Intent | Record::Job | Record::Run | Record::Conversation)) = kind
+        && event["deleted"] != true
+        && let Some(id) = event["id"].as_str()
+    {
+        let _visibility = crate::policy::enter_read_context(client);
+        let db = store.db();
+        let mut filtered = event.clone();
+        if kind == Record::Conversation {
+            filtered["record"] = records::one(&db, kind, id)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+        } else if let Err(error) = crate::projections::record(&db, kind, &mut filtered["record"]) {
+            crate::logf!("events: {} {id}: {error}", kind.name());
+        }
+        return frame("change", event.get("revision"), &filtered);
+    }
+    frame("change", event.get("revision"), event)
 }
 
 /// `GET events`: open a stream. It begins with `hello` naming the newest published revision; every later
@@ -238,6 +271,23 @@ fn event_stream_response(body: mpsc::Receiver<Bytes>) -> Reply {
     reply
 }
 
+// Bound delivery of the entire authorized batch for slow subscribers.
+async fn deliver(
+    out: &mpsc::Sender<Bytes>,
+    chunk: impl IntoIterator<Item = Bytes>,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        for c in chunk {
+            out.send(c).await?;
+        }
+        Ok::<_, mpsc::error::SendError<Bytes>>(())
+    })
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+#[allow(clippy::too_many_lines)]
 fn stream_inner(
     state: &Arc<State>,
     client: &Client,
@@ -245,6 +295,9 @@ fn stream_inner(
     session: Option<&str>,
     heartbeat: Duration,
 ) -> Reply {
+    if let Err(no) = crate::policy::stream_target(state, client, conversation) {
+        return no;
+    }
     let session = session.map(String::from);
     let mut changes = state.hub.tx.subscribe();
     let from = state.hub.published();
@@ -266,12 +319,21 @@ fn stream_inner(
     };
     let hello_conversation = conversation.map(String::from);
     tokio::spawn(async move {
-        let session_live = || {
-            session.as_ref().is_none_or(|token| {
-                crate::ui_auth::authenticate(&state.store, token).is_ok_and(|csrf| csrf.is_some())
-            })
+        let revoke = || deliver(&out, [frame("revoked", None, &json!({}))], heartbeat);
+        let authorized = || match &session {
+            Some(token) => crate::ui_auth::authenticate(&state.store, token).is_ok_and(|session| {
+                session.is_some_and(|(browser, _)| {
+                    browser.kind == client.kind
+                        && browser.member.scope.role == client.member.scope.role
+                        && browser.member_id() == client.member_id()
+                })
+            }),
+            None => live(&state.store, &client),
         };
-        if !session_live() || !live(&state.store, &me) {
+        if !authorized() {
+            if session.is_none() {
+                revoke().await;
+            }
             return;
         }
         let mut hello = json!({"revision": from, "replay": false, "credential_id": me});
@@ -292,24 +354,26 @@ fn stream_inner(
             let chunk = tokio::select! {
                 () = state.hub.stop.cancelled() => break,
                 () = out.closed() => break,
-                _ = beat.tick() => {
-                    if !session_live() || !live(&state.store, &me) {
-                        let _ = out.try_send(frame("revoked", None, &json!({})));
-                        break;
-                    }
-                    vec![Bytes::from_static(b": ping\n\n")]
-                }
+                _ = beat.tick() => vec![Bytes::from_static(b": ping\n\n")],
                 m = changes.recv() => match m {
                     Ok(Msg::Changes(events)) => events
                         .iter()
                         .filter(|e| ours(e, true) && visible(&state.store, &client, e, true))
-                        .map(|e| frame("change", e.get("revision"), e))
+                        .map(|e| change_frame(&state.store, &client, e))
                         .collect(),
                     Ok(Msg::Revoked(id)) if id == me => {
-                        let _ = out.try_send(frame("revoked", None, &json!({})));
+                        revoke().await;
                         break;
                     }
-                    Ok(Msg::Revoked(_)) => continue,
+                    Ok(Msg::AuthorizationChanged(id, seq)) if id == client.member_id() => {
+                        if client.kind != Kind::Lead {
+                            deliver(&out, [frame("change", Some(&json!(seq)),
+                                &json!({"kind":"authorization_changed","id":id,"revision":seq}))], heartbeat).await;
+                        }
+                        revoke().await;
+                        break;
+                    }
+                    Ok(Msg::Revoked(_) | Msg::AuthorizationChanged(..)) => continue,
                     Ok(Msg::RunEvents(events)) => events
                         .iter()
                         .filter(|e| ours(e, false) && visible(&state.store, &client, e, false))
@@ -328,18 +392,15 @@ fn stream_inner(
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
             };
-            for c in chunk {
-                // Check every event, including each record in a batch. A slow browser cannot
-                // block this task beyond the session-check interval.
-                if !session_live() {
-                    return;
-                }
-                if tokio::time::timeout(heartbeat, out.send(c))
-                    .await
-                    .map_or(true, |result| result.is_err())
-                {
-                    return;
-                }
+            if chunk.is_empty() {
+                continue;
+            }
+            if !authorized() {
+                revoke().await;
+                break;
+            }
+            if !deliver(&out, chunk, heartbeat).await {
+                break;
             }
         }
     });
@@ -361,19 +422,8 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir()?;
         let store = Store::open(&tmp.path().join("data"))?;
         crate::access::ensure_local_credential(&store)?;
-        let id =
-            store
-                .db()
-                .query_row("SELECT id FROM credentials WHERE kind = 'local'", [], |r| {
-                    r.get(0)
-                })?;
-        let client = Client {
-            id,
-            kind: Kind::Local,
-            conversation_id: None,
-            intent_id: None,
-            node: None,
-        };
+        let bearer = std::fs::read_to_string(crate::access::local_credential_path(&store))?;
+        let client = crate::access::client(&store, bearer.trim())?.ok_or("missing local actor")?;
         let (token, _) = crate::ui_auth::exchange(&store, &crate::ui_auth::issue(&store)?)?
             .ok_or("pairing failed")?;
         let args = Args::parse(&[
@@ -427,21 +477,23 @@ pub(crate) mod tests {
         crate::access::register_node(&state.store, "home")?;
         let node = {
             let db = state.store.db();
-            db.execute_batch(
-                "INSERT INTO conversations(conversation_id,node,spec,spec_version,model,
+            db.fixture_batch(
+                "INSERT INTO conversations (org_id, conversation_id,node,spec,spec_version,model,
                 instructions_tokens,tools,created_by,created_at,lead)
-                VALUES('c1','home','s','v','m',0,0,'local','now',1);",
+                VALUES(:org_id, 'c1','home','s','v','m',0,0,'local','now',1);",
             )?;
-            db.query_row("SELECT id FROM nodes WHERE name='home'", [], |r| r.get(0))?
+            db.query_row(
+                "SELECT id FROM nodes WHERE +org_id = :org_id AND name='home'",
+                rusqlite::params![],
+                |r| r.get(0),
+            )?
         };
         let minted = crate::access::mint_lead(&state.store, "first", "c1", None, "cred_test")?;
-        let lead = Client {
-            id: minted["credential_id"].as_str().ok_or("missing id")?.into(),
-            kind: Kind::Lead,
-            conversation_id: Some("c1".into()),
-            intent_id: None,
-            node: Some("home".into()),
-        };
+        let lead = crate::access::client(
+            &state.store,
+            minted["token"].as_str().ok_or("missing token")?,
+        )?
+        .ok_or("missing lead actor")?;
         let mut reply = stream(&state, &lead, None);
         opened(&mut reply).await?;
         assert_eq!(
@@ -495,8 +547,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn bearer_stream_reports_revocation_when_the_next_batch_arrives() -> Res {
+        let (_tmp, state, owner, _) = fixture()?;
+        let (code, _) = crate::access::issue_pairing(&state.store, "device", &owner.id, None)?;
+        let (id, _, token) =
+            crate::access::exchange_pairing(&state.store, &code)?.ok_or("pairing refused")?;
+        let client = crate::access::client(&state.store, &token)?.ok_or("device refused")?;
+        let mut reply = stream(&state, &client, None);
+        opened(&mut reply).await?;
+        state.hub.run_events(vec![json!({"message": "first"})]);
+        let first = tokio::time::timeout(Duration::from_secs(1), reply.body_mut().frame())
+            .await?
+            .ok_or("stream closed")??
+            .into_data()
+            .map_err(|_| "not data")?;
+        assert!(String::from_utf8_lossy(&first).contains("first"));
+        // A direct store update leaves the stream to detect revocation on delivery.
+        state.store.db().execute(
+            "UPDATE credentials SET revoked_at = 'now' WHERE +org_id = :org_id AND id = ?1",
+            params![id],
+        )?;
+        state
+            .hub
+            .run_events(vec![json!({"message": "after revocation"})]);
+        let bytes = tokio::time::timeout(Duration::from_secs(1), reply.into_body().collect())
+            .await??
+            .to_bytes();
+        assert_eq!(bytes, frame("revoked", None, &json!({})));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ui_stream_closes_on_logout_before_forwarding_an_event() -> Res {
-        let (_tmp, state, client, token) = fixture()?;
+        let (_tmp, state, _, token) = fixture()?;
+        let (client, _) =
+            crate::ui_auth::authenticate(&state.store, &token)?.ok_or("missing browser")?;
         let mut reply = browser_stream(&state, &client, "c1", &token);
         opened(&mut reply).await?;
         crate::ui_auth::logout(&state.store, &token)?;
@@ -506,13 +591,15 @@ pub(crate) mod tests {
         let bytes = tokio::time::timeout(Duration::from_secs(1), reply.into_body().collect())
             .await??
             .to_bytes();
-        assert!(bytes.is_empty(), "no event after logout: {bytes:?}");
+        assert_eq!(bytes, frame("revoked", None, &json!({})));
         Ok(())
     }
 
     #[tokio::test]
     async fn idle_ui_stream_closes_when_session_expires() -> Res {
-        let (_tmp, state, client, token) = fixture()?;
+        let (_tmp, state, _, token) = fixture()?;
+        let (client, _) =
+            crate::ui_auth::authenticate(&state.store, &token)?.ok_or("missing browser")?;
         // A short heartbeat exercises the same idle check without a 15-second test delay.
         assert!(HEARTBEAT <= Duration::from_secs(15));
         let mut reply = stream_inner(
@@ -523,10 +610,10 @@ pub(crate) mod tests {
             Duration::from_millis(20),
         );
         opened(&mut reply).await?;
-        state
-            .store
-            .db()
-            .execute("UPDATE ui_sessions SET expires_at = 0", [])?;
+        state.store.db().execute(
+            "UPDATE ui_sessions SET expires_at = 0 WHERE +org_id = :org_id",
+            rusqlite::params![],
+        )?;
         let bytes = tokio::time::timeout(Duration::from_secs(1), reply.into_body().collect())
             .await??
             .to_bytes();
@@ -537,7 +624,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn ui_stream_only_forwards_its_conversation() -> Res {
-        let (_tmp, state, client, token) = fixture()?;
+        let (_tmp, state, _, token) = fixture()?;
+        let (client, _) =
+            crate::ui_auth::authenticate(&state.store, &token)?.ok_or("missing browser")?;
         let mut reply = browser_stream(&state, &client, "c1", &token);
         opened(&mut reply).await?;
         state.hub.run_events(vec![

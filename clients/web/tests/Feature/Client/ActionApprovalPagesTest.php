@@ -141,7 +141,8 @@ it('fetches an approval the stream says changed, once per batch, and shows a new
         ->assertSee("git push origin 'lane/fix it'")
         ->assertSee('Approve');
 
-    Http::assertSentCount(2);
+    // The list once and the changed approval once (asking who this device is aside).
+    expect(Http::recorded(fn (Request $request) => ! str_ends_with($request->url(), '/me')))->toHaveCount(2);
 });
 
 it('fetches on a lane page only the approvals of its own job', function () {

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Client;
 
+use App\Client\BrowserApproval;
 use App\Client\DirectorClient;
 use App\Client\Exceptions\DirectorUnavailable;
 use App\Http\Controllers\Controller;
@@ -22,6 +23,33 @@ class EvidenceController extends Controller
     public function job(DirectorClient $director, string $job, string $path): Response
     {
         return $this->relay($director, 'jobs', $job, $path);
+    }
+
+    /**
+     * A browser action approval's screenshot (CLIENT-API.md "Action approvals"), fetched with this device's Director
+     * credential so the page never holds it, and passed on only as a JPEG that is never cached. The route accepts
+     * only a lowercase sha256; a Director 404 or 403 is a plain 404 here.
+     */
+    public function browserScreenshot(DirectorClient $director, string $sha): Response
+    {
+        abort_unless(BrowserApproval::validSha($sha), 404);
+
+        try {
+            $answer = $director->browserScreenshot($sha);
+        } catch (DirectorUnavailable) {
+            abort(502, 'The Director could not be reached.');
+        }
+
+        abort_if(in_array($answer->status(), [403, 404], true), 404);
+        $type = strtolower(trim(explode(';', (string) $answer->header('Content-Type'))[0]));
+        abort_unless($answer->status() === 200 && $type === 'image/jpeg' && str_starts_with($answer->body(), "\xFF\xD8\xFF"), 502, 'The Director did not send a JPEG.');
+
+        return response($answer->body(), 200, [
+            'Content-Type' => 'image/jpeg',
+            'Cache-Control' => 'no-store, private',
+            'X-Content-Type-Options' => 'nosniff',
+            'Content-Security-Policy' => 'sandbox',
+        ]);
     }
 
     private function relay(DirectorClient $director, string $kind, string $id, string $path): Response

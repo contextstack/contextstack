@@ -35,4 +35,28 @@ class TailscaleAddress
 
         return null;
     }
+
+    /**
+     * The address another device types to reach this Director: the Director's own URL when it is not loopback, else
+     * this machine's Tailscale address on the same port (the Director accepts plain HTTP over Tailscale). '' when
+     * neither is known.
+     */
+    public function directorAddress(Connection $connection): string
+    {
+        $host = parse_url($connection->url, PHP_URL_HOST);
+
+        if (! in_array($host, ['127.0.0.1', 'localhost', '::1', '[::1]'], true)) {
+            return $connection->url;
+        }
+
+        $ip = $this->ipv4();
+
+        if ($ip === null) {
+            return '';
+        }
+
+        $port = parse_url($connection->url, PHP_URL_PORT);
+
+        return 'http://'.$ip.(is_int($port) ? ':'.$port : '');
+    }
 }

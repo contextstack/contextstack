@@ -3,9 +3,10 @@
 
 use crate::control;
 use crate::server::{Call, Reply, State, internal, json, refusal};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::util::{self, now_utc, sha256_hex};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -52,11 +53,11 @@ impl Drop for Held {
 }
 
 /// What `GET work` answers now, and its cursor.
-fn snapshot(db: &Connection, node_id: i64) -> rusqlite::Result<(Value, Value, String)> {
+fn snapshot(db: &ScopedConnection, node_id: i64) -> rusqlite::Result<(Value, Value, String)> {
     let jobs = crate::jobs::for_node(db, node_id)?;
     let control = control::open_for(db, node_id)?;
     let mut stmt = db.prepare_cached(
-        "SELECT job_id, revision FROM jobs WHERE node_id = ?1 AND state IN ('offered', 'accepted') ORDER BY rowid",
+        "SELECT job_id, revision FROM jobs WHERE +org_id = :org_id AND node_id = ?1 AND state IN ('offered', 'accepted') ORDER BY rowid",
     )?;
     let mut seen = String::new();
     for row in stmt.query_map(params![node_id], |r| {
@@ -198,21 +199,21 @@ fn parse_events(body: &[u8]) -> Result<(String, Vec<Event>), String> {
 /// Who a run id belongs to: `Ok(None)` for a new run, `Ok(Some(confirmed))` for this node's run of this job;
 /// a 409 when another job or node holds it.
 fn owner(
-    db: &Connection,
+    db: &ScopedConnection,
     node_id: i64,
     job_id: &str,
     run_id: &str,
 ) -> Result<Option<i64>, Box<Reply>> {
     let known: Result<Option<(i64, String, i64)>, _> = db
         .query_row(
-            "SELECT node_id, job_id, confirmed FROM live_runs WHERE run_id = ?1",
+            "SELECT node_id, job_id, confirmed FROM live_runs WHERE +org_id = :org_id AND run_id = ?1",
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional();
     let other_node: Result<Option<i64>, _> = db
         .query_row(
-            "SELECT node_id FROM runs WHERE run_id = ?1",
+            "SELECT node_id FROM runs WHERE +org_id = :org_id AND run_id = ?1",
             params![run_id],
             |r| r.get(0),
         )
@@ -250,7 +251,7 @@ pub fn post_events(state: &State, call: &Call, node_id: i64, node: &str, run_id:
     let mut db = state.store.db();
     let ours = db
         .query_row(
-            "SELECT 1 FROM jobs WHERE job_id = ?1 AND node_id = ?2",
+            "SELECT 1 FROM jobs WHERE +org_id = :org_id AND job_id = ?1 AND node_id = ?2",
             params![job_id, node_id],
             |_| Ok(()),
         )
@@ -286,14 +287,14 @@ pub fn post_events(state: &State, call: &Call, node_id: i64, node: &str, run_id:
     let recorded = (|| -> rusqlite::Result<()> {
         let tx = crate::store::write_tx(&mut db)?;
         tx.execute(
-            "INSERT INTO live_runs (run_id, node_id, job_id, confirmed, first_at, last_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-             ON CONFLICT(run_id) DO UPDATE SET confirmed = excluded.confirmed, last_at = excluded.last_at",
+            "INSERT INTO live_runs (org_id, run_id, node_id, job_id, confirmed, first_at, last_at) VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(run_id) DO UPDATE SET confirmed = excluded.confirmed, last_at = excluded.last_at WHERE +live_runs.org_id = :org_id",
             params![run_id, node_id, job_id, confirmed, stamp],
         )?;
         for e in &accepted {
             tx.execute(
-                "INSERT INTO run_events (run_id, seq, kind, partial, payload, at, received_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO run_events (org_id, run_id, seq, kind, partial, payload, at, received_at)
+                 VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     run_id,
                     e.seq,
@@ -333,14 +334,17 @@ pub fn post_events(state: &State, call: &Call, node_id: i64, node: &str, run_id:
 }
 
 /// The conversation a job serves, as `(conversation_id, "turn_id" | "summary_id", id)`.
-pub fn conversation_tag(db: &Connection, job_id: &str) -> Option<(String, &'static str, String)> {
+pub fn conversation_tag(
+    db: &ScopedConnection,
+    job_id: &str,
+) -> Option<(String, &'static str, String)> {
     conversation_of(db, job_id)
 }
 
-fn conversation_of(db: &Connection, job_id: &str) -> Option<(String, &'static str, String)> {
+fn conversation_of(db: &ScopedConnection, job_id: &str) -> Option<(String, &'static str, String)> {
     db.query_row(
-        "SELECT conversation_id, 'turn_id', turn_id FROM turns WHERE job_id = ?1
-         UNION ALL SELECT conversation_id, 'summary_id', summary_id FROM summaries WHERE job_id = ?1 LIMIT 1",
+        "SELECT conversation_id, 'turn_id', turn_id FROM turns WHERE +org_id = :org_id AND job_id = ?1
+         UNION ALL SELECT conversation_id, 'summary_id', summary_id FROM summaries WHERE +org_id = :org_id AND job_id = ?1 LIMIT 1",
         params![job_id],
         |r| {
             let field: String = r.get(1)?;
@@ -351,10 +355,14 @@ fn conversation_of(db: &Connection, job_id: &str) -> Option<(String, &'static st
 }
 
 /// `GET runs/{id}/events?after=`: a run's live events, for clients. `None` when the run is unknown.
-pub fn read_events(db: &Connection, run_id: &str, after: i64) -> rusqlite::Result<Option<Value>> {
+pub fn read_events(
+    db: &ScopedConnection,
+    run_id: &str,
+    after: i64,
+) -> rusqlite::Result<Option<Value>> {
     let live: Option<(String, String, i64)> = db
         .query_row(
-            "SELECT l.job_id, n.name, l.confirmed FROM live_runs l JOIN nodes n ON n.id = l.node_id
+            "SELECT l.job_id, n.name, l.confirmed FROM (SELECT * FROM live_runs WHERE +org_id = :org_id) l JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = l.node_id
              WHERE l.run_id = ?1",
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -362,8 +370,8 @@ pub fn read_events(db: &Connection, run_id: &str, after: i64) -> rusqlite::Resul
         .optional()?;
     let finished: Option<(Option<String>, String)> = db
         .query_row(
-            "SELECT (SELECT j.job_id FROM jobs j WHERE j.run_id = r.run_id LIMIT 1), n.name
-             FROM runs r JOIN nodes n ON n.id = r.node_id WHERE r.run_id = ?1",
+            "SELECT (SELECT j.job_id FROM jobs j WHERE +org_id = :org_id AND j.run_id = r.run_id LIMIT 1), n.name
+             FROM (SELECT * FROM runs WHERE +org_id = :org_id) r JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = r.node_id WHERE r.run_id = ?1",
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -374,7 +382,7 @@ pub fn read_events(db: &Connection, run_id: &str, after: i64) -> rusqlite::Resul
         (None, None) => return Ok(None),
     };
     let mut stmt = db.prepare_cached(
-        "SELECT seq, kind, partial, payload, at, received_at FROM run_events WHERE run_id = ?1 AND seq > ?2
+        "SELECT seq, kind, partial, payload, at, received_at FROM run_events WHERE +org_id = :org_id AND run_id = ?1 AND seq > ?2
          ORDER BY seq LIMIT ?3",
     )?;
     let events = stmt

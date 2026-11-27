@@ -1,14 +1,15 @@
 //! Normalisation for two hard lines: writes to a Git remote, and credential stores.
 //!
-//! A hard line sends an action to the owner without asking the reviewer model. The Git check looks
-//! at command positions in argv and inline shell code, including commands passed to wrappers.
+//! A hard line sends an action to a human (an owner or the assigned admin) without asking the
+//! reviewer model. The Git check looks at command positions in argv and inline shell code, including
+//! commands passed to wrappers.
 //!
-//! Remote writes use a closed list: a `git` or `gh` invocation skips the owner only when it is a form
-//! known not to write to a remote. Anything else, including subcommands added by future releases, an
-//! alias that does not resolve to a listed form, and `-c` settings that can run commands or redirect
-//! remotes, waits on the owner. A deny list would have to name every write path git and gh offer
-//! (`push`, `send-pack`, `http-push`, `remote-*` helpers, `gh pr merge`, `gh api -X POST`, …) and
-//! would silently fail open on the next one.
+//! Remote writes use a closed list: a `git` or `gh` invocation skips the human decision only when it
+//! is a form known not to write to a remote. Anything else, including subcommands added by future
+//! releases, an alias that does not resolve to a listed form, and `-c` settings that can run commands
+//! or redirect remotes, waits on a human. A deny list would have to name every write path git and gh
+//! offer (`push`, `send-pack`, `http-push`, `remote-*` helpers, `gh pr merge`, `gh api -X POST`, …)
+//! and would silently fail open on the next one.
 //!
 //! Credential stores are matched on normalised absolute paths: `~`, `~user`, `$HOME` and `${HOME}` are
 //! expanded, relative paths are taken from the workspace (the action's working directory), `..` is
@@ -384,8 +385,8 @@ fn substitution(chars: &mut impl Iterator<Item = char>, end: char) -> String {
 fn refused(form: &str) -> String {
     let form: String = form.chars().take(120).collect();
     format!(
-        "Git push requires an owner decision: `{form}` can write to a Git remote or run another \
-         command; only read-only git and gh forms skip the owner."
+        "Git push needs a human decision (an owner or the assigned admin): `{form}` can write to \
+         a Git remote or run another command; only read-only git and gh forms skip it."
     )
 }
 
@@ -532,7 +533,7 @@ fn env_write(args: &[String], depth: usize) -> Option<String> {
 }
 
 fn push_reason() -> String {
-    "Git push requires an owner decision.".to_owned()
+    "Git push needs a human decision (an owner or the assigned admin).".to_owned()
 }
 
 fn segment_words(segment: &[Token]) -> Vec<String> {

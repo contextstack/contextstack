@@ -47,6 +47,7 @@ function fakeProject(array $project, array $more = []): void
         director('usage*') => Http::response(['by' => 'project_id', 'period' => 'all', 'groups' => [], 'total' => ['runs' => 0, 'kinds' => []]]),
         ...$more,
     ]);
+    fakeDirectorBackground();
 }
 
 it('creates a project with a budget under a key and opens it', function () {
@@ -54,6 +55,7 @@ it('creates a project with a budget under a key and opens it', function () {
         director('projects') => Http::sequence()->push(['projects' => []])
             ->push(['project' => projectRecord(['budget' => budgetShown('active')])], 201),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.projects')->assertSee('No projects yet.');
     $key = $page->get('createKey');
@@ -67,6 +69,7 @@ it('creates a project with a budget under a key and opens it', function () {
 
 it('creates a project without a budget when none is given', function () {
     Http::fake([director('projects') => Http::sequence()->push(['projects' => []])->push(['project' => projectRecord()], 201)]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.projects')->set('name', 'free')->call('create');
 
@@ -80,6 +83,7 @@ it('lists projects, each budget state shown distinctly: no budget set is never b
         projectRecord(['project_id' => 'prj_reserved', 'name' => 'busy', 'budget' => budgetShown('reserved', ['waiting_job_ids' => ['job_9']])]),
         projectRecord(['project_id' => 'prj_spent', 'name' => 'spent', 'budget' => budgetShown('exhausted')]),
     ]])]);
+    fakeDirectorBackground();
 
     $html = $this->get(route('projects.index'))->assertOk()->getContent();
 
@@ -143,6 +147,7 @@ it('attaches an intent to a project by naming it when the intent is submitted', 
         director('objects/*') => Http::response(['stored' => true]),
         director('intents') => Http::response(['intent' => intentRecord(['project_id' => 'prj_1']), 'jobs' => [jobRecord(['state' => 'waiting'])], 'runs' => []], 201),
     ]);
+    fakeDirectorBackground();
 
     Livewire::withQueryParams(['project' => 'prj_1'])->test('pages::client.intent-create')
         ->assertSet('projectId', 'prj_1')->assertSee('site rebuild')
@@ -164,6 +169,7 @@ it('shows usage by source, each for what it is, and never an API-price estimate'
             ],
             'total' => ['runs' => 7, 'charged_usd' => 0.4, 'kinds' => []]]),
     ]);
+    fakeDirectorBackground();
 
     $page = $this->get(route('usage'))->assertOk();
     $html = $page->getContent();
@@ -188,6 +194,7 @@ it('asks for usage by project, conversation, intent or node over a month or all 
             ['project_id' => null, 'runs' => 1, 'charged_usd' => 0, 'kinds' => ['local' => ['runs' => 1, 'shown' => 'local: usage only, no cost']]],
         ], 'total' => ['runs' => 4, 'charged_usd' => 0.4, 'kinds' => []]]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::withQueryParams(['node' => 'laptop'])->test('pages::client.usage')
         ->set('by', 'project')->set('period', 'month')
@@ -205,11 +212,12 @@ it('shows source budgets labelled, off distinct from used up, and lets the owner
         ['source' => 'openai', 'state' => $openaiState, 'budget' => $openaiState === 'off' ? null : ['usd' => 5.0, 'period' => 'day'], 'shared' => false,
             'spent' => ['day_usd' => $openaiState === 'exhausted' ? 5.0 : 0, 'month_usd' => 0], 'shown' => $shown],
     ]]];
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => true]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => true]),
         director('source-budgets') => Http::response($report('exhausted', 'budget used up until 2026-11-11T05:00:00Z')),
         director('source-budgets/*') => Http::sequence()->push($report('active', 'active: $5.00 left'))->push($report('off', 'off, set a budget to use')),
     ]);
+    fakeDirectorBackground();
 
     $page = Livewire::test('pages::client.sources')
         ->assertSee('set a budget to use')->assertDontSeeText('off, set a budget to use')->assertSee('until 2026-11-11T05:00:00Z')->assertDontSee('This device is paired');
@@ -224,13 +232,14 @@ it('shows source budgets labelled, off distinct from used up, and lets the owner
 });
 
 it('shows the Director\'s 403 owner_only clearly when a non-owner credential sets a source budget', function () {
+    meOnDirector(['credential_id' => 'cred_phone', 'owner' => false]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_phone', 'owner' => false]),
         director('source-budgets') => Http::response(['gateway' => '127.0.0.1:9200', 'budgets' => ['total' => null, 'sources' => [
             ['source' => 'openai', 'state' => 'off', 'budget' => null, 'shared' => false, 'spent' => ['day_usd' => 0, 'month_usd' => 0], 'shown' => 'off, set a budget to use'],
         ]]]),
         director('source-budgets/*') => Http::response(['error' => 'Forbidden', 'code' => 'owner_only', 'detail' => 'only the owner may do that'], 403),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.sources')->assertSee('This credential is not the owner')
         ->set('source', '*')->set('usd', '5')->call('setSource')
@@ -241,15 +250,17 @@ it('shows the Director\'s 403 owner_only clearly when a non-owner credential set
 });
 
 it('shows a gateway the Director cannot reach as the Director says', function () {
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => true]);
     Http::fake([
-        director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => true]),
         director('source-budgets') => Http::response(['error' => 'Bad Gateway', 'code' => 'gateway_unavailable', 'detail' => 'connection refused'], 502),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.sources')->assertSee('The Director could not reach its gateway: connection refused');
 });
 
 it('reads only the Director on the new pages, never this app\'s database', function () {
+    meOnDirector(['owner' => true]);
     Http::fake([
         director('conversations/con_1/thread') => Http::response(['conversation' => conversationRecord(), 'turns' => [], 'summaries' => []]),
         director('conversations?*') => Http::response(['conversations' => []]),
@@ -258,9 +269,9 @@ it('reads only the Director on the new pages, never this app\'s database', funct
         director('intents?*') => Http::response(['intents' => [], 'jobs' => []]),
         director('nodes') => Http::response(['nodes' => []]),
         director('usage*') => Http::response(['groups' => [], 'total' => ['runs' => 0, 'kinds' => []]]),
-        director('me') => Http::response(['owner' => true]),
         director('source-budgets') => Http::response(['budgets' => ['sources' => [], 'total' => null]]),
     ]);
+    fakeDirectorBackground();
     // No database is configured (phpunit.xml names a connection that does not exist), so any read of one fails.
 
     foreach ([route('conversations.index'), route('conversations.create'), route('conversations.show', 'con_1'), route('projects.index'),

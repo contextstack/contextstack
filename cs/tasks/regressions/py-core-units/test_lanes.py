@@ -33,7 +33,7 @@ class LanesTests(unittest.TestCase):
         self.g('config', 'user.email', 'owner@example.test')
         (self.main / 'file').write_text('seed\n')
         self.commit(self.main, 'seed')
-        self.cfg = {**lanes.DEFAULTS, 'name': 'repo', 'path': self.main}
+        self.cfg = {**lanes.DEFAULTS, 'name': 'repo', 'path': self.main, 'land_check': 'host'}
         self.configure()
 
     def g(self, *args, cwd=None):
@@ -76,7 +76,7 @@ class LanesTests(unittest.TestCase):
     def test_repo_config_pins_short_form_defaults_and_invalid_entries(self):
         repos = Path(os.environ['CS_REPOS_FILE'])
         repos.write_text(json.dumps({'repo': str(self.main)}))
-        self.assertEqual(lanes.repo_config('repo'), self.cfg)
+        self.assertEqual(lanes.repo_config('repo'), {**self.cfg, 'land_check': 'sandbox'})
         for value, reason in (({}, 'not in'), ({'repo': {}}, 'no path'),
                               ({'repo': {'path': str(self.main), 'unknown': 1}}, 'unknown keys'),
                               ({'repo': {'path': str(self.main), 'land': 'bad'}}, 'land must'),

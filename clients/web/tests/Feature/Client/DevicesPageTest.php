@@ -102,3 +102,29 @@ it('says so when the Director keeps device management to its own machine', funct
 
     Livewire::test('pages::client.devices')->assertSee('does not let this credential manage devices');
 });
+
+it('shows an admin each other member\'s devices with their name and role, apart from its own', function () {
+    meOnDirector(meAs('admin'));
+    Http::fake([
+        director('members') => Http::response(['members' => [['id' => 'mem_sam', 'display_name' => 'Sam', 'role' => 'viewer', 'status' => 'active']]]),
+        director('credentials') => Http::response(['credentials' => [
+            deviceCredential(['member_id' => 'mem_me', 'name' => 'my-mac']),
+            deviceCredential(['id' => 'cred_sam', 'member_id' => 'mem_sam', 'name' => 'sams-ipad']),
+        ]]),
+    ]);
+
+    Livewire::test('pages::client.devices')
+        ->assertSeeHtml('data-test="devices-others"')
+        ->assertSee('Your devices')
+        ->assertSee('Sam · Viewer')
+        ->assertSeeInOrder(['my-mac', 'sams-ipad']);
+});
+
+it('says in plain words that a device cannot revoke itself', function () {
+    Http::fake([
+        director('credentials/cred_ipad') => Http::response(['error' => 'Conflict', 'code' => 'self_revoke', 'detail' => 'self'], 409),
+        director('credentials') => Http::response(['credentials' => [deviceCredential()]]),
+    ]);
+
+    Livewire::test('pages::client.devices')->call('revoke', 'cred_ipad')->assertSee('A device cannot revoke itself');
+});

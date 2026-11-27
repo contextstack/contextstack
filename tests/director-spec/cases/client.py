@@ -245,10 +245,13 @@ def accept(ctx, node, job_id):
     ctx.expect(a.status == 200, "node accept", a)
 
 
-def finish(ctx, node, job_id, run_id=None, files=None):
+def finish(ctx, node, job_id, run_id=None, files=None, row_fields=None):
     """The node reports a run and the job's end, as spool-send would. Returns the run fixture."""
     run_id = run_id or "%s-run" % ctx.serial_tag()
     run = run_fixture(run_id, overrides=files)
+    if row_fields:
+        run["row_line"] = json.dumps({**json.loads(run["row_line"]), **row_fields})
+        run["envelope"]["row_sha256"] = sha(run["row_line"])
     for data in run["files"].values():
         ctx.expect(node.call("PUT", "objects/" + sha(data), raw=data).status == 200, "PUT objects")
     a = node.call("POST", "envelopes", body={"envelope": run["envelope"], "row_line": run["row_line"]})
@@ -842,7 +845,16 @@ def _(ctx):
 def _(ctx):
     """A paired owner can issue codes, list credentials and revoke another device."""
     n, o, actor = ctx.node(), owner(ctx), device(ctx)
-    ctx.expect(actor.call("GET", "me").json["owner"] is True, "a paired device acts for the owner")
+    local_me = o.call("GET", "me").json
+    device_me = actor.call("GET", "me").json
+    ctx.expect(device_me["owner"] is True and device_me["role"] == "owner"
+               and device_me["credential_id"] == actor.credential_id, "a paired device acts for the owner", device_me)
+    ctx.expect(device_me["member"] == local_me["member"] and local_me["member"]["id"]
+               and local_me["member"]["display_name"] == "Owner", "the device resolves the bootstrap member", device_me)
+    ctx.expect(set(local_me["capabilities"]) == set(device_me["capabilities"]) | {"land"}
+               and "land" not in device_me["capabilities"]
+               and {"read_work", "manage_source_budgets", "manage_director_budgets"} <= set(device_me["capabilities"]),
+               "only the host-local owner advertises land", local_me)
     issued = actor.call("POST", "pairings", body={"name": "second-device"})
     ctx.expect(issued.status == 200, "device issues a pairing code")
     pending = actor.call("GET", "credentials").json["pairings"]
@@ -927,7 +939,15 @@ def _(ctx):
     conv = created(ctx, o, n, intent_id=intent)
     actor = device(ctx)
     l = lead(ctx, actor, conv, intent)
-    ctx.expect(l.call("GET", "me").json["owner"] is False, "lead is not owner")
+    identity = l.call("GET", "me").json
+    ctx.expect(identity["owner"] is False and identity["role"] == "owner"
+               and identity["member"] == actor.call("GET", "me").json["member"]
+               and identity["credential_id"] == l.credential_id
+               and identity["conversation_id"] == conv["conversation_id"],
+               "lead resolves the sponsor and retains its conversation binding", identity)
+    ctx.expect(set(identity["capabilities"]) == {
+        "read_work", "start_work", "control_work", "decide_run", "edit_backlog", "edit_decision_log"},
+        "lead advertises scoped work operations", identity)
     credentials = o.call("GET", "credentials").json["credentials"]
     record = next(x for x in credentials if x["id"] == l.credential_id)
     ctx.expect(record["kind"] == "lead" and record["conversation_id"] == conv["conversation_id"]
@@ -937,9 +957,10 @@ def _(ctx):
     refused(ctx, l.call("POST", "credentials/lead", body={"name": "escape", "conversation_id": conv["conversation_id"]}),
             403, "owner_only", "lead mint")
     for body in ({"name": "bad", "conversation_id": "missing"},
-                 {"name": "bad", "conversation_id": conv["conversation_id"], "intent_id": "missing"},
-                 {"conversation_id": conv["conversation_id"]}):
-        refused(ctx, o.call("POST", "credentials/lead", body=body), 422, "invalid_request", "invalid binding")
+                 {"name": "bad", "conversation_id": conv["conversation_id"], "intent_id": "missing"}):
+        refused(ctx, o.call("POST", "credentials/lead", body=body), 404, "not_found", "unknown binding")
+    refused(ctx, o.call("POST", "credentials/lead", body={"conversation_id": conv["conversation_id"]}),
+            422, "invalid_request", "missing credential name")
     ctx.expect(o.call("DELETE", "credentials/" + l.credential_id).status == 200, "owner revokes a lead")
     refused(ctx, l.call("GET", "me"), 401, "unauthenticated", "revoked lead")
 
@@ -1013,7 +1034,7 @@ def _(ctx):
 
 @case(C, "lead", "lead-intent-and-node-scope")
 def _(ctx):
-    """A scoped lead sees its attached intent plus self-submitted intents; unscoped means its node, never another."""
+    """Pinning adds the attached intent. Both leads see their submissions and conversation descendants."""
     from cases.conversations import created
     n, other, o = ctx.node2(), ctx.node2("other"), owner(ctx)
     attached = submitted(ctx, o, n)
@@ -1058,9 +1079,16 @@ def _(ctx):
     ctx.expect(l.call("GET", "intents?dispatch_id=" + foreign_key).json == {"intents": [], "jobs": []},
                "dispatch lookup does not expose foreign work")
     unscoped = lead(ctx, o, conv)
-    expected = visible | {foreign["jobs"][0]["job_id"], fresh.json["jobs"][0]["job_id"]}
+    unscoped_own = submitted(ctx, unscoped, n)
+    expected = {own["jobs"][0]["job_id"], unscoped_own["jobs"][0]["job_id"]}
     ctx.expect({j["job_id"] for j in unscoped.call("GET", "jobs").json["jobs"]} == expected,
-               "without intent binding all jobs on bound node are visible")
+               "unpinned lead lists only conversation work")
+    for path in (f"jobs/{jid}", f"runs/{rid}", "objects/" + sha(run["files"]["terminal.json"])):
+        refused(ctx, unscoped.call("GET", path), 403, "owner_only", "unpinned lead cannot read " + path)
+    ctx.expect(unscoped.call("GET", "runs").json["runs"] == [], "unpinned lead cannot list foreign runs")
+    ctx.expect(unscoped.call("GET", "usage?period=all").json["total"]["runs"] == 0,
+               "unpinned lead usage excludes unrelated runs")
+    refused(ctx, unscoped.submit(n.name, key=foreign_key), 403, "owner_only", "unpinned replay cannot reveal work")
     refused(ctx, unscoped.submit(other.name), 403, "owner_only", "submit to another node")
     elsewhere = created(ctx, o, n)
     for path in ("conversations/" + elsewhere["conversation_id"], "conversations/%s/thread" % elsewhere["conversation_id"]):

@@ -53,6 +53,9 @@ class Budgets extends DirectorScreen
 
     public function edit(string $source): void
     {
+        if (! $this->can('manage_source_budgets')) {
+            return;
+        }
         $this->editing = $source;
         $this->usd = '';
         $this->problem = '';

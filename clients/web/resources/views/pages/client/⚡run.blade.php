@@ -213,10 +213,12 @@ new #[Layout('layouts::client')] #[Title('Run')] class extends DirectorPage
                 @else
                     <x-client.needs-action :heading="__('Decision about this result')" data-test="decision">
                         <flux:textarea wire:model="note" :aria-label="__('Note on the decision (optional)')" :placeholder="__('Note (optional)')" rows="1" resize="vertical" />
+                        @allowed($run, 'decide', 'decide_run')
                         <div class="flex gap-2">
                             <flux:button size="sm" variant="primary" icon="check" wire:click="approve">{{ __('Approve') }}</flux:button>
                             <flux:button size="sm" variant="danger" icon="x-mark" wire:click="reject">{{ __('Reject') }}</flux:button>
                         </div>
+                        @endallowed
                     </x-client.needs-action>
                 @endif
 

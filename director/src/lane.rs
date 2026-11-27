@@ -238,6 +238,12 @@ fn budget(profile: &Value, harness_coder: bool, given: Option<&Value>) -> Result
             budget[k] = v.clone();
         }
     }
+    if profile["name"] == "gate" {
+        if budget["seconds"].as_f64() == Some(0.0) {
+            return Err(No::invalid("gate requires a positive seconds budget"));
+        }
+        budget["usd"] = json!(0);
+    }
     Ok(budget)
 }
 
@@ -274,11 +280,14 @@ fn spec_model_and_tools(
     repo_view: bool,
     agent: Option<&str>,
 ) -> Result<(String, &'static str), No> {
+    if (agent == Some("gate")) != (model == "gate") {
+        return Err(No::invalid("agent gate must use the gate executor"));
+    }
     if !model_name(model) {
         return Err(No::invalid("invalid model name"));
     }
     let harness = model.strip_prefix("harness:");
-    if harness.is_none() && !crate::capabilities::is_cli_template(model) {
+    if model != "gate" && harness.is_none() && !crate::capabilities::is_cli_template(model) {
         return Err(unknown_template(model));
     }
     let spec_model = harness.map_or_else(|| model.to_owned(), |gateway| json!(gateway).to_string());
@@ -336,7 +345,7 @@ pub fn build(input: &Value, code: &std::path::Path) -> Result<BuiltBundle, No> {
     let repo = get("repo")?.filter(|s| !s.is_empty());
     let lane = get("lane")?.filter(|s| !s.is_empty());
     let read_only = profile["writes"].as_bool() == Some(false);
-    let repo_view = read_only && repo.is_some() && lane.is_none();
+    let repo_view = read_only && agent != Some("gate") && repo.is_some() && lane.is_none();
     if (!repo_view && repo.is_some() != lane.is_some())
         || repo.into_iter().chain(lane).any(|s| !name(s))
     {
@@ -519,7 +528,7 @@ fn resolve_offer(
             .store
             .db()
             .query_row(
-                "SELECT status FROM nodes WHERE name = ?1 AND revoked_at IS NULL",
+                "SELECT status FROM nodes WHERE +org_id = :org_id AND name = ?1 AND revoked_at IS NULL",
                 [node],
                 |r| r.get(0),
             )
@@ -589,6 +598,8 @@ pub fn expand(
     };
     meta.extend(fields["meta"].as_object().cloned().unwrap_or_default());
     fields.insert("meta".into(), json!(meta));
+    let mut db = state.store.db();
+    let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
     let mut files = Vec::new();
     for (path, data, mode) in contents {
         state
@@ -597,6 +608,7 @@ pub fn expand(
             .map_err(|e| No::internal(&e))?;
         files.push(json!({"path":path,"sha256":util::sha256_hex(data.as_bytes()),"mode":mode}));
     }
+    tx.commit().map_err(|e| No::internal(&e))?;
     m.extend(fields);
     m.insert("files".into(), json!(files));
     Ok(())
@@ -763,6 +775,34 @@ mod tests {
         assert_eq!(spec["model"], "cursor-sol");
         assert_eq!(files[1].1, "Override");
         input["repo"] = Value::Null;
+        input["lane"] = Value::Null;
+        assert!(build(&input, dir.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gate_bundle_requires_lane_and_keeps_its_budget() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let agents = dir.path().join("cs/agents");
+        std::fs::create_dir_all(&agents).map_err(|e| e.to_string())?;
+        std::fs::write(
+            agents.join("gate.md"),
+            include_str!("../../cs/agents/gate.md"),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut input = json!({
+            "title": "Verify", "goal": "Run gate", "agent": "gate", "repo": "project",
+            "lane": "feature", "budget": {"seconds": 45, "usd": 5}, "check_window": 30
+        });
+        let (_, files) = build(&input, dir.path()).map_err(|e| e.2)?;
+        let spec: Value = serde_yaml::from_str(&files[0].1).map_err(|e| e.to_string())?;
+        assert_eq!(spec["model"], "gate");
+        assert_eq!(spec["budget"]["usd"].as_f64(), Some(0.0));
+        assert_eq!(spec["budget"]["seconds"], 45);
+        assert_eq!(spec["check_window"], 30);
+        input["model"] = json!("codex");
+        assert!(build(&input, dir.path()).is_err());
+        input["model"] = Value::Null;
         input["lane"] = Value::Null;
         assert!(build(&input, dir.path()).is_err());
         Ok(())

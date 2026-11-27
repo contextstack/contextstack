@@ -8,6 +8,7 @@
 //! | `--allow-origin ORIGIN` (repeatable) | `DIRECTOR_ALLOWED_ORIGINS` (comma-separated) | none |
 //! | `--stale-after SECONDS` | `DIRECTOR_STALE_AFTER` | 300 |
 //! | `--offer-grace SECONDS` | `DIRECTOR_OFFER_GRACE` | 30 |
+//! | `--browser-action-ttl SECONDS` | `DIRECTOR_BROWSER_ACTION_TTL` | 86400 |
 //! | `--context-window MODEL=TOKENS` (repeatable) | `DIRECTOR_CONTEXT_WINDOWS` (comma-separated) | the table in `thread.rs` |
 //! | `--compact-at FRACTION` | `DIRECTOR_COMPACT_AT` | 0.6 |
 //! | `--gateway URL` (loopback only) | `DIRECTOR_GATEWAY` | `http://127.0.0.1:9200` |
@@ -117,6 +118,8 @@ pub struct Settings {
     pub stale_after_seconds: i64,
     /// An offered job not pulled for this long shows `waiting: node_not_pulled` on its job and turn.
     pub offer_grace_seconds: i64,
+    /// How long a captured browser action can wait for its owner.
+    pub browser_action_ttl_seconds: i64,
     /// Conversation compaction: context windows and the share of a window a thread may fill.
     pub compaction: crate::thread::Settings,
     /// The local model gateway, for source budgets.
@@ -154,6 +157,15 @@ impl Settings {
         };
         let stale_after_seconds = seconds(args, "stale-after", "DIRECTOR_STALE_AFTER", 300)?;
         let offer_grace_seconds = seconds(args, "offer-grace", "DIRECTOR_OFFER_GRACE", 30)?;
+        let browser_action_ttl_seconds = seconds(
+            args,
+            "browser-action-ttl",
+            "DIRECTOR_BROWSER_ACTION_TTL",
+            86_400,
+        )?;
+        if browser_action_ttl_seconds > 604_800 {
+            return Err("--browser-action-ttl cannot exceed 604800 seconds".into());
+        }
         let bounds = crate::reservations::Bounds::default();
         let reservations = crate::reservations::Bounds {
             node_stale: seconds(
@@ -211,6 +223,7 @@ impl Settings {
             allowed_origins: args.many("allow-origin", "DIRECTOR_ALLOWED_ORIGINS"),
             stale_after_seconds,
             offer_grace_seconds,
+            browser_action_ttl_seconds,
         })
     }
 }
@@ -247,6 +260,21 @@ mod tests {
             "--tls-cert=x".to_string(),
         ])?);
         assert!(s.is_err(), "cert without key");
+        Ok(())
+    }
+
+    #[test]
+    fn browser_action_ttl_is_configurable_and_bounded() -> Result<(), String> {
+        let configured = |seconds| {
+            Args::parse(&[
+                "--data-dir=/d".into(),
+                format!("--browser-action-ttl={seconds}"),
+            ])
+            .and_then(|args| Settings::from_args(&args))
+        };
+        assert_eq!(configured(600)?.browser_action_ttl_seconds, 600);
+        assert!(configured(0).is_err());
+        assert!(configured(604_801).is_err());
         Ok(())
     }
 }

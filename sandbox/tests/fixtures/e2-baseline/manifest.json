@@ -59,6 +59,7 @@
     "_executor.py:main:sandbox_cmd",
     "_executor.py:refresh_sandbox:sandbox_cmd",
     "_executor.py:sandbox_cmd:sandbox-exec",
+    "_land_check.py:module:sandbox-exec",
     "_lead_host.py:build:sandbox_cmd",
     "_lead_host.py:make_session:sandbox_builder",
     "_machine_finish.py:profiled_check:check_command",

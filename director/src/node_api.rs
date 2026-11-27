@@ -53,7 +53,7 @@ pub async fn handle(state: &Arc<State>, call: &Call, rest: &str) -> Reply {
             Value::Null,
         );
     };
-    let (node_id, name) = match access::node(&state.store, token) {
+    let principal = match access::node(&state.store, token) {
         Ok(Some(found)) => found,
         Ok(None) => {
             return refusal(
@@ -65,6 +65,8 @@ pub async fn handle(state: &Arc<State>, call: &Call, rest: &str) -> Reply {
         }
         Err(e) => return internal(&e),
     };
+    let node_id = principal.id;
+    let name = principal.name;
     let sent = version(call.header(H_PROTOCOL));
     let Some(v) = sent.filter(|v| SUPPORTED.contains(v)) else {
         return refusal(
@@ -79,7 +81,12 @@ pub async fn handle(state: &Arc<State>, call: &Call, rest: &str) -> Reply {
     };
     let installation = &state.store.installation;
     let mut reply = if call.header(H_INSTALLATION) == Some(installation.as_str()) {
-        if let Err(e) = fleet::note_protocol(&state.store.db(), node_id, &name, v) {
+        let noted = {
+            let db = state.store.db();
+            debug_assert_eq!(db.scope().org_id, principal.registered_by.scope.org_id);
+            fleet::note_protocol(&db, node_id, &name, v)
+        };
+        if let Err(e) = noted {
             return internal(&e);
         }
         let node = Node {
@@ -95,6 +102,12 @@ pub async fn handle(state: &Arc<State>, call: &Call, rest: &str) -> Reply {
                 rest.split('/').collect::<Vec<_>>().as_slice()
         {
             crate::action_approvals::node(state, call, node_id, job, parts)
+        } else if v >= 2 && crate::policy::node_land_route(&call.method, rest) {
+            crate::lead_land::node(state, call, node_id, rest)
+        } else if v >= 2 && crate::policy::node_release_route(&call.method, rest) {
+            crate::lead_install::node(state, call, node_id, rest)
+        } else if v >= 2 && crate::policy::node_browser_action_route(&call.method, rest) {
+            crate::action_approvals::browser_jobs(state, node_id)
         } else {
             route(state, call, &node, rest)
         }

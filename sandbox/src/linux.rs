@@ -41,6 +41,19 @@ pub fn bwrap_path() -> Option<PathBuf> {
 
 fn syscall_number(name: &str) -> Option<i64> {
     let number = match name {
+        "keyctl" => libc::SYS_keyctl,
+        "add_key" => libc::SYS_add_key,
+        "request_key" => libc::SYS_request_key,
+        "bpf" => libc::SYS_bpf,
+        "perf_event_open" => libc::SYS_perf_event_open,
+        "userfaultfd" => libc::SYS_userfaultfd,
+        "pidfd_getfd" => libc::SYS_pidfd_getfd,
+        #[cfg(target_arch = "x86_64")]
+        "link" => libc::SYS_link,
+        "linkat" => libc::SYS_linkat,
+        #[cfg(target_arch = "x86_64")]
+        "symlink" => libc::SYS_symlink,
+        "symlinkat" => libc::SYS_symlinkat,
         "ptrace" => libc::SYS_ptrace,
         "process_vm_readv" => libc::SYS_process_vm_readv,
         "process_vm_writev" => libc::SYS_process_vm_writev,
@@ -71,8 +84,12 @@ fn domain_rule(domain: Domain) -> Result<Vec<SeccompRule>, seccompiler::BackendE
     let (op, family) = match domain {
         Domain::Any => return Ok(Vec::new()), // empty: the call always matches
         Domain::NotUnix => (SeccompCmpOp::Ne, libc::AF_UNIX),
-        Domain::NotIp => {
-            let conditions = [libc::AF_INET, libc::AF_INET6]
+        Domain::NotIp | Domain::NotIpOrUnix => {
+            let mut families = vec![libc::AF_INET, libc::AF_INET6];
+            if domain == Domain::NotIpOrUnix {
+                families.push(libc::AF_UNIX);
+            }
+            let conditions = families
                 .into_iter()
                 .map(|family| {
                     SeccompCondition::new(
@@ -95,6 +112,10 @@ fn domain_rule(domain: Domain) -> Result<Vec<SeccompRule>, seccompiler::BackendE
 /// The denylist for `net` as raw BPF bytes (`struct sock_filter` array, native endian), which is
 /// what bwrap's `--seccomp` reads.
 pub fn bpf(net: Net) -> Result<Vec<u8>, Failure> {
+    compile_bpf(&seccomp::rules(net))
+}
+
+fn compile_bpf(denylist: &[seccomp::Deny]) -> Result<Vec<u8>, Failure> {
     let failed = |error: &dyn std::fmt::Display| {
         unenforceable(format!(
             "seccomp filter could not be built: {error}; the tool was not run"
@@ -111,7 +132,7 @@ pub fn bpf(net: Net) -> Result<Vec<u8>, Failure> {
         )));
     };
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-    for deny in seccomp::rules(net) {
+    for deny in denylist {
         let number = syscall_number(deny.syscall)
             .ok_or_else(|| failed(&format!("unknown syscall {}", deny.syscall)))?;
         rules.insert(number, domain_rule(deny.domain).map_err(|e| failed(&e))?);
@@ -124,7 +145,35 @@ pub fn bpf(net: Net) -> Result<Vec<u8>, Failure> {
         arch,
     )
     .map_err(|e| failed(&e))?;
-    let program: BpfProgram = filter.try_into().map_err(|e| failed(&e))?;
+    let mut program: BpfProgram = filter.try_into().map_err(|e| failed(&e))?;
+    if cfg!(target_arch = "x86_64") {
+        use seccompiler::sock_filter;
+        // x32 shares the x86_64 audit architecture, but sets bit 30 in the syscall number.
+        // Load seccomp_data.nr, skip the errno return for native syscall numbers.
+        program.splice(
+            ..0,
+            [
+                sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                sock_filter {
+                    code: 0x35,
+                    jt: 0,
+                    jf: 1,
+                    k: 0x4000_0000,
+                },
+                sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: SeccompAction::Errno(errno).into(),
+                },
+            ],
+        );
+    }
     let mut bytes = Vec::with_capacity(program.len() * 8);
     for instruction in &program {
         bytes.extend_from_slice(&instruction.code.to_ne_bytes());
@@ -255,13 +304,135 @@ pub fn run(bwrap: &Path, plan: &bwrap::Plan, call: &Call<'_>) -> Result<Ran, Fai
     })
 }
 
+/// Launch an executor with an empty root, projected mounts and private IP loopback.
+pub fn run_executor(
+    request: &crate::cli_executor::ExecutorRequest,
+    arguments: &[String],
+) -> Result<ExitStatus, Failure> {
+    let path = bwrap_path()
+        .ok_or_else(|| unenforceable("bwrap is required for Linux executor confinement"))?;
+    if !userns_works(&path) {
+        return Err(unenforceable(
+            "bwrap cannot create an unprivileged user namespace; executor refused",
+        ));
+    }
+    let (mut plan, deny_symlinks) = crate::executor_mounts::plan(request)?;
+    let mut sockets = crate::executor_mounts::named_sockets(request)?;
+    let ports = crate::linux_relay::checked_ports(request)?;
+    let requires_landlock = !sockets.is_empty() || !ports.is_empty();
+    let use_landlock = (requires_landlock || request.check_scratch.is_some())
+        && cs_landlock::supports_named_sockets();
+    if requires_landlock && !use_landlock {
+        return Err(unenforceable(
+            "named Unix sockets require Linux Landlock ABI 9; executor refused",
+        ));
+    }
+    let relay = crate::linux_relay::HostRelay::start(&ports)
+        .map_err(|e| unenforceable(format!("cannot start host loopback relay: {e}")))?;
+    sockets.extend(relay.endpoints.iter().map(|(_, path)| path.clone()));
+    let mut command = arguments.to_vec();
+    if use_landlock {
+        let source = std::env::current_exe().map_err(|e| unenforceable(e.to_string()))?;
+        let target = PathBuf::from("/.cs-executor-launch");
+        command.insert(0, "--".to_owned());
+        let socket_json =
+            serde_json::to_string(&sockets).map_err(|e| unenforceable(e.to_string()))?;
+        let relay_json =
+            serde_json::to_string(&relay.endpoints).map_err(|e| unenforceable(e.to_string()))?;
+        command.splice(
+            0..0,
+            [
+                target.display().to_string(),
+                "--exec-with-sockets".to_owned(),
+                socket_json,
+                relay_json,
+            ],
+        );
+        plan.mounts.push(bwrap::Mount::RoAt { source, target });
+    }
+    let (command, args) = command
+        .split_first()
+        .ok_or_else(|| unenforceable("executor command is missing"))?;
+    let filter = seccomp_fd(&compile_bpf(&seccomp::executor_rules(
+        use_landlock,
+        deny_symlinks,
+    ))?)?;
+    let sockets: Vec<_> = sockets
+        .into_iter()
+        .map(|path| (path.clone(), path))
+        .collect();
+    let (mut status_reader, status_writer) = status_pipe()?;
+    let launch = bwrap::Launch {
+        net: Net::Loopback,
+        gateway: None,
+        sockets: &sockets,
+        workspace: &request.workspace,
+        seccomp_fd: filter.as_raw_fd(),
+        status_fd: status_writer.as_raw_fd(),
+        tool: Path::new(command),
+        args,
+    };
+    let mut process = Command::new(&path);
+    cs_child_signals::reset_on_exec(&mut process);
+    let mut mask_files = Vec::new();
+    let bwrap_args = bwrap::executor_argv(&plan, &launch, || {
+        // bwrap closes each data descriptor after copying it.
+        let fd = memfd_create("cs-sandbox-empty-mask", MemfdFlags::empty())
+            .map_err(|e| unenforceable(format!("cannot create empty executor file mask: {e}")))?;
+        let raw_fd = fd.as_raw_fd();
+        mask_files.push(fd);
+        Ok(raw_fd)
+    })?;
+    let mut child = process
+        .args(bwrap_args)
+        .spawn()
+        .map_err(|e| unenforceable(format!("cannot start bwrap: {e}")))?;
+    drop(mask_files);
+    drop(status_writer);
+    drop(filter);
+    let (status, report) =
+        crate::json_status::wait_with_status_drain(&mut child, &mut status_reader)?;
+    if !bwrap::started(&report) {
+        return Err(unenforceable(format!(
+            "bwrap could not build the executor sandbox ({status})"
+        )));
+    }
+    Ok(status)
+}
+
+/// Apply the socket rules after bwrap has built the mount namespace.
+pub fn exec_with_sockets(args: &[String]) -> Result<i32, Failure> {
+    use std::os::unix::process::CommandExt;
+    let [socket_json, relay_json, separator, binary, rest @ ..] = args else {
+        return Err(unenforceable("invalid executor socket bootstrap arguments"));
+    };
+    if separator != "--" {
+        return Err(unenforceable("invalid executor socket bootstrap separator"));
+    }
+    let sockets: Vec<PathBuf> = serde_json::from_str(socket_json)
+        .map_err(|e| unenforceable(format!("invalid executor sockets: {e}")))?;
+    let endpoints: Vec<(u16, PathBuf)> = serde_json::from_str(relay_json)
+        .map_err(|e| unenforceable(format!("invalid executor relay endpoints: {e}")))?;
+    cs_landlock::restrict_unix_sockets(&sockets)
+        .map_err(|e| unenforceable(format!("cannot restrict Unix sockets with Landlock: {e}")))?;
+    for (port, socket) in endpoints {
+        crate::linux_relay::start_sandbox(port, &socket).map_err(|e| {
+            unenforceable(format!("cannot forward executor loopback port {port}: {e}"))
+        })?;
+    }
+    let error = Command::new(binary).args(rest).exec();
+    Err(unenforceable(format!(
+        "cannot execute confined command: {error}"
+    )))
+}
+
 /// Whether this host lets bwrap create an unprivileged user namespace: the trivial sandbox
 /// `bwrap --unshare-user --ro-bind / / true`, run for real.
 pub fn userns_works(bwrap: &Path) -> bool {
     let mut command = Command::new(bwrap);
     cs_child_signals::reset_on_exec(&mut command);
     command
-        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+        .args(["--unshare-user", "--ro-bind", "/", "/", "/bin/true"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

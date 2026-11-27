@@ -1,5 +1,5 @@
 [workspace]
-members = ["director", "gateway", "harness", "harness/http-client", "sandbox", "sandbox/child-signals", "tools"]
+members = ["browser-host", "director", "gateway", "harness", "harness/http-client", "sandbox", "sandbox/child-signals", "sandbox/landlock", "tools"]
 resolver = "2"
 
 [workspace.package]

@@ -4,7 +4,7 @@ ContextStack runs coding work through AI agents on your own machines. You can us
 
 ## Status
 
-The current release line is **0.2.0**, now in release candidates. First-time setup targets **macOS on Apple Silicon**. **Linux** support is next. Read [known issues](docs/release/alpha-known-issues.md) before you install.
+The current release line is **0.3.0**, now in release candidates. First-time setup targets **macOS on Apple Silicon**. **Linux** support is next. Read [known issues](docs/release/alpha-known-issues.md) before you install.
 
 ## Install
 

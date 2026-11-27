@@ -35,3 +35,28 @@ def diff_stat(raw):
         elif line.startswith("-"):
             minus += 1
     return {"files": sorted(files)[:50], "added": plus, "removed": minus}
+
+
+def diff_paths(text):
+    """List paths from Git patch metadata, including binary and mode-only changes."""
+    paths = set()
+    preamble, *sections = re.split(r"(?m)^diff --git ", text)
+    for section in sections or ["\n" + preamble]:
+        header, _, metadata = section.partition("\n")
+        found = set()
+        for line in metadata.splitlines():
+            if line.startswith(("@@", "GIT binary patch", "Binary files ")):
+                break
+            if line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+                found.add(line.split(" ", 2)[2])
+            elif line.startswith(("--- ", "+++ ")):
+                path = line[4:].split("\t", 1)[0]
+                if path != "/dev/null":
+                    found.add(re.sub(r'^("?)[ab]/', r"\1", path))
+        if not found:
+            same_path = re.fullmatch(r'("?)a/(.+)\1 \1b/\2\1', header)
+            if same_path:
+                quote, path = same_path.groups()
+                found.add(quote + path + quote)
+        paths.update(found)
+    return sorted(paths)

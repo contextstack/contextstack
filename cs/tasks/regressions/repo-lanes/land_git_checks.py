@@ -44,6 +44,44 @@ def run(kit, expect, tmp):
             git(repo, "update-index", "--add", "--cacheinfo", "100644," + oid + "," + name)
         git(repo, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", message)
 
+    receipt_repo = root / "receipt"
+    receipt_repo.mkdir()
+    git(receipt_repo, "init", "-q", "-b", "main")
+    git(receipt_repo, "config", "user.name", "Receipt Fixture")
+    git(receipt_repo, "config", "user.email", "receipt@example.test")
+    commit_raw(receipt_repo, {"cs/README": "seed\n"}, "seed")
+    commit_raw(receipt_repo, {"cs/README": "checked\n"}, "checked")
+    checked_tree = git(receipt_repo, "write-tree")
+    git(receipt_repo, "reset", "--soft", "HEAD^")
+    hooks = receipt_repo / "scripts/git-hooks"
+    hooks.mkdir(parents=True)
+    dispatcher = hooks / "pre-commit"
+    dispatcher.write_bytes((kit.parent / "scripts/git-hooks/pre-commit").read_bytes())
+    dispatcher.chmod(0o755)
+    gate = receipt_repo / "cs/scripts/hooks/pre-commit"
+    gate.parent.mkdir(parents=True)
+    gate.write_text("#!/bin/sh\necho 'FAIL fixture hook ran'\nexit 1\n")
+    gate.chmod(0o755)
+    git(receipt_repo, "config", "core.hooksPath", str(hooks))
+    receipt = receipt_repo / ".git/cs-land-check-123abc"
+    receipt.write_text(checked_tree + "\n")
+    for label, extra, expected, diagnostic in (
+        ("regular commit", {}, 1, "fixture hook ran"),
+        ("land with mismatched tree", {"CS_LAND_COMMIT": "1", "CS_LAND_CHECK_RECEIPT": "123abc"}, 1,
+         "invalid sandboxed land receipt"),
+        ("land with matching tree", {"CS_LAND_COMMIT": "1", "CS_LAND_CHECK_RECEIPT": "123abc"}, 0, ""),
+    ):
+        if label == "land with mismatched tree":
+            (receipt_repo / "cs/README").write_text("unchecked\n")
+            git(receipt_repo, "add", "cs/README")
+        elif label == "land with matching tree":
+            git(receipt_repo, "read-tree", checked_tree)
+        done = subprocess.run(["git", "-C", str(receipt_repo), "commit", "-qm", label],
+                              capture_output=True, text=True, env={**env, **extra})
+        expect(done.returncode == expected and diagnostic in done.stderr
+               and (label == "regular commit" or "fixture hook ran" not in done.stderr),
+               label + " handles the tree-bound receipt", (done.stdout, done.stderr))
+
     for mode in ("squash", "merge"):
         case = root / mode
         case.mkdir()
@@ -67,7 +105,7 @@ def run(kit, expect, tmp):
         hook.chmod(0o755)
         commit_raw(main, {"payload.txt": "first\nmiddle\nlast\n"}, "seed")
         expected_author = git(main, "log", "-1", "--format=%an <%ae>")
-        (root / "repos.json").write_text(json.dumps({"test": {"path": str(main), "land": mode,
+        (root / "repos.json").write_text(json.dumps({"test": {"path": str(main), "land": mode, "land_check": "host",
                                                            "hooks_path": str(hooks),
                                                            "gate": "git diff --cached > /dev/null"}}))
         lane = case / "attributes"

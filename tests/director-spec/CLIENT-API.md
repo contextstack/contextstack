@@ -4,8 +4,8 @@ The contract between a Director and its clients (`client-web` first, then `clien
 `client-desktop`). It covers Director.Plan step 4, "first journey through a client" (vault
 `runtime-modernization/Director.Plan.md`; contract outline v1.5 §1 decisions 3 and 12, §6, §8, §10), and the
 additions of step 5: cancel outcomes, live run output, node status and schedules (§4.3, §4.4, §5.1, §6.2, §6.3,
-§8.1), of step 6: conversations (§11), and of step 7: usage and budgets (§12). None changed existing behaviour, so this
-is still version 1 (§10). It sits
+§8.1), of step 6: conversations (§11), and of step 7: usage and budgets (§12). Teams adds role-based
+authorization and narrows lead scope in the pre-freeze version 1 contract. It sits
 alongside [NODE-PROTOCOL.md](NODE-PROTOCOL.md), which covers the node side. `tests/director-spec/run --side client --impl rust`
 checks it from outside. The Rust Director (`director/`) is the only
 implementation.
@@ -27,33 +27,111 @@ spending (§12).
 
 ## 2. Access
 
-Every request carries `Authorization: Bearer <token>`, including requests from the same machine.
+Send `Authorization: Bearer <token>`, including requests from the same machine. The two enrollment exchanges,
+`POST /api/v1/pair` and `POST /api/v1/invites/accept`, accept a code in place of a bearer.
 
 | Credential | How it is obtained | May |
 | --- | --- | --- |
 | local (`csl_…`) | created at install, in `<data>/local-credential` (0600) | owner access |
-| device (`csd_…`) | pairing: the owner issues a one-time code, and the device sends it to `POST /api/v1/pair {"code"}` | owner access, with self-revocation refused |
-| lead (`cslead_…`) | owner mints with `POST credentials/lead`, bound to a conversation and optionally an intent | the scoped lane operations below |
+| device (`csd_…`) | a member issues a one-time pairing code and the device sends it to `POST /api/v1/pair {"code"}` | the member's current role, with self-revocation refused |
+| lead (`cslead_…`) | an eligible sponsor mints with `POST credentials/lead`, bound to a conversation and optionally an intent | the scoped lane operations below |
 | node (`csn_…`) | `director-rs node register` | nothing here (401) |
 
-The Director owns the installation and its records. The local credential and every paired device act for the
-owner, including when the Director runs on a separate host. `GET me` returns `owner: true` for these credentials.
-Leads receive 403 `owner_only` on owner routes. A missing, unknown or revoked token gets 401 `unauthenticated`.
+The Director owns the installation and its records. The local credential and existing paired devices act for
+the bootstrap owner, including when the Director runs on a separate host. Leads receive 403 `owner_only` on
+owner routes. A missing, unknown, revoked or disabled member credential gets 401 `unauthenticated`.
 
-- `POST pairings {"name"}` (local or device) returns 200 `{code, name, expires_at}`. The code works once, for 10 minutes.
+`GET me` returns `credential_id`, `owner`, `member: {id, display_name}`, `role` and `capabilities` (an array
+of strings). The role comes from the member's current record and is one of `owner`, `admin`, `member` or
+`viewer`. `owner` is true for human credentials with the owner role. A lead also returns `conversation_id`.
+Its member and role describe its sponsor, and its capabilities reflect the lead's scoped operations.
+The Director computes capabilities using the same policy that authorizes each operation.
+`assignable_roles` and `invitable_roles` list the role values available to this caller. An owner can
+assign `[owner, admin, member, viewer]` and invite `[admin, member, viewer]`. An admin gets
+`[member, viewer]` for both. Members, viewers and leads get empty arrays. The target's current role
+and status still apply, including the bootstrap-owner and last-active-owner protections.
+Capabilities indicate eligibility. The Director also checks the requested resource and the credential's scope.
+Every active human member can read the org's work. Members can start, control and decide their own work.
+Admins can manage Director budgets and decide their assigned action approvals, including hard-line requests.
+`land`, `install`, `rollback` and `browser_action` approvals are owner-only.
+Only owners can change Gateway source limits, and only the local owner credential has the `land` capability.
+
+Human capability grants accumulate from viewer through owner:
+
+| Minimum role | Capability strings |
+| --- | --- |
+| Viewer | `read_work`, `manage_own_devices`, `read_member_directory`, `rename_self` |
+| Member | `start_work`, `control_work`, `decide_run`, `edit_backlog`, `edit_decision_log`, `sponsor_lead` |
+| Admin | `approve_action`, `read_source_budgets`, `manage_director_budgets`, `manage_members`, `manage_member_devices`, `edit_projects`, `manage_schedules` |
+| Owner | `manage_source_budgets`, `manage_org_settings`, `land` (host-local only) |
+
+- `POST pairings {"name"}` (local or device) returns 200 `{code, name, expires_at, member_id, link}`. The code works once, for 10 minutes.
 - `GET credentials` (local or device) returns `{credentials, pairings}`. Credential rows contain
   `id, kind, name, created_at, created_by, last_used_at, revoked_at, revoked_by, conversation_id, intent_id, node`.
   A lead mint records its actor in `created_by`. Pairing rows contain
   `name, issued_by, issued_at, expires_at, used_at, credential_id`, including codes awaiting exchange.
   Revocations record the actor in `revoked_by`. Actor fields store credential IDs, or `node:<id>` for automatic
   hosted-lead rotation. Historical actor fields may be null. The list exposes no codes, tokens or hashes.
+  Credential and pairing rows include `member_id`. All roles see their own devices and pairings.
+  Owners see the org inventory. Admins also see member and viewer credentials and pairings.
+  Lead issuers can see and revoke leads they minted.
 - `DELETE credentials/{id}` (local or device) returns 200 `{id, revoked: true}`. Revocation takes effect on the
   next request and ends open event streams (§8). A device deleting its own credential gets 409 `self_revoke`.
+  The host-local credential is protected with 409 `protected_credential` over the API.
   Clients offer **Forget this device** to remove the saved credential locally.
 - On the Director host, `cs device list`, `cs device pair NAME` and `cs device revoke ID` provide recovery
   using the installed Director's data directory.
 
-### 2.1 Mint a hosted lead: `POST credentials/lead` (owner only)
+### Member management and enrollment
+
+- `GET members` returns `{members:[{id,display_name,role,status}]}`. Owners see all members.
+  Admins manage members and viewers. Members and viewers lack membership management.
+- `GET members/directory` returns a bare array of `{id,display_name,role,active}` for the organization.
+  Every active human member can read it. Leads receive 403. `active` is false for pending and disabled members.
+- `PATCH members/{id}` accepts `role` and/or `status` with an Idempotency-Key and returns `{member}`.
+  Pending members activate through enrollment. Protected owner changes return 409. Disablement
+  revokes credentials and outstanding enrollment codes and ends affected streams. Reactivation
+  permits fresh recovery pairing. Send `{display_name}` by itself to rename. A human can rename
+  their own member record. Managers can rename other members within their existing hierarchy.
+  Display names are trimmed and must contain 1–100 UTF-8 bytes without control characters.
+  For a fresh Director, set the bootstrap owner's display name with `serve --owner-name NAME`
+  or `DIRECTOR_OWNER_NAME`.
+- `POST invites {display_name,role}` creates a pending member and a 24-hour invite. Use
+  `POST invites {member_id}` to replace a pending member’s code. Both return 201 with
+  `{id,member_id,role,code,expires_at,link}`. The copyable app deep link conveys the Director origin
+  and invite code. Issuance has no idempotent replay of the code. Reissue to get a fresh code.
+  Keep the code out of HTTP URLs, history and telemetry.
+- `GET invites` returns `{invites:[{id,member_id,display_name,role,status,expires_at,issued_by}]}`.
+  The statuses are `pending`, `consumed`, `revoked` and `expired`. `issued_by` is the issuer's
+  credential ID. `DELETE invites/{id}` requires an `Idempotency-Key`, returns `{id,revoked:true}`
+  and retains the pending member. Reissuing an accepted invite returns 409.
+- Anonymous `POST /api/v1/invites/accept {code,name}` returns 201 with
+  `{credential_id,name,token,member,role}`. Invalid, expired, revoked and used codes return the
+  same 403 `invite_refused`. The device `name` must match `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`.
+  Throttling returns 429 `rate_limited` with `Retry-After` and is separate from pairing.
+- `POST pairings` accepts optional `member_id` for recovery. Both issuer and target eligibility
+  are checked at exchange. Only owners can target another owner. Anonymous `POST /api/v1/pair`
+  accepts `{code}` and returns 200 `{credential_id,name,token,member,role}`. In both enrollment
+  responses, `member` is `{id,display_name}`. Store the returned device token securely and fetch `me`.
+
+Member status is `pending`, `active` or `disabled`. Owners can invite an admin, member or viewer.
+Admins can invite members and viewers. A role change, disablement or revocation can invalidate
+an open stream. On disconnect or an `authorization_changed` event, refresh `me` and discard cached
+protected records the current identity can no longer read. A stale write can fail with 403 or
+404 after reassignment. The same current authorization applies to replay and direct reads.
+
+- `GET advertised-url` and `PUT advertised-url` require `manage_org_settings` (owner only).
+  PUT accepts `{url}` and both return `{url}`. Use an HTTP or HTTPS origin, such as
+  `https://director.example.ts.net`, or null to clear it. An invalid origin returns 422 `invalid_request`.
+  The advertised URL takes precedence for invite and pairing links. Otherwise, the Director accepts
+  `X-ContextStack-Invite-Origin` from loopback peers and uses the request Host and connection scheme
+  for other peers or when the header is absent. An invalid loopback override returns 422 `invalid_request`
+  when no advertised URL is set. The links are `contextstack://invite?url=…&code=…` and
+  `contextstack://pair?url=…&code=…` respectively.
+
+### 2.1 Mint a hosted lead with `POST credentials/lead`
+
+Owners and admins can sponsor within the org. Members can sponsor their own conversations.
 
 ```json
 {"name": "hosted-lead", "conversation_id": "conv_…", "intent_id": "01…"}
@@ -72,7 +150,7 @@ The token is returned only by this mint response; only its hash is stored. This 
 ### 2.3 Lead home node: `GET lead-node`, `PUT lead-node` (local or device)
 
 Hosted-lead conversations run on one **home machine** for task execution. Local and paired credentials may
-read and change it. Leads receive 403 `owner_only` for both calls.
+read it. Owners can change it. Leads receive 403 `owner_only` for both calls.
 
 `GET lead-node` answers `{"node": "<name>", "source": "default" | "set"}`. The default is the first node registered on
 this Director (`local_node` in `meta`); after `PUT`, `source` is `set`.
@@ -82,42 +160,27 @@ this Director (`local_node` in `meta`); after `PUT`, `source` is `set`.
 
 ### 2.2 Lead access
 
-A lead's estate node is the bound conversation's node. **With `intent_id`, work is limited to that intent plus
-intents submitted by that particular lead credential. Without it, all jobs on that node are visible**, including
-jobs created administratively. Neither form permits submitting work on another node. Lists, usage rollups and
-SSE changes/live output are filtered to this scope. Reads and writes naming work outside it answer 403
-`owner_only` with the existing `{error, code, detail}` shape. Bundle reuse through `from_job`, decisions, cancels,
-and object reads are checked against the same scope; a shared object is readable if an allowed job/run lists it.
-An explicit `files` bundle may reference only objects uploaded by this lead credential or listed by work
-already in its scope. Knowing a foreign object's hash cannot copy it into a newly submitted intent. Uploading
-the actual bytes through `PUT objects/{sha256}` records possession for that credential, including a deduplicated
-upload whose answer is `stored: false`; that upload may then be referenced in future bundles. This permission
-survives restart. Idempotency replay cannot reveal an out-of-scope record. For a lead credential, the same key with different content for an out-of-scope write answers 403 `owner_only` and names no record.
+A lead uses its bound conversation’s node. It can see work submitted by its credential,
+work descended from the bound conversation, and the explicit intent if the credential is pinned.
+An unpinned lead sees only its own submissions and conversation work. The same restrictions apply
+to direct IDs, lists, usage totals, live output, events and replay receipts. A lead can read its bound
+conversation and thread, post wake turns, set or clear attention, send allowed peer briefs, and request
+a hosted land. It can read scoped approval status. Human approval decisions require a human credential.
 
-| Operation | Local owner | Device | Lead |
-| --- | --- | --- | --- |
-| `GET me`, `GET models`, `GET repos`, `GET nodes`, `GET nodes/{name}` | yes | yes | yes |
-| Submit/list/read intents, jobs, runs; bundle/evidence files and live run events | yes | yes | scoped to node and optional intent, plus own submissions |
-| Decide and read decision receipts; cancel and read cancel receipts | yes | yes | same work scope |
-| `PUT objects/{sha256}` for bundles | yes | yes | yes |
-| `GET objects/{sha256}` | listed objects | listed objects | listed by allowed work |
-| `GET usage`, `GET events` | yes | yes | filtered to allowed work; bound conversation events also allowed |
-| `GET conversations/{id}` and `/thread`; read turns/summaries | yes | yes | bound conversation only |
-| `GET events?conversation=ID` | yes | yes | bound conversation only |
-| Pair, list/revoke credentials, mint lead credentials | yes | yes, except self-revocation | no |
-| Read/write lead node and chief of staff, rename conversations | yes | yes | no |
-| Decide an action approval | yes | yes | no |
-| Add job attempts | yes | yes | scoped to own intents and descendants |
-| Mark owner messages or override an owner mark | yes | yes | scoped marks only, with local marks protected |
-| Create/list conversations; post turns; stop/resume; redo summaries | yes | yes | no |
-| Create/read projects, read source budgets, read/change schedules | yes | yes | no |
-| Write project/conversation budgets | yes | yes | no |
-| Set/clear conversation `attention` (§11.6) | yes | yes | bound conversation only |
-| Write source budgets | yes | yes | no |
-| Land lanes (`cs land`) | local owner operation; **recorded** on the node API, readable here | no write | no |
+A lead can add attempts and mark owner messages on its own lanes, subject to protected marks.
+It can decide runs and cancel jobs from its own submissions or conversation descendants. Pinning
+an intent permits reading its work. The lead’s project exception covers the project’s backlog, decision log
+and heartbeat. The capability table and the lead ACL both apply to each write.
+
+Bundle reuse through `from_job` requires job visibility. An explicit `files` bundle may reference
+objects uploaded by the lead or listed by an authorized job or run. Uploading bytes through
+`PUT objects/{sha256}` records possession even when the reply is `stored: false`. The Director
+remembers that credential’s possession across restarts. An idempotency conflict with a hidden
+receipt includes no record. Lead ACL refusals use 403 `owner_only`. The effective role and
+target policy can also return 403 `forbidden` or hide sensitive IDs with 404.
 
 A lead cannot exchange a pairing code at `POST /api/v1/pair` using its bearer credential, even with a live code.
-All refused lead operations use 403 `owner_only`. The lead ACL denies operations not explicitly allowed here.
+Invite acceptance also refuses a lead bearer.
 
 The rules for transport and origin come before the credential check, and they apply to every route, including
 the event stream:
@@ -131,6 +194,21 @@ Nothing is recorded for a refused request.
 **Refusals** take the form `{error, code, detail}`, sometimes with extra fields. The codes are listed in §9.
 
 ## 3. Records and revisions
+
+Client records include the display name beside relevant member IDs: `sponsor_display_name`,
+`responsible_display_name` and `assignee_display_name`. A name is null if there is no matching member.
+Conversation and schedule records expose `paused_reason`, which is `sponsor_ineligible` when the
+responsible sponsor cannot dispatch work and null otherwise.
+
+The `actions` object contains booleans for the caller and record. Intents expose `control`, jobs
+expose `cancel`, runs expose `decide` and conversations expose `control`, `archive` and `adopt`.
+Conversation control refers to editing the conversation. Adoption indicates authority to adopt it
+as the caller. The action is hidden when the caller already sponsors the conversation. The chosen sponsor still has to pass the assignment rules. Approvals and their
+needs-you and attention items expose `decide`, `answer` and `clear`. Install and rollback actions
+are available only to human owners. Owners can decide or answer an open approval, answer release
+attention that is waiting for acknowledgment, and clear an eligible release request. Backlog attention and backlog needs-you
+items expose `answer`. Explicit conversation attention and its work-trace entries expose `control` for
+clearing it. The server also checks the write payload and lifecycle constraints when performing an action.
 
 Every record is a flat JSON object with an integer `revision`. Revisions come from a single sequence for the
 whole installation:
@@ -270,7 +348,8 @@ and descendants within scope. A lead overriding a local mark receives 403 `owner
 | `GET repos` | `{repos}`: machine-reported `{node, name, path, branch}` rows; latest inventory per machine, excluding revoked machines | all |
 | `GET schedules[?node=NAME]` | `{schedules}`: every node's schedules in one list (§4.4) |
 | `GET schedules/{node}/{schedule_id}` | `{schedule, firings, changes}`: the schedule, its latest 100 firings, its changes |
-| `GET me` | `{credential_id, owner}` |
+| `PATCH schedules/{node}/{schedule_id}` (key) `{responsible_member_id}` | 200 `{schedule, firings, changes}`. Owner or admin reassigns the schedule to an active eligible sponsor. Admins can reassign schedules from members or viewers to themselves or eligible members. New firings remain paused while the responsible member is ineligible. Existing offers and accepted jobs can settle. |
+| `GET me` | `{credential_id, owner, member: {id, display_name}, role, capabilities, assignable_roles, invitable_roles, conversation_id?}` |
 
 ### 4.3 Node status
 
@@ -461,6 +540,8 @@ Landing still runs on the machine (`cs land`), but the node **reports** the outc
   `dirty main`).
 - `attempts` lists earlier records for this run, oldest first. Each entry has `state`, `reason`, `land_id`, and
   `time` (when that attempt was recorded). A first record has `"attempts": []`.
+- When the node reports host probe coverage, the land includes `host_probe_coverage` with `covered`
+  and `uncovered` arrays of probe names. Skipped probes are uncovered.
 - A run has one current land record. While it is `failed` or `refused`, another report under a new idempotency
   key replaces it: the new record is current, and the replaced one is appended to `attempts`. `landed` is final.
   A further report under a different key is refused with 409 `already_landed`; the refusal includes the existing
@@ -505,8 +586,9 @@ as cancelled and releases its reservation (the same terminal path as a newly app
 
 ### 6.3 Change a schedule: `POST schedules/{node}/{schedule_id}/changes` (Idempotency-Key)
 
-Body: `{"expect_revision": 4, "set": {"enabled": false}}`. `set` holds one or both of `enabled` (boolean) and
-`missed` (`skip` | `catch_up`). `expect_revision` is the `schedule_revision` the client saw.
+Body: `{"expect_revision": 4, "set": {"enabled": false}}`. `set` holds one or more of `enabled` (boolean),
+`missed` (`skip` | `catch_up`), `cron` or `timezone`. `expect_revision` is the `schedule_revision` the client saw.
+Cron and timezone use the format in §6.3.1.
 
 **Answer:** 202 with the change record:
 
@@ -529,6 +611,33 @@ Body: `{"expect_revision": 4, "set": {"enabled": false}}`. `set` holds one or bo
   second is refused as `revision_mismatch`.
 - An unknown or removed schedule is 404. A `set` with nothing in it, an unknown field, or a bad value is 422.
 - `GET schedule-changes/{id}` reads a change; `GET schedules/{node}/{schedule_id}` lists them all.
+
+#### 6.3.1 Create a schedule: `POST schedules` (Idempotency-Key)
+
+```json
+{"name": "Nightly evaluation", "node": "laptop", "cron": "0 2 * * *", "timezone": "America/New_York",
+ "spec": "spec.yaml", "task": "tasks/eval", "missed": "catch_up", "budget": {"usd": 10, "period": "month"}}
+```
+
+- Supply a name of 1–200 bytes, an active target node, a relative task path, and exactly one of a relative
+  `spec` path or an `agent` profile ID. `missed` defaults to `skip`. `grant` can name an estate grant used by
+  schedule dispatch. Firing uses the node's configured `CS_DIRECTOR_DISPATCH` and existing grant checks.
+- `cron` has five numeric fields (minute, hour, day of month, month, day of week) with wildcards, lists,
+  inclusive ranges and positive steps. `timezone` is an IANA name or `local` for the target node's local timezone.
+  The Director refuses invalid values with 422 and unknown target nodes with 404.
+- An optional `budget` uses the same dollar and period rules as other scope budgets (§12). When set, the schedule
+  record includes its `budget`, and jobs carrying the schedule ID on that node reserve against it.
+- The 202 answer is a change record with `kind: "create"` and `expect_revision: 0`. The Director assigns the
+  schedule ID. Until the node reports revision 1, the schedule has revision 0 and is shown disabled. The same
+  key replays the change. The node creates it enabled.
+
+#### 6.3.2 Delete a schedule: `DELETE schedules/{node}/{schedule_id}` (Idempotency-Key)
+
+Supply `{"expect_revision": 4}`. The 202 answer is a change record with `kind: "delete"` and
+`set: {"enabled": false}`. The node appends a disabled tombstone at the next revision. The next schedule
+report sets `removed_at`; detail still shows its firings and changes. Edits and new delete requests against a
+removed schedule return 404. Repeating the same delete with the same key replays its record.
+
 
 ## 7. Write rules
 
@@ -578,6 +687,7 @@ data: {"kind": "job", "id": "01J…", "revision": 42, "record": {…the job as i
 - A comment line (`: ping`) arrives every 15 seconds while the stream is idle.
 - `event: run_event` carries a run's live output (§8.1). It has no `id:` line.
 - `event: run.land` carries a run's land record (§6.4). It has no `id:` line.
+- `authorization_changed` is an affected-member-only `change` event before stream closure.
 - `event: revoked` ends the stream when the credential is revoked.
 - `event: resync` ends the stream when it fell too far behind.
 - A hosted lead's global stream carries `change` events only for records in its work scope; `change` events for other nodes' status never arrive.
@@ -635,11 +745,19 @@ Browsers: `EventSource` cannot send an `Authorization` header, so a browser clie
 
 | Status | Code | When |
 | --- | --- | --- |
-| 401 | `unauthenticated` | no client credential, or an unknown, revoked or node token |
+| 401 | `unauthenticated` | no client credential, an unknown, revoked or node token, or a disabled principal |
+| 403 | `forbidden` | the authenticated caller lacks capability or target authority |
 | 403 | `owner_only` | a lead calling an owner-only or out-of-scope route |
 | 403 | `origin_refused`, `transport_refused` | the browser-origin and transport rules (§2) |
 | 403 | `pairing_refused` | `POST /api/v1/pair` with no matching live code |
-| 404 | `not_found` | no such route or record |
+| 403 | `invite_refused` | invite code is invalid, expired, revoked or spent |
+| 429 | `rate_limited` | too many invite exchanges from the same peer; retry after the `Retry-After` delay |
+| 404 | `land_lane_not_found` | no eligible finished lane for the hosted conversation |
+| 404 | `not_found` | missing or hidden route or record, including foreign-org IDs and approvals or credentials outside the caller's visibility |
+| 409 | `sponsor_ineligible` | adopt the conversation before requesting a host land, install or rollback |
+| 409 | `member_conflict` | protected owner, pending-member transition or enrollment lifecycle conflict |
+| 409 | `protected_credential` | a client attempts to revoke the host-local credential |
+| 409 | `conflict` | approval has left the required state, or a land approval has no commit pin |
 | 409 | `self_revoke` | a device attempts to revoke its own credential |
 | 409 | `idempotency_conflict` | the key was used for a different request |
 | 409 | `already_decided` | the run's result is already decided |
@@ -692,8 +810,16 @@ bundle, runs it and reports, exactly as for an intent, and does not know it is p
 | `POST conversations` (key) | 201 `{conversation}`; hosted-lead may omit `node` (uses `lead_node`) |
 | `GET conversations[?node=NAME][&intent=ID][&lead=1][&project=ID][&limit=N]` | `{conversations}`, newest first by `created_at` (at most 500). With `lead=1`, only hosted-lead conversations (`lead` is true). With `project`, only conversations in that project. With `node` or `intent`, only that node or attached intent. `limit` (1..500, applied after the filters) caps the list; missing means 500. Invalid `limit`, `lead`, or unknown `project` is refused with 422 `invalid_request`. With no query parameters, the answer matches the previous behaviour (newest first, at most 500). |
 | `GET conversations/{id}` | `{conversation}` |
+| `PATCH conversations/{id}` (key) `{sponsor_member_id}` | 200 `{conversation}`. Owner or admin adopts a conversation. A sponsor change revokes existing lead credentials for that conversation. Admins can adopt from a member or viewer and can assign themselves or an eligible member. |
 | `GET conversations/{id}/thread` | `{conversation, turns, summaries}`: the whole thread, every turn and summary, always |
 | `POST conversations/{id}/turns` (key) `{message}` | 201 `{turn, conversation}` |
+| `POST conversations/{id}/notes` (key) `{message, schedule_key?}` | 201 `{turn, conversation}` for a completed note (local owner only). A known `node/schedule_id` uses the schedule's responsible member as `posted_by`. Otherwise the note uses the posting credential. |
+
+Google Tasks delivery also sends `source: "google_tasks"` and `trust: "untrusted"`
+on the note route. This records a completed `browser_data` turn attributed to
+Google Tasks and exposes the source and trust in `detail`. Lead context presents
+its text as untrusted data.
+| `POST conversations/{id}/land` `{repo, lane}` | 200 land approval record for a finished lane on the hosted conversation's node and project |
 | `POST conversations/{id}/stop` (key) | 202 `{conversation, cancel}` |
 | `POST conversations/{id}/resume` (key) | 200 `{conversation, cancel}` |
 | `POST conversations/{id}/summaries/{summary_id}/redo` (key) | 202 `{summary}` |
@@ -732,6 +858,7 @@ The bundle must not hold `conversation/context.md` or anything under `tasks/turn
 | Path | What |
 | --- | --- |
 | `conversation/context.md` | the thread before this turn: a summary of an older portion if one is used, then earlier turns whole, each as the person's message and the reply (a turn that was stopped or failed says so instead of a reply). On the first turn it says so |
+| `conversation/lessons.md` | A frozen snapshot of active lessons on every hosted lead turn. Up to 40 lines, including the heading and any omission count. |
 | `conversation/decision-log.md` | a frozen snapshot of the active decisions for a hosted lead’s project, when there are any. If the Markdown exceeds 12,000 characters, the snapshot keeps whole entries in descending update order and reports how many were omitted. |
 | `tasks/turn/goal.md` | the person's message, byte for byte |
 | `tasks/turn/check` | `exit 0`, mode 0755: a turn has no check; its reply is its result |
@@ -788,8 +915,15 @@ Every conversation read includes `"lead": true` or `"lead": false`. New rows set
 
 - `state`: `idle` (nothing to do), `running` (a turn's job is out), `summarising` (the next turn waits for a
   summary), `held` (stopped; turns queue and do not start).
-- `attention` is `null` or `{"question", "job_id"?, "set_at", "set_by"}`: the hosted lead (or owner) asks for one
-  decision while child lanes keep running. Unlike `held`, the queue is not stopped.
+- `responsible_member_id` attributes the thread's work and `sponsor_member_id` identifies the sponsor
+  used by manual mint and node rotation. Intents and schedules also expose `responsible_member_id`.
+  Adoption atomically revokes prior leads and preserves work attribution. Ineligibility pauses
+  queued dispatch, heartbeat wakes and rotation. Held jobs expose `sponsor_ineligible` in their
+  budget reason. Adoption or restored eligibility retries queued turns and waiting jobs.
+  An offered or accepted job can still report and settle.
+- `attention` is `null` or `{"question", "job_id"?, "set_at", "set_by", "assignee_member_id", "action_approval_id"?}`.
+  The `job_id` may be null, including for land approvals. The hosted lead (or owner)
+  asks for one decision while child lanes keep running. The queue continues.
 - `compaction` is the budget as it stands now (§11.4).
 - `waiting` is the active turn's `waiting` (below), or null when there is no active turn.
 
@@ -913,15 +1047,43 @@ naming that id. A completed wake reply is ordered after started and terminal tur
 person turns, so it appears in their context when they start. Pending turns retain their relative order and
 turn IDs, and their sequence numbers can change when a wake reply is recorded.
 
+#### Peer messages
+
+| Route | Request and response |
+| --- | --- |
+| `GET peer-message-allowlist` | Owner-only. `200 {pairs}`, empty by default. Pairs with an archived conversation are omitted. |
+| `PUT peer-message-allowlist` | Owner-only. Requires an `Idempotency-Key`. Replace the list with `{pairs: [{from_conversation, to_conversation}]}` and return `200 {pairs}`. Pairs with an archived conversation are ignored. Each remaining pair must name two distinct conversations in the organization. Send `{"pairs":[]}` to disable all peer messaging. |
+| `GET conversations/{id}/peer-messages` | `200 {peers}` lists the currently enabled destination IDs for this source. |
+| `POST conversations/{id}/peer-messages` | Requires `Idempotency-Key` and `{to, text}`. Returns `201 {turn_id}`. |
+
+Discovery and sending require `start_work` on the source conversation. A hosted lead can use only its own
+conversation, and the Director checks the sponsor's live role. The owner must allow each direction separately.
+A missing pair returns 403 `peer_not_allowed`. Text must be nonblank and at most 16,384 UTF-8 bytes, and both
+conversations must be unarchived for a new send.
+
+The target receives a turn in its normal queue with `origin: "wake"`, the brief in `message`, and
+`peer: {from_conversation, from_title, trust: "untrusted"}`. The title is captured on send and falls back to the
+source ID for untitled conversations. Use the `peer` field to distinguish peer briefs from other wakes. Peer
+text is data. It conveys no owner instructions or approvals. A response sent through the reverse pair arrives
+as another wake with its own attribution.
+
+The same credential replaying the same key and request gets `200 {turn_id}` with `Idempotent-Replayed: true`
+while it remains authorized and the pair remains enabled. A conflicting use of a key returns 409. The receipt
+grants no access to the receiving conversation or its run output. A pair can deliver 20 new messages in a rolling
+hour. Further new sends return 429 `peer_rate_limited` and raise attention on the sender conversation.
+
 ### 11.7 Attention (needs-you)
 
 A hosted lead escalates without stopping the queue: `PUT conversations/{id}/attention` with `question` (required,
 non-empty, at most 4000 bytes) and optional `job_id` (at most 128 bytes). The answer is `{conversation}` with
 `attention` set. `DELETE conversations/{id}/attention` clears it to `null`; both writes touch the conversation and
-emit a `conversation` change on the event stream (§8). Any client credential may set or clear attention except a
-**lead**, which may do so only on its bound conversation (§2.2). Posting an owner or device turn (`POST …/turns`)
+emit a `conversation` change on the event stream (§8). A human needs control of the conversation. A lead can act only on its bound conversation (§2.2). Posting an owner or device turn (`POST …/turns`)
 clears attention in the same transaction as the queued turn, so every client sees it was answered. Attention writes
 need no `Idempotency-Key`.
+Operational attention is delivered to its eligible assignee and to owners. The Director
+assigns the sponsor when eligible. The active bootstrap owner receives items when that
+assignment is unavailable. The Director reroutes open items atomically with role and
+status changes that invalidate their assignments.
 
 ### 11.8 Archive and deletion
 
@@ -936,8 +1098,7 @@ while archived returns 409 `archived`: unarchive first.
 archived records; `archived=all` selects both. Other values return 422 `invalid_request`.
 Archive selection combines with node, intent, lead, project and limit in SQL before limiting.
 
-`DELETE conversations/{id}` requires an `Idempotency-Key` and owner authority (lead
-credentials receive 403 `owner_only`). It returns 200 `{"deleted":"<id>"}`;
+`DELETE conversations/{id}` requires an `Idempotency-Key` and control of the conversation. Leads receive 403 `owner_only`. It returns 200 `{"deleted":"<id>"}`;
 a subsequent delete, including with the same key, returns 404. Any turn outside done,
 error or stopped refuses deletion with 409 `busy`: stop it first. Deletion atomically
 removes the conversation, files, turns, summaries, attention and conversation budget,
@@ -1084,10 +1245,12 @@ A job's `run_ids` lists the run its end names, then every run whose report names
 
 ### 12.4 Usage: `GET usage`
 
-`by` is `source` (the default), `project`, `conversation`, `intent` or `node`. `period` is `day` (the default), `month`
+`by` is `source` (the default), `project`, `conversation`, `intent`, `node` or `schedule`. `period` is `day` (the default), `month`
 or `all`; `date` (`YYYY-MM-DD` or `YYYY-MM`) picks which, default today. Days and months are local to the Director's
 host, as budget periods are (§12.2); `from` and `to` are those local midnights in UTC. `project`, `conversation`, `intent`,
 `node` keep only those runs. A run counts in the period its report was received.
+With `by=schedule`, the response has `by: "schedule_id"` and groups runs by their job metadata's
+`schedule_id` (null when absent). Use `node=NAME` to see a node's usage for a schedule ID shared by multiple nodes.
 
 ```json
 {"by": "project_id", "period": "day", "from": "2026-11-10T05:00:00Z", "to": "2026-11-11T05:00:00Z",
@@ -1346,35 +1509,107 @@ this list and its model/fallback chain; `CS_AGENTS_DIR` does not affect MCP.
 
 ## Action approvals
 
-- `GET action-approvals?status=needs_owner&job=JOB` lists the queue in
-  `action_approvals`. Both filters are optional. The list returns up to 500
+- `GET action-approvals?status=needs_owner&job=JOB&conversation=ID` returns `200 {action_approvals}`.
+  All filters are optional and combine with the caller's visibility scope.
+  `conversation` selects approvals linked directly or through the originating job or intent,
+  using the same links as conversation attention. The list returns up to 500
   visible approvals, with `needs_owner` first, then newest first by creation
-  time within each group. `GET action-approvals/ID` fetches one record. Read
-  access follows the job.
-- Show the exact `argv`, `needs`, absolute `write_paths`, requester model
-  and reason, job and run, reviewer model, verdict and review reason. An
+  time within each group. `GET action-approvals/ID` returns the bare approval record. Read
+  access for an admin follows `assignee_member_id` and excludes owner-only approvals: kinds
+  `land`, `install`, `rollback` and `browser_action`.
+  Owners can see all organization approvals. Leads receive scoped status fields.
+- Job approval records contain `id`, `job_id`, `run_id`, `status`, `created_at` and `revision`.
+  They also include `intent_id` when the linked job belongs to a task.
+  Human responses include the request's `argv`, `needs`, absolute `write_paths`,
+  `requesting_model` and `reason` when available. Review, decision, claim and outcome fields
+  include `reviewer_model`, `verdict`, `review_reason`, `reviewed_at`, `decided_by`,
+  `decided_at`, `claimed_at` and `outcome` as the approval advances. An
   absent reviewer model means no model was selected or called. Each
   `network:loopback:<port>` entry names one requested localhost port, such
   as `network:loopback:3000`. On macOS these entries open the named ports
   on host localhost. On Linux the action receives a private localhost.
   ContextStack service ports are reserved.
+- A `kind: "browser_action"` approval exposes `origin`, `action` (`submit`, `post`, or
+  `buy`), `target`, `field_values_digest`, `values_summary`, `expires_at`,
+  `screenshot_sha`, `has_field_warning`, and `masked_or_hidden_count`.
+  The two warning fields are always sent together.
+  Each summary entry has a name, a hidden flag, and a full value or a length
+  with a prefix and last four characters. Passwords show only their length.
+  `excluded: true` identifies a hidden per-load token whose value is excluded
+  from the digest and refreshed at execution. Preserve duplicate names and
+  show hidden entries. When `has_field_warning` is true, prominently display
+  “N fields masked or hidden — review the screenshot” with the supplied count.
+  The screenshot is available at `GET browser-action-screenshots/{sha}` as JPEG.
+  Browser approval evidence is visible only to human owners, regardless of
+  assignment. Scoped leads can read status fields.
+  It goes directly to
+  `needs_owner`. Only human owners can decide, answer, or clear it, and owner
+  projections show `actions.decide` and `actions.answer` while a decision is open.
+  The work trace includes the origin, action, target, summary, warning flag and count, expiry, and screenshot reference.
+  The owner has until `expires_at` to decide, 24 hours by default. Both `decide`
+  and `answer` sweep browser expirations in the same transaction before applying
+  the decision. A decision after `expires_at` returns 409 `conflict` and the
+  record reads `status: "expired"`. Clients should re-fetch the approval on a 409.
+  An approved proposal includes `followup_job_id` to track execution. The follow-up
+  job has no lane of its own and uses the proposing job's `intent_id`, so it
+  appears under the same task. Its responsible member is the approval's assigned
+  member. Clearing the approval before claim cancels execution.
+  The three approval mutation routes in the inventory below also cover this kind.
 - `POST action-approvals/ID/decide` with `{"decision":"approve"}` or
-  `{"decision":"deny"}` requires a local or paired credential. Leads get 403 `owner_only`.
+  `{"decision":"deny"}` requires an assigned admin or an eligible owner. Leads get 403 `owner_only`.
+  Hard-line requests, including Git remote writes and credential paths, go straight to
+  `needs_owner` without a model review. A human decides them: the assigned admin or any owner.
+  Unassigned admins, members, viewers and leads cannot. They are assigned like other command
+  requests, to the job's responsible member when that member is an owner or admin and otherwise
+  to an owner. `actions.decide` and `actions.answer` are true for exactly those who may decide.
+  Their `review_reason` for a Git remote write begins
+  “Git push needs a human decision (an owner or the assigned admin)”.
+  `land`, `install`, `rollback` and `browser_action` approvals remain owner-only.
   Only `needs_owner` is decidable. The approval record includes the acting credential ID as `decided_by`
-  and decision time as `decided_at`. A competing or repeated decision returns 409.
+  and decision time as `decided_at`. Success returns 200 with the updated bare approval record.
+  A competing or repeated decision returns 409 `conflict`. Unsupported values return 422 `invalid_request`.
 - The event stream sends a `change` with kind `action_approval` when a
   pending approval is created, a reviewer model is selected, its status changes,
   it is claimed, or its execution outcome is recorded. The event uses the approval ID as `id` and carries
-  `record: {id, job_id, revision}`. Fetch `GET action-approvals/ID` for the
-  latest state. Event visibility follows the job.
+  `record: {id, job_id, revision}` for job approvals or
+  `record: {id, conversation_id, revision}` for land approvals. Fetch
+  `GET action-approvals/ID` for the latest state. Event visibility follows the
+  same assignment rules for humans and scoped visibility for leads.
 - Task work traces include approval entries in `needs_you` with
   `action_approval_id` and the escalation reason. Conversation `attention`
-  can also link an approval when it has no explicit attention question.
+  can also link an approval when it has no explicit attention question and includes its `kind` (`action` or `land`).
+  These projections include `intent_id` when the linked job belongs to a task.
+  These needs-you items include `options: [{id, label}]`, `default: "no_go"`,
+  and `links: {approval, job?}`. Submit an explicit `{"choice":"go"}` or
+  `{"choice":"no_go"}` to `POST action-approvals/ID/answer`. It applies the
+  same transition and authorization as `decide`, and returns the approval
+  with the answering member ID in `decided_by`. Admins can answer assigned
+  approvals. Land approvals require the owner. Viewers cannot answer.
 - An approved action may be claimed once by the originating run. The
   harness checks the same record if the model repeats the request. An
   owner decision records authorization even if the original run has ended.
   There is no execution on a finished job. A consumed claim with an unknown
   outcome must be treated as potentially executed.
+- The node reports a browser follow-up outcome with `run_id` and `status` on the
+  existing node outcome route. The approval stores that result in `outcome.status`:
+  `submitted` means the site accepted the submission. `submission_unknown` means
+  the request was sent, then a redirect or timeout occurred after sending, so the
+  site may have acted. `refused` means the browser refused before anything was
+  sent. `outcome.reason` is present only for `refused`, and only when the node
+  supplies a valid printable ASCII reason of at most 160 characters; it may
+  therefore be absent for `refused` and is always absent for other statuses.
+  Legacy nodes may report `exit_code: 0`, which produces
+  `outcome.status: "succeeded"` and is treated as `submitted`.
+- `submitted` and legacy `succeeded` finish the follow-up job as `done` with
+  `terminal_row.stop: "browser_action"`. `submission_unknown` also finishes it
+  as `done`, but uses the distinguishable stop `browser_action_unknown` so clients
+  can warn that delivery is uncertain. `refused` and any other outcome status
+  finish it as `error` with stop `browser_action`.
+- For both `submitted` and `submission_unknown`, check the site before trying the
+  action again. A `submission_unknown` approval is already claimed and final:
+  there is no client re-propose route. A new proposal can come only from the agent
+  or schedule on a later run. Clients must not offer “approve again” for
+  `submission_unknown`.
 - When a job reaches a terminal state (`done` or `error`), its `pending` and
   `needs_owner` approvals move to `expired` with reason `job ended` (recorded
   on `outcome` and, when no review reason exists yet, on `review_reason`).
@@ -1382,7 +1617,126 @@ this list and its model/fallback chain; `CS_AGENTS_DIR` does not affect MCP.
   At Director start, open approvals whose jobs are already terminal are expired
   the same way.
 
+### Hosted land approvals
+
+`POST conversations/{id}/land` accepts `{repo,lane}` and requires `start_work` and control of the
+conversation. A hosted lead can request landing for its bound conversation
+using its sponsor's current role. The 200 response is the bare approval record.
+The Director returns the open request for
+the lane when one exists, or the successful request for the same target run.
+Use `GET action-approvals/ID` to follow a particular request.
+
+The approval has `kind: "land"`, `id`, `conversation_id`, `repo`, `lane`,
+`target_run_id`, `argv`, `reason`, `status`, `created_at` and `revision`.
+After inspection it also has the full `commit` and `base` object IDs and the
+boolean `protected` and `tracing` flags. Review, decision, claim and outcome
+fields appear as they become available. `job_id` and `run_id` are absent.
+
+The node inspects a `pending` request. Automatic approval requires a passing gate and a
+qualifying reviewer run for the pinned commit submitted by a human credential belonging to
+an active owner. A member, admin or lead submission cannot supply that review. A request
+that needs a manual decision is routed to the owner as `needs_owner`. Pending inspections
+expire after five minutes. Owner decision requests and unclaimed approvals
+expire after 24 hours. An unavailable
+inspection ends the request and allows a fresh request. Only an owner can
+decide a land approval. The decision endpoint returns 409 when asked to
+approve a land without a commit pin.
+
+### Hosted release approvals
+
+`POST conversations/{id}/install-release` accepts `{}` for the node's local
+`main` commit or `{"bundle":"NAME"}` for a staged bundle. The conversation
+must be an active hosted lead conversation. The caller needs `start_work`
+and control of that conversation. `POST conversations/{id}/rollback` accepts
+`{}` and requests the previous installed release. Both routes return a
+`200` action approval. A second open release switch in the organization
+returns `409 conflict`.
+
+Install approvals have `kind: "install"` and manual rollback approvals have
+`kind: "rollback"`. Both carry the initiating `conversation_id` and a
+`bundle` value (string for a named staged bundle, otherwise null or absent).
+The node moves the request from `pending` to `needs_owner` and supplies
+`commit` and `target_hash` (40- or 64-digit hex strings), `schema_current`
+and `schema_target` (nonnegative integers, omitted when unavailable), and
+`release_notes_diff` (string). It also supplies these display strings.
+
+- `commit_provenance` is `"Pinned from local main and built by node-bundle"`
+  for a local build or `"claimed commit (from bundle.json)"` for a bundle's
+  claimed commit.
+- `backup` is `"Local backup only"` or `"Local and configured off-machine backup"`.
+
+Only a human owner can decide
+through `action-approvals/ID/decide` or `/answer`. The approval covers that
+pin and, for an install, the recovery from a failed trial.
+
+Follow the approval by ID. `outcome` is absent until the Director has a
+status to report. Its fields are:
+
+| Field | JSON type | Presence |
+|---|---|---|
+| `status` | string | Always present on an outcome. |
+| `reason` | string | Present on node receipts, expiry, worker lease interruption, and owner-cleared requests. |
+| `release` | string | Current release, present on node receipts. |
+| `smoke_ok` | boolean | Present on `installed`, `rolled_back`, and `rollback_failed` receipts. |
+| `smoke` | object | Present with `smoke_ok`, with boolean `ok` and array `checks`. Each check has string `name`, boolean `ok`, optional string `reason`, and optional `seconds` and `skipped` (each a number or boolean). |
+| `waiting_jobs` | unsigned integer | Present on `rollback_failed` when the node reports how many jobs are holding up rollback. |
+| `acknowledged` | boolean | Present as `true` when a waiting rollback has been acknowledged or a later manual rollback on the same node switches away from the failed release. |
+| `cleared` | boolean | Present as `true` on an `interrupted` outcome cleared or created by the owner. |
+| `switched_without_smoke` | boolean | Present on a node-reported `interrupted` receipt. `true` means the node switched releases without a smoke result. |
+
+The complete set of `outcome.status` values is:
+
+| Status | Meaning |
+|---|---|
+| `waiting_on_owner` | The node inspected the release and is waiting for a decision. |
+| `unavailable` | The node could not inspect and pin the release. |
+| `denied` | The owner denied the request. |
+| `expired` | The open request expired before execution. |
+| `unknown` | The node claimed the approval and the Director has no receipt yet. |
+| `installed` | Installation smoke passed. |
+| `rolled_back` | Installation smoke failed and the previous release was restored. |
+| `restored` | The approved manual rollback completed. |
+| `rollback_failed` | Installation smoke failed and rollback could not be verified. |
+| `failed` | The node could not complete the approved switch. |
+| `timed_out` | The switch timed out before switching. |
+| `interrupted` | The node reported interruption, the worker lease expired, or the owner cleared the request. |
+
+An unacknowledged `rollback_failed` with `waiting_jobs` raises conversation
+attention with the sole option `{"id":"acknowledge","label":"Acknowledge rollback is waiting"}`
+and a null default. A human owner can send `{"choice":"acknowledge"}` to
+`POST action-approvals/ID/answer` when `actions.answer` is true. This sets
+`outcome.acknowledged` to true and dismisses the attention item.
+
+`actions.clear` is a boolean on approval reads and approval attention.
+When true, a human owner can `POST action-approvals/ID/clear` to close a
+pending request, one awaiting a decision, or an approved request with no
+outcome, an unknown or interrupted outcome, or an unacknowledged rollback
+waiting on jobs. Clearing a waiting rollback acknowledges it. Other clears
+record an interrupted outcome with `cleared: true`. Clearing an unclaimed
+request also sets the approval's `status` to `denied`. Clear and acknowledge
+return the updated bare approval on success and add `closed_by` and
+`closed_at` (member ID and timestamp strings).
+
+A post-install wake turn in the initiating conversation carries the same
+summary in `message`, with `origin: "wake"` and `detail.approval_id` (string).
+If the turn fails, its detail may also carry an `error` string.
+`GET conversations/{id}/smoke` returns
+`{"last_smoke": OUTCOME_OR_NULL}` for the conversation's node. The
+`smoke` MCP tool calls this read-only route and starts no jobs.
+
+When a trial ran, the outcome also carries
+`"smoke": {"ok": BOOL, "checks": [{"name": STRING, "ok": BOOL, "reason": STRING}]}`.
+Every check has `name` and `ok`; `reason` is present only when the check
+gave one. Names and reasons are cleaned display text, never secrets.
+
 ### Project decision log
+
+Decision log entries can carry `kind: "lesson"`. The `record_decision` MCP
+tool accepts the same field. Lessons use the existing create, revise, retire,
+and revision checks. Active lessons appear in `conversation/lessons.md`,
+ordered by source count and then most recent revision. Lesson text is
+condensed to one line per entry, and the full record remains in the project
+decision log.
 
 Routes below are relative to `projects/{project_id}/decision_log`. The project
 belongs to the Director installation. Local and paired clients act for its
@@ -1418,8 +1772,10 @@ attachment.
 
 ## Project backlog and heartbeat
 
-The Director installation owns its projects and backlog records. Paired devices share the owner's
-access. A lead credential can access the backlog and backlog events for its conversation's project.
+The Director installation owns its projects and backlog records. A lead credential can access the
+backlog, backlog events, and heartbeat settings for its conversation's project. Owners and admins
+can configure a project's heartbeat. A lead with a member, admin, or owner sponsor can configure
+its own conversation with a minimum interval of 900 seconds. It can disable its own heartbeat.
 
 | Route under `projects/{project_id}` | Result |
 |---|---|
@@ -1430,6 +1786,8 @@ access. A lead credential can access the backlog and backlog events for its conv
 | `POST backlog/reorder` | `200 {items}`. Pass `{items: [{item_id, revision, priority}, ...]}` for an atomic priority update. |
 | `GET backlog/next_unblocked` | `200 {item}`, where `item` is null when nothing is ready |
 | `GET backlog/needs_you` | `200 {items}` with all open items that have an owner blocker |
+| `POST backlog/{item_id}/answer` | `200 {item}`. Pass the current `revision` and the selected option ID as `choice`. Only the assigned member or a human owner may answer or remove an owner blocker. |
+| `GET backlog.md` | `200 text/markdown` with Now, Next, Blocked, and Needs you sections. Requires project read access. |
 | `GET heartbeat` | `200 {project_id, interval_seconds, conversation_id}` |
 | `PUT heartbeat` | `200` with the saved schedule. Enable with a positive integer `interval_seconds` and an unarchived hosted lead's `conversation_id` in the project. Send `{interval_seconds: null}` to turn it off. |
 
@@ -1450,6 +1808,27 @@ The global event stream sends `backlog_item` changes. Hosted conversation attent
 first owner-blocked item when there is no conversation question or action approval taking precedence.
 Clients can use `backlog/needs_you` to show the entire project's needs-you list.
 
+Answering requires a human credential with backlog edit access. Hosted leads receive
+`403 forbidden` on the answer route. They can use `backlog_update` to add owner blockers
+and ask a needs-you question. An update from a hosted lead receives `403 forbidden`
+if it removes or replaces an owner blocker, closes an open item with an owner blocker,
+changes or clears an existing `needs_you` question, or supplies `needs_you_answer`.
+
+An owner blocker can carry `needs_you: {options, default?, links?}` in the
+backlog item JSON. Each of the one to six options has a unique `id` and a
+`label`. The default identifies an option to highlight. Link keys are
+`job`, `run`, `lane`, `approval`, and `backlog`; values are resource IDs.
+Conversation attention projects these fields at the top level with
+`project_id`, `revision`, and `links.backlog`. An owner blocker without
+configured choices has the single default option `unblock`. Plain
+conversation attention keeps its existing fields and reply flow.
+
+Answering requires `edit_backlog` and an authorized human credential. The selected
+option clears the item's owner blockers and preserves other blockers.
+A blocked item with no remaining blockers moves to `next`. The saved item
+includes `needs_you_answer: {choice, label, member_id, answered_at}`.
+Closed items and stale revisions return 409.
+
 The heartbeat defaults to off, with both schedule fields null. The Director waits one interval
 before the first turn, defers while the target conversation is held or busy, and never overlaps
 heartbeat turns in the same project. An open item with an owner blocker and `stop: true` pauses
@@ -1458,3 +1837,128 @@ the project's heartbeat. Turns use the regular conversation records and events w
 
 Lead MCP tools are `backlog(project_id, action?, status?)`, where action is `list` or `next`,
 and `backlog_update(project_id, item_id?, revision?, ..., key?)`. Omit `item_id` to create an item.
+
+## Policy route inventory
+
+Browser screenshot reads require a human owner. Browser approval reads expose
+evidence to human owners and scoped status to leads.
+
+The node-only protocol 2 route `GET /api/v1/nodes/me/browser-action-jobs`
+requires a node credential and returns that node’s scheduled browser follow-ups.
+
+Paths are relative to `/api/v1/client`. `{id}` is one path segment and
+`{rest...}` covers the remaining segments. The policy capability is the route
+entry point. Record scope, credential kind and lifecycle rules also apply.
+The anonymous enrollment routes use `/api/v1` and have their own checks.
+
+| Method | Path | Policy capability |
+| --- | --- | --- |
+| `DELETE` | `/conversations/{id}` | `ControlWork` |
+| `DELETE` | `/conversations/{id}/attention` | `ControlWork` |
+| `DELETE` | `/conversations/{id}/budget` | `ManageDirectorBudgets` |
+| `DELETE` | `/credentials/{id}` | `ManageOwnDevices` |
+| `DELETE` | `/invites/{id}` | `ManageMembers` |
+| `DELETE` | `/projects/{id}/budget` | `ManageDirectorBudgets` |
+| `DELETE` | `/schedules/{id}/{id}` | `ManageSchedules` |
+| `DELETE` | `/source-budgets/{id}` | `ManageSourceBudgets` |
+| `GET` | `/action-approvals` | `ApproveAction` |
+| `GET` | `/action-approvals/{id}` | `ApproveAction` |
+| `GET` | `/browser-action-screenshots/{id}` | `ApproveAction` |
+| `GET` | `/advertised-url` | `ManageOrgSettings` |
+| `GET` | `/agents` | `ReadWork` |
+| `GET` | `/agents/{id}` | `ReadWork` |
+| `GET` | `/cancels/{id}` | `ReadWork` |
+| `GET` | `/chief-of-staff` | `ReadWork` |
+| `GET` | `/conversations` | `ReadWork` |
+| `GET` | `/conversations/{id}` | `ReadWork` |
+| `GET` | `/conversations/{id}/peer-messages` | `StartWork` |
+| `GET` | `/conversations/{id}/smoke` | `ReadWork` |
+| `GET` | `/conversations/{id}/thread` | `ReadWork` |
+| `GET` | `/credentials` | `ManageOwnDevices` |
+| `GET` | `/decisions/{id}` | `ReadWork` |
+| `GET` | `/events` | `ReadWork` |
+| `GET` | `/intents` | `ReadWork` |
+| `GET` | `/intents/{id}` | `ReadWork` |
+| `GET` | `/intents/{id}/work-trace` | `ReadWork` |
+| `GET` | `/invites` | `ManageMembers` |
+| `GET` | `/jobs` | `ReadWork` |
+| `GET` | `/jobs/{id}` | `ReadWork` |
+| `GET` | `/jobs/{id}/files/{id}/{rest...}` | `ReadWork` |
+| `GET` | `/lead-node` | `ReadWork` |
+| `GET` | `/me` | `ReadWork` |
+| `GET` | `/members` | `ManageMembers` |
+| `GET` | `/members/directory` | `ReadMemberDirectory` |
+| `GET` | `/models` | `ReadWork` |
+| `GET` | `/nodes` | `ReadWork` |
+| `GET` | `/nodes/{id}` | `ReadWork` |
+| `GET` | `/objects/{id}` | `ReadWork` |
+| `GET` | `/peer-message-allowlist` | `ManageOrgSettings` |
+| `GET` | `/projects` | `ReadWork` |
+| `GET` | `/projects/{id}` | `ReadWork` |
+| `GET` | `/projects/{id}/backlog.md` | `ReadWork` |
+| `GET` | `/projects/{id}/backlog/{rest...}` | `ReadWork` |
+| `GET` | `/projects/{id}/decision_log/{rest...}` | `ReadWork` |
+| `GET` | `/projects/{id}/heartbeat` | `ReadWork` |
+| `GET` | `/repos` | `ReadWork` |
+| `GET` | `/runs` | `ReadWork` |
+| `GET` | `/runs/{id}` | `ReadWork` |
+| `GET` | `/runs/{id}/decision` | `ReadWork` |
+| `GET` | `/runs/{id}/events` | `ReadWork` |
+| `GET` | `/runs/{id}/files/{id}/{rest...}` | `ReadWork` |
+| `GET` | `/schedule-changes/{id}` | `ReadWork` |
+| `GET` | `/schedules` | `ReadWork` |
+| `GET` | `/schedules/{id}/{id}` | `ReadWork` |
+| `GET` | `/source-budgets` | `ReadSourceBudgets` |
+| `GET` | `/summaries/{id}` | `ReadWork` |
+| `GET` | `/turns/{id}` | `ReadWork` |
+| `GET` | `/usage` | `ReadWork` |
+| `PATCH` | `/conversations/{id}` | `ControlWork` |
+| `PATCH` | `/members/{id}` | `ManageMembers` |
+| `PATCH` | `/schedules/{id}/{id}` | `ManageSchedules` |
+| `POST` | `/action-approvals/{id}/answer` | `ApproveAction` |
+| `POST` | `/action-approvals/{id}/clear` | `ApproveAction` |
+| `POST` | `/action-approvals/{id}/decide` | `ApproveAction` |
+| `POST` | `/conversations` | `StartWork` |
+| `POST` | `/conversations/{id}/archive` | `ControlWork` |
+| `POST` | `/conversations/{id}/install-release` | `StartWork` |
+| `POST` | `/conversations/{id}/land` | `StartWork` |
+| `POST` | `/conversations/{id}/rollback` | `StartWork` |
+| `POST` | `/conversations/{id}/notes` | `StartWork` |
+| `POST` | `/conversations/{id}/peer-messages` | `StartWork` |
+| `POST` | `/conversations/{id}/resume` | `ControlWork` |
+| `POST` | `/conversations/{id}/stop` | `ControlWork` |
+| `POST` | `/conversations/{id}/summaries/{id}/redo` | `StartWork` |
+| `POST` | `/conversations/{id}/turns` | `StartWork` |
+| `POST` | `/conversations/{id}/unarchive` | `ControlWork` |
+| `POST` | `/conversations/{id}/wake-turns` | `StartWork` |
+| `POST` | `/credentials/lead` | `SponsorLead` |
+| `POST` | `/intents` | `StartWork` |
+| `POST` | `/intents/{id}/jobs` | `StartWork` |
+| `POST` | `/invites` | `ManageMembers` |
+| `POST` | `/jobs/{id}/cancel` | `ControlWork` |
+| `POST` | `/pairings` | `ManageOwnDevices` |
+| `POST` | `/projects` | `EditProjects` |
+| `POST` | `/projects/{id}/backlog` | `EditBacklog` |
+| `POST` | `/projects/{id}/backlog/reorder` | `EditBacklog` |
+| `POST` | `/projects/{id}/backlog/{id}/answer` | `EditBacklog` |
+| `POST` | `/projects/{id}/backlog/{id}/update` | `EditBacklog` |
+| `POST` | `/projects/{id}/decision_log` | `EditDecisionLog` |
+| `POST` | `/projects/{id}/decision_log/import` | `EditDecisionLog` |
+| `POST` | `/projects/{id}/decision_log/{id}/retire` | `EditDecisionLog` |
+| `POST` | `/projects/{id}/decision_log/{id}/revise` | `EditDecisionLog` |
+| `POST` | `/projects/{id}/decision_log/{id}/supersede` | `EditDecisionLog` |
+| `POST` | `/runs/{id}/decision` | `DecideRun` |
+| `POST` | `/schedules` | `ManageSchedules` |
+| `POST` | `/schedules/{id}/{id}/changes` | `ManageSchedules` |
+| `PUT` | `/advertised-url` | `ManageOrgSettings` |
+| `PUT` | `/chief-of-staff` | `ManageOrgSettings` |
+| `PUT` | `/conversations/{id}/attention` | `ControlWork` |
+| `PUT` | `/conversations/{id}/budget` | `ManageDirectorBudgets` |
+| `PUT` | `/intents/{id}/owner-messages/{id}/mark` | `ControlWork` |
+| `PUT` | `/lead-node` | `ManageOrgSettings` |
+| `PUT` | `/objects/{id}` | `StartWork` |
+| `PUT` | `/peer-message-allowlist` | `ManageOrgSettings` |
+| `PUT` | `/projects/{id}/budget` | `ManageDirectorBudgets` |
+| `PUT` | `/projects/{id}/heartbeat` | `ManageSchedules` |
+| `PUT` | `/source-budgets` | `ManageSourceBudgets` |
+| `PUT` | `/source-budgets/{id}` | `ManageSourceBudgets` |

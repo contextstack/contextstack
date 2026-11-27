@@ -7,6 +7,7 @@ OS confinement for one CS tool call (Plan.CS.v2.1 §6; phase 3a macOS, phase 3b 
     cs-sandbox --policy FILE [--cwd DIR] [--report-dir DIR] -- TOOL [ARGS...]
     cs-sandbox --probe --policy FILE
     cs-sandbox --policy FILE --profile cli-executor --request FILE
+    cs-sandbox --profile land-check --request FILE
 
 - `--cwd` is the workspace (default: the current directory). `TOOL` is an absolute path, a path with a slash resolved against the wrapper's directory, or a bare name found on `PATH`.
 - `--report-dir`: after the tool exits, `DIR/<unix-ms>-<pid>.json` with `backend`, `tool`, `args`, `cwd`, `effective_policy` (its `tmp` is the call's tmp dir), `profile_sha256`, `narrowed`, `exit`, `signal`, `duration_ms`. A report that cannot be written is one stderr line, never a failed call.
@@ -31,7 +32,7 @@ Host policy (`cs/policy/sandbox.json`; `$CODE_ROOT` = `CS_CODE_ROOT` or the poli
      "linux": ["$CODE_ROOT/tools/bin", "$REPO_ROOT/target/release",...]},
      "allow_net": ["none"], "write_env": {"CS_BROWSER_STATE": ["$HOME/.contextstack"]},
      "profiles": {"browser": {"read": {"macos": ["$HOME/.claude/skills/gstack",...], "linux": [...]}}},
-     "sockets": {"browser-public": "$HOME/.contextstack/browser/sockets/public.sock"}}
+     "sockets": {"browser-public": "$HOME/.contextstack/public-browser/sockets/public.sock"}}
 
 `runtime_read` is one list for every OS or one list per OS (`macos`, `linux`); an OS without a list is 101. In a read list, `$TOOL_PYTHON` is the base install of `$CODE_ROOT/.venv` (`pyvenv.cfg` `home`, canonical, less a final `bin`), read-only; no venv or `home`, or a base of `/`, drops the entry (`policy.rs` `tool_python`).
 
@@ -83,6 +84,20 @@ A descriptor's `"profile"` asks for a named profile; the only one is `browser`. 
 
 Seatbelt does not nest under a deny-default profile (`forbidden-sandbox-reinit`), so a tool that runs its own `sandbox-exec` must skip it when `sandbox_check(getpid, NULL, 0)` returns 1.
 
+## Whole executor runs on Linux
+
+Executor launches project the ordered Seatbelt file rules into bubblewrap mounts. Secret files
+are mounted read-only from `/dev/null`, and denied directories use a read-only empty tmpfs.
+A literal or subpath deny under a writable mount must be enforceable at launch. An absent
+target that the executor could create causes exit 101. Regex file denies apply at launch only.
+
+Executors use private IP loopback. The host forwards only explicitly declared TCP endpoints,
+including the lane approval bridge and configured adapter endpoints. Hosted lead MCP uses
+its declared Unix socket. Both mechanisms require Landlock ABI 9. The Director and gateway
+defaults (8780 and 9200) and configured reserved listeners cannot be forwarded. Direct provider
+connections require a host-side bridge with this backend. Sharing the host network would
+require enforcing reserved-port restrictions across the supported kernels and transports.
+
 ## Linux (phase 3b)
 
 `bwrap --unshare-user --disable-userns --unshare-ipc --unshare-pid --unshare-uts --unshare-cgroup-try [--unshare-net] --die-with-parent --new-session --cap-drop ALL --dev /dev --proc /proc --dir /tmp`, then the mount plan (`src/bwrap.rs`): every readable path outside the writable ones `--ro-bind` (canonical; an absent one is skipped and reported as a `read` narrowing), the workspace, tmp and granted `write_env` dirs `--bind`, parents before children, each symlink on the way to a runtime path (`/lib64`, `/bin`, Ubuntu's `/etc/resolv.conf`) recreated with `--symlink`, and the tool binary bound read-only when no read path covers it (`target/release/cs-tools`). Then `--remount-ro /`, so a write anywhere else is `EROFS`; `--chdir` the workspace; `--seccomp FD` and `--json-status-fd FD`, both inherited fds (a memfd and a pipe) set up with rustix, no `unsafe`. Net: `none`, `gateway` and `loopback` unshare the network; `gateway` also `--ro-bind`s the canonical `CS_GATEWAY_SOCKET` at the path the tool sees. An outside path is not denied but absent: a planted symlink dangles (`ENOENT`).
@@ -100,3 +115,19 @@ On macOS, a shell running under the lane sandbox failed to launch the setuid `/b
 The generated native check profile's explicit `process-exec` deny targets `/bin/launchctl`.
 Seatbelt refused to apply that profile from inside the lane sandbox and blocked access to the
 unified log, so the specific rule behind the `ps` failure could not be confirmed.
+
+## Land-check profile
+
+On macOS, `cs-sandbox --profile land-check --request FILE` prints a Seatbelt
+profile. Use `--request -` to read the JSON from stdin. The trusted host supplies
+the paths in [the version 1 schema](land-check-request.schema.json). TMPDIR,
+scratch and cache directories must resolve beneath `run_tmp`. Set
+`darwin_user_temp` from `getconf DARWIN_USER_TEMP_DIR`. The renderer grants
+the enclosing Darwin per-user tree. Writable roots may not overlap the main
+checkout or a declared toolchain root.
+
+`_estate_io.land_check_request` builds the payload and collects configured
+reserved ports through the same helper used for approved localhost actions.
+The renderer always denies outbound localhost access to ports 8780 and 9200
+as well. `_estate_io.render_land_check_request` returns the emitted bytes.
+Linux reports this profile as unsupported.

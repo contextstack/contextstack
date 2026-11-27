@@ -40,7 +40,6 @@ Main open classes (from internal tracking; not exhaustive):
 - **client-web** is optional in the bundle; PHP and extra activation flags are on you.
 - **The browser link from `cs init`** works once and expires in five minutes; run `cs ui` for a new one.
 - **Task lanes and `cs land`** assume you review agent-written code; landing runs your repo's check (`cs/ops/bin/_lanes.py`).
-- **`cs mcp` serves one call at a time** — a long `land_task` blocks other tools.
 - **Releases may be unsigned** when signing secrets are absent (see below).
 - **No hosted account signup**; pairing or a local owner credential is the access model.
 
@@ -60,7 +59,9 @@ CI signs and notarizes macOS bundles when Apple signing secrets are set. If they
 
 ## Landing checks
 
-When you land a task's work with **`cs land`**, ContextStack merges the branch and runs your repository's own checks (its gate) to decide whether to commit. Agents do their work inside a sandbox, but that landing check currently runs **outside** the sandbox, directly on your machine, with your user's access — so code an agent wrote is executed unconfined at landing time.
+By default, **`cs land`** runs your repository's gate in a detached checkout under Seatbelt on macOS or bubblewrap on Linux. Landing stops if the sandbox cannot run. Unattended lands that touch paths in the owner probe list also stop and request owner host probes.
+
+The owner kill switch is `"land_check": "host"` in the repo's entry in `~/.contextstack/config/repos.json` (or the file selected by `CS_REPOS_FILE`). This setting runs the gate with the owner's user privileges. An executable custom pre-commit hook requires host mode because only the ContextStack hook can skip a gate already run in confinement. `cs doctor` shows sandbox readiness, the probe list location, and each repo's effective mode.
 
 For now, review a task's changes before landing (`git diff main...lane/<name>` in the repository), especially in repositories whose checks run arbitrary scripts.
 

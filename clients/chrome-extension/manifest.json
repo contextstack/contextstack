@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "ContextStack Browser",
+  "version": "0.1.0",
+  "description": "Read visible page text for ContextStack on approved sites.",
+  "minimum_chrome_version": "106",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvaz512BUj/5OmGl81tes3TdZ39x3gbes9taJ6arvDt70/QkCOOXxphqUR2W+YqsWa7GXip/zJ51Y3Z2LfPGnWiu7LV0iNNUfsreUXx/VbOHr7b68MgO5lZPd9fInIDo5Bu6PNEbVkTnN/ji7prIR1SpAw7JIrWptvbM4Oq49Ny3AOI/F7RsnpV2mj5lgU7nMZ/brsp2xE2tm7zH6k62IMuomeNkF+dnBay1CUyuA4YrlFbXFhhzEfGC2m69c4tR2r8TvjlAWdsyhKldDmXeHIBj/dNVrhBByPXxDmFQlsx+P/D11fWza0ndduPFsEHUW1LuNdk7DVVUdj4vsJmILswIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
+    "scripting",
+    "tabGroups",
+    "webNavigation",
+    "webRequest"
+  ],
+  "optional_permissions": ["contentSettings"],
+  "optional_host_permissions": ["https://*/*", "<all_urls>"],
+  "background": { "service_worker": "worker.js", "type": "module" },
+  "action": { "default_popup": "permissions.html" }
+}

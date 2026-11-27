@@ -2,22 +2,23 @@
 //! reply is taken from the run's evidence (`thread::reply_of`), the turn or summary is settled as `done`, `error`
 //! or `stopped`, and the queue moves on.
 
+use crate::store::ScopedConnection;
 use crate::store::{Record, Store, touch};
 use crate::thread;
 use crate::turns::{Res, advance, db_err, set_turn};
 use crate::util::now_utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 /// How a job ended, once it has: its state, the reply its run carried, and whether a cancel stopped it.
 fn ending(
     store: &Store,
-    db: &Connection,
+    db: &ScopedConnection,
     job_id: &str,
 ) -> Res<Option<(String, Option<String>, bool)>> {
     let job: Option<(String, Option<String>, Option<String>)> = db
         .query_row(
-            "SELECT j.state, j.run_id, k.outcome FROM jobs j LEFT JOIN cancels c ON c.job_id = j.job_id
-             LEFT JOIN controls k ON k.control_id = c.control_id WHERE j.job_id = ?1",
+            "SELECT j.state, j.run_id, k.outcome FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j LEFT JOIN (SELECT * FROM cancels WHERE +org_id = :org_id) c ON c.job_id = j.job_id
+             LEFT JOIN (SELECT * FROM controls WHERE +org_id = :org_id) k ON k.control_id = c.control_id WHERE j.job_id = ?1",
             params![job_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -32,9 +33,11 @@ fn ending(
     let mut reply = None;
     if let Some(run) = run {
         let recorded = db
-            .query_row("SELECT 1 FROM runs WHERE run_id = ?1", params![run], |_| {
-                Ok(())
-            })
+            .query_row(
+                "SELECT 1 FROM runs WHERE +org_id = :org_id AND run_id = ?1",
+                params![run],
+                |_| Ok(()),
+            )
             .optional()
             .map_err(db_err)?
             .is_some();
@@ -43,7 +46,7 @@ fn ending(
         }
         let sha: Option<String> = db
             .query_row(
-                "SELECT sha256 FROM run_files WHERE run_id = ?1 AND path = 'messages.jsonl'",
+                "SELECT sha256 FROM run_files WHERE +org_id = :org_id AND run_id = ?1 AND path = 'messages.jsonl'",
                 params![run],
                 |r| r.get(0),
             )
@@ -57,7 +60,7 @@ fn ending(
 }
 
 /// A job ended or its run arrived: settle the turn or summary it carries, then move the queue.
-pub fn settle_job(store: &Store, db: &Connection, job_id: &str) -> Res<()> {
+pub fn settle_job(store: &Store, db: &ScopedConnection, job_id: &str) -> Res<()> {
     let owner = |sql: &str| {
         db.query_row(sql, params![job_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -66,10 +69,10 @@ pub fn settle_job(store: &Store, db: &Connection, job_id: &str) -> Res<()> {
         .map_err(db_err)
     };
     let turn = owner(
-        "SELECT turn_id, conversation_id FROM turns WHERE job_id = ?1 AND state = 'running'",
+        "SELECT turn_id, conversation_id FROM turns WHERE +org_id = :org_id AND job_id = ?1 AND state = 'running'",
     )?;
     let summary = owner(
-        "SELECT summary_id, conversation_id FROM summaries WHERE job_id = ?1 AND state = 'running'",
+        "SELECT summary_id, conversation_id FROM summaries WHERE +org_id = :org_id AND job_id = ?1 AND state = 'running'",
     )?;
     if turn.is_none() && summary.is_none() {
         return Ok(());
@@ -89,7 +92,9 @@ pub fn settle_job(store: &Store, db: &Connection, job_id: &str) -> Res<()> {
             db,
             &conv,
             &id,
-            "UPDATE turns SET state = ?1, reply = ?2, detail = ?3, finished_at = ?4 WHERE turn_id = ?5",
+            "UPDATE turns SET state = ?1, reply = ?2, detail = CASE WHEN origin = 'wake' AND json_valid(detail)
+                 THEN CASE WHEN ?3 IS NULL THEN detail ELSE json_set(detail, '$.error', ?3) END ELSE ?3 END,
+                 finished_at = ?4 WHERE +org_id = :org_id AND (turn_id = ?5)",
             &[&state, &reply, &detail, &now, &id],
         )?;
         crate::logf!("conversation {conv}: turn {id} {state}");
@@ -97,7 +102,7 @@ pub fn settle_job(store: &Store, db: &Connection, job_id: &str) -> Res<()> {
     }
     if let Some((id, conv)) = summary {
         db.execute(
-            "UPDATE summaries SET state = ?1, text = ?2, detail = ?3, finished_at = ?4 WHERE summary_id = ?5",
+            "UPDATE summaries SET state = ?1, text = ?2, detail = ?3, finished_at = ?4 WHERE +org_id = :org_id AND (summary_id = ?5)",
             params![state, reply, detail, now, id],
         )
         .map_err(db_err)?;
@@ -111,7 +116,7 @@ pub fn settle_job(store: &Store, db: &Connection, job_id: &str) -> Res<()> {
 
 /// Move the queue after a settlement, under its own savepoint: whatever fails there (the next turn or summary
 /// cannot be offered) is logged and rolled back alone, never undoing the settlement and its reply.
-fn advance_apart(store: &Store, db: &Connection, conv: &str) {
+fn advance_apart(store: &Store, db: &ScopedConnection, conv: &str) {
     if let Err(e) = crate::reservations::savepoint(db, "advance", || advance(store, db, conv)) {
         crate::logf!("conversation {conv}: the queue did not move after a settlement: {e}");
     }
@@ -119,14 +124,14 @@ fn advance_apart(store: &Store, db: &Connection, conv: &str) {
 
 /// After an acked envelope: a job's end or a run's report may settle a turn. A failure here is logged and rolled
 /// back on its own; it never refuses the envelope.
-pub fn after_envelope(store: &Store, db: &Connection, job_terminal: bool, subject: &str) {
+pub fn after_envelope(store: &Store, db: &ScopedConnection, job_terminal: bool, subject: &str) {
     let run = || -> Res<()> {
         if job_terminal {
             return settle_job(store, db, subject);
         }
         let job: Option<String> = db
             .query_row(
-                "SELECT job_id FROM jobs WHERE run_id = ?1",
+                "SELECT job_id FROM jobs WHERE +org_id = :org_id AND run_id = ?1",
                 params![subject],
                 |r| r.get(0),
             )
@@ -134,7 +139,7 @@ pub fn after_envelope(store: &Store, db: &Connection, job_terminal: bool, subjec
             .map_err(db_err)?;
         job.map_or(Ok(()), |j| settle_job(store, db, &j))
     };
-    if db.execute_batch("SAVEPOINT turns").is_err() {
+    if db.savepoint_sql("SAVEPOINT turns").is_err() {
         return;
     }
     let done = run();
@@ -146,7 +151,7 @@ pub fn after_envelope(store: &Store, db: &Connection, job_terminal: bool, subjec
     if let Err(e) = done {
         crate::logf!("conversations after {subject}: {e}");
     }
-    let _ = db.execute_batch(end);
+    let _ = db.savepoint_sql(end);
 }
 
 #[cfg(test)]
@@ -167,15 +172,15 @@ mod tests {
         let prompt: &[u8] = b"Be brief.\n";
         let db = store.db();
         db.execute(
-            "INSERT INTO conversations (conversation_id, node, spec, spec_version, model, instructions_tokens, tools,
+            "INSERT INTO conversations (org_id, conversation_id, node, spec, spec_version, model, instructions_tokens, tools,
                                         created_by, created_at)
-             VALUES ('c1', 'node-a', 'spec.yaml', 'v1', 'local-coder', 3, 0, 'cred', ?1)",
+             VALUES (:org_id, 'c1', 'node-a', 'spec.yaml', 'v1', 'local-coder', 3, 0, 'cred', ?1)",
             params![now_utc()],
         )?;
         for (path, data) in [("spec.yaml", spec), ("prompts/p.md", prompt)] {
             store.put_object(data)?;
             db.execute(
-                "INSERT INTO conversation_files VALUES ('c1', ?1, ?2, ?3, 420)",
+                "INSERT INTO conversation_files (org_id, conversation_id, path, sha256, bytes, mode) VALUES (:org_id, 'c1', ?1, ?2, ?3, 420)",
                 params![path, sha256_hex(data), i64::try_from(data.len())?],
             )?;
         }
@@ -186,8 +191,8 @@ mod tests {
     fn post(store: &Store, id: &str, message: &str) -> R {
         let db = store.db();
         db.execute(
-            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at)
-             VALUES (?1, 'c1', (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns), ?2, 'queued', 'cred', ?3)",
+            "INSERT INTO turns (org_id, turn_id, conversation_id, seq, message, state, posted_by, posted_at)
+             VALUES (:org_id, ?1, 'c1', (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns), ?2, 'queued', 'cred', ?3)",
             params![id, message, now_utc()],
         )?;
         turns::advance(store, &db, "c1")?;
@@ -219,11 +224,11 @@ mod tests {
         if let Some((run_id, messages)) = &run {
             store.put_object(messages.as_bytes())?;
             db.execute(
-                "INSERT INTO runs (run_id, node_id, usage, received_at) VALUES (?1, 1, '{}', ?2)",
+                "INSERT INTO runs (org_id, run_id, node_id, usage, received_at) VALUES (:org_id, ?1, 1, '{}', ?2)",
                 params![run_id, now_utc()],
             )?;
             db.execute(
-                "INSERT INTO run_files VALUES (?1, 'messages.jsonl', ?2, ?3)",
+                "INSERT INTO run_files (org_id, run_id, path, sha256, bytes) VALUES (:org_id, ?1, 'messages.jsonl', ?2, ?3)",
                 params![
                     run_id,
                     sha256_hex(messages.as_bytes()),
@@ -254,6 +259,10 @@ mod tests {
     fn one_turn_at_a_time_and_the_next_carries_the_reply() -> R {
         let tmp = tempfile::tempdir()?;
         let store = setup(tmp.path())?;
+        store.db().fixture_batch(
+            "INSERT INTO members VALUES ('author', :org_id, 'Author', 'member', 'active');
+             UPDATE conversations SET responsible_member_id = 'author' WHERE +org_id = :org_id;",
+        )?;
         post(&store, "t1", "first")?;
         post(&store, "t2", "second")?;
         let (s1, j1, _) = turn(&store, "t1")?;
@@ -266,6 +275,12 @@ mod tests {
         let (s2, j2, _) = turn(&store, "t2")?;
         assert_eq!(s2, "running");
         let context = context_of(&store, &j2.ok_or("no job")?)?;
+        let attributed: i64 = store.db().query_row(
+            "SELECT count(*) FROM jobs WHERE +org_id = :org_id AND responsible_member_id = 'author'",
+            params![],
+            |row| row.get(0),
+        )?;
+        assert_eq!(attributed, 2);
         assert!(
             context.contains("first") && context.contains("REPLY-1") && !context.contains("second")
         );
@@ -320,7 +335,7 @@ mod tests {
         // The next turn needs a summary, and no job of this conversation can be offered any more: its spec is
         // not a mapping, and a budget now applies.
         let db = store.db();
-        db.execute("UPDATE conversations SET instructions_tokens = 1000000000 WHERE conversation_id = 'c1'", [])?;
+        db.execute("UPDATE conversations SET instructions_tokens = 1000000000 WHERE conversation_id = 'c1'", params![])?;
         let bad: &[u8] = b"- not a mapping\n";
         store.put_object(bad)?;
         db.execute(
@@ -347,7 +362,7 @@ mod tests {
         );
         let (state, detail): (String, Option<String>) = store.db().query_row(
             "SELECT state, detail FROM summaries WHERE conversation_id = 'c1' ORDER BY rowid DESC LIMIT 1",
-            [],
+            params![],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         assert_eq!(state, "error");

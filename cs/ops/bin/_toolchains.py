@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -25,6 +26,9 @@ def login_toolchain_additions(path, service_path):
         raise ValueError("toolchains.json must be a list")
 
     shell = os.environ.get("SHELL")
+    if (os.environ.get("CS_PLATFORM") or sys.platform) == "linux":
+        if not shell or not shutil.which(shell):
+            shell = "/bin/sh"
     if not shell:
         raise ValueError("login shell lookup failed (SHELL is unset)")
     try:
@@ -209,9 +213,52 @@ def _cargo_bins(entries):
 
 
 @cache
-def discover():
+def land_entries():
+    """Fill missing land-check toolchains from the host command path."""
+    entries = list(_entries())
+    configured = {entry.get("name") for entry in entries}
+    for name in ("cargo", "uv", "node", "npm", "php", "composer", "python3"):
+        found = shutil.which(name)
+        if name in configured or not found:
+            continue
+        binary = Path(found).absolute()
+        entry = {"name": name, "bin": str(binary.parent)}
+        if name == "cargo":
+            paths = cargo_toolchain_paths(binary)
+            if not paths:
+                continue
+            entry.update({key: str(path) for key, path in paths.items()})
+        if name == "uv":
+            python = uv_python_dir(binary)
+            if not python:
+                continue
+            entry["python"] = str(python)
+        entries.append(entry)
+    return entries
+
+
+@cache
+def land_uv_cache():
+    """Resolve the host cache independently of the gate's private HOME."""
+    entry = next((entry for entry in land_entries() if entry.get("name") == "uv"), None)
+    if entry is None:
+        return None
+    binary = Path(entry["bin"]) / "uv"
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "XDG_CACHE_HOME", "UV_CACHE_DIR")
+           if key in os.environ}
+    try:
+        result = subprocess.run([str(binary), "--no-config", "cache", "dir"], env=env,
+                                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    path = Path(result.stdout.strip())
+    return path.resolve() if result.returncode == 0 and path.is_absolute() and _grantable(path) else None
+
+
+@cache
+def discover(*, land=False):
     roots = []
-    entries = _entries()
+    entries = land_entries() if land else _entries()
     cargo_bins = _cargo_bins(entries)
     for entry in entries:
         _validate_entry(entry)
@@ -237,14 +284,16 @@ def discover():
             continue
         roots.extend((directory, directory.resolve()))
         roots.extend(binary_roots(directory / name))
+    if land and (cache_root := land_uv_cache()) is not None:
+        roots.append(cache_root)
     return tuple(dict.fromkeys(str(root) for root in roots if _grantable(Path(root))))
 
 
 @cache
-def discover_path_dirs():
+def discover_path_dirs(*, land=False):
     """Directories prepended to PATH; uv's parent is listed but not granted as a read subtree."""
     dirs = []
-    entries = _entries()
+    entries = land_entries() if land else _entries()
     cargo_bins = _cargo_bins(entries)
     for entry in entries:
         _validate_entry(entry)
@@ -259,15 +308,17 @@ def discover_path_dirs():
 
 
 @cache
-def discover_sandbox_links():
+def discover_sandbox_links(*, land=False):
     """Literal read/exec grants (uv and Rust proxies; not whole bin directories)."""
     links = []
-    for entry in _entries():
+    for entry in land_entries() if land else _entries():
         name = entry.get("name")
         if name not in ("uv", "cargo"):
             continue
         _validate_entry(entry)
         tools = ("uv",) if name == "uv" else ("cargo", "rustc")
+        if land and name == "cargo":
+            tools += ("rustfmt", "cargo-fmt", "clippy-driver", "cargo-clippy")
         for tool in tools:
             called = Path(entry["bin"]) / tool
             binary = called.resolve()
@@ -313,7 +364,7 @@ def harness_lane_env(workspace, path, *, sandboxed=False):
         yield env
 
 
-def uv_lane_env(tmpdir):
+def uv_lane_env(tmpdir, *, land=False):
     """uv writes only under the lane's tmp; it finds Pythons in the granted read-only folder, never by HOME."""
     root = Path(tmpdir)
     env = {
@@ -323,20 +374,20 @@ def uv_lane_env(tmpdir):
         "UV_PYTHON_INSTALL_DIR": str(root / "uv-python"),
         "UV_PYTHON_DOWNLOADS": "never",
     }
-    for entry in _entries():
+    for entry in land_entries() if land else _entries():
         if isinstance(entry, dict) and entry.get("name") == "uv" and isinstance(entry.get("python"), str):
             env["UV_PYTHON_INSTALL_DIR"] = str(Path(entry["python"]).resolve())
             break
     return env
 
 
-def cargo_lane_env(tmpdir, workspace=None):
+def cargo_lane_env(tmpdir, workspace=None, *, land=False):
     """Lane-writable CARGO_HOME; host registry via symlink (read-only grant); offline fetches."""
     root = Path(tmpdir)
     cargo_home = root / "cargo-home"
     cargo_home.mkdir(parents=True, exist_ok=True)
     rustup_home = registry_home = toolchain_name = None
-    for entry in _entries():
+    for entry in land_entries() if land else _entries():
         if not (isinstance(entry, dict) and entry.get("name") == "cargo"):
             continue
         if isinstance(entry.get("rustup"), str):

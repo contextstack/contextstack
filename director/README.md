@@ -225,32 +225,33 @@ is shown as stale, never as stopped. Refusals are `{error, code, detail}`, as in
 ## Action approval hard lines
 
 A lane may ask for a command outside its sandbox (network, extra write paths, delete). A second model reviews the
-request, except when a hard line applies: then the request goes straight to the owner (`needs_owner`, verdict
-`no_go`) with the reason below, and the reviewer is never asked. The rules live in `action_approvals.rs`
-(`owner_only`) and `action_approvals/hard_lines.rs`. The Git check looks at command positions in argv and inline
-shell code, including commands passed to wrappers such as `find -exec`. Inline interpreter code gets a conservative
-check for embedded commands.
+request, except when a hard line applies: then the request goes straight to a human (`needs_owner`, verdict
+`no_go`) with the reason below, and the reviewer is never asked. Any owner or the assigned admin may decide it;
+unassigned admins, leads, members and viewers may not. Browser actions, land, install and rollback approvals stay
+owner-only. The rules live in `action_approvals.rs` (`hard_line_reason`) and `action_approvals/hard_lines.rs`. The
+Git check looks at command positions in argv and inline shell code, including commands passed to wrappers such as
+`find -exec`. Inline interpreter code gets a conservative check for embedded commands.
 
 | hard line | reason shown |
 |---|---|
-| Writing to a Git remote. A `git` or `gh` invocation outside the permitted list, or a push helper such as `git-send-pack`, `git-http-push` or `git-remote-*` in command position | Git push requires an owner decision (naming the form when it is not plain `push`) |
+| Writing to a Git remote. A `git` or `gh` invocation outside the permitted list, or a push helper such as `git-send-pack`, `git-http-push` or `git-remote-*` in command position | Git push needs a human decision (an owner or the assigned admin), naming the form when it is not plain `push` |
 | The workspace cannot be shown to lie inside the user's home | The workspace cannot be verified as lying inside the user's home. |
 | A credential, key, token or protected configuration path: a path part named like one (`*credential*`, `*token*`, `*secret*`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `Keychains`, `.env*`, `*.pem`, …), or a credential store under the home | The action references a credential, key, token, or protected configuration path. |
 | A path outside the user's home (system executables aside), or with `..` | The action references a path outside the user's home. |
 
-**Git and gh are a closed list.** A `git` command skips the owner only as a listed subcommand that neither writes to
+**Git and gh are a closed list.** A `git` command skips the human decision only as a listed subcommand that neither writes to
 a remote nor runs a caller-chosen command (`fetch`, `pull`, `clone`, `ls-remote`, `log`, `diff`, `status`, `commit`,
 `rebase`, …), without the options that would run one (`--upload-pack`, `rebase --exec`, `bisect run`,
 `submodule foreach`, `grep -O`, `clone -c`/`--template`, `archive --exec`). The permitted `config` forms cover
-supported reads and setting `user.name` or `user.email`. Credential config keys still require the owner. Global
+supported reads and setting `user.name` or `user.email`. Credential config keys still require a human. Global
 `-c` settings are limited to harmless keys; `-c alias.*` is resolved (git prefers a builtin to an alias of the same
-name), and a `!` shell alias, `--config-env` or `--exec-path=` waits on the owner. `gh` skips the owner only as
+name), and a `!` shell alias, `--config-env` or `--exec-path=` waits on a human. `gh` skips the human decision only as
 `pr view|list|diff|checks|status`, `issue view|list|status`, `repo view|list|clone`, `run view|list|watch|download`,
 `workflow view|list`, `release view|list|download`, `label|cache list`, `search …`, `status`, and `api` as a GET
 without fields (`-X`/`--method` other than GET, `-f`/`-F`/`--field`/`--raw-field`/`--input`, and `graphql` wait on
-the owner). A closed list was chosen over naming bypasses: git and gh have many ways to write to a remote
+a human). A closed list was chosen over naming bypasses: git and gh have many ways to write to a remote
 (`push`, `send-pack`, `http-push`, remote helpers, aliases, `gh pr merge`, `gh repo sync`, `gh api -X POST`, …),
-and a new one would pass a deny list silently, while it fails closed here (to an owner decision, not a refusal).
+and a new one would pass a deny list silently, while it fails closed here (to a human decision, not a refusal).
 
 **Credential stores** (home-relative): the paths every agent sandbox already denies (`sandbox/src/cli_executor.rs`:
 `.contextstack/credentials` and the Director, gateway, node and lead secrets, `.ssh`, `.aws`, `.gnupg`, `.config/gh`,

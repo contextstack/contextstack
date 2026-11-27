@@ -21,7 +21,7 @@ use crate::server::{Call, Reply, State, internal, json, refusal};
 use crate::store::{Record, touch};
 use crate::usage::{self, By, Only, Span};
 use crate::util::{self, now_utc};
-use crate::work::{No, body, content, key, prior, remember, render};
+use crate::work::{No, body, content, key, remember, render};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
@@ -42,9 +42,6 @@ pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
         ("GET", ["usage"]) => return usage(state, call, client),
         ("GET", ["source-budgets"]) => return sources(state, None),
         ("PUT", ["source-budgets"]) => {
-            if let Some(no) = not_owner(client) {
-                return no;
-            }
             if call.body.len() > gateway::MAX_DOCUMENT {
                 return refusal(
                     422,
@@ -56,9 +53,6 @@ pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
             return sources(state, Some(&call.body));
         }
         ("PUT" | "DELETE", ["source-budgets", source]) => {
-            if let Some(no) = not_owner(client) {
-                return no;
-            }
             return one_source(state, call, source);
         }
         _ => return refusal(404, "not_found", "no such route or record", Value::Null),
@@ -72,7 +66,7 @@ pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
 
 /// A budget body: `{usd, period?}`; `usd` is dollars (a number or decimal string, 0 or more), `period` is `total`
 /// (the default), `day` or `month` (local days and months on this host, `budget::Period`).
-fn parse_budget(m: &Map<String, Value>) -> Result<(budget::Micros, Period), No> {
+pub(crate) fn parse_budget(m: &Map<String, Value>) -> Result<(budget::Micros, Period), No> {
     let usd = m
         .get("usd")
         .and_then(budget::amount)
@@ -111,7 +105,7 @@ fn create(state: &State, call: &Call, client: &Client) -> Reply {
     let want = json!({"name": name, "budget": budget.map(|(u, p)| json!({"usd_micros": u, "period": p.name()}))});
     let sha = content("project", "", &want);
     let mut db = state.store.db();
-    match prior(&db, &key, &sha) {
+    match crate::work::scoped_prior(&db, &key, &sha, client) {
         Ok(Some((kind, id))) => return wrapped(&db, 200, kind, &id, true),
         Ok(None) => {}
         Err(r) => return r.reply(),
@@ -120,7 +114,7 @@ fn create(state: &State, call: &Call, client: &Client) -> Reply {
         let id = format!("prj_{}", util::ulid()?.to_lowercase());
         let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
         tx.execute(
-            "INSERT INTO projects (project_id, name, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO projects (org_id, project_id, name, created_by, created_at) VALUES (:org_id, ?1, ?2, ?3, ?4)",
             params![id, name, client.id, now_utc()],
         )
         .map_err(|e| e.to_string())?;
@@ -140,7 +134,7 @@ fn create(state: &State, call: &Call, client: &Client) -> Reply {
 
 /// A project or conversation as `{project}` / `{conversation}`.
 fn wrapped(
-    db: &rusqlite::Connection,
+    db: &crate::store::ScopedConnection,
     status: u16,
     kind: Record,
     id: &str,
@@ -185,7 +179,7 @@ fn set_budget(state: &State, call: &Call, client: &Client, kind: &str, id: &str)
     let mut db = state.store.db();
     let exists = db
         .query_row(
-            &format!("SELECT 1 FROM {table} WHERE {col} = ?1"),
+            &format!("SELECT 1 FROM {table} WHERE +org_id = :org_id AND {col} = ?1"),
             params![id],
             |_| Ok(()),
         )
@@ -242,18 +236,6 @@ fn usage(state: &State, call: &Call, client: &Client) -> Reply {
         Ok(v) => json(200, &v),
         Err(e) => internal(&e),
     }
-}
-
-/// Only owner credentials may set source budgets.
-fn not_owner(client: &Client) -> Option<Reply> {
-    (!client.is_owner()).then(|| {
-        refusal(
-            403,
-            "owner_only",
-            "only an owner credential may set source budgets",
-            Value::Null,
-        )
-    })
 }
 
 /// Source-budget writes through this Director, one at a time, so two edits never lose one another.

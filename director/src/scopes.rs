@@ -1,29 +1,39 @@
-//! Budgets as set on a project or conversation, and as shown: the room left under one (`usd − settled charges this
+//! Budgets as set on a project, conversation or schedule, and as shown: the room left under one (`usd − settled charges this
 //! period − held reservations`, read from `job_budgets`), setting and removing one, and the `budget` fields of
 //! project, conversation and job records. The lifecycle of a job's reservation is in `reservations.rs`.
 
 use crate::budget::{self, Micros, Period, Room, Scope};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::turns::{Res, db_err};
 use crate::util::now_utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-/// The `job_budgets` column naming a scope kind.
-pub(crate) fn column(kind: &str) -> &'static str {
-    if kind == "project" {
-        "project_id"
-    } else {
-        "conversation_id"
+/// Compare schedule scope by node and schedule ID, including jobs recorded before schedule budgets.
+const SCHEDULE_KEY: &str = "(SELECT n.name || '/' || json_extract(j.meta, '$.schedule_id')
+    FROM (SELECT * FROM jobs WHERE +org_id = :org_id) j
+    JOIN (SELECT * FROM nodes WHERE +org_id = :org_id) n ON n.id = j.node_id
+    WHERE j.job_id = job_budgets.job_id)";
+
+fn column(kind: &str) -> &'static str {
+    match kind {
+        "project" => "project_id",
+        "schedule" => SCHEDULE_KEY,
+        _ => "conversation_id",
     }
 }
 
 /// A budget as set: `(usd, period, set_by, set_at)`.
 type Set = (Micros, Period, String, String);
 
-pub(crate) fn budget_of(db: &Connection, kind: &str, id: &str) -> rusqlite::Result<Option<Set>> {
+pub(crate) fn budget_of(
+    db: &ScopedConnection,
+    kind: &str,
+    id: &str,
+) -> rusqlite::Result<Option<Set>> {
     db.query_row(
-        "SELECT usd_micros, period, set_by, set_at FROM budgets WHERE scope = ?1 AND scope_id = ?2",
+        "SELECT usd_micros, period, set_by, set_at FROM budgets WHERE +org_id = :org_id AND scope = ?1 AND scope_id = ?2",
         params![kind, id],
         |r| {
             let period: String = r.get(1)?;
@@ -40,7 +50,7 @@ pub(crate) fn budget_of(db: &Connection, kind: &str, id: &str) -> rusqlite::Resu
 
 /// `(spent this period, held now)` under a scope.
 pub(crate) fn tallies(
-    db: &Connection,
+    db: &ScopedConnection,
     kind: &str,
     id: &str,
     period: Period,
@@ -52,14 +62,14 @@ pub(crate) fn tallies(
             "SELECT COALESCE(SUM(CASE WHEN state = 'settled' AND (?2 IS NULL OR settled_at >= ?2)
                                       THEN charged_micros END), 0),
                     COALESCE(SUM(CASE WHEN state = 'held' THEN reserved_micros END), 0)
-             FROM job_budgets WHERE {col} = ?1"
+             FROM job_budgets WHERE +org_id = :org_id AND {col} = ?1"
         ),
         params![id, since],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
 }
 
-pub(crate) fn room(db: &Connection, scope: &Scope) -> rusqlite::Result<Option<Room>> {
+pub(crate) fn room(db: &ScopedConnection, scope: &Scope) -> rusqlite::Result<Option<Room>> {
     let Some((usd, period, ..)) = budget_of(db, scope.kind, &scope.id)? else {
         return Ok(None);
     };
@@ -74,7 +84,7 @@ pub(crate) fn room(db: &Connection, scope: &Scope) -> rusqlite::Result<Option<Ro
 
 /// Set a scope's budget, replacing any.
 pub fn set(
-    db: &Connection,
+    db: &ScopedConnection,
     kind: &'static str,
     id: &str,
     usd: Micros,
@@ -82,9 +92,9 @@ pub fn set(
     who: &str,
 ) -> Res<()> {
     db.execute(
-        "INSERT INTO budgets (scope, scope_id, usd_micros, period, set_by, set_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(scope, scope_id) DO UPDATE SET usd_micros = excluded.usd_micros, period = excluded.period,
-           set_by = excluded.set_by, set_at = excluded.set_at",
+        "INSERT INTO budgets (org_id, scope, scope_id, usd_micros, period, set_by, set_at) VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(org_id, scope, scope_id) DO UPDATE SET usd_micros = excluded.usd_micros, period = excluded.period,
+           set_by = excluded.set_by, set_at = excluded.set_at WHERE +budgets.org_id = :org_id",
         params![kind, id, usd, period.name(), who, now_utc()],
     )
     .map_err(db_err)?;
@@ -92,31 +102,31 @@ pub fn set(
 }
 
 /// Remove a scope's budget: only its source budgets apply from now.
-pub fn clear(db: &Connection, kind: &'static str, id: &str) -> Res<()> {
+pub fn clear(db: &ScopedConnection, kind: &'static str, id: &str) -> Res<()> {
     db.execute(
-        "DELETE FROM budgets WHERE scope = ?1 AND scope_id = ?2",
+        "DELETE FROM budgets WHERE +org_id = :org_id AND scope = ?1 AND scope_id = ?2",
         params![kind, id],
     )
     .map_err(db_err)?;
     touch_kind(db, kind, id)
 }
 
-fn touch_kind(db: &Connection, kind: &str, id: &str) -> Res<()> {
-    let record = if kind == "project" {
-        Record::Project
-    } else {
-        Record::Conversation
+fn touch_kind(db: &ScopedConnection, kind: &str, id: &str) -> Res<()> {
+    let record = match kind {
+        "project" => Record::Project,
+        "schedule" => Record::Schedule,
+        _ => Record::Conversation,
     };
     touch(db, record, id).map_err(db_err).map(|_| ())
 }
 
 /// A job's `budget` field: its reservation, or null for a job made before budgets.
-pub fn job_view(db: &Connection, job_id: &str) -> rusqlite::Result<Value> {
+pub fn job_view(db: &ScopedConnection, job_id: &str) -> rusqlite::Result<Value> {
     let money = |m: Option<Micros>| m.map_or(Value::Null, budget::usd);
     db.query_row(
         "SELECT state, project_id, conversation_id, ceiling_micros, trials, reserved_micros, charged_micros,
                 charge_basis, reason, detail, reserved_at, settled_at, settled_by, corrected_at
-         FROM job_budgets WHERE job_id = ?1",
+         FROM job_budgets WHERE +org_id = :org_id AND job_id = ?1",
         params![job_id],
         |r| {
             let state: String = r.get(0)?;
@@ -143,10 +153,10 @@ pub fn job_view(db: &Connection, job_id: &str) -> rusqlite::Result<Value> {
 }
 
 /// A project's or conversation's `budget` field. "No budget set" (`none`) is not "budget used up" (`exhausted`).
-pub fn scope_view(db: &Connection, kind: &'static str, id: &str) -> rusqlite::Result<Value> {
+pub fn scope_view(db: &ScopedConnection, kind: &'static str, id: &str) -> rusqlite::Result<Value> {
     let col = column(kind);
     let mut stmt = db.prepare_cached(&format!(
-        "SELECT job_id FROM job_budgets WHERE {col} = ?1 AND state = 'waiting' ORDER BY rowid"
+        "SELECT job_id FROM job_budgets WHERE +org_id = :org_id AND {col} = ?1 AND state = 'waiting' ORDER BY rowid"
     ))?;
     let waiting: Vec<String> = stmt
         .query_map(params![id], |r| r.get(0))?

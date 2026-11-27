@@ -39,9 +39,14 @@ const streams = new Map();
  * calls their begin(), receive(), dropped() and refused().
  */
 export class SharedStream {
-    constructor(url, open = (signal) => fetch(url, { headers: { Accept: 'text/event-stream' }, credentials: 'same-origin', signal })) {
+    constructor(
+        url,
+        open = (signal) => fetch(url, { headers: { Accept: 'text/event-stream' }, credentials: 'same-origin', signal }),
+        reload = () => window.location.reload(),
+    ) {
         this.url = url;
         this.open = open;
+        this.reload = reload;
         this.scopes = new Set();
         this.running = false;
         this.live = false;
@@ -226,6 +231,11 @@ export class SharedStream {
             for (const scope of this.scopes) {
                 scope.begin();
             }
+        } else if (name === 'change' && payload?.kind === 'authorization_changed') {
+            // This member's role or status changed: every control on screen was drawn for the old one. Load the page
+            // again so it asks the Director who this device is now (CLIENT-API.md §8).
+            this.reload();
+            return 'end';
         } else if (name === 'change' || name === 'run_event') {
             for (const scope of this.scopes) {
                 scope.receive(name, payload);
@@ -236,7 +246,10 @@ export class SharedStream {
                 scope.refused(payload?.detail ?? 'The Director refused the stream.');
             }
             return 'end';
-        } else if (name === 'revoked' || name === 'resync') {
+        } else if (name === 'revoked') {
+            this.reload();
+            return 'end';
+        } else if (name === 'resync') {
             return 'end';
         } else if (name === 'relay_end') {
             return 'planned';

@@ -111,9 +111,9 @@ class ActionApprovalTests(unittest.TestCase):
             self.request_action()
         self.client.call.assert_not_called()
 
-    def test_hard_line_and_reviewer_timeout_wait_for_owner(self):
+    def test_hard_line_and_reviewer_timeout_wait_for_a_human(self):
         regression_argv = self.request["argv"]
-        for model, reason in [(None, "Git push requires an owner decision."),
+        for model, reason in [(None, "Git push needs a human decision (an owner or the assigned admin)."),
                               ("reviewer", "The action reviewer timed out.")]:
             with self.subTest(reason=reason):
                 record = dict(id="first", status="needs_owner", verdict="no_go", review_reason=reason)

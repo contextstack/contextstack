@@ -1,9 +1,0 @@
-{
-  "exit": 1,
-  "stdout": "browser_fetch: gstack browse is unavailable; set CS_BROWSE to its executable\n",
-  "files": {
-    ".cs-calls.jsonl": "{\"args\": {\"url\": \"https://93.184.216.34/source\"}, \"name\": \"browser_fetch\"}\n",
-    "_evidence/manifest.jsonl": null
-  },
-  "untouched": true
-}

@@ -29,16 +29,15 @@ Rules tier (`scripts/estate_classify.py`): a change lands only in a green-check 
   path absent on the host is skipped and reported as a `read` narrowing (phase 3b). `allow_net`: the `net` values a descriptor's `"sandbox"` request may get
   (`none` | `gateway` | `all`); anything else narrows to `none`. The wrapper intersects this
   with the descriptor request and gives each call a private TMPDIR outside the workspace.
-- `write_env` {VAR: [roots]}: write targets named by variables are confined to the host's state
-  root, `~/.contextstack` (launcher default `CS_BROWSER_STATE` = `~/.contextstack/state/browser-state`).
-- `profiles` {browser: {read}}: listing `browser` lets a descriptor's `"profile": "browser"` run headless
-  Chromium (gstack, Playwright cache); the wrapper then turns Chromium's own sandbox off and is the
-  browser's only sandbox (`sandbox/README.md`). Unlisted: narrowed, the tool fails.
+- `write_env` {VAR: [roots]}: optionally restricts write targets named by variables to declared roots.
+- `profiles` {name: {read}}: declares additional read paths for a named profile.
 - `sockets` {name: path}: unix sockets a descriptor's `"sockets": [name]` may reach, the only endpoint
   added (`CS_SOCKET_<NAME>` names it). `browser-public` is the browser broker's `public` set.
 
 `browser.json` — `ops/bin/browser-broker`: the Chrome binary per OS and the origin `sets`;
-each set is served on `~/.contextstack/browser/sockets/<set>.sock`, which `sandbox.json` grants by name.
+each set is served on `~/.contextstack/public-browser/sockets/<set>.sock`, which `sandbox.json` grants by name.
+`browser-native.json` is the installed owner Chrome policy. Its sockets are private to the scheduled reader
+and action bridge.
 - The `$HOME/Library/Application Support/Herd/.../node/v22.21.1` entry is host-specific (this
   Mac's node, for `defuddle_extract`); a node image's install path replaces it.
 - The launcher (`ops/bin/tick`, `ops/bin/run-spec`, via `ops/bin/_sandbox_policy.py`)

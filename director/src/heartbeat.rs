@@ -2,17 +2,18 @@
 
 use crate::access::Client;
 use crate::server::{Call, Reply, State, json};
+use crate::store::ScopedConnection;
 use crate::store::{Store, write_tx};
 use crate::work::{self, No};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 const MESSAGE: &str = "Backlog heartbeat: use backlog to take the next unblocked item in project {project}.     Dispatch or advance it as appropriate and update the backlog with backlog_update.     If nothing is ready, report that and finish.";
 
-fn schedule(db: &Connection, project: &str) -> rusqlite::Result<Value> {
+fn schedule(db: &ScopedConnection, project: &str) -> rusqlite::Result<Value> {
     db.query_row(
-        "SELECT conversation_id, interval_seconds FROM project_heartbeats WHERE project_id = ?1",
+        "SELECT conversation_id, interval_seconds FROM project_heartbeats WHERE +org_id = :org_id AND project_id = ?1",
         [project],
         |r| {
             Ok(
@@ -36,10 +37,31 @@ fn configure(state: &State, call: &Call, client: &Client, project: &str) -> Resu
     let mut db = state.store.db();
     let tx = write_tx(&mut db).map_err(|e| No::internal(&e))?;
     crate::backlog::check_project(&tx, client, project)?;
+    let is_lead = client.kind == crate::access::Kind::Lead;
+    if is_lead {
+        let scheduled = schedule(&tx, project).map_err(|e| No::internal(&e))?;
+        let own = client.conversation_id.as_deref();
+        if own.is_none()
+            || input
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| Some(id) != own)
+            || scheduled["conversation_id"]
+                .as_str()
+                .is_some_and(|id| Some(id) != own)
+        {
+            return Err(No(
+                403,
+                "forbidden",
+                "a lead may only manage its own heartbeat".into(),
+                Value::Null,
+            ));
+        }
+    }
     match input.get("interval_seconds") {
         Some(Value::Null) if input.len() == 1 => {
             tx.execute(
-                "DELETE FROM project_heartbeats WHERE project_id = ?1",
+                "DELETE FROM project_heartbeats WHERE +org_id = :org_id AND (project_id = ?1)",
                 [project],
             )
             .map_err(|e| No::internal(&e))?;
@@ -51,6 +73,11 @@ fn configure(state: &State, call: &Call, client: &Client, project: &str) -> Resu
                 .ok_or_else(|| {
                     No::invalid("interval_seconds must be a positive 32-bit integer or null")
                 })?;
+            if is_lead && seconds < LEAD_MIN_INTERVAL_SECONDS {
+                return Err(No::invalid(&format!(
+                    "a lead may set its heartbeat to at least {LEAD_MIN_INTERVAL_SECONDS} seconds"
+                )));
+            }
             let conversation = input
                 .get("conversation_id")
                 .and_then(Value::as_str)
@@ -59,7 +86,7 @@ fn configure(state: &State, call: &Call, client: &Client, project: &str) -> Resu
                 })?;
             let valid = tx
                 .prepare(
-                    "SELECT 1 FROM conversations WHERE conversation_id = ?1
+                    "SELECT 1 FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1
                 AND project_id = ?2 AND lead = 1 AND archived_at IS NULL",
                 )
                 .and_then(|mut stmt| stmt.exists(params![conversation, project]))
@@ -69,11 +96,11 @@ fn configure(state: &State, call: &Call, client: &Client, project: &str) -> Resu
                     "conversation_id must name an unarchived hosted lead in this project",
                 ));
             }
-            tx.execute("INSERT INTO project_heartbeats (project_id, conversation_id, interval_seconds, due_at)
-                        VALUES (?1, ?2, ?3, ?4 + ?3 * 1000)
+            tx.execute("INSERT INTO project_heartbeats (org_id, project_id, conversation_id, interval_seconds, due_at)
+                        VALUES (:org_id, ?1, ?2, ?3, ?4 + ?3 * 1000)
                         ON CONFLICT(project_id) DO UPDATE SET conversation_id = excluded.conversation_id,
                             interval_seconds = excluded.interval_seconds, due_at = excluded.due_at
-                        WHERE conversation_id != excluded.conversation_id OR interval_seconds != excluded.interval_seconds",
+                        WHERE +project_heartbeats.org_id = :org_id AND (conversation_id != excluded.conversation_id OR interval_seconds != excluded.interval_seconds)",
                         params![project, conversation, seconds, Utc::now().timestamp_millis()])
                 .map_err(|e| No::internal(&e))?;
         }
@@ -101,11 +128,16 @@ pub(crate) fn handle(state: &State, call: &Call, client: &Client, project: &str)
     result.map_or_else(No::reply, |answer| json(200, &answer))
 }
 
+/// A hosted lead may wake itself no more often than this (owners may choose any interval).
+pub(crate) const LEAD_MIN_INTERVAL_SECONDS: i64 = 900;
+
 pub(crate) fn tick(store: &Store) -> Result<(), String> {
     let mut db = store.db();
     let now = Utc::now().timestamp_millis();
     let projects = db
-        .prepare("SELECT project_id FROM project_heartbeats WHERE due_at <= ?1")
+        .prepare(
+            "SELECT project_id FROM project_heartbeats WHERE +org_id = :org_id AND due_at <= ?1",
+        )
         .and_then(|mut stmt| {
             stmt.query_map([now], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()
@@ -119,29 +151,40 @@ pub(crate) fn tick(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
-fn fire(store: &Store, db: &mut Connection, project: &str, now: i64) -> Result<(), String> {
+fn fire(store: &Store, db: &mut ScopedConnection, project: &str, now: i64) -> Result<(), String> {
     let tx = write_tx(db).map_err(|e| e.to_string())?;
     // Recheck every condition under the same write lock that records and advances the turn.
     let target = tx.query_row(&format!(
-        "SELECT h.conversation_id FROM project_heartbeats h
-         JOIN conversations c ON c.conversation_id = h.conversation_id
+        "SELECT h.conversation_id FROM (SELECT * FROM project_heartbeats WHERE +org_id = :org_id) h
+         JOIN (SELECT * FROM conversations WHERE +org_id = :org_id) c ON c.conversation_id = h.conversation_id
          WHERE h.project_id = ?1 AND h.due_at <= ?2 AND c.held = 0 AND c.archived_at IS NULL
-           AND NOT EXISTS (SELECT 1 FROM summaries s WHERE s.conversation_id = h.conversation_id
+           AND NOT EXISTS (SELECT 1 FROM summaries s WHERE +org_id = :org_id AND s.conversation_id = h.conversation_id
                  AND s.state = 'running')
-           AND NOT EXISTS (SELECT 1 FROM turns t JOIN conversations tc ON tc.conversation_id = t.conversation_id
+           AND NOT EXISTS (SELECT 1 FROM (SELECT * FROM turns WHERE +org_id = :org_id) t JOIN (SELECT * FROM conversations WHERE +org_id = :org_id) tc ON tc.conversation_id = t.conversation_id
                WHERE t.state IN ('queued','summarising','running')
                  AND (t.conversation_id = h.conversation_id OR (t.origin = 'heartbeat' AND tc.project_id = ?1)))
-           AND NOT EXISTS (SELECT 1 FROM backlog_items WHERE project_id = ?1
+           AND NOT EXISTS (SELECT 1 FROM backlog_items WHERE +org_id = :org_id AND project_id = ?1
                AND {owner_blocked} AND json_extract(data, '$.stop') = 1)",
         owner_blocked = crate::backlog::OWNER_BLOCKED,
     ), params![project, now], |r| r.get::<_, String>(0)).optional().map_err(|e| e.to_string())?;
     let Some(conversation) = target else {
         return Ok(());
     };
+    if !crate::sponsorship::can_dispatch(&tx, &conversation).map_err(|e| e.to_string())? {
+        return Ok(());
+    }
     let message = MESSAGE.replace("{project}", project);
-    crate::turns::enqueue(store, &tx, &conversation, &message, "director", "heartbeat")?;
+    crate::turns::enqueue(
+        store,
+        &tx,
+        &conversation,
+        &message,
+        "director",
+        "heartbeat",
+        None,
+    )?;
     tx.execute(
-        "UPDATE project_heartbeats SET due_at = ?2 + interval_seconds * 1000 WHERE project_id = ?1",
+        "UPDATE project_heartbeats SET due_at = ?2 + interval_seconds * 1000 WHERE +org_id = :org_id AND (project_id = ?1)",
         params![project, now],
     )
     .map_err(|e| e.to_string())?;

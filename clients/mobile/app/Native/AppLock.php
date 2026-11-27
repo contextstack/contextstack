@@ -34,6 +34,14 @@ class AppLock
     /** The screen that was asked for when the lock stepped in, to go back to once unlocked. */
     private string $returnTo = '/';
 
+    /**
+     * That screen's query (a pairing or invite link's address and code), held in memory only, never written to the
+     * lock file, and handed over once.
+     *
+     * @var array<string, mixed>
+     */
+    private array $returnQuery = [];
+
     public function __construct(private readonly string $path) {}
 
     public static function fromConfig(): self
@@ -92,9 +100,27 @@ class AppLock
     /**
      * NativePHP's screen guard keeps only the path of a redirect, so the screen to return to is held here.
      */
-    public function stoppedAt(string $path): void
+    /**
+     * @param  array<string, mixed>  $query
+     */
+    public function stoppedAt(string $path, array $query = []): void
     {
-        $this->returnTo = str_starts_with($path, '/') && ! str_starts_with($path, '//') && $path !== '/locked' ? $path : '/';
+        $inside = str_starts_with($path, '/') && ! str_starts_with($path, '//') && $path !== '/locked';
+        $this->returnTo = $inside ? $path : '/';
+        $this->returnQuery = $inside ? $query : [];
+    }
+
+    /**
+     * The query of the screen to go back to, given once: a code in it is not kept after it has been handed over.
+     *
+     * @return array<string, mixed>
+     */
+    public function takeReturnQuery(): array
+    {
+        $query = $this->returnQuery;
+        $this->returnQuery = [];
+
+        return $query;
     }
 
     public function returnTo(): string

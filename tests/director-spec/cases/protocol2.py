@@ -384,3 +384,94 @@ def _(ctx):
     n.report(second["control_id"], "refused", "revision_mismatch", detail="schedule is at 3")
     got = c.call("GET", "schedule-changes/" + second["change_id"]).json
     ctx.expect(got["state"] == "refused" and got["outcome"] == "revision_mismatch", "the second is refused", got)
+
+
+def create_schedule(ctx, n, c, **over):
+    body = {"node": n.name, "name": "Nightly", "cron": "0 2 * * *", "timezone": "America/New_York",
+            "spec": "spec.yaml", "task": "tasks/t", "missed": "skip"}
+    body.update(over)
+    key = new_key("schedule-create")
+    answer = c.call("POST", "schedules", body=body, key=key)
+    ctx.expect(answer.status == 202 and answer.json["pending"] and answer.json["kind"] == "create",
+               "creation is pending at the node", answer)
+    replay = c.call("POST", "schedules", body=body, key=key)
+    ctx.expect(replay.status == 200 and replay.header("idempotent-replayed") == "true"
+               and replay.json["change_id"] == answer.json["change_id"], "creation replays", replay)
+    return answer.json
+
+
+@case(D, "schedules", "schedule-lifecycle", RUST)
+def _(ctx):
+    """Create, edit and delete travel through control and reconcile once the node reports its ledger."""
+    n, c = ctx.node2(), owner(ctx)
+    bad = {"node": n.name, "name": "Invalid", "cron": "0 24 * * *", "timezone": "UTC",
+           "spec": "spec.yaml", "task": "tasks/t"}
+    refused(ctx, c.call("POST", "schedules", body=bad, key=new_key()), 422, "invalid_request", "bad cron")
+    refused(ctx, c.call("POST", "schedules", body=dict(bad, cron="0 2 * * *", timezone="Mars/Olympus"),
+                        key=new_key()), 422, "invalid_request", "bad timezone")
+    created = create_schedule(ctx, n, c)
+    sid, path = created["schedule_id"], "schedules/" + created["schedule_key"]
+    pending = c.call("GET", path).json["schedule"]
+    ctx.expect(pending["schedule_revision"] == 0 and pending["enabled"] is False, "pending definition", pending)
+
+    def apply(change, kind, revision, snapshot):
+        message, = n.control().json["control"]
+        body = message["body"]
+        ctx.expect(message["control_id"] == change["control_id"] and body["schedule_id"] == sid
+                   and body["expect_revision"] == revision - 1 and body.get("kind") == kind
+                   and body["set"] == change["set"], "node receives the requested change", message)
+        ctx.expect(n.report(message["control_id"], "applied", "applied", result={"revision": revision}).status == 200,
+                   "node settles the change")
+        ctx.expect(n.schedules([snapshot]).status == 200, "node reports the new ledger revision")
+        detail = c.call("GET", path).json["schedule"]
+        ctx.expect(detail["schedule_revision"] == revision and not detail["pending_change_ids"],
+                   "Director shows the confirmed revision", detail)
+        return detail
+
+    snapshot = schedule(sid, timezone="America/New_York",
+                        definition={"director_managed": True, "name": "Nightly"})
+    n.schedules([])
+    detail = apply(created, "create", 1, snapshot)
+    ctx.expect(detail["name"] == "Nightly" and detail["enabled"] is True, "created schedule is active", detail)
+    fields = {"cron": "*/15 8-17 * * 1-5", "timezone": "Europe/Paris", "missed": "catch_up", "enabled": False}
+    edit = c.call("POST", path + "/changes", body={"expect_revision": 1, "set": fields}, key=new_key())
+    ctx.expect(edit.status == 202, "edit queued", edit)
+    snapshot = dict(snapshot, revision=2, **fields)
+    detail = apply(edit.json, None, 2, snapshot)
+    ctx.expect(all(detail[k] == v for k, v in fields.items()), "cron, zone, policy and enabled changed", detail)
+    key = new_key("delete")
+    deletion = c.call("DELETE", path, body={"expect_revision": 2}, key=key)
+    ctx.expect(deletion.status == 202, "deletion queued", deletion)
+    tombstone = dict(snapshot, revision=3, definition={**snapshot["definition"], "deleted": True})
+    detail = apply(deletion.json, "delete", 3, tombstone)
+    ctx.expect(detail["removed_at"] and detail["enabled"] is False, "deleted schedule is a tombstone", detail)
+    n.schedules([tombstone])
+    ctx.expect(c.call("GET", path).json["schedule"] == detail, "a repeated tombstone keeps its original timestamp")
+    ctx.expect(c.call("DELETE", path, body={"expect_revision": 2}, key=key).status == 200, "delete replays")
+
+
+@case(D, "schedules", "schedule-budget-and-usage", RUST)
+def _(ctx):
+    """The first firing reserves schedule money, the second waits, and finalized usage is attributed."""
+    from cases.budgets import finish, offered_usd
+
+    n, c = ctx.node2(), owner(ctx)
+    created = create_schedule(ctx, n, c, budget={"usd": 0.1})
+    sid, path = created["schedule_id"], "schedules/" + created["schedule_key"]
+    command = ("job", "create", "--node", n.name, "--bundle", str(ctx.target.bundle), "--meta", "schedule_id=" + sid)
+    first = ctx.target.admin(*command)["job_id"]
+    second = ctx.target.admin(*command)["job_id"]
+    ctx.expect(offered_usd(n, first) == 0.1, "the scheduled spec carries its reservation")
+    held = c.call("GET", "jobs/" + second).json
+    ctx.expect(held["state"] == "waiting" and held["budget"]["reason"] == "budget_reserved",
+               "the next firing waits for its schedule", held)
+    finish(ctx, n, first, charged=0.1)
+    held = c.call("GET", "jobs/" + second).json
+    ctx.expect(held["state"] == "waiting" and held["budget"]["reason"] == "budget_exhausted",
+               "settled spend exhausts the schedule", held)
+    budget = c.call("GET", path).json["schedule"]["budget"]
+    ctx.expect(budget["spent_usd"] == 0.1 and budget["waiting_job_ids"] == [second], "budget shows usage and waiters", budget)
+    usage = c.call("GET", "usage?by=schedule&period=all&node=" + n.name).json
+    group, = usage["groups"]
+    ctx.expect(usage["by"] == "schedule_id" and group["schedule_id"] == sid and group["runs"] == 1
+               and group["charged_usd"] == 0.1, "usage groups scheduled jobs", usage)

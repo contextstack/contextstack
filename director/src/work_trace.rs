@@ -13,10 +13,11 @@
 use crate::access::{Client, Kind};
 use crate::jobs::Plan;
 use crate::server::{Call, Reply, State, internal, json, refusal};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::util::{self, now_utc};
 use crate::work::{No, body};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
 const MARKS: [&str; 3] = ["instruction", "answer", "intervention"];
@@ -80,7 +81,7 @@ pub fn parse_origin(m: &Map<String, Value>) -> Result<Origin, No> {
 
 /// Infer conversation-turn origin from a source job or an active lead turn when still `api`.
 pub fn resolve_origin(
-    db: &Connection,
+    db: &ScopedConnection,
     mut origin: Origin,
     client: &Client,
     from_job: Option<&str>,
@@ -108,18 +109,18 @@ pub fn resolve_origin(
     Ok(origin)
 }
 
-fn turn_for_job(db: &Connection, job_id: &str) -> rusqlite::Result<Option<(String, String)>> {
+fn turn_for_job(db: &ScopedConnection, job_id: &str) -> rusqlite::Result<Option<(String, String)>> {
     db.query_row(
-        "SELECT conversation_id, turn_id FROM turns WHERE job_id = ?1",
+        "SELECT conversation_id, turn_id FROM turns WHERE +org_id = :org_id AND job_id = ?1",
         params![job_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
     .optional()
 }
 
-fn active_turn(db: &Connection, conversation_id: &str) -> rusqlite::Result<Option<String>> {
+fn active_turn(db: &ScopedConnection, conversation_id: &str) -> rusqlite::Result<Option<String>> {
     db.query_row(
-        "SELECT turn_id FROM turns WHERE conversation_id = ?1
+        "SELECT turn_id FROM turns WHERE +org_id = :org_id AND conversation_id = ?1
          AND state IN ('queued', 'summarising', 'running') ORDER BY seq DESC LIMIT 1",
         params![conversation_id],
         |r| r.get(0),
@@ -129,14 +130,14 @@ fn active_turn(db: &Connection, conversation_id: &str) -> rusqlite::Result<Optio
 
 /// Reason JSON for a job after the task's first, stored on `jobs.work_reason`.
 pub fn reason_for_job(
-    db: &Connection,
+    db: &ScopedConnection,
     intent_id: &str,
     meta: &Map<String, Value>,
     client: &Client,
 ) -> Result<Option<Value>, No> {
     let prior: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE intent_id = ?1",
+            "SELECT COUNT(*) FROM jobs WHERE +org_id = :org_id AND intent_id = ?1",
             params![intent_id],
             |r| r.get(0),
         )
@@ -191,10 +192,10 @@ pub fn reason_for_job(
 }
 
 /// The job's meta; `None` when no such job exists.
-fn job_meta(db: &Connection, job_id: &str) -> Result<Option<Value>, String> {
+fn job_meta(db: &ScopedConnection, job_id: &str) -> Result<Option<Value>, String> {
     let meta: Option<String> = db
         .query_row(
-            "SELECT meta FROM jobs WHERE job_id = ?1",
+            "SELECT meta FROM jobs WHERE +org_id = :org_id AND job_id = ?1",
             params![job_id],
             |r| r.get(0),
         )
@@ -205,7 +206,7 @@ fn job_meta(db: &Connection, job_id: &str) -> Result<Option<Value>, String> {
 
 /// Record needs-you when attention is raised on a conversation for one of its jobs.
 pub fn on_attention_set(
-    tx: &Connection,
+    tx: &ScopedConnection,
     conversation_id: &str,
     job_id: Option<&str>,
     raised_at: &str,
@@ -216,7 +217,7 @@ pub fn on_attention_set(
     };
     let intent: Option<String> = tx
         .query_row(
-            "SELECT intent_id FROM jobs WHERE job_id = ?1",
+            "SELECT intent_id FROM jobs WHERE +org_id = :org_id AND job_id = ?1",
             params![job_id],
             |r| r.get(0),
         )
@@ -228,15 +229,16 @@ pub fn on_attention_set(
     };
     tx.execute(
         "UPDATE task_needs_you SET status = 'cleared', cleared_at = ?2, cleared_by = ?3
-         WHERE intent_id = ?1 AND status = 'open'",
+         WHERE +org_id = :org_id AND (intent_id = ?1 AND status = 'open')",
         params![intent_id, raised_at, raised_by],
     )
     .map_err(|e| e.to_string())?;
     let id = util::ulid().map_err(|e| e.to_string())?;
     tx.execute(
-        "INSERT INTO task_needs_you (needs_you_id, intent_id, conversation_id, job_id,
-                                     raised_at, raised_by, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open')",
+        "INSERT INTO task_needs_you (org_id, needs_you_id, intent_id, conversation_id, job_id,
+                                     raised_at, raised_by, status, assignee_member_id)
+         SELECT :org_id, ?1, ?2, ?3, ?4, ?5, ?6, 'open', attention_assignee_member_id
+         FROM conversations WHERE +org_id=:org_id AND conversation_id=?3",
         params![id, intent_id, conversation_id, job_id, raised_at, raised_by],
     )
     .map_err(|e| e.to_string())?;
@@ -245,14 +247,14 @@ pub fn on_attention_set(
 
 /// Clear open needs-you rows for intents tied to this conversation's jobs.
 pub fn on_attention_clear(
-    tx: &Connection,
+    tx: &ScopedConnection,
     conversation_id: &str,
     cleared_by: &str,
 ) -> Result<(), String> {
     let now = now_utc();
     tx.execute(
         "UPDATE task_needs_you SET status = 'cleared', cleared_at = ?2, cleared_by = ?3
-         WHERE conversation_id = ?1 AND status = 'open'",
+         WHERE +org_id = :org_id AND (conversation_id = ?1 AND status = 'open')",
         params![conversation_id, now, cleared_by],
     )
     .map_err(|e| e.to_string())?;
@@ -294,7 +296,7 @@ pub fn set_mark(
     let mut db = state.store.db();
     let exists = db
         .query_row(
-            "SELECT 1 FROM intents WHERE intent_id = ?1",
+            "SELECT 1 FROM intents WHERE +org_id = :org_id AND intent_id = ?1",
             params![intent_id],
             |_| Ok(()),
         )
@@ -316,33 +318,34 @@ pub fn set_mark(
     let now = now_utc();
     let done = (|| -> Result<(), String> {
         let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
-        let owner = client.is_owner();
+        let owner = client.kind != crate::access::Kind::Lead
+            && client
+                .reload_member(&tx)
+                .map_err(|e| e.to_string())?
+                .is_some_and(|fresh| fresh.member.scope.role == Some(crate::access::Role::Owner));
         let existing: Option<String> = tx
             .query_row(
-                "SELECT actor FROM owner_message_marks WHERE message_id = ?1 AND intent_id = ?2",
+                "SELECT actor FROM owner_message_marks WHERE +org_id = :org_id AND message_id = ?1 AND intent_id = ?2",
                 params![message_id, intent_id],
                 |r| r.get(0),
             )
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(actor) = existing {
-            let prior_owner: bool = tx
-                .query_row(
-                    "SELECT kind = 'local' FROM credentials WHERE id = ?1",
-                    params![actor],
-                    |r| r.get(0),
-                )
-                .unwrap_or(false);
+            let prior_owner = tx.prepare(
+                "SELECT 1 FROM (SELECT member_id FROM credentials WHERE +org_id = :org_id AND id = ?1 AND kind != 'lead') c
+                 JOIN (SELECT id FROM members WHERE +org_id = :org_id AND role = 'owner') m ON m.id = c.member_id"
+            ).and_then(|mut stmt| stmt.exists(params![actor])).map_err(|e| e.to_string())?;
             if prior_owner && !owner {
                 return Err("owner_correction".into());
             }
         }
         tx.execute(
-            "INSERT INTO owner_message_marks (message_id, intent_id, mark, actor, marked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO owner_message_marks (org_id, message_id, intent_id, mark, actor, marked_at)
+             VALUES (:org_id, ?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(message_id) DO UPDATE SET mark = excluded.mark, actor = excluded.actor,
                                                   marked_at = excluded.marked_at
-             WHERE intent_id = excluded.intent_id",
+             WHERE +owner_message_marks.org_id = :org_id AND (intent_id = excluded.intent_id)",
             params![message_id, intent_id, mark, client.id, now],
         )
         .map_err(|e| e.to_string())?;
@@ -367,7 +370,7 @@ pub fn set_mark(
 }
 
 fn owner_message_on_task(
-    db: &Connection,
+    db: &ScopedConnection,
     intent_id: &str,
     message_id: &str,
 ) -> rusqlite::Result<bool> {
@@ -381,7 +384,7 @@ fn owner_message_on_task(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT 1 FROM turns t JOIN credentials c ON c.id = t.posted_by
+        "SELECT 1 FROM (SELECT * FROM turns WHERE +org_id = :org_id) t JOIN (SELECT * FROM credentials WHERE +org_id = :org_id) c ON c.id = t.posted_by
          WHERE t.turn_id = ?1 AND t.conversation_id IN ({placeholders})
            AND c.kind IN ('local', 'device')"
     );
@@ -394,11 +397,11 @@ fn owner_message_on_task(
         .map(|v| v.is_some())
 }
 
-fn task_conversation_ids(db: &Connection, intent_id: &str) -> rusqlite::Result<Vec<String>> {
+fn task_conversation_ids(db: &ScopedConnection, intent_id: &str) -> rusqlite::Result<Vec<String>> {
     let mut ids = Vec::new();
     if let Some(c) = db
         .query_row(
-            "SELECT origin_conversation_id FROM intents WHERE intent_id = ?1",
+            "SELECT origin_conversation_id FROM intents WHERE +org_id = :org_id AND intent_id = ?1",
             params![intent_id],
             |r| r.get::<_, Option<String>>(0),
         )
@@ -409,7 +412,7 @@ fn task_conversation_ids(db: &Connection, intent_id: &str) -> rusqlite::Result<V
     }
     if let Some(c) = db
         .query_row(
-            "SELECT lead_conversation_id FROM intents WHERE intent_id = ?1",
+            "SELECT lead_conversation_id FROM intents WHERE +org_id = :org_id AND intent_id = ?1",
             params![intent_id],
             |r| r.get::<_, Option<String>>(0),
         )
@@ -420,8 +423,9 @@ fn task_conversation_ids(db: &Connection, intent_id: &str) -> rusqlite::Result<V
             ids.push(c);
         }
     }
-    let mut stmt =
-        db.prepare_cached("SELECT conversation_id FROM conversations WHERE intent_id = ?1")?;
+    let mut stmt = db.prepare_cached(
+        "SELECT conversation_id FROM conversations WHERE +org_id = :org_id AND intent_id = ?1",
+    )?;
     for row in stmt.query_map(params![intent_id], |r| r.get::<_, String>(0))? {
         let c = row?;
         if !ids.contains(&c) {
@@ -431,11 +435,11 @@ fn task_conversation_ids(db: &Connection, intent_id: &str) -> rusqlite::Result<V
     Ok(ids)
 }
 
-pub fn assemble(db: &Connection, intent_id: &str) -> Result<Option<Value>, String> {
+pub fn assemble(db: &ScopedConnection, intent_id: &str) -> Result<Option<Value>, String> {
     let row: Option<(String, Option<String>, String, Option<String>, Option<String>)> = db
         .query_row(
             "SELECT intent_id, title, COALESCE(origin_kind, 'api'), origin_conversation_id, origin_turn_id
-             FROM intents WHERE intent_id = ?1",
+             FROM intents WHERE +org_id = :org_id AND intent_id = ?1",
             params![intent_id],
             |r| {
                 Ok((
@@ -464,7 +468,7 @@ pub fn assemble(db: &Connection, intent_id: &str) -> Result<Option<Value>, Strin
     let mut stmt = db
         .prepare_cached(
             "SELECT job_id, state, finished_at, run_id, work_reason FROM jobs
-             WHERE intent_id = ?1 ORDER BY rowid",
+             WHERE +org_id = :org_id AND intent_id = ?1 ORDER BY rowid",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -523,10 +527,10 @@ pub fn assemble(db: &Connection, intent_id: &str) -> Result<Option<Value>, Strin
     })))
 }
 
-fn runs_for_job(db: &Connection, job_id: &str) -> Result<Vec<String>, String> {
+fn runs_for_job(db: &ScopedConnection, job_id: &str) -> Result<Vec<String>, String> {
     let mut runs = Vec::new();
     if let Ok(term) = db.query_row(
-        "SELECT run_id FROM jobs WHERE job_id = ?1",
+        "SELECT run_id FROM jobs WHERE +org_id = :org_id AND job_id = ?1",
         params![job_id],
         |r| r.get::<_, Option<String>>(0),
     ) {
@@ -535,7 +539,9 @@ fn runs_for_job(db: &Connection, job_id: &str) -> Result<Vec<String>, String> {
         }
     }
     let mut stmt = db
-        .prepare_cached("SELECT run_id FROM runs WHERE job_id = ?1 ORDER BY rowid")
+        .prepare_cached(
+            "SELECT run_id FROM runs WHERE +org_id = :org_id AND job_id = ?1 ORDER BY rowid",
+        )
         .map_err(|e| e.to_string())?;
     for row in stmt
         .query_map(params![job_id], |r| r.get::<_, String>(0))
@@ -550,7 +556,7 @@ fn runs_for_job(db: &Connection, job_id: &str) -> Result<Vec<String>, String> {
 }
 
 fn job_decisions(
-    db: &Connection,
+    db: &ScopedConnection,
     job_id: &str,
     terminal_run: Option<&str>,
     finished: bool,
@@ -561,7 +567,7 @@ fn job_decisions(
         if let Ok(Some((decision, actor, at))) = db
             .query_row(
                 "SELECT d.decision, d.decided_by, d.decided_at FROM decisions d
-                 WHERE d.run_id = ?1",
+                 WHERE +org_id = :org_id AND d.run_id = ?1",
                 params![run_id],
                 |r| {
                     Ok((
@@ -577,7 +583,7 @@ fn job_decisions(
         }
         if let Ok(Some((landed_by, landed_at))) = db
             .query_row(
-                "SELECT landed_by, landed_at FROM lands WHERE run_id = ?1 AND current = 1 AND state = 'landed'",
+                "SELECT landed_by, landed_at FROM lands WHERE +org_id = :org_id AND run_id = ?1 AND current = 1 AND state = 'landed'",
                 params![run_id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
@@ -588,7 +594,7 @@ fn job_decisions(
     }
     if let Ok(Some((requested_by, requested_at))) = db
         .query_row(
-            "SELECT requested_by, requested_at FROM cancels WHERE job_id = ?1",
+            "SELECT requested_by, requested_at FROM cancels WHERE +org_id = :org_id AND job_id = ?1",
             params![job_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
@@ -605,11 +611,11 @@ fn job_decisions(
     (decisions, none_yet)
 }
 
-fn needs_you_for(db: &Connection, intent_id: &str) -> Result<Vec<Value>, String> {
+fn needs_you_for(db: &ScopedConnection, intent_id: &str) -> Result<Vec<Value>, String> {
     let mut stmt = db
         .prepare_cached(
-            "SELECT needs_you_id, raised_at, status, cleared_at, cleared_by FROM task_needs_you
-             WHERE intent_id = ?1 ORDER BY raised_at",
+            "SELECT needs_you_id, raised_at, status, cleared_at, cleared_by, assignee_member_id, conversation_id FROM task_needs_you
+             WHERE +org_id = :org_id AND intent_id = ?1 ORDER BY raised_at",
         )
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -621,23 +627,33 @@ fn needs_you_for(db: &Connection, intent_id: &str) -> Result<Vec<Value>, String>
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
             ))
         })
         .map_err(|e| e.to_string())?
     {
-        let (id, raised_at, status, cleared_at, cleared_by) = row.map_err(|e| e.to_string())?;
-        let mut item = json!({"id": id, "raised_at": raised_at, "status": status});
+        let (id, raised_at, status, cleared_at, cleared_by, assignee, conversation) =
+            row.map_err(|e| e.to_string())?;
+        if !crate::policy::attention_visible(assignee.as_deref(), None) {
+            continue;
+        }
+        let mut item = json!({"id": id, "raised_at": raised_at, "status": status, "assignee_member_id": assignee});
         if status == "cleared" {
             item["cleared_at"] = json!(cleared_at);
             item["cleared_by"] = json!(cleared_by);
         }
+        crate::projections::names(db, &mut item).map_err(|e| e.to_string())?;
+        item["actions"] = json!({"control": status == "open" && crate::policy::projected_action(
+            db, "DELETE", &["conversations", &conversation, "attention"], false,
+        )});
         out.push(item);
     }
     Ok(out)
 }
 
 fn owner_messages_for(
-    db: &Connection,
+    db: &ScopedConnection,
     intent_id: &str,
 ) -> Result<(Vec<String>, Vec<Value>), String> {
     let conversations = task_conversation_ids(db, intent_id).map_err(|e| e.to_string())?;
@@ -651,9 +667,9 @@ fn owner_messages_for(
         .join(", ");
     let sql = format!(
         "SELECT t.turn_id, m.mark, m.actor, m.marked_at
-         FROM turns t
-         JOIN credentials c ON c.id = t.posted_by
-         LEFT JOIN owner_message_marks m ON m.message_id = t.turn_id AND m.intent_id = ?1
+         FROM (SELECT * FROM turns WHERE +org_id = :org_id) t
+         JOIN (SELECT * FROM credentials WHERE +org_id = :org_id) c ON c.id = t.posted_by
+         LEFT JOIN (SELECT * FROM owner_message_marks WHERE +org_id = :org_id) m ON m.message_id = t.turn_id AND m.intent_id = ?1
          WHERE t.conversation_id IN ({placeholders}) AND c.kind IN ('local', 'device')
          ORDER BY t.posted_at"
     );
@@ -663,7 +679,7 @@ fn owner_messages_for(
     let mut ids = Vec::new();
     let mut marks = Vec::new();
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(sql_args.iter()), |r| {
+        .query_map(sql_args.iter(), |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
@@ -690,7 +706,7 @@ fn owner_messages_for(
 /// Persist `work_reason` when a follow-on job is planned.
 pub fn stamp_job_reason(
     plan: &mut Plan,
-    db: &Connection,
+    db: &ScopedConnection,
     intent_id: &str,
     client: &Client,
 ) -> Result<(), No> {
@@ -729,6 +745,7 @@ mod tests {
         let client = Client {
             id: "owner".into(),
             kind: Kind::Local,
+            member: crate::access::Member::fixture(),
             conversation_id: None,
             intent_id: None,
             node: Some("n".into()),
@@ -743,14 +760,14 @@ mod tests {
         Ok(())
     }
 
-    fn seed_task(db: &Connection) -> Result<(), String> {
-        db.execute_batch(
-            "INSERT INTO nodes (id, name, token_hash, created_at) VALUES (1, 'n', 'h', 't');
-             INSERT INTO intents (intent_id, node, spec, task, trials, meta, bundle_sha256, created_by, created_at,
+    fn seed_task(db: &ScopedConnection) -> Result<(), String> {
+        db.fixture_batch(
+            "INSERT INTO nodes (org_id, id, name, token_hash, created_at) VALUES (:org_id, 1, 'n', 'h', 't');
+             INSERT INTO intents (org_id, intent_id, node, spec, task, trials, meta, bundle_sha256, created_by, created_at,
                                   origin_kind)
-             VALUES ('task-1', 'n', 's', 'tasks/t', 1, '{}', 'b', 'owner', 't', 'api');
-             INSERT INTO jobs (job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
-             VALUES ('job-1', 1, 's', 'tasks/t', 1, 'b', '{}', 'done', 't', 'task-1');",
+             VALUES (:org_id, 'task-1', 'n', 's', 'tasks/t', 1, '{}', 'b', 'owner', 't', 'api');
+             INSERT INTO jobs (org_id, job_id, node_id, spec, task, trials, bundle_sha256, meta, state, created_at, intent_id)
+             VALUES (:org_id, 'job-1', 1, 's', 'tasks/t', 1, 'b', '{}', 'done', 't', 'task-1');",
         )
         .map_err(|e| e.to_string())?;
         Ok(())

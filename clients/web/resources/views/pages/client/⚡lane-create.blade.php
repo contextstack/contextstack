@@ -365,6 +365,7 @@ new #[Layout('layouts::client')] #[Title('New task lane')] class extends Compone
         </flux:callout>
     @endif
 
+    @capable('start_work')
     <form wire:submit="submit" class="space-y-6">
         <div class="grid gap-4 sm:grid-cols-2">
             <flux:select wire:model.live="node" :label="__('Machine')">
@@ -462,4 +463,9 @@ new #[Layout('layouts::client')] #[Title('New task lane')] class extends Compone
 
         <flux:button type="submit" variant="primary">{{ __('Start task lane') }}</flux:button>
     </form>
+    @else
+        <flux:callout icon="information-circle" data-test="cannot-start">
+            <flux:callout.text>{{ __('Your role can read work here but not start new task lanes. An owner, admin or member can.') }}</flux:callout.text>
+        </flux:callout>
+    @endcapable
 </section>

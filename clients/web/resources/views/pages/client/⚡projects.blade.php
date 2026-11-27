@@ -134,6 +134,7 @@ new #[Layout('layouts::client')] #[Title('Projects')] class extends DirectorPage
         </flux:table>
     @endif
 
+    @capable('edit_projects')
     <flux:card>
         <form wire:submit="create" class="space-y-4">
             <flux:heading size="lg">{{ __('New project') }}</flux:heading>
@@ -149,4 +150,5 @@ new #[Layout('layouts::client')] #[Title('Projects')] class extends DirectorPage
             </div>
         </form>
     </flux:card>
+    @endcapable
 </section>

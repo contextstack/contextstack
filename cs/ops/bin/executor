@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and finish one CLI work order on the machine."""
+"""Run and finish one CLI or local gate work order on the machine."""
 import sys
 from pathlib import Path
 

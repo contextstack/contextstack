@@ -2,7 +2,7 @@
   "runtime": "python3",
   "timeout_seconds": 120,
   "sandbox": {"net": "none"},
-  "description": "Ask the Director to review one exact command that requires additional sandbox permission. Use exec for ordinary sandboxed commands. For a registry or documentation download, use argv [\"/usr/bin/curl\", \"-q\", \"--\", \"https://host/path\"]. For local test sockets, list each port in needs, for example network:loopback:3000. The owner sees each requested port. On macOS these ports open on host localhost. On Linux the action gets a private localhost with no access to host services. ContextStack service ports are reserved. For a write_paths request, provide the specific absolute paths. If the action is waiting on the owner, continue without it if possible. Repeating the exact request during this run checks the same approval.",
+  "description": "Ask the Director to review one exact command that requires additional sandbox permission, or ask the owner to approve a declared browser form action using browser with url, origin_set, action and target. The host captures browser evidence. Use exec for ordinary sandboxed commands. For a registry or documentation download, use argv [\"/usr/bin/curl\", \"-q\", \"--\", \"https://host/path\"]. For local test sockets, list each port in needs, for example network:loopback:3000. The owner sees each requested port. On macOS these ports open on host localhost. On Linux the action gets a private localhost with no access to host services. ContextStack service ports are reserved. For a write_paths request, provide the specific absolute paths. If the action is waiting for a human decision, continue without it if possible. Repeating the exact command request during this run checks the same approval.",
   "inputSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -10,8 +10,19 @@
       "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
       "needs": {"type": "array", "items": {"type": "string", "pattern": "^(network|network:loopback:[1-9][0-9]{0,4}|write_paths|delete)$"}, "minItems": 1, "uniqueItems": true},
       "write_paths": {"type": "array", "items": {"type": "string"}},
-      "reason": {"type": "string", "minLength": 1}
+      "reason": {"type": "string", "minLength": 1},
+      "browser": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "url": {"type": "string"},
+          "origin_set": {"type": "string"},
+          "action": {"enum": ["submit", "post", "buy"]},
+          "target": {"type": "string"}
+        },
+        "required": ["url", "origin_set", "action", "target"]
+      }
     },
-    "required": ["argv", "needs", "reason"]
+    "oneOf": [{"required": ["argv", "needs", "reason"]}, {"required": ["browser"]}]
   }
 }

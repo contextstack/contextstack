@@ -9,6 +9,7 @@ it('sends a device with no credential to the connection page', function () {
     connectClientWeb();
     unlink(config('client.local_credential'));
     Http::fake();
+    fakeDirectorBackground();
 
     $this->get(route('intents.index'))->assertRedirect(route('connect'));
     $this->get(route('connect'))->assertOk()->assertSee('Not connected');
@@ -18,11 +19,12 @@ it('sends a device with no credential to the connection page', function () {
 it('pairs this device with a one-time code and then uses the device token, never showing it', function () {
     $directory = connectClientWeb();
     unlink(config('client.local_credential'));
+    meOnDirector(['credential_id' => 'cred_phone', 'owner' => true]);
     Http::fake([
         'http://other.test/api/v1/pair' => Http::response(['credential_id' => 'cred_phone', 'name' => 'phone', 'token' => 'csd_secret_device_token']),
-        'http://other.test/api/v1/client/me' => Http::response(['credential_id' => 'cred_phone', 'owner' => true]),
         'http://other.test/api/v1/client/intents?*' => Http::response(['intents' => [], 'jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.connect')
         ->set('url', 'http://other.test/')
@@ -51,6 +53,7 @@ it('saves nothing when the Director refuses the pairing code', function () {
     $directory = connectClientWeb();
     unlink(config('client.local_credential'));
     Http::fake(['http://director.test/api/v1/pair' => Http::response(['error' => 'Forbidden', 'code' => 'pairing_refused', 'detail' => 'no live pairing code matches'], 403)]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.connect')
         ->set('code', 'WRONG-CODE0')
@@ -64,6 +67,7 @@ it('saves nothing when the Director refuses the pairing code', function () {
 it('reads the local credential at each request, so a rotated credential is used at once', function () {
     connectClientWeb('csl_first');
     Http::fake([director('intents?*') => Http::response(['intents' => [], 'jobs' => []])]);
+    fakeDirectorBackground();
 
     $this->get(route('intents.index'))->assertOk();
     file_put_contents(config('client.local_credential'), "csl_second\n");
@@ -77,14 +81,17 @@ it('reads the local credential at each request, so a rotated credential is used 
 it('tells the person when the Director no longer accepts the credential', function () {
     connectClientWeb();
     Http::fake([director('intents?*') => Http::response(['error' => 'Unauthorized', 'code' => 'unauthenticated', 'detail' => 'unknown credential'], 401)]);
+    fakeDirectorBackground();
 
-    $this->get(route('intents.index'))->assertOk()->assertSee('It may have been revoked: pair again.', false);
+    // Nothing the Director showed stays on screen; Settings offers to reconnect or forget this device.
+    $this->get(route('intents.index'))->assertOk()->assertSee('no longer accepts this device', false)->assertSee('Reconnect or forget this device');
 });
 
 it('forgets a saved device connection', function () {
     $directory = connectClientWeb();
     app(ConnectionStore::class)->saveDevice('http://other.test', 'csd_x', 'cred_x', 'phone');
     Http::fake(['*' => Http::response(['credential_id' => 'cred_local', 'owner' => true])]);
+    fakeDirectorBackground();
 
     Livewire::test('pages::client.connect')->call('forget')->assertSee('the local credential (');
 

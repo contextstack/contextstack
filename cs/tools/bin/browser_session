@@ -10,49 +10,31 @@ CS_BROWSER_BROKER_EXEC (fixtures only) names a program that answers the same lin
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 from pathlib import Path
 
 import _calllog
+from _broker_client import ask
 from _web import append_manifest, atomic_json, fail, normalize_url, safe_directory
 
-MAX_REPLY = 8 * 1024 * 1024
-TIMEOUT = 120
+WATCH_PREFIX = "price-watch-"
 
 
-def ask(set_name, request):
-    line = json.dumps(request, sort_keys=True).encode() + b"\n"
-    fake = os.environ.get("CS_BROWSER_BROKER_EXEC")
-    if fake:
-        done = subprocess.run([fake], input=line, capture_output=True, timeout=TIMEOUT)
-        raw = done.stdout
-    else:
-        var = "CS_SOCKET_BROWSER_" + set_name.upper().replace("-", "_")
-        path = os.environ.get(var)
-        if not path:
-            fail("no browser broker socket granted for set %s (%s unset)" % (set_name, var))
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.settimeout(TIMEOUT)
-        try:
-            conn.connect(path)
-        except OSError as error:
-            fail("browser broker unreachable at %s: %s" % (var, error.strerror or error))
-        conn.sendall(line)
-        raw = b""
-        while not raw.endswith(b"\n") and len(raw) <= MAX_REPLY:
-            chunk = conn.recv(1 << 16)
-            if not chunk:
-                break
-            raw += chunk
-        conn.close()
-    if len(raw) > MAX_REPLY or not raw.strip():
-        fail("browser broker reply is empty or exceeds %d bytes" % MAX_REPLY)
-    reply = json.loads(raw)
-    if not isinstance(reply, dict):
-        fail("browser broker reply is not an object")
-    return reply
+def extract_watch(text, extract, selected):
+    from _watch_extract import extract_price
+
+    def timed_out(*_):
+        raise TimeoutError("price extraction timed out")
+
+    signal.signal(signal.SIGALRM, timed_out)
+    signal.alarm(10)
+    try:
+        return extract_price(text, extract, selected=selected)
+    finally:
+        signal.alarm(0)
 
 
 def store(relative_dir, digest, suffix, raw):
@@ -70,18 +52,33 @@ def store(relative_dir, digest, suffix, raw):
 try:
     invoked = os.path.basename(sys.argv[0])
     set_name = "public" if invoked == "browser_session" else invoked.removeprefix("browser_").replace("_", "-")
+    if set_name == "google-tasks":
+        fail("Google Tasks requires the scheduled reader")
+    watch = set_name.startswith(WATCH_PREFIX)
     args = json.load(sys.stdin)
     _calllog.record("browser_session", args)
-    if not isinstance(args, dict) or set(args) - {"url"}:
+    fields = {"url", "extract"} if watch else {"url"}
+    if not isinstance(args, dict) or set(args) - fields:
         fail("args must be {url}")
     requested = normalize_url(args.get("url"))
     evidence = safe_directory("_evidence")
-    reply = ask(set_name, {"verb": "open", "url": requested})
+    request = {"verb": "open", "url": requested}
+    extract = args.get("extract")
+    if "extract" in args:
+        if (not isinstance(extract, dict) or
+                set(extract) not in ({"selector", "number_parser"}, {"regex", "number_parser"}) or
+                extract["number_parser"] not in ("decimal_dot", "decimal_comma")):
+            fail("invalid watch extractor")
+        if "selector" in extract:
+            request["selector"] = extract["selector"]
+    reply = ask(set_name, request)
     if reply.get("ok") is not True:
+        if watch and reply.get("error_kind") == "timeout":
+            raise TimeoutError("browser broker timed out")
         blocked = reply.get("blocked") or []
         fail("browser broker refused: %s%s" % (reply.get("error"), "; blocked %s" % blocked if blocked else ""))
     text = reply.get("text")
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(text, str) or (not watch and not text.strip()):
         fail("browser rendered no visible text")
     raw = text.encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()
@@ -93,6 +90,18 @@ try:
               "content_type": "text/plain; charset=utf-8", "bytes": len(raw), "sha256": digest,
               "body_path": store("_evidence/bodies", digest, ".txt", raw),
               "navigations": reply.get("navigations") or [], "blocked": reply.get("blocked") or []}
+    if "selector" in request:
+        selected = reply.get("selected")
+        if selected is not None and not isinstance(selected, str):
+            fail("broker returned invalid selector text")
+        record["selected"] = selected
+    status = record["status"]
+    if extract and isinstance(status, (int, float)) and 200 <= status < 300:
+        price = extract_watch(text, extract, record.get("selected"))
+        if price is None:
+            record["error_kind"] = "layout_changed"
+        else:
+            record["price"] = price
     record_id = hashlib.sha256(("browser_session\0" + requested + "\0" + digest).encode()).hexdigest()
     record_path = Path("_evidence/fetches") / (record_id + ".json")
     safe_directory("_evidence/fetches")
@@ -101,5 +110,7 @@ try:
     print(json.dumps({"ok": True, "evidence": str(record_path), **record,
                       "preview": text[:4000]}, sort_keys=True))
 except (KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+    if watch and isinstance(error, (socket.timeout, TimeoutError, subprocess.TimeoutExpired)):
+        print(json.dumps({"ok": False, "error_kind": "timeout"}))
     print("browser_session: " + str(error), file=sys.stderr)
     sys.exit(1)

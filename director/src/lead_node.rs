@@ -1,52 +1,54 @@
-//! Hosted-lead home node: optional `meta.lead_node`, else `meta.local_node` (first node registered on this Director).
+//! Hosted-lead home node: optional `org_settings.lead_node`, else `org_settings.local_node` (first node registered on this Director).
 
 use crate::access;
 use crate::server::{Call, Reply, State, internal, json, refusal};
-use crate::util::now_utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::store::ScopedConnection;
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 const KEY_LEAD: &str = "lead_node";
 const KEY_LOCAL: &str = "local_node";
 
 /// Remember the first node registered on this Director as its local node (one home machine for leads).
-pub fn note_local_node(db: &Connection, name: &str) -> rusqlite::Result<()> {
+pub fn note_local_node(db: &ScopedConnection, name: &str) -> rusqlite::Result<()> {
     db.execute(
-        "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+        "INSERT OR IGNORE INTO org_settings (org_id, key, value) VALUES (:org_id, ?1, ?2)",
         params![KEY_LOCAL, name],
     )?;
     Ok(())
 }
 
-fn meta_value(db: &Connection, key: &str) -> Result<Option<String>, String> {
-    db.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
-        r.get(0)
-    })
-    .optional()
-    .map_err(|e| e.to_string())
-}
-
-/// The node hosted leads use: explicit setting, else the local node.
-pub fn effective(db: &Connection) -> Result<Option<String>, String> {
-    if let Some(name) = meta_value(db, KEY_LEAD)? {
-        return Ok(Some(name));
-    }
-    if let Some(name) = meta_value(db, KEY_LOCAL)? {
-        return Ok(Some(name));
-    }
-    // Installs registered before `local_node` was recorded: the first live node is the Director's own.
+fn setting(db: &ScopedConnection, key: &str) -> Result<Option<String>, String> {
     db.query_row(
-        "SELECT name FROM nodes WHERE revoked_at IS NULL ORDER BY id LIMIT 1",
-        [],
+        "SELECT value FROM org_settings WHERE +org_id = :org_id AND key = ?1",
+        params![key],
         |r| r.get(0),
     )
     .optional()
     .map_err(|e| e.to_string())
 }
 
-fn node_live(db: &Connection, name: &str) -> Result<bool, String> {
+/// The node hosted leads use: explicit setting, else the local node.
+pub fn effective(db: &ScopedConnection) -> Result<Option<String>, String> {
+    if let Some(name) = setting(db, KEY_LEAD)? {
+        return Ok(Some(name));
+    }
+    if let Some(name) = setting(db, KEY_LOCAL)? {
+        return Ok(Some(name));
+    }
+    // Installs registered before `local_node` was recorded: the first live node is the Director's own.
     db.query_row(
-        "SELECT 1 FROM nodes WHERE name = ?1 AND revoked_at IS NULL",
+        "SELECT name FROM nodes WHERE +org_id = :org_id AND revoked_at IS NULL ORDER BY id LIMIT 1",
+        params![],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn node_live(db: &ScopedConnection, name: &str) -> Result<bool, String> {
+    db.query_row(
+        "SELECT 1 FROM nodes WHERE +org_id = :org_id AND name = ?1 AND revoked_at IS NULL",
         params![name],
         |_| Ok(()),
     )
@@ -56,11 +58,11 @@ fn node_live(db: &Connection, name: &str) -> Result<bool, String> {
 }
 
 /// `GET lead-node`: `{node, source}` where `source` is `default` or `set`.
-pub fn get_answer(db: &Connection) -> Result<Value, String> {
+pub fn get_answer(db: &ScopedConnection) -> Result<Value, String> {
     let Some(node) = effective(db)? else {
         return Err("no lead home node is configured; register a node on this Director".into());
     };
-    let source = if meta_value(db, KEY_LEAD)?.is_some() {
+    let source = if setting(db, KEY_LEAD)?.is_some() {
         "set"
     } else {
         "default"
@@ -87,11 +89,16 @@ pub fn put(state: &State, call: &Call) -> Reply {
         }
         Err(e) => return internal(&e),
     }
-    if let Err(e) = db.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![KEY_LEAD, name],
-    ) {
-        return internal(&e.to_string());
+    let written = (|| -> rusqlite::Result<()> {
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO org_settings (org_id, key, value) VALUES (:org_id, ?1, ?2) ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value WHERE +org_settings.org_id = :org_id",
+            params![KEY_LEAD, name],
+        )?;
+        tx.commit()
+    })();
+    if let Err(e) = written {
+        return internal(&e);
     }
     match get_answer(&db) {
         Ok(v) => json(200, &v),
@@ -101,7 +108,7 @@ pub fn put(state: &State, call: &Call) -> Reply {
 
 /// Enforce hosted-lead placement on the lead home node; inject `node` when omitted.
 pub fn apply_create_node(
-    db: &Connection,
+    db: &ScopedConnection,
     m: &mut serde_json::Map<String, Value>,
     built_lead: bool,
 ) -> Result<(), crate::work::No> {
@@ -139,20 +146,26 @@ pub fn issue_credential(
     node_name: &str,
     conversation_id: &str,
 ) -> Reply {
-    let row: Option<(i64, String)> = {
-        let db = state.store.db();
-        db.query_row(
-            "SELECT lead, node FROM conversations WHERE conversation_id = ?1",
+    let mut db = state.store.db();
+    let tx = match crate::store::write_tx(&mut db) {
+        Ok(tx) => tx,
+        Err(e) => return internal(&e),
+    };
+    let row = tx
+        .query_row(
+            "SELECT lead, node FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
             params![conversation_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?)),
         )
-        .optional()
-        .unwrap_or(None)
+        .optional();
+    let row = match row {
+        Ok(row) => row,
+        Err(e) => return internal(&e),
     };
     let Some((lead, conv_node)) = row else {
         return refusal(404, "not_found", "no such conversation", Value::Null);
     };
-    if lead == 0 {
+    if !lead {
         return refusal(
             409,
             "not_a_lead",
@@ -168,15 +181,11 @@ pub fn issue_credential(
             Value::Null,
         );
     }
-    let live = {
-        let db = state.store.db();
-        db.query_row(
-            "SELECT 1 FROM nodes WHERE id = ?1 AND name = ?2 AND revoked_at IS NULL",
-            params![node_id, node_name],
-            |_| Ok(()),
-        )
-        .optional()
-        .is_ok_and(|o| o.is_some())
+    let live = match tx.prepare(
+        "SELECT 1 FROM nodes WHERE +org_id = :org_id AND id = ?1 AND name = ?2 AND revoked_at IS NULL",
+    ).and_then(|mut stmt| stmt.exists(params![node_id, node_name])) {
+        Ok(live) => live,
+        Err(e) => return internal(&e),
     };
     if !live {
         return refusal(
@@ -186,38 +195,28 @@ pub fn issue_credential(
             Value::Null,
         );
     }
-    // Mint first, then revoke the older ones: a failed mint leaves the machine's current credential working. If this
-    // answer is lost, the machine's next call with its old credential gets 401 and it fetches again.
+    match crate::sponsorship::can_dispatch(&tx, conversation_id) {
+        Ok(true) => {}
+        Ok(false) => return crate::policy::denied(),
+        Err(e) => return internal(&e),
+    }
     let actor = format!("node:{node_id}");
-    let minted = match access::mint_lead(&state.store, "hosted-lead", conversation_id, None, &actor)
-    {
+    let minted = match access::mint_lead_in(&tx, "hosted-lead", conversation_id, None, &actor) {
         Ok(v) => v,
         Err(e) => return refusal(422, "invalid_request", &e, Value::Null),
     };
-    let Some(new_id) = minted["credential_id"].as_str().map(str::to_string) else {
-        return internal(&"minted lead credential has no id".to_string());
-    };
-    let revoked = state
-        .store
-        .db()
-        .prepare(
-            "UPDATE credentials SET revoked_at = ?1, revoked_by = ?4
-         WHERE kind = 'lead' AND conversation_id = ?2 AND revoked_at IS NULL AND id != ?3
-         RETURNING id",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(params![now_utc(), conversation_id, new_id, actor], |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        });
-    match revoked {
-        Ok(ids) => {
-            for id in ids {
-                state.hub.revoked(&id);
-            }
-        }
+    let revoked = crate::sponsorship::revoke_leads(
+        &tx,
+        conversation_id,
+        minted["credential_id"].as_str(),
+        &actor,
+    );
+    let ids = match revoked.and_then(|ids| tx.commit().map(|()| ids)) {
+        Ok(ids) => ids,
         Err(e) => return internal(&e),
+    };
+    for id in ids {
+        state.hub.revoked(&id);
     }
     json(201, &minted)
 }
@@ -230,14 +229,15 @@ mod tests {
     type Res = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn falls_back_to_the_first_live_node_without_local_node() -> Result<(), String> {
-        let db = Connection::open_in_memory().map_err(|e| e.to_string())?;
-        db.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL, revoked_at TEXT);
-             INSERT INTO nodes (id, name) VALUES (1, 'node-b'), (2, 'node-a');",
-        )
-        .map_err(|e| e.to_string())?;
+    fn falls_back_to_the_first_live_node_without_local_node() -> Res {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open(&tmp.path().join("data"))?;
+        let db = store.db();
+        db.fixture_batch(
+            "INSERT INTO nodes (org_id, id, name, token_hash, created_at)
+             VALUES (:org_id, 1, 'node-b', 'hash-b', 'now'),
+                    (:org_id, 2, 'node-a', 'hash-a', 'now');",
+        )?;
         assert_eq!(effective(&db)?, Some("node-b".to_string()));
         Ok(())
     }

@@ -385,6 +385,7 @@ pub fn resolve(
             .and_then(Value::as_str)
             .filter(|model| {
                 allow_bare
+                    && *model != "gate"
                     && !model.starts_with("harness:")
                     && !crate::capabilities::is_cli_template(model)
             })
@@ -626,11 +627,11 @@ fn title(name: &str) -> Option<&str> {
 }
 
 /// Add the last reported capabilities of non-revoked nodes to the client catalog.
-pub fn add_nodes(db: &rusqlite::Connection, catalog: &mut Value) -> rusqlite::Result<()> {
+pub fn add_nodes(db: &crate::store::ScopedConnection, catalog: &mut Value) -> rusqlite::Result<()> {
     let mut stmt = db.prepare(
-        "SELECT name, status FROM nodes WHERE revoked_at IS NULL AND status IS NOT NULL ORDER BY name",
+        "SELECT name, status FROM nodes WHERE +org_id = :org_id AND revoked_at IS NULL AND status IS NOT NULL ORDER BY name",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(rusqlite::params![], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     let mut checked_nodes = Vec::new();
@@ -922,9 +923,9 @@ mod tests {
         let db = store.db();
         let status = json!({"agent_capabilities": {"harness": true, "harness_models": ["qwen3:latest", "local-coder"]}});
         db.execute(
-            "INSERT INTO nodes (name, token_hash, created_at, status)
-             VALUES ('node-a', 'node-a-token', 'now', ?1), ('node-b', 'node-b-token', 'now', ?2),
-                    ('node-c', 'node-c-token', 'now', '{}')",
+            "INSERT INTO nodes (org_id, name, token_hash, created_at, status)
+             VALUES (:org_id, 'node-a', 'node-a-token', 'now', ?1), (:org_id, 'node-b', 'node-b-token', 'now', ?2),
+                    (:org_id, 'node-c', 'node-c-token', 'now', '{}')",
             [
                 status.to_string(),
                 json!({"agent_capabilities": {"harness": true, "harness_models": ["local-coder"]}})

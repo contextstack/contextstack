@@ -289,3 +289,35 @@ def _(ctx):
                "bounded snapshot keeps the two most recently updated entries and a fetch note")
     ctx.expect(sent["context"]["decision_log"] == {"revision": revised["revision"], "entry_count": 2},
                "trace counts the entries sent", sent)
+
+
+@case("client", AREA, "hosted-turn-lessons-injected-and-capped")
+def _(ctx):
+    from cases.conversations import job_files, post as send, reply, turn
+
+    o, node = owner(ctx), ctx.node2()
+    pid, path = log_path(ctx, o)
+    first = None
+    for number in range(42):
+        entry = post(o, path, {"kind": "lesson", "decision": f"Lesson number {number:02d}",
+                               "why": "First line\nsecond line", "sources": ["source"]}).json["entry"]
+        if first is None:
+            first = entry
+    conv = hosted(ctx, o, node, project_id=pid)
+    initial = send(ctx, o, conv, "Read lessons")
+    files = job_files(node, initial["job_id"])
+    lesson_path = "conversation/lessons.md"
+    frozen = files[lesson_path].decode()
+    ctx.expect(len(frozen.splitlines()) == 40 and "Lesson number 41" in frozen
+               and "Lesson number 00" not in frozen and "First line second line" in frozen
+               and "Lesson number" not in files["conversation/decision-log.md"].decode(),
+               "lesson snapshot is bounded and newest lessons are present", frozen)
+    revised = post(o, path + "/" + first["entry_id"] + "/revise",
+                   {"revision": first["revision"], "decision": "Revised lesson"}).json["entry"]
+    post(o, path + "/" + entry["entry_id"] + "/retire", {"revision": entry["revision"]})
+    queued = send(ctx, o, conv, "Read revised lessons")
+    reply(ctx, node, initial["job_id"], "Done")
+    followup = turn(o, queued["turn_id"])
+    updated = job_files(node, followup["job_id"])[lesson_path].decode()
+    ctx.expect(revised["kind"] == "lesson" and "Revised lesson" in updated and "Lesson number 41" not in updated
+               and "Revised lesson" not in frozen, "new turn sees revisions and retirements", updated)

@@ -134,12 +134,14 @@ new #[Lazy] class extends Component
 ?>
 
 <div class="grid grid-cols-1 gap-px" wire:poll.15s.visible="refresh" data-test="thread-rail">
+    @capable('start_work')
     <a href="{{ route('conversations.create') }}" wire:navigate wire:current.exact="cs-thread-current"
        class="flex h-8 items-center gap-2 rounded-lg px-2 text-sm text-zinc-700 hover:bg-black/5 dark:text-zinc-300 dark:hover:bg-white/[.06] [&.cs-thread-current]:bg-black/[.07] dark:[&.cs-thread-current]:bg-white/10"
        data-test="rail-new-chat">
         <flux:icon.pencil-square variant="micro" class="size-4 shrink-0" />
         <span>{{ __('New chat') }}</span>
     </a>
+    @endcapable
     @if ($chief !== null)
         <a href="{{ route('conversations.show', $chief['id']) }}" wire:navigate.hover wire:current="cs-thread-current"
            class="flex h-8 items-center gap-2 rounded-lg px-2 text-sm font-medium text-zinc-800 hover:bg-black/5 dark:text-zinc-200 dark:hover:bg-white/[.06] [&.cs-thread-current]:bg-black/[.07] dark:[&.cs-thread-current]:bg-white/10"

@@ -7,6 +7,7 @@
 //! | `GET conversations[?node=&intent=&lead=1&project=ID&limit=N]`, `GET conversations/{id}` | `{conversations}`, `{conversation}` |
 //! | `GET conversations/{id}/thread` | `{conversation, turns, summaries}`: the whole thread, always |
 //! | `POST conversations/{id}/turns` (key) `{message}` | 201 `{turn, conversation}` |
+//! | `POST conversations/{id}/notes` (key) `{message, schedule_key?}` | 201 `{turn, conversation}`: completed note (local owner only) |
 //! | `POST conversations/{id}/wake-turns` (key) `{nudge, reply, jobs?}` | 201 `{turn, conversation}`: `origin: wake` (hosted lead only) |
 //! | `POST conversations/{id}/stop` (key) | 202 `{conversation, cancel}` |
 //! | `POST conversations/{id}/resume` (key) | 200 `{conversation, cancel}` |
@@ -15,15 +16,16 @@
 //! | `DELETE conversations/{id}/attention` | 200 `{conversation}` |
 //! | `GET turns/{id}`, `GET summaries/{id}` | one record |
 
-use crate::access::{Client, Kind};
+use crate::access::{Client, Kind, Role};
 use crate::jobs::{self, BundleFile, Unusable};
 use crate::records;
 use crate::server::{Call, Reply, State, internal, json, refusal};
+use crate::store::ScopedConnection;
 use crate::store::{Record, touch};
 use crate::thread;
 use crate::util::{self, now_utc};
 use crate::work::{No, body, content, key, remember, scoped_prior};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
 /// The longest message a turn takes.
@@ -38,6 +40,11 @@ pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
     let db = || state.store.db();
     let found = match (call.method.as_str(), parts) {
         ("PATCH", ["conversations", id]) => {
+            if serde_json::from_slice::<Value>(&call.body)
+                .is_ok_and(|body| body.get("sponsor_member_id").is_some())
+            {
+                return crate::sponsorship::adopt(state, call, client, id);
+            }
             return crate::chief_of_staff::rename(state, call, client, id);
         }
         ("DELETE", ["conversations", id]) => return delete(state, call, client, id),
@@ -49,8 +56,19 @@ pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
         ("GET", ["conversations", id]) => answer(&db(), id, false),
         ("GET", ["conversations", id, "thread"]) => thread_of(&db(), id),
         ("POST", ["conversations", id, "turns"]) => return post_turn(state, call, client, id),
+        ("POST", ["conversations", id, "notes"]) => return post_note(state, call, client, id),
         ("POST", ["conversations", id, "wake-turns"]) => {
             return post_wake_turn(state, call, client, id);
+        }
+        ("POST", ["conversations", id, op @ ("install-release" | "rollback")])
+        | ("GET", ["conversations", id, op @ "smoke"]) => {
+            return crate::lead_install::request(state, call, id, op);
+        }
+        ("GET", ["conversations", id, "peer-messages"]) => {
+            return crate::peer_messages::peers(state, id);
+        }
+        ("POST", ["conversations", id, "peer-messages"]) => {
+            return crate::peer_messages::post(state, call, client, id);
         }
         ("POST", ["conversations", id, word @ ("stop" | "resume")]) => {
             return hold(state, call, client, id, word);
@@ -79,7 +97,7 @@ pub fn handle(state: &State, call: &Call, client: &Client, parts: &[&str]) -> Re
     }
 }
 
-fn list_conversations(db: &Connection, call: &Call) -> Reply {
+fn list_conversations(db: &ScopedConnection, call: &Call) -> Reply {
     let limit = match call.query("limit") {
         None => records::MAX_INTENTS,
         Some(raw) => match raw
@@ -133,7 +151,7 @@ fn list_conversations(db: &Connection, call: &Call) -> Reply {
 }
 
 /// `{conversation}`, with the active turn's `cancel` when asked; null for an unknown conversation.
-fn answer(db: &Connection, id: &str, with_cancel: bool) -> rusqlite::Result<Value> {
+fn answer(db: &ScopedConnection, id: &str, with_cancel: bool) -> rusqlite::Result<Value> {
     let Some(conversation) = records::one(db, Record::Conversation, id)? else {
         return Ok(Value::Null);
     };
@@ -141,7 +159,7 @@ fn answer(db: &Connection, id: &str, with_cancel: bool) -> rusqlite::Result<Valu
     if with_cancel {
         let cancel: Option<String> = db
             .query_row(
-                "SELECT c.cancel_id FROM turns t JOIN cancels c ON c.job_id = t.job_id
+                "SELECT c.cancel_id FROM (SELECT * FROM turns WHERE +org_id = :org_id) t JOIN (SELECT * FROM cancels WHERE +org_id = :org_id) c ON c.job_id = t.job_id
                  WHERE t.conversation_id = ?1 ORDER BY t.seq DESC LIMIT 1",
                 params![id],
                 |r| r.get(0),
@@ -155,7 +173,7 @@ fn answer(db: &Connection, id: &str, with_cancel: bool) -> rusqlite::Result<Valu
     Ok(out)
 }
 
-fn thread_of(db: &Connection, id: &str) -> rusqlite::Result<Value> {
+fn thread_of(db: &ScopedConnection, id: &str) -> rusqlite::Result<Value> {
     let Some(conversation) = records::one(db, Record::Conversation, id)? else {
         return Ok(Value::Null);
     };
@@ -210,7 +228,7 @@ fn normalise(m: &Map<String, Value>) -> Result<Value, No> {
 }
 
 /// The conversation's project: the one named, else its intent's. Naming another than its intent's is refused.
-fn project_of(db: &Connection, want: &Value) -> Result<Option<String>, No> {
+fn project_of(db: &ScopedConnection, want: &Value) -> Result<Option<String>, No> {
     let named = want["project_id"].as_str().map(String::from);
     crate::work::project_exists(db, named.as_deref())?;
     let Some(intent) = want["intent_id"].as_str() else {
@@ -218,7 +236,7 @@ fn project_of(db: &Connection, want: &Value) -> Result<Option<String>, No> {
     };
     let of_intent: Option<String> = db
         .query_row(
-            "SELECT project_id FROM intents WHERE intent_id = ?1",
+            "SELECT project_id FROM intents WHERE +org_id = :org_id AND intent_id = ?1",
             params![intent],
             |r| r.get(0),
         )
@@ -240,10 +258,11 @@ pub(crate) fn check_bundle(
     files: &[BundleFile],
 ) -> Result<(thread::SpecFacts, i64), No> {
     let find = |p: &str| files.iter().find(|f| f.path == p);
-    if let Some(f) = files
-        .iter()
-        .find(|f| f.path == thread::CONTEXT_PATH || f.path.starts_with("tasks/turn/"))
-    {
+    if let Some(f) = files.iter().find(|f| {
+        f.path == thread::CONTEXT_PATH
+            || f.path == crate::decision_log::LESSONS_PATH
+            || f.path.starts_with("tasks/turn/")
+    }) {
         return Err(No::invalid(&format!(
             "{} is written by the Director for each turn; leave it out of the bundle",
             f.path
@@ -437,7 +456,7 @@ fn default_bundle(state: &State, m: &mut Map<String, Value>, paired: bool) -> Re
 
 fn conversation_source_files(
     state: &State,
-    db: &Connection,
+    db: &ScopedConnection,
     want: &Value,
 ) -> Result<Vec<BundleFile>, Box<Reply>> {
     match &want["source"] {
@@ -464,14 +483,18 @@ fn conversation_source_files(
     }
 }
 
-fn validate_create_targets(db: &Connection, want: &Value, node: &str) -> Result<(), Box<Reply>> {
+fn validate_create_targets(
+    db: &ScopedConnection,
+    want: &Value,
+    node: &str,
+) -> Result<(), Box<Reply>> {
     let known = |sql: &str, v: &str| {
         db.query_row(sql, params![v], |_| Ok(()))
             .optional()
             .map(|o| o.is_some())
     };
     match known(
-        "SELECT 1 FROM nodes WHERE name = ?1 AND revoked_at IS NULL",
+        "SELECT 1 FROM nodes WHERE +org_id = :org_id AND name = ?1 AND revoked_at IS NULL",
         node,
     ) {
         Ok(true) => {}
@@ -483,7 +506,10 @@ fn validate_create_targets(db: &Connection, want: &Value, node: &str) -> Result<
         Err(e) => return Err(Box::new(internal(&e))),
     }
     if let Some(intent) = want["intent_id"].as_str() {
-        match known("SELECT 1 FROM intents WHERE intent_id = ?1", intent) {
+        match known(
+            "SELECT 1 FROM intents WHERE +org_id = :org_id AND intent_id = ?1",
+            intent,
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 return Err(Box::new(
@@ -525,7 +551,12 @@ fn create_bundle(
         m.remove("harness");
         m.insert("model".into(), json!(model));
     }
-    default_bundle(state, m, pair.is_some())?;
+    {
+        let mut db = state.store.db();
+        let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
+        default_bundle(state, m, pair.is_some())?;
+        tx.commit().map_err(|e| No::internal(&e))?;
+    }
     crate::lead_node::apply_create_node(&state.store.db(), m, built_lead)?;
     if built_chat && m.get("node").is_none_or(Value::is_null) {
         let node = crate::lead_node::effective(&state.store.db())
@@ -605,16 +636,16 @@ fn create(state: &State, call: &Call, client: &Client) -> Reply {
         let spec_version = jobs::bundle_sha(&files);
         let lead_i = i64::from(lead);
         tx.execute(
-            "INSERT INTO conversations (conversation_id, title, node, spec, spec_version, model, instructions_tokens,
-                                        tools, intent_id, created_by, created_at, project_id, lead)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO conversations (org_id, conversation_id, title, node, spec, spec_version, model, instructions_tokens,
+                                        tools, intent_id, created_by, created_at, project_id, lead, responsible_member_id, sponsor_member_id)
+             VALUES (:org_id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
             params![id, want["title"].as_str(), s("node"), s("spec"), spec_version, facts.model,
-                    instructions, facts.tools, want["intent_id"].as_str(), client.id, now_utc(), project, lead_i],
+                    instructions, facts.tools, want["intent_id"].as_str(), client.id, now_utc(), project, lead_i, client.member_id()],
         )
         .map_err(|e| e.to_string())?;
         for f in &files {
             tx.execute(
-                "INSERT INTO conversation_files (conversation_id, path, sha256, bytes, mode) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO conversation_files (org_id, conversation_id, path, sha256, bytes, mode) VALUES (:org_id, ?1, ?2, ?3, ?4, ?5)",
                 params![id, f.path, f.sha256, i64::try_from(f.bytes).unwrap_or(i64::MAX), f.mode],
             )
             .map_err(|e| e.to_string())?;
@@ -633,10 +664,10 @@ fn create(state: &State, call: &Call, client: &Client) -> Reply {
     }
 }
 
-fn exists(db: &Connection, id: &str) -> Result<(), Box<Reply>> {
+fn exists(db: &ScopedConnection, id: &str) -> Result<(), Box<Reply>> {
     match db
         .query_row(
-            "SELECT 1 FROM conversations WHERE conversation_id = ?1",
+            "SELECT 1 FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
             params![id],
             |_| Ok(()),
         )
@@ -653,7 +684,7 @@ fn exists(db: &Connection, id: &str) -> Result<(), Box<Reply>> {
     }
 }
 
-fn turn_answer(db: &Connection, turn: &str) -> rusqlite::Result<Value> {
+fn turn_answer(db: &ScopedConnection, turn: &str) -> rusqlite::Result<Value> {
     let Some(t) = records::one(db, Record::Turn, turn)? else {
         return Ok(Value::Null);
     };
@@ -687,6 +718,131 @@ fn wake_jobs(m: &Map<String, Value>) -> Result<Vec<&str>, No> {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| No::invalid("jobs is a list of job id strings")),
         Some(_) => Err(No::invalid("jobs is a list of at most 100 job id strings")),
+    }
+}
+
+fn note_attribution(
+    db: &ScopedConnection,
+    schedule_key: Option<&str>,
+    owner: &str,
+    untrusted: bool,
+) -> Result<(String, &'static str, Option<String>), No> {
+    Ok(if untrusted {
+        (
+            "system:google_tasks".to_owned(),
+            "browser_data",
+            Some(json!({"source":"google_tasks","trust":"untrusted"}).to_string()),
+        )
+    } else {
+        let responsible = db
+                .query_row(
+                    "SELECT responsible_member_id FROM schedules WHERE +org_id = :org_id AND schedule_key = ?1",
+                    [schedule_key],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| No::internal(&e))?
+                .flatten();
+        (
+            responsible.unwrap_or_else(|| owner.to_owned()),
+            "note",
+            None,
+        )
+    })
+}
+
+/// Record a completed owner note without starting a model turn.
+fn post_note(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
+    if client.kind != Kind::Local || client.member.scope.role != Some(Role::Owner) {
+        return refusal(
+            403,
+            "owner_only",
+            "only the local owner may post notes",
+            Value::Null,
+        );
+    }
+    let (key, m) = match (key(call), body(call)) {
+        (Ok(k), Ok(m)) => (k, m),
+        (Err(e), _) | (_, Err(e)) => return e.reply(),
+    };
+    let message = match wake_text(&m, "message") {
+        Ok(message) => message,
+        Err(e) => return e.reply(),
+    };
+    let mut note = json!({"message": message});
+    let untrusted = match (m.get("source"), m.get("trust")) {
+        (None, None) => false,
+        (Some(source), Some(trust)) if source == "google_tasks" && trust == "untrusted" => {
+            note["source"] = source.clone();
+            note["trust"] = trust.clone();
+            true
+        }
+        _ => return No::invalid("unsupported note source or trust").reply(),
+    };
+    let schedule_key = match m.get("schedule_key") {
+        None => None,
+        Some(Value::String(key)) if !key.is_empty() => {
+            note["schedule_key"] = json!(key);
+            Some(key.as_str())
+        }
+        _ => {
+            return refusal(
+                422,
+                "invalid_request",
+                "schedule_key must be a nonempty string",
+                Value::Null,
+            );
+        }
+    };
+    let sha = content("conversation_note", id, &note);
+    let mut db = state.store.db();
+    let made = (|| -> Result<(String, bool), No> {
+        let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
+        if let Some((_, turn)) = scoped_prior(&tx, &key, &sha, client)? {
+            return Ok((turn, true));
+        }
+        let found = tx
+            .query_row(
+                "SELECT 1 FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| No::internal(&e))?;
+        if found.is_none() {
+            return Err(No(
+                404,
+                "not_found",
+                "no such conversation".into(),
+                Value::Null,
+            ));
+        }
+        require_unarchived(&tx, id)?;
+        let (author, origin, detail) = note_attribution(&tx, schedule_key, &client.id, untrusted)?;
+        let turn = format!(
+            "trn_{}",
+            util::ulid().map_err(|e| No::internal(&e))?.to_lowercase()
+        );
+        let seq = make_room_for_completed_turn(&tx, id).map_err(|e| No::internal(&e))?;
+        tx.execute(
+            "INSERT INTO turns (org_id, turn_id, conversation_id, seq, message, state, posted_by, posted_at,
+                                finished_at, origin, detail)
+             VALUES (:org_id, ?1, ?2, ?3, ?4, 'done', ?5, ?6, ?6, ?7, ?8)",
+            params![turn, id, seq, message, author, now_utc(), origin, detail],
+        ).map_err(|e| No::internal(&e))?;
+        touch(&tx, Record::Turn, &turn).map_err(|e| No::internal(&e))?;
+        touch(&tx, Record::Conversation, id).map_err(|e| No::internal(&e))?;
+        remember(&tx, &key, &sha, Record::Turn, &turn, client).map_err(|e| No::internal(&e))?;
+        tx.commit().map_err(|e| No::internal(&e))?;
+        Ok((turn, false))
+    })();
+    match made {
+        Ok((turn, replayed)) => reply_with(
+            if replayed { 200 } else { 201 },
+            turn_answer(&db, &turn),
+            replayed,
+        ),
+        Err(e) => e.reply(),
     }
 }
 
@@ -741,7 +897,7 @@ fn post_wake_turn(state: &State, call: &Call, client: &Client, id: &str) -> Repl
     }
     let lead = db
         .query_row(
-            "SELECT lead FROM conversations WHERE conversation_id = ?1",
+            "SELECT lead FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
             params![id],
             |r| r.get::<_, i64>(0),
         )
@@ -765,11 +921,11 @@ fn post_wake_turn(state: &State, call: &Call, client: &Client, id: &str) -> Repl
         let now = now_utc();
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
         require_unarchived(&tx, id)?;
-        let seq = make_room_for_wake(&tx, id).map_err(|e| No::internal(&e))?;
+        let seq = make_room_for_completed_turn(&tx, id).map_err(|e| No::internal(&e))?;
         tx.execute(
-            "INSERT INTO turns (turn_id, conversation_id, seq, message, state, posted_by, posted_at, reply, finished_at,
+            "INSERT INTO turns (org_id, turn_id, conversation_id, seq, message, state, posted_by, posted_at, reply, finished_at,
                                 origin, detail)
-             VALUES (?1, ?2, ?7, '', 'done', ?3, ?4, ?5, ?4, 'wake', ?6)",
+             VALUES (:org_id, ?1, ?2, ?7, '', 'done', ?3, ?4, ?5, ?4, 'wake', ?6)",
             params![turn, id, client.id, now, reply, detail, seq],
         )
         .map_err(|e| No::internal(&e))?;
@@ -785,10 +941,10 @@ fn post_wake_turn(state: &State, call: &Call, client: &Client, id: &str) -> Repl
     }
 }
 
-// Put the completed reply before pending messages so those turns can use it as context.
-fn make_room_for_wake(db: &Connection, id: &str) -> rusqlite::Result<i64> {
+// Put the completed turn before pending messages so those turns can use it as context.
+fn make_room_for_completed_turn(db: &ScopedConnection, id: &str) -> rusqlite::Result<i64> {
     let seq = db.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?1
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE +org_id = :org_id AND conversation_id = ?1
          AND state NOT IN ('queued', 'summarising')",
         [id],
         |r| r.get::<_, i64>(0),
@@ -796,7 +952,7 @@ fn make_room_for_wake(db: &Connection, id: &str) -> rusqlite::Result<i64> {
     let pending = db
         .prepare(
             "SELECT turn_id, seq, ROW_NUMBER() OVER (ORDER BY seq) FROM turns
-         WHERE conversation_id = ?1 AND state IN ('queued', 'summarising') ORDER BY seq DESC",
+         WHERE +org_id = :org_id AND conversation_id = ?1 AND state IN ('queued', 'summarising') ORDER BY seq DESC",
         )?
         .query_map([id], |r| {
             Ok((
@@ -810,7 +966,7 @@ fn make_room_for_wake(db: &Connection, id: &str) -> rusqlite::Result<i64> {
     for (turn, old_seq, position) in pending {
         let next = (old_seq + 1).max(seq + position);
         db.execute(
-            "UPDATE turns SET seq = ?2 WHERE turn_id = ?1",
+            "UPDATE turns SET seq = ?2 WHERE +org_id = :org_id AND (turn_id = ?1)",
             params![turn, next],
         )?;
         touch(db, Record::Turn, &turn)?;
@@ -849,8 +1005,9 @@ fn post_turn(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
             crate::work_trace::on_attention_clear(&tx, id, &client.id)
                 .map_err(|e| No::internal(&e))?;
         }
-        let turn = crate::turns::enqueue(&state.store, &tx, id, message, &client.id, "person")
-            .map_err(|e| No::internal(&e))?;
+        let turn =
+            crate::turns::enqueue(&state.store, &tx, id, message, &client.id, "person", None)
+                .map_err(|e| No::internal(&e))?;
         remember(&tx, &key, &sha, Record::Turn, &turn, client).map_err(|e| No::internal(&e))?;
         tx.commit().map_err(|e| No::internal(&e))?;
         Ok(turn)
@@ -861,11 +1018,11 @@ fn post_turn(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
     }
 }
 
-fn clear_attention_cols(db: &Connection, id: &str) -> rusqlite::Result<()> {
+fn clear_attention_cols(db: &ScopedConnection, id: &str) -> rusqlite::Result<()> {
     db.execute(
         "UPDATE conversations SET attention_question = NULL, attention_job_id = NULL,
-         attention_set_at = NULL, attention_set_by = NULL
-         WHERE conversation_id = ?1 AND attention_question IS NOT NULL",
+         attention_set_at = NULL, attention_set_by = NULL, attention_assignee_member_id = NULL
+         WHERE +org_id = :org_id AND (conversation_id = ?1 AND attention_question IS NOT NULL)",
         params![id],
     )?;
     Ok(())
@@ -905,10 +1062,17 @@ fn set_attention(state: &State, call: &Call, client: &Client, id: &str) -> Reply
     let done = (|| -> Result<(), String> {
         let tx = crate::store::write_tx(&mut db).map_err(|e| e.to_string())?;
         let now = now_utc();
+        let sponsor = crate::sponsorship::sponsor(&tx, id).map_err(|e| e.to_string())?;
+        let assignee = crate::sponsorship::assignee(
+            &tx,
+            sponsor.as_deref(),
+            crate::policy::Capability::DecideRun,
+        )
+        .map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE conversations SET attention_question = ?2, attention_job_id = ?3,
-             attention_set_at = ?4, attention_set_by = ?5 WHERE conversation_id = ?1",
-            params![id, question, job_id, now, client.id],
+             attention_set_at = ?4, attention_set_by = ?5, attention_assignee_member_id=?6 WHERE +org_id = :org_id AND (conversation_id = ?1)",
+            params![id, question, job_id, now, client.id, assignee],
         )
         .map_err(|e| e.to_string())?;
         touch(&tx, Record::Conversation, id).map_err(|e| e.to_string())?;
@@ -929,7 +1093,7 @@ fn clear_attention(state: &State, client: &Client, id: &str) -> Reply {
     }
     let had = db
         .query_row(
-            "SELECT attention_question IS NOT NULL FROM conversations WHERE conversation_id = ?1",
+            "SELECT attention_question IS NOT NULL FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
             params![id],
             |r| r.get::<_, bool>(0),
         )
@@ -1012,7 +1176,7 @@ fn redo(state: &State, call: &Call, client: &Client, id: &str, sid: &str) -> Rep
     }
     let old: Option<(i64, Option<String>, String)> = match db
         .query_row(
-            "SELECT through_seq, based_on, state FROM summaries WHERE summary_id = ?1 AND conversation_id = ?2",
+            "SELECT through_seq, based_on, state FROM summaries WHERE +org_id = :org_id AND summary_id = ?1 AND conversation_id = ?2",
             params![sid, id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -1061,10 +1225,10 @@ fn redo(state: &State, call: &Call, client: &Client, id: &str, sid: &str) -> Rep
     }
 }
 
-fn require_unarchived(db: &Connection, id: &str) -> Result<(), No> {
+fn require_unarchived(db: &ScopedConnection, id: &str) -> Result<(), No> {
     let archived: bool = db
         .query_row(
-            "SELECT archived_at IS NOT NULL FROM conversations WHERE conversation_id = ?1",
+            "SELECT archived_at IS NOT NULL FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1",
             [id],
             |r| r.get(0),
         )
@@ -1091,7 +1255,7 @@ fn archive(state: &State, call: &Call, client: &Client, id: &str, word: &str) ->
         let tx = crate::store::write_tx(&mut db).map_err(|e| No::internal(&e))?;
         let known: bool = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?1)",
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1)",
                 [id],
                 |r| r.get(0),
             )
@@ -1112,8 +1276,8 @@ fn archive(state: &State, call: &Call, client: &Client, id: &str, word: &str) ->
             let at = (word == "archive").then(now_utc);
             let changed = tx
                 .execute(
-                    "UPDATE conversations SET archived_at = ?2 WHERE conversation_id = ?1
-                 AND (archived_at IS NULL) != (?2 IS NULL)",
+                    "UPDATE conversations SET archived_at = ?2 WHERE +org_id = :org_id AND (conversation_id = ?1
+                 AND (archived_at IS NULL) != (?2 IS NULL))",
                     params![id, at],
                 )
                 .map_err(|e| No::internal(&e))?;
@@ -1148,7 +1312,7 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
         let sql = |q: &str| tx.execute(q, [id]).map_err(|e| No::internal(&e));
         let exists: bool = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id = ?1)",
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1)",
                 [id],
                 |r| r.get(0),
             )
@@ -1162,7 +1326,7 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
             ));
         }
         scoped_prior(&tx, &key, &sha, client)?;
-        let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM turns WHERE conversation_id = ?1 AND state NOT IN ('done', 'error', 'stopped'))", [id], |r| r.get(0)).map_err(|e| No::internal(&e))?;
+        let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM turns WHERE +org_id = :org_id AND conversation_id = ?1 AND state NOT IN ('done', 'error', 'stopped'))", [id], |r| r.get(0)).map_err(|e| No::internal(&e))?;
         if busy {
             return Err(No(
                 409,
@@ -1172,32 +1336,32 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
             ));
         }
         let credentials = tx
-            .prepare("SELECT id FROM credentials WHERE conversation_id = ?1 AND kind = 'lead'")
+            .prepare("SELECT id FROM credentials WHERE +org_id = :org_id AND conversation_id = ?1 AND kind = 'lead'")
             .and_then(|mut s| {
                 s.query_map([id], |r| r.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
             .map_err(|e| No::internal(&e))?;
         sql(
-            "DELETE FROM lead_objects WHERE credential_id IN (SELECT id FROM credentials WHERE conversation_id = ?1 AND kind = 'lead')",
+            "DELETE FROM lead_objects WHERE +org_id = :org_id AND (credential_id IN (SELECT id FROM credentials WHERE +org_id = :org_id AND conversation_id = ?1 AND kind = 'lead'))",
         )?;
         tx.execute(
             "UPDATE credentials SET revoked_by = CASE WHEN revoked_at IS NULL THEN ?2 ELSE revoked_by END,
-             revoked_at = COALESCE(revoked_at, ?3), conversation_id = NULL WHERE conversation_id = ?1",
+             revoked_at = COALESCE(revoked_at, ?3), conversation_id = NULL WHERE +org_id = :org_id AND (conversation_id = ?1)",
             params![id, client.id, now_utc()],
         ).map_err(|e| No::internal(&e))?;
-        let jobs = tx.prepare("SELECT job_id FROM turns WHERE conversation_id = ?1 AND job_id IS NOT NULL UNION SELECT job_id FROM summaries WHERE conversation_id = ?1 UNION SELECT job_id FROM jobs WHERE intent_id IN (SELECT intent_id FROM intents WHERE conversation_id = ?1 OR lead_conversation_id = ?1)").and_then(|mut s| s.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| No::internal(&e))?;
+        let jobs = tx.prepare("SELECT job_id FROM turns WHERE +org_id = :org_id AND conversation_id = ?1 AND job_id IS NOT NULL UNION SELECT job_id FROM summaries WHERE +org_id = :org_id AND conversation_id = ?1 UNION SELECT job_id FROM jobs WHERE +org_id = :org_id AND intent_id IN (SELECT intent_id FROM intents WHERE +org_id = :org_id AND (conversation_id = ?1 OR lead_conversation_id = ?1))").and_then(|mut s| s.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| No::internal(&e))?;
         for job in jobs {
             touch(&tx, Record::Job, &job).map_err(|e| No::internal(&e))?;
         }
-        sql("DELETE FROM conversation_files WHERE conversation_id = ?1")?;
-        sql("DELETE FROM turns WHERE conversation_id = ?1")?;
-        sql("DELETE FROM summaries WHERE conversation_id = ?1")?;
+        sql("DELETE FROM conversation_files WHERE +org_id = :org_id AND (conversation_id = ?1)")?;
+        sql("DELETE FROM turns WHERE +org_id = :org_id AND (conversation_id = ?1)")?;
+        sql("DELETE FROM summaries WHERE +org_id = :org_id AND (conversation_id = ?1)")?;
         let intents = tx
             .prepare(
-                "SELECT intent_id FROM intents WHERE conversation_id = ?1 OR lead_conversation_id = ?1
+                "SELECT intent_id FROM intents WHERE +org_id = :org_id AND (conversation_id = ?1 OR lead_conversation_id = ?1)
                  UNION
-                 SELECT intent_id FROM conversations WHERE conversation_id = ?1 AND intent_id IS NOT NULL",
+                 SELECT intent_id FROM conversations WHERE +org_id = :org_id AND conversation_id = ?1 AND intent_id IS NOT NULL",
             )
             .and_then(|mut stmt| {
                 stmt.query_map([id], |r| r.get::<_, String>(0))?
@@ -1205,16 +1369,20 @@ fn delete(state: &State, call: &Call, client: &Client, id: &str) -> Reply {
             })
             .map_err(|e| No::internal(&e))?;
         sql(
-            "UPDATE intents SET conversation_id = CASE WHEN conversation_id = ?1 THEN NULL ELSE conversation_id END, lead_conversation_id = CASE WHEN lead_conversation_id = ?1 THEN NULL ELSE lead_conversation_id END WHERE conversation_id = ?1 OR lead_conversation_id = ?1",
+            "UPDATE intents SET conversation_id = CASE WHEN conversation_id = ?1 THEN NULL ELSE conversation_id END, lead_conversation_id = CASE WHEN lead_conversation_id = ?1 THEN NULL ELSE lead_conversation_id END WHERE +org_id = :org_id AND (conversation_id = ?1 OR lead_conversation_id = ?1)",
         )?;
         for intent in intents {
             touch(&tx, Record::Intent, &intent).map_err(|e| No::internal(&e))?;
         }
-        sql("UPDATE job_budgets SET conversation_id = NULL WHERE conversation_id = ?1")?;
-        sql("DELETE FROM budgets WHERE scope = 'conversation' AND scope_id = ?1")?;
+        sql(
+            "UPDATE job_budgets SET conversation_id = NULL WHERE +org_id = :org_id AND (conversation_id = ?1)",
+        )?;
+        sql(
+            "DELETE FROM budgets WHERE +org_id = :org_id AND scope = 'conversation' AND scope_id = ?1",
+        )?;
         touch(&tx, Record::Conversation, id).map_err(|e| No::internal(&e))?;
         crate::work_trace::on_attention_clear(&tx, id, &client.id).map_err(|e| No::internal(&e))?;
-        sql("DELETE FROM conversations WHERE conversation_id = ?1")?;
+        sql("DELETE FROM conversations WHERE +org_id = :org_id AND (conversation_id = ?1)")?;
         remember(&tx, &key, &sha, Record::Conversation, id, client)
             .map_err(|e| No::internal(&e))?;
         tx.commit().map_err(|e| No::internal(&e))?;

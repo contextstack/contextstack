@@ -21,14 +21,14 @@ BUNDLE` installs it with no network and no system Python into
   file's sha256 in the bundle and in the installed release, each binary and
   its `target/release/` link, and each manifest
   tool's runtime: python3 from the release; node, curl, bwrap or
-  sandbox-exec, gstack browse and Playwright from the host, present or
+  sandbox-exec and the public browser broker from the host, present or
   missing per the manifest's `requires`. Exit 0 complete, 2 a host runtime
   missing (the tools needing it are named), 1 the install is wrong.
 - A refused install writes nothing under HOME; no uv `~/.local/bin` shim, no
   file in `code_root/`. A bundle for a target this host cannot build records every
   binary required, not bundled.
-- A bundle for this host ships `bin/` cs-harness, cs-sandbox, cs-tools and
-  csgateway-rs only, and builds with no `go` on PATH: the Go runner and
+- A bundle for this host ships `bin/` cs-harness, cs-sandbox, cs-tools,
+  cs-gateway and browser-host, plus the Chrome extension. It builds with no `go` on PATH: the Go runner and
   gateway are archived ; earlier releases keep theirs.
 - A production bundle is built from an export (`git archive HEAD | tar -x`,
   then `node-bundle build --commit <sha>`): there `release_files` is the

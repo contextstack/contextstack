@@ -78,7 +78,10 @@ try:
     import _lanes  # noqa: E402
 
     def write_repos(**entries):
-        repos.write_text(json.dumps(entries))
+        repos.write_text(json.dumps({
+            name: {"land_check": "host", **entry} if isinstance(entry, dict) else entry
+            for name, entry in entries.items()
+        }))
 
     def cs_land(repo, lane, *extra):
         # cs reads node.env at startup; fixture landing must never consult host config.

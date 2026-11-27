@@ -21,20 +21,9 @@ use Native\Mobile\Events\Biometric\Completed as BiometricCompleted;
 use Native\Mobile\Events\Scanner\CodeScanned;
 use Native\Mobile\Testing\Native;
 
-const DirectorUrl = 'http://192.0.2.1:8780';
-
 beforeEach(function () {
-    $directory = sys_get_temp_dir().'/cs-mobile-test-'.bin2hex(random_bytes(4));
-    config(['client.settings_path' => $directory.'/connection.json', 'client.lock_path' => $directory.'/lock.json', 'client.director_url' => DirectorUrl]);
-    Http::preventStrayRequests();
-    Native::fakeBridge()->withSecureStorage();
+    isolateDevice();
 });
-
-function pairDevice(): void
-{
-    app(ConnectionStore::class)->saveDevice(DirectorUrl, 'csd_test_token', 'cred_ipad', 'iPad');
-    Http::fake([DirectorUrl.'/api/v1/client/projects' => Http::response(['projects' => []])]);
-}
 
 /**
  * @param  array<string, mixed>  $overrides
@@ -46,7 +35,7 @@ function needsOwner(array $overrides = []): array
         'id' => 'aa_1', 'job_id' => 'job_1', 'run_id' => 'run_1', 'status' => 'needs_owner',
         'argv' => ['git', 'push', 'origin', 'main'], 'needs' => ['network'], 'write_paths' => [],
         'reason' => 'Publish the fix', 'requesting_model' => 'opus', 'reviewer_model' => 'sonnet',
-        'verdict' => 'no_go', 'review_reason' => 'Git push requires an owner decision.',
+        'verdict' => 'no_go', 'review_reason' => 'Git push needs a human decision (an owner or the assigned admin).',
         'outcome' => ['status' => 'waiting_on_owner'], 'created_at' => '2026-11-21T10:00:00Z',
     ], $overrides);
 }
@@ -60,7 +49,10 @@ function fakeWaiting(array $approvals, array $conversations = []): void
 }
 
 it('pairs with a code and keeps only the device token', function () {
-    Http::fake([DirectorUrl.'/api/v1/pair' => Http::response(['credential_id' => 'cred_ipad', 'name' => 'iPad', 'token' => 'csd_new'])]);
+    Http::fake([
+        DirectorUrl.'/api/v1/pair' => Http::response(['credential_id' => 'cred_ipad', 'name' => 'iPad', 'token' => 'csd_new']),
+        DirectorUrl.'/api/v1/client/me' => Http::response(['credential_id' => 'cred_ipad', 'owner' => true]),
+    ]);
 
     Native::test(Connect::class)
         ->assertSet('url', DirectorUrl)
@@ -126,7 +118,7 @@ it('shows the approval detail and approves it', function () {
 
     Native::test(Waiting::class)
         ->call('select', 'aa_1')
-        ->assertSee('Git push requires an owner decision.')
+        ->assertSee('Git push needs a human decision (an owner or the assigned admin).')
         ->assertSee('No go from sonnet')
         ->tap('Approve')
         ->assertSet('selected', null)
@@ -209,20 +201,23 @@ it('keeps a paired device paired when the Keychain does not give its token, and 
 });
 
 it('pairs at once from a scanned pairing code', function () {
-    Http::fake([DirectorUrl.'/api/v1/pair' => Http::response(['credential_id' => 'cred_ipad', 'name' => 'ipad', 'token' => 'csd_scanned'])]);
+    Http::fake([
+        DirectorUrl.'/api/v1/pair' => Http::response(['credential_id' => 'cred_ipad', 'name' => 'ipad', 'token' => 'csd_scanned']),
+        DirectorUrl.'/api/v1/client/me' => Http::response(['credential_id' => 'cred_ipad', 'owner' => true]),
+    ]);
 
     Native::test(Connect::class)
         ->emitNative(CodeScanned::class, ['data' => 'contextstack://pair?url='.urlencode(DirectorUrl).'&code=K7QM-2XPA', 'format' => 'qr'])
         ->assertReplacedWith('/');
 
-    Http::assertSent(fn (Request $request) => $request['code'] === 'K7QM-2XPA');
+    Http::assertSent(fn (Request $request) => str_ends_with($request->url(), '/api/v1/pair') && $request['code'] === 'K7QM-2XPA');
     expect(app(ConnectionStore::class)->resolve()->token)->toBe('csd_scanned');
 });
 
 it('refuses a scanned code that is not a pairing link', function () {
     Native::test(Connect::class)
         ->emitNative(CodeScanned::class, ['data' => 'https://example.com/pair?code=1', 'format' => 'qr'])
-        ->assertSee('That is not a ContextStack pairing code');
+        ->assertSee('That is not a ContextStack pairing or invite code');
 
     Http::assertNothingSent();
 });
@@ -475,6 +470,9 @@ it('keeps the same key when the answer to a message is lost, so sending again re
         if (str_ends_with($request->url(), '/thread')) {
             return Http::response(conversationThread([]));
         }
+        if (str_ends_with($request->url(), '/me')) {
+            return Http::response(['credential_id' => 'cred_ipad', 'owner' => true]);
+        }
         $keys[] = $request->header('Idempotency-Key')[0];
         if (count($keys) === 1) {
             throw new ConnectionException('timed out');
@@ -719,6 +717,7 @@ it('does not start a conversation twice when only the first message failed to ar
     Http::fake(function (Request $request) use (&$turns) {
         return match (true) {
             str_ends_with($request->url(), '/models') => Http::response(['models' => [['name' => 'codex', 'label' => 'Codex']]]),
+            str_ends_with($request->url(), '/me') => Http::response(['credential_id' => 'cred_ipad', 'owner' => true]),
             str_ends_with($request->url(), '/client/conversations') => Http::response(['conversation' => ['conversation_id' => 'con_9']], 201),
             default => ++$turns === 1 ? throw new ConnectionException('timed out') : Http::response(['turn' => ['state' => 'running'], 'conversation' => []], 201),
         };
@@ -951,7 +950,7 @@ it('asks for the unlock before the pairing screen when the app is locked, and wa
     Native::visit('/pair?url='.urlencode('http://192.0.2.50:8780').'&code=ABCD-EFGH')->assertReplacedWith('/locked');
 
     app(AppLock::class)->unlock();
-    Native::visit('/connect')->assertSee('already paired with '.DirectorUrl);
+    Native::visit('/connect')->assertSee('already connected to '.DirectorUrl);
 });
 
 it('keeps the rest of Waiting when one project\'s backlog fails', function () {

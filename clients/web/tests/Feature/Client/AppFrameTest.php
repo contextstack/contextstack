@@ -6,6 +6,7 @@ beforeEach(fn () => connectClientWeb());
 
 it('frames every page with the icon rail and the collapsible thread panel', function () {
     Http::fake([director('nodes') => Http::response(['nodes' => []])]);
+    fakeDirectorBackground();
 
     $this->get(route('fleet'))->assertOk()
         ->assertSee('data-test="nav-rail"', false)
@@ -16,7 +17,8 @@ it('frames every page with the icon rail and the collapsible thread panel', func
 });
 
 it('leaves the theme to the system unless the settings page picks one', function () {
-    Http::fake([director('me') => Http::response(['credential_id' => 'cred_local', 'owner' => true])]);
+    meOnDirector(['credential_id' => 'cred_local', 'owner' => true]);
+    fakeDirectorBackground();
 
     $this->get(route('fleet'))->assertDontSee('<html lang="en" class="dark"', false);
     $this->get(route('connect'))->assertOk()
@@ -34,6 +36,7 @@ it('puts a thread\'s details in its side panel, with the lanes first on a lead',
         director('intents*') => Http::response(['intents' => []]),
         director('jobs*') => Http::response(['jobs' => []]),
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('conversations.show', 'con_lead'))->assertOk()
         ->assertSee('data-full-bleed', false)
@@ -50,6 +53,7 @@ it('writes messages in Flux\'s editor, which sends Markdown through the same pos
         director('models') => Http::response(['models' => [], 'default_model' => null]),
         director('conversations/con_chat/thread') => Http::response(['conversation' => $conversation, 'turns' => [], 'summaries' => []]),
     ]);
+    fakeDirectorBackground();
 
     $this->get(route('conversations.show', 'con_chat'))->assertOk()
         ->assertSee('data-cs-composer', false)
@@ -60,6 +64,8 @@ it('writes messages in Flux\'s editor, which sends Markdown through the same pos
 });
 
 it('writes the first message of a new conversation in the same editor, kept in the form\'s message field', function () {
+    Http::fake([director('intents?*') => Http::response(['intents' => [], 'jobs' => []])]);
+    fakeDirectorBackground();
     Livewire::test('pages::client.conversation-create')
         ->assertSeeHtml('x-data="composer({ form: true })"')
         ->assertSeeHtmlInOrder(['data-test="first-message"', '<ui-editor', 'x-on:keydown.capture="keydown($event)"', '<ui-editor-content>'])

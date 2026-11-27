@@ -126,7 +126,7 @@ it('asks the Director only for what a list shows: one more than the window, and 
     Livewire::test('pages::client.intents')->call('showMore');
     Livewire::test('pages::client.lanes');
 
-    $asked = Http::recorded()->map(fn (array $pair): string => (string) parse_url($pair[0]->url(), PHP_URL_QUERY))->all();
+    $asked = Http::recorded(fn ($request) => ! str_ends_with($request->url(), '/me'))->map(fn (array $pair): string => (string) parse_url($pair[0]->url(), PHP_URL_QUERY))->values()->all();
     expect($asked)->toBe(['limit=51', 'limit=101', 'lanes=1&limit=51']);
 });
 
